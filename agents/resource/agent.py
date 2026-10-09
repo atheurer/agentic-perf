@@ -354,13 +354,20 @@ def _jumpstarter_selector_changed(
     fields: dict[str, Any], directives: dict[str, Any]
 ) -> bool:
     """Return whether an explicit board selector differs from the active lease."""
-    requested = directives.get("board_selector") or fields.get("board_selector")
-    if not isinstance(requested, str) or not requested.strip():
-        return False
-
+    requested = (
+        directives.get("jumpstarter_selector")
+        or directives.get("board_selector")
+        or fields.get("jumpstarter_selector")
+        or fields.get("board_selector")
+    )
+    requested_exporter = directives.get("exporter_name") or fields.get("exporter_name")
     metadata = fields.get("resource_provider_metadata") or {}
     if not isinstance(metadata, dict):
         return True
+    if requested_exporter and metadata.get("exporter_name") != requested_exporter:
+        return True
+    if not isinstance(requested, str) or not requested.strip():
+        return False
 
     selector = metadata.get("selector") or metadata.get("jumpstarter_selector")
     exporter_name = metadata.get("exporter_name")
@@ -391,10 +398,125 @@ def _jumpstarter_selector_changed(
     return False
 
 
+def _selection_sources(
+    provider: str, fields: dict[str, Any], directives: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return provider-specific selection maps in directive precedence order."""
+    sources: list[dict[str, Any]] = []
+    for source in (fields, directives):
+        for key in ("resource_selection", f"{provider}_selection", provider):
+            value = source.get(key)
+            if isinstance(value, dict):
+                nested = value.get(provider)
+                sources.append(nested if isinstance(nested, dict) else value)
+        sources.append(source)
+    return sources
+
+
+def _explicit_provider_selection(
+    provider: str, fields: dict[str, Any], directives: dict[str, Any]
+) -> dict[str, Any]:
+    allowed = {
+        "aws": {
+            "instance_specs",
+            "instance_type",
+            "instance_count",
+            "count",
+            "ami",
+            "os",
+            "root_volume_gb",
+        },
+        "quads": {"hostnames", "duration_hours"},
+        "psap-cc": {"cluster_id", "duration_hours"},
+    }.get(provider, set())
+    selection: dict[str, Any] = {}
+    for source in _selection_sources(provider, fields, directives):
+        for key in allowed:
+            if key in source and source[key] is not None:
+                selection[key] = source[key]
+    return selection
+
+
+def _saved_aws_specs(
+    metadata: dict[str, Any],
+) -> tuple[tuple[str, str, int], ...] | None:
+    selections = metadata.get("reservation_selections")
+    if not isinstance(selections, list) or not selections:
+        return None
+
+    totals: dict[tuple[str, str], int] = {}
+    for selection in selections:
+        if not isinstance(selection, dict):
+            return None
+        specs = selection.get("instance_specs")
+        if isinstance(specs, list) and specs:
+            entries = specs
+        elif selection.get("instance_type"):
+            entries = [
+                {
+                    "instance_type": selection["instance_type"],
+                    "count": selection.get("count", selection.get("instance_count", 1)),
+                    "role": selection.get("role"),
+                }
+            ]
+        else:
+            return None
+
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("instance_type"):
+                return None
+            try:
+                count = int(entry.get("count", 1))
+            except (TypeError, ValueError):
+                return None
+            if count < 1:
+                return None
+            key = (str(entry.get("role") or ""), str(entry["instance_type"]))
+            totals[key] = totals.get(key, 0) + count
+    return tuple(
+        sorted(
+            (role, instance_type, count)
+            for (role, instance_type), count in totals.items()
+        )
+    )
+
+
+def _requested_aws_specs(
+    fields: dict[str, Any], directives: dict[str, Any]
+) -> tuple[tuple[str, str, int], ...] | None:
+    ticket_fields = dict(fields)
+    ticket_fields["directives"] = directives
+    try:
+        selection = _auto_reservation_selection("aws", {"custom_fields": ticket_fields})
+    except ValueError:
+        return None
+
+    specs = selection.get("instance_specs")
+    if not isinstance(specs, list):
+        return None
+    return tuple(
+        sorted(
+            (
+                str(spec.get("role") or ""),
+                str(spec["instance_type"]),
+                int(spec["count"]),
+            )
+            for spec in specs
+        )
+    )
+
+
+def _saved_selection_records(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    records = metadata.get("reservation_selections")
+    if isinstance(records, list):
+        return [item for item in records if isinstance(item, dict)]
+    return []
+
+
 def _provider_selection_changed(
     provider: str, fields: dict[str, Any], directives: dict[str, Any]
 ) -> bool:
-    """Detect changed explicit selectors that are represented in saved metadata."""
+    """Detect material provider requirements that differ from the saved lease."""
     metadata = fields.get("resource_provider_metadata") or {}
     if not isinstance(metadata, dict):
         return True
@@ -403,14 +525,110 @@ def _provider_selection_changed(
         return _jumpstarter_selector_changed(fields, directives)
 
     if provider == "aws":
-        for key in ("instance_type", "ami"):
-            requested = directives.get(key, fields.get(key))
-            active = metadata.get(key)
-            if requested is not None and requested != active:
+        requested = _explicit_provider_selection(provider, fields, directives)
+        for key in ("ami",):
+            if requested.get(key) is not None and requested[key] != metadata.get(key):
+                return True
+
+        records = _saved_selection_records(metadata)
+        for key in ("os", "root_volume_gb"):
+            if requested.get(key) is not None and (
+                not records
+                or any(record.get(key) != requested[key] for record in records)
+            ):
+                return True
+
+        requested_specs = _requested_aws_specs(fields, directives)
+        if requested_specs is not None:
+            saved_specs = _saved_aws_specs(metadata)
+            if saved_specs is None or saved_specs != requested_specs:
+                return True
+        elif requested.get("instance_specs") is not None:
+            # Malformed or incomplete requirements cannot safely reuse a lease.
+            return True
+
+        requested_type = requested.get("instance_type")
+        if requested_type:
+            active_types = set()
+            if metadata.get("instance_type"):
+                active_types.add(str(metadata["instance_type"]))
+            instance_types = metadata.get("instance_types")
+            if isinstance(instance_types, dict):
+                active_types.update(str(value) for value in instance_types.values())
+            if requested_type not in active_types:
+                return True
+
+        requested_count = requested.get("count", requested.get("instance_count"))
+        if requested_count is None and fields.get("required_hosts"):
+            required_hosts = fields.get("required_hosts") or []
+            requested_count = sum(
+                1
+                for host in required_hosts
+                if isinstance(host, dict) and not host.get("host")
+            )
+        if requested_count is not None:
+            try:
+                expected_count = int(requested_count)
+            except (TypeError, ValueError):
+                return True
+            instance_ids = metadata.get("instance_ids")
+            if isinstance(instance_ids, str):
+                actual_count = len(
+                    [value for value in instance_ids.split(",") if value]
+                )
+            elif isinstance(instance_ids, (list, tuple, set)):
+                actual_count = len(instance_ids)
+            else:
+                saved_specs = _saved_aws_specs(metadata)
+                actual_count = (
+                    sum(item[2] for item in saved_specs) if saved_specs else None
+                )
+            if actual_count is None or actual_count != expected_count:
+                return True
+
+    if provider == "quads":
+        requested = _explicit_provider_selection(provider, fields, directives)
+        requested_hostnames = requested.get("hostnames")
+        if requested_hostnames is None:
+            try:
+                ticket_fields = dict(fields)
+                ticket_fields["directives"] = directives
+                requested_hostnames = _auto_reservation_selection(
+                    "quads", {"custom_fields": ticket_fields}
+                ).get("hostnames")
+            except ValueError:
+                if fields.get("required_hosts"):
+                    return True
+        if requested_hostnames is not None:
+            if isinstance(requested_hostnames, str):
+                requested_hostnames = [
+                    name.strip()
+                    for name in requested_hostnames.split(",")
+                    if name.strip()
+                ]
+            if not isinstance(requested_hostnames, list) or any(
+                not isinstance(name, str) or not name.strip()
+                for name in requested_hostnames
+            ):
+                return True
+            records = _saved_selection_records(metadata)
+            saved_hostnames = [
+                hostname
+                for record in records
+                for hostname in record.get("hostnames", [])
+                if isinstance(hostname, str)
+            ]
+            if not saved_hostnames and isinstance(metadata.get("hostnames"), list):
+                saved_hostnames = metadata["hostnames"]
+            if not saved_hostnames or sorted(saved_hostnames) != sorted(
+                requested_hostnames
+            ):
                 return True
 
     if provider == "psap-cc":
-        requested = directives.get("cluster_id", fields.get("cluster_id"))
+        requested = _explicit_provider_selection(provider, fields, directives).get(
+            "cluster_id"
+        )
         active = metadata.get("cluster_id")
         if requested is not None and requested != active:
             return True
@@ -606,14 +824,14 @@ class ResourceAgent(AgentBase):
 
         fields = ticket.get("custom_fields", {})
         directives = fields.get("directives", {})
-        requested_provider = directives.get("resource_provider")
-        if not requested_provider:
-            return True
-
         recorded_provider = fields.get("resource_provider")
         current_provider = recorded_provider
         if not current_provider and fields.get("quads_assignment_id"):
             current_provider = "quads"
+        requested_provider = directives.get("resource_provider") or current_provider
+        if not requested_provider:
+            return True
+
         changed = current_provider != requested_provider
         if current_provider == requested_provider:
             changed = _provider_selection_changed(
@@ -621,6 +839,34 @@ class ResourceAgent(AgentBase):
             )
         if not changed:
             return True
+
+        if (
+            requested_provider != current_provider
+            and requested_provider != "user_provided"
+        ):
+            if not self._registry:
+                return await pause(
+                    "**Resource provider change paused:** The requested provider "
+                    f"({requested_provider}) cannot be verified because no provider "
+                    "registry is available. The previous allocation was retained.",
+                )
+            try:
+                # Resolve the target before releasing the active allocation. This
+                # verifies that it is a known, configured provider while preserving
+                # the old resources if the requested provider cannot be used.
+                await self._registry.get_provider(str(requested_provider))
+            except Exception as exc:
+                logger.warning(
+                    "[resource] Requested provider %s is unavailable: %s",
+                    requested_provider,
+                    type(exc).__name__,
+                )
+                return await pause(
+                    "**Resource provider change paused:** The requested provider "
+                    f"({requested_provider}) is unknown or not configured. The "
+                    "previous allocation was retained; configure the provider or "
+                    "choose another directive before retrying.",
+                )
 
         metadata = fields.get("resource_provider_metadata") or {}
         metadata = metadata if isinstance(metadata, dict) else {}
@@ -1527,7 +1773,11 @@ class ResourceAgent(AgentBase):
                     )
                     return
 
+                selection_record = dict(selection)
                 duration_hours = selection.pop("duration_hours", None)
+                selection_record["duration_hours"] = (
+                    duration_hours if duration_hours is not None else 36
+                )
                 reserve_args: dict[str, Any] = {
                     "provider": rp,
                     "selection": selection,
@@ -1637,6 +1887,17 @@ class ResourceAgent(AgentBase):
                         )
                     if not reservation_metadata:
                         reservation_metadata = result_metadata
+                    selection_history = reservation_metadata.get(
+                        "reservation_selections"
+                    )
+                    selection_history = (
+                        list(selection_history)
+                        if isinstance(selection_history, list)
+                        else []
+                    )
+                    if selection_record not in selection_history:
+                        selection_history.append(selection_record)
+                    reservation_metadata["reservation_selections"] = selection_history
                     if fallback_id and not has_reservation_metadata(
                         rp, reservation_metadata
                     ):

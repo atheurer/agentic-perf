@@ -1673,6 +1673,176 @@ class TestProviderCorrectAutoReservation:
         assert final_fields["resource_reservation_id"] == "i-new"
 
     @pytest.mark.asyncio
+    async def test_changed_jumpstarter_board_selector_without_provider_directive(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "resource_reservation_id": "old-lease",
+                "resource_provider_metadata": {
+                    "lease_id": "old-lease",
+                    "selector": "board-type=ride4,enabled=true,pool=open",
+                },
+                "board_selector": "board-type=ride5",
+            },
+        }
+        old_metadata = dict(ticket["custom_fields"]["resource_provider_metadata"])
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        old_provider.terminate.assert_awaited_once_with("old-lease", old_metadata)
+        reset = agent._client.patch.await_args.kwargs["json"]["fields"]
+        assert reset["resource_reservation_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_changed_aws_count_releases_existing_instances(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "aws",
+                "resource_reservation_id": "i-old-1,i-old-2",
+                "resource_provider_metadata": {
+                    "instance_ids": ["i-old-1", "i-old-2"],
+                    "instance_type": "m5.xlarge",
+                    "reservation_selections": [
+                        {"instance_type": "m5.xlarge", "count": 2}
+                    ],
+                },
+                "directives": {"count": 3},
+            },
+        }
+        old_metadata = dict(ticket["custom_fields"]["resource_provider_metadata"])
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        old_provider.terminate.assert_awaited_once_with("i-old-1,i-old-2", old_metadata)
+        assert (
+            agent._client.patch.await_args.kwargs["json"]["fields"]["resource_provider"]
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_changed_aws_role_specific_specs_release_existing_instances(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "aws",
+                "resource_reservation_id": "i-controller,i-target",
+                "resource_provider_metadata": {
+                    "instance_ids": ["i-controller", "i-target"],
+                    "instance_types": {
+                        "controller": "m6i.large",
+                        "target": "c6i.large",
+                    },
+                    "reservation_selections": [
+                        {
+                            "instance_specs": [
+                                {
+                                    "instance_type": "m6i.large",
+                                    "count": 1,
+                                    "role": "controller",
+                                },
+                                {
+                                    "instance_type": "c6i.large",
+                                    "count": 1,
+                                    "role": "target",
+                                },
+                            ]
+                        }
+                    ],
+                },
+                "directives": {
+                    "instance_specs": [
+                        {
+                            "instance_type": "m6i.large",
+                            "count": 1,
+                            "role": "controller",
+                        },
+                        {
+                            "instance_type": "c6i.xlarge",
+                            "count": 1,
+                            "role": "target",
+                        },
+                    ]
+                },
+            },
+        }
+        old_metadata = dict(ticket["custom_fields"]["resource_provider_metadata"])
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        old_provider.terminate.assert_awaited_once_with(
+            "i-controller,i-target", old_metadata
+        )
+
+    @pytest.mark.asyncio
+    async def test_changed_quads_hostnames_releases_existing_assignment(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "quads",
+                "resource_reservation_id": "42",
+                "resource_provider_metadata": {
+                    "assignment_id": 42,
+                    "reservation_selections": [{"hostnames": ["host-old.example.com"]}],
+                },
+                "hostnames": ["host-new.example.com"],
+            },
+        }
+        old_metadata = dict(ticket["custom_fields"]["resource_provider_metadata"])
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        old_provider.terminate.assert_awaited_once_with("42", old_metadata)
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_target_provider_keeps_old_allocation(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "status": "awaiting_hardware",
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "resource_reservation_id": "old-lease",
+                "resource_provider_metadata": {"lease_id": "old-lease"},
+                "directives": {"resource_provider": "unknown-provider"},
+            },
+        }
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(
+            side_effect=ValueError("Unknown resource provider")
+        )
+
+        assert not await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        agent._registry.get_provider.assert_awaited_once_with("unknown-provider")
+        old_provider.terminate.assert_not_awaited()
+        agent._client.patch.assert_not_awaited()
+        assert ticket["custom_fields"]["resource_reservation_id"] == "old-lease"
+
+    @pytest.mark.asyncio
     async def test_unconfirmed_old_release_keeps_allocation_and_blocks_retry(self):
         ticket = {
             "id": "PERF-TEST",
@@ -1758,9 +1928,15 @@ class TestProviderCorrectAutoReservation:
         aws.terminate = AsyncMock(return_value={"status": "terminated"})
         quads = MagicMock()
         quads.terminate = AsyncMock(return_value={"status": "terminated"})
+        jumpstarter = MagicMock()
+        jumpstarter.terminate = AsyncMock(return_value={"status": "terminated"})
         agent._registry = MagicMock()
         agent._registry.get_provider = AsyncMock(
-            side_effect=lambda name: {"aws": aws, "quads": quads}[name]
+            side_effect=lambda name: {
+                "aws": aws,
+                "quads": quads,
+                "jumpstarter": jumpstarter,
+            }[name]
         )
 
         assert await agent._reconcile_provider_directive("PERF-TEST", ticket)

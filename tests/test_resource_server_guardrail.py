@@ -613,7 +613,10 @@ async def test_reservation_cannot_switch_provider_after_first_allocation():
     fields = srv._ticket["custom_fields"]
     assert fields["resource_provider"] == "aws"
     assert fields["resource_reservation_id"] == "i-first"
-    assert fields["resource_provider_metadata"] == {"instance_ids": ["i-first"]}
+    assert fields["resource_provider_metadata"]["instance_ids"] == ["i-first"]
+    assert fields["resource_provider_metadata"]["reservation_selections"] == [
+        {"instance_type": "m5.xlarge", "count": 1, "duration_hours": 36}
+    ]
     assert fields["resource_reservation_outcome_unknown"] is False
 
 
@@ -715,7 +718,10 @@ async def test_same_provider_retry_discards_failed_attempt_metadata():
     )
 
     assert result["status"] == "success"
-    assert result["provider_metadata"] == {"instance_ids": ["i-current"]}
+    assert result["provider_metadata"]["instance_ids"] == ["i-current"]
+    assert result["provider_metadata"]["reservation_selections"] == [
+        {"instance_type": "m5.xlarge", "count": 1, "duration_hours": 36}
+    ]
     assert (
         "diagnostic_region"
         not in srv._ticket["custom_fields"]["resource_provider_metadata"]
@@ -1012,7 +1018,10 @@ class TestReservationFailureTracking:
         )
         assert srv._ticket["custom_fields"]["resource_reservation_id"] == "i-partial"
         assert srv._ticket["custom_fields"]["resource_provider_metadata"] == {
-            "instance_ids": ["i-partial"]
+            "instance_ids": ["i-partial"],
+            "reservation_selections": [
+                {"instance_type": "m5.xlarge", "count": 1, "duration_hours": 36}
+            ],
         }
         assert len(requests) == 2
         assert json.loads(requests[0].content)["fields"] == {
@@ -1022,7 +1031,12 @@ class TestReservationFailureTracking:
         assert json.loads(requests[1].content)["fields"] == {
             "resource_reservation_outcome_unknown": True,
             "resource_provider": "aws",
-            "resource_provider_metadata": {"instance_ids": ["i-partial"]},
+            "resource_provider_metadata": {
+                "instance_ids": ["i-partial"],
+                "reservation_selections": [
+                    {"instance_type": "m5.xlarge", "count": 1, "duration_hours": 36}
+                ],
+            },
             "resource_reservation_id": "i-partial",
         }
 
@@ -1100,6 +1114,10 @@ class TestReservationFailureTracking:
             "resource_provider_metadata": {
                 "instance_ids": ["i-first", "i-second"],
                 "public_ips": ["198.51.100.1", "198.51.100.2"],
+                "reservation_selections": [
+                    {"instance_type": "m5.xlarge", "count": 1, "duration_hours": 36},
+                    {"instance_type": "m5.xlarge", "count": 1, "duration_hours": 36},
+                ],
             },
             "resource_reservation_id": "i-first,i-second",
         }

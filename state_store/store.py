@@ -677,6 +677,7 @@ class TicketStore:
                     in {
                         TicketStatus.TRIAGE_PENDING,
                         TicketStatus.AWAITING_HARDWARE,
+                        TicketStatus.PREPARING_PLATFORM,
                         TicketStatus.AWAITING_PROVISION,
                         TicketStatus.EXECUTING_BENCHMARK,
                     }

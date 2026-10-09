@@ -125,6 +125,32 @@ class TestStalePipelineFieldClearing:
         ticket = store.get_ticket(tid)
         assert "platform_ready" not in ticket.custom_fields
 
+    def test_resume_to_preparing_platform_clears_old_successful_jumpstarter_image(
+        self, store
+    ):
+        tid = _make_ticket_at_guidance(store, "awaiting_hardware")
+        store.update_fields(
+            tid,
+            {
+                "jumpstarter_flash": {
+                    "status": "success",
+                    "image_version": "9.4",
+                    "image_url": "http://images.example/9.4.raw",
+                },
+                "directives": {"image_version": "9.5"},
+            },
+        )
+
+        store.transition_ticket(
+            tid,
+            TransitionRequest(status=TicketStatus.PREPARING_PLATFORM),
+        )
+
+        ticket = store.get_ticket(tid)
+        assert ticket.custom_fields["directives"]["image_version"] == "9.5"
+        assert "jumpstarter_flash" not in ticket.custom_fields
+        assert "platform_ready" not in ticket.custom_fields
+
     def test_resume_clears_all_stale_fields(self, store):
         tid = _make_ticket_at_guidance(store, "awaiting_hardware")
         store.transition_ticket(
