@@ -209,6 +209,7 @@ class AgentMCPClient:
         self._tool_routing: dict[str, str] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._closing = False
+        self._reconnect_startup_tasks: set[asyncio.Task[None]] = set()
         self.trace_context = trace_context
         # Optional hook for provider-specific call_tool behavior (e.g.,
         # Jumpstarter connect guards). It may return a string for a local
@@ -655,18 +656,22 @@ class AgentMCPClient:
             raise
 
         try:
-            conn.session = session
-            self._servers[name] = conn
-            self._record_boundary(conn, LifecycleState.CONNECTED)
-            # The connection is installed before the initial tool discovery
-            # request. Cleanup must therefore close this CONNECTED boundary
-            # if list_tools is cancelled, fails, or finds a conflict.
-            conn.connected = True
-            if generation:
-                self._record_boundary(conn, LifecycleState.RECONNECTED)
-            self._record_boundary(
-                conn, LifecycleState.REQUEST_SENT, tool_name="list_tools"
-            )
+            async with self._lifecycle_lock:
+                connection_rejected = self._closing
+                if not connection_rejected:
+                    conn.session = session
+                    self._servers[name] = conn
+                    self._record_boundary(conn, LifecycleState.CONNECTED)
+                    # Installation and shutdown admission share the lifecycle
+                    # lock, so a connection cannot appear after teardown starts.
+                    conn.connected = True
+                    if generation:
+                        self._record_boundary(conn, LifecycleState.RECONNECTED)
+                    self._record_boundary(
+                        conn, LifecycleState.REQUEST_SENT, tool_name="list_tools"
+                    )
+            if connection_rejected:
+                raise asyncio.CancelledError()
             result = await session.list_tools()
         except asyncio.CancelledError as exc:
             cancellation_state = _cancellation_state(exc)
@@ -926,29 +931,18 @@ class AgentMCPClient:
         not possible — e.g. because the original connection parameters were
         not stored or the subprocess cannot be relaunched.
         """
-        async with self._lifecycle_lock:
-            if self._closing:
-                return False
-
-            current = self._servers.get(conn.name)
-            if current is not conn:
-                return (
-                    current is not None
-                    and current.connected
-                    and current.session is not None
-                )
-
-            async with conn._reconnect_lock:
-                current = self._servers.get(conn.name)
+        async with conn._reconnect_lock:
+            async with self._lifecycle_lock:
                 if self._closing:
                     return False
+
+                current = self._servers.get(conn.name)
                 if current is not conn:
                     return (
                         current is not None
                         and current.connected
                         and current.session is not None
                     )
-
                 params = conn._connect_params
                 if params is None:
                     logger.warning(
@@ -957,31 +951,40 @@ class AgentMCPClient:
                     )
                     return False
 
-                logger.info(
-                    "Attempting to reconnect MCP server %s (generation %d)",
-                    conn.name,
-                    conn.reconnect_generation + 1,
-                )
-                try:
-                    await self.connect_command(
+                connect_task = asyncio.create_task(
+                    self.connect_command(
                         command=params.command,
                         args=params.args,
                         name=conn.name,
                         env=params.env,
                         ticket_id=params.ticket_id,
                         agent_id=params.agent_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to reconnect MCP server %s (error_type=%s)",
-                        conn.name,
-                        type(exc).__name__,
-                    )
-                    return False
+                    ),
+                    name=f"mcp-reconnect:{conn.name}",
+                )
+                self._reconnect_startup_tasks.add(connect_task)
 
+            logger.info(
+                "Attempting to reconnect MCP server %s (generation %d)",
+                conn.name,
+                conn.reconnect_generation + 1,
+            )
+            try:
+                await connect_task
+            except Exception as exc:
+                logger.warning(
+                    "Failed to reconnect MCP server %s (error_type=%s)",
+                    conn.name,
+                    type(exc).__name__,
+                )
+                return False
+            finally:
+                async with self._lifecycle_lock:
+                    self._reconnect_startup_tasks.discard(connect_task)
+
+            async with self._lifecycle_lock:
                 if self._closing:
                     return False
-
                 new_conn = self._servers.get(conn.name)
                 if new_conn is None or new_conn.session is None:
                     return False
@@ -1600,8 +1603,17 @@ class AgentMCPClient:
         return True
 
     async def disconnect(self) -> None:
-        self._closing = True
         async with self._lifecycle_lock:
+            self._closing = True
+            reconnect_tasks = tuple(self._reconnect_startup_tasks)
+
+        for task in reconnect_tasks:
+            task.cancel()
+        if reconnect_tasks:
+            await asyncio.gather(*reconnect_tasks, return_exceptions=True)
+
+        async with self._lifecycle_lock:
+            self._reconnect_startup_tasks.difference_update(reconnect_tasks)
             for conn in list(self._servers.values()):
                 self._record_boundary(conn, LifecycleState.DISCONNECTED)
                 conn.connected = False

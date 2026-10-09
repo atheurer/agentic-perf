@@ -535,6 +535,7 @@ async def test_reconnect_audit_trail():
 @pytest.mark.asyncio
 async def test_disconnect_closes_connection_installed_by_inflight_reconnect():
     reconnect_started = asyncio.Event()
+    reconnect_cancelled = asyncio.Event()
     finish_reconnect = asyncio.Event()
     params = _default_connect_params()
     client, conn = _make_connected_client(connect_params=params)
@@ -545,7 +546,12 @@ async def test_disconnect_closes_connection_installed_by_inflight_reconnect():
         command, args=None, name=None, env=None, ticket_id=None, agent_id=None
     ):
         reconnect_started.set()
-        await finish_reconnect.wait()
+        try:
+            await finish_reconnect.wait()
+        except asyncio.CancelledError:
+            # Model startup completing at the same time shutdown cancels it.
+            reconnect_cancelled.set()
+            await finish_reconnect.wait()
         new_conn = _ServerConnection(
             name=name,
             session=_FakeSession(tools=[_make_tool("check_host")]),
@@ -565,9 +571,9 @@ async def test_disconnect_closes_connection_installed_by_inflight_reconnect():
         client, "connect_command", side_effect=install_reconnected_server
     ):
         reconnect_task = asyncio.create_task(client._reconnect_server(conn))
-        await reconnect_started.wait()
+        await asyncio.wait_for(reconnect_started.wait(), timeout=1)
         disconnect_task = asyncio.create_task(client.disconnect())
-        await asyncio.sleep(0)
+        await asyncio.wait_for(reconnect_cancelled.wait(), timeout=1)
         closing_started = client._closing
         disconnect_waiting = not disconnect_task.done()
 
@@ -594,19 +600,15 @@ async def test_reconnect_waiting_when_disconnect_starts_does_not_relaunch():
     connect_command = AsyncMock()
     client.connect_command = connect_command
 
-    await client._lifecycle_lock.acquire()
+    await conn._reconnect_lock.acquire()
     reconnect_task = asyncio.create_task(client._reconnect_server(conn))
     await asyncio.sleep(0)
-    disconnect_task = asyncio.create_task(client.disconnect())
-    await asyncio.sleep(0)
-    closing_started = client._closing
-    client._lifecycle_lock.release()
+    try:
+        await client.disconnect()
+    finally:
+        conn._reconnect_lock.release()
 
-    reconnect_succeeded = await reconnect_task
-    await disconnect_task
-
-    assert closing_started is True
-    assert reconnect_succeeded is False
+    assert await reconnect_task is False
     connect_command.assert_not_awaited()
     assert client._servers == {}
     assert conn._shutdown.is_set()

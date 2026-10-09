@@ -1349,6 +1349,74 @@ async def test_client_cancellation_during_connect_cleans_up_task():
 
 
 @pytest.mark.asyncio
+async def test_disconnect_cancels_reconnect_stuck_in_initialize(monkeypatch):
+    initialize_started = asyncio.Event()
+    client = AgentMCPClient()
+    params = _ConnectParams(
+        command="python",
+        args=["server.py"],
+        env={},
+        ticket_id="PERF-1",
+        agent_id="test-agent",
+    )
+    conn = _ServerConnection(
+        name="local",
+        session=None,
+        transport="stdio",
+        ticket_id="PERF-1",
+        agent_id="test-agent",
+        connected=True,
+        _connect_params=params,
+    )
+    client._servers["local"] = conn
+    client._tool_routing["check_host"] = "local"
+
+    class _HangingInitializeSession(_TestClientSession):
+        async def initialize(self):
+            initialize_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(
+        mcp_client_module,
+        "ClientSession",
+        _HangingInitializeSession,
+    )
+
+    reconnect_task = asyncio.create_task(client._reconnect_server(conn))
+    await asyncio.wait_for(initialize_started.wait(), timeout=1)
+    assert client._servers == {}
+
+    await asyncio.wait_for(client.disconnect(), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await reconnect_task
+
+    assert client._reconnect_startup_tasks == set()
+    assert client._servers == {}
+    assert client._tool_routing == {}
+    terminal_events = [
+        event
+        for event in client.audit_events
+        if event.lifecycle.state
+        in {
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+            LifecycleState.TIMED_OUT,
+            LifecycleState.REJECTED,
+            LifecycleState.SHORT_CIRCUITED,
+            LifecycleState.RESPONSE_RECEIVED,
+        }
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].lifecycle.state == LifecycleState.CANCELLED
+    assert terminal_events[0].outcome == OperationOutcome.CANCELLED
+
+
+@pytest.mark.asyncio
 async def test_client_timeout_during_connect_is_audited_as_timed_out():
     entered = asyncio.Event()
     release = asyncio.Event()
