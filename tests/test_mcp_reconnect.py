@@ -18,7 +18,7 @@ from agents.mcp_client import (
     _is_disconnect_error,
     _ServerConnection,
 )
-from providers.tracing import LifecycleState, RetryKind, TraceContext
+from providers.tracing import LifecycleState, OperationOutcome, RetryKind, TraceContext
 
 # ---------------------------------------------------------------------------
 # Unit tests for _is_disconnect_error
@@ -504,20 +504,112 @@ async def test_reconnect_audit_trail():
         client._tool_routing["check_host"] = name
 
     with patch.object(client, "connect_command", side_effect=fake_connect_command):
-        # The call returns an error (no retry) but reconnects for future calls
-        try:
-            result = await client.call_tool(
-                "check_host", {}, trace_context=_trace_context()
-            )
-            # call_tool may return error string instead of raising
-            assert "not retried" in result.lower() or "ambiguous" in result.lower()
-        except Exception:
-            pass  # MCPToolCallError is acceptable
+        with pytest.raises(MCPToolCallError) as exc_info:
+            await client.call_tool("check_host", {}, trace_context=_trace_context())
 
-    states = [e.lifecycle.state for e in client.audit_events]
-    # Should see DISCONNECTED from the transport failure.
-    # No RESPONSE_RECEIVED — we don't retry ambiguous calls.
-    assert LifecycleState.DISCONNECTED in states
+    assert exc_info.value.retry_classification == "ambiguous_after_send"
+    states = [event.lifecycle.state for event in client.audit_events]
+    assert states == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.DISCONNECTED,
+        LifecycleState.FAILED,
+    ]
+    terminal_events = [
+        event
+        for event in client.audit_events
+        if event.lifecycle.state
+        in {
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+            LifecycleState.TIMED_OUT,
+            LifecycleState.REJECTED,
+            LifecycleState.SHORT_CIRCUITED,
+            LifecycleState.RESPONSE_RECEIVED,
+        }
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].outcome == OperationOutcome.FAILURE
+    assert terminal_events[0].lifecycle.retry_kind == RetryKind.AMBIGUOUS_AFTER_SEND
+
+
+@pytest.mark.asyncio
+async def test_disconnect_closes_connection_installed_by_inflight_reconnect():
+    reconnect_started = asyncio.Event()
+    finish_reconnect = asyncio.Event()
+    params = _default_connect_params()
+    client, conn = _make_connected_client(connect_params=params)
+    conn.session = None
+    installed_connections = []
+
+    async def install_reconnected_server(
+        command, args=None, name=None, env=None, ticket_id=None, agent_id=None
+    ):
+        reconnect_started.set()
+        await finish_reconnect.wait()
+        new_conn = _ServerConnection(
+            name=name,
+            session=_FakeSession(tools=[_make_tool("check_host")]),
+            transport="stdio",
+            endpoint=command,
+            ticket_id=ticket_id,
+            agent_id=agent_id,
+            connected=True,
+            reconnect_generation=1,
+            _connect_params=params,
+        )
+        installed_connections.append(new_conn)
+        client._servers[name] = new_conn
+        client._tool_routing["check_host"] = name
+
+    with patch.object(
+        client, "connect_command", side_effect=install_reconnected_server
+    ):
+        reconnect_task = asyncio.create_task(client._reconnect_server(conn))
+        await reconnect_started.wait()
+        disconnect_task = asyncio.create_task(client.disconnect())
+        await asyncio.sleep(0)
+        closing_started = client._closing
+        disconnect_waiting = not disconnect_task.done()
+
+        finish_reconnect.set()
+        reconnect_succeeded = await reconnect_task
+        await disconnect_task
+
+    assert closing_started is True
+    assert disconnect_waiting is True
+    assert reconnect_succeeded is False
+    assert len(installed_connections) == 1
+    new_conn = installed_connections[0]
+    assert new_conn.connected is False
+    assert new_conn._shutdown.is_set()
+    assert client._servers == {}
+    assert client._tool_routing == {}
+
+
+@pytest.mark.asyncio
+async def test_reconnect_waiting_when_disconnect_starts_does_not_relaunch():
+    params = _default_connect_params()
+    client, conn = _make_connected_client(connect_params=params)
+    conn.session = None
+    connect_command = AsyncMock()
+    client.connect_command = connect_command
+
+    await client._lifecycle_lock.acquire()
+    reconnect_task = asyncio.create_task(client._reconnect_server(conn))
+    await asyncio.sleep(0)
+    disconnect_task = asyncio.create_task(client.disconnect())
+    await asyncio.sleep(0)
+    closing_started = client._closing
+    client._lifecycle_lock.release()
+
+    reconnect_succeeded = await reconnect_task
+    await disconnect_task
+
+    assert closing_started is True
+    assert reconnect_succeeded is False
+    connect_command.assert_not_awaited()
+    assert client._servers == {}
+    assert conn._shutdown.is_set()
 
 
 @pytest.mark.asyncio

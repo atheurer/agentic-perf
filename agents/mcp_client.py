@@ -207,6 +207,8 @@ class AgentMCPClient:
     ) -> None:
         self._servers: dict[str, _ServerConnection] = {}
         self._tool_routing: dict[str, str] = {}
+        self._lifecycle_lock = asyncio.Lock()
+        self._closing = False
         self.trace_context = trace_context
         # Optional hook for provider-specific call_tool behavior (e.g.,
         # Jumpstarter connect guards). It may return a string for a local
@@ -924,51 +926,72 @@ class AgentMCPClient:
         not possible — e.g. because the original connection parameters were
         not stored or the subprocess cannot be relaunched.
         """
-        async with conn._reconnect_lock:
+        async with self._lifecycle_lock:
+            if self._closing:
+                return False
+
             current = self._servers.get(conn.name)
-            if current is not None and current is not conn:
-                return current.connected and current.session is not None
+            if current is not conn:
+                return (
+                    current is not None
+                    and current.connected
+                    and current.session is not None
+                )
 
-            params = conn._connect_params
-            if params is None:
-                logger.warning(
-                    "Cannot reconnect MCP server %s: no stored connection parameters",
+            async with conn._reconnect_lock:
+                current = self._servers.get(conn.name)
+                if self._closing:
+                    return False
+                if current is not conn:
+                    return (
+                        current is not None
+                        and current.connected
+                        and current.session is not None
+                    )
+
+                params = conn._connect_params
+                if params is None:
+                    logger.warning(
+                        "Cannot reconnect MCP server %s: no stored connection parameters",
+                        conn.name,
+                    )
+                    return False
+
+                logger.info(
+                    "Attempting to reconnect MCP server %s (generation %d)",
                     conn.name,
+                    conn.reconnect_generation + 1,
                 )
-                return False
+                try:
+                    await self.connect_command(
+                        command=params.command,
+                        args=params.args,
+                        name=conn.name,
+                        env=params.env,
+                        ticket_id=params.ticket_id,
+                        agent_id=params.agent_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to reconnect MCP server %s (error_type=%s)",
+                        conn.name,
+                        type(exc).__name__,
+                    )
+                    return False
 
-            logger.info(
-                "Attempting to reconnect MCP server %s (generation %d)",
-                conn.name,
-                conn.reconnect_generation + 1,
-            )
-            try:
-                await self.connect_command(
-                    command=params.command,
-                    args=params.args,
-                    name=conn.name,
-                    env=params.env,
-                    ticket_id=params.ticket_id,
-                    agent_id=params.agent_id,
+                if self._closing:
+                    return False
+
+                new_conn = self._servers.get(conn.name)
+                if new_conn is None or new_conn.session is None:
+                    return False
+
+                logger.info(
+                    "Successfully reconnected MCP server %s (generation %d)",
+                    new_conn.name,
+                    new_conn.reconnect_generation,
                 )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to reconnect MCP server %s (error_type=%s)",
-                    conn.name,
-                    type(exc).__name__,
-                )
-                return False
-
-            new_conn = self._servers.get(conn.name)
-            if new_conn is None or new_conn.session is None:
-                return False
-
-            logger.info(
-                "Successfully reconnected MCP server %s (generation %d)",
-                new_conn.name,
-                new_conn.reconnect_generation,
-            )
-            return True
+                return True
 
     async def _dispatch_mcp_request(
         self,
@@ -1577,25 +1600,27 @@ class AgentMCPClient:
         return True
 
     async def disconnect(self) -> None:
-        for conn in list(self._servers.values()):
-            self._record_boundary(conn, LifecycleState.DISCONNECTED)
-            conn.connected = False
-            conn._shutdown.set()
-            if conn._task is not None and not conn._task.done():
-                try:
-                    await asyncio.wait_for(conn._task, timeout=3)
-                except TimeoutError:
-                    conn._task.cancel()
-                    await conn._task
-                except (Exception, BaseException):
-                    pass
-        self._servers.clear()
-        self._tool_routing.clear()
-        if self._trace_client is not None and self._owns_trace_client:
-            self._trace_client.close()
-        self._trace_client = None
-        self._owns_trace_client = False
-        logger.info("MCP client disconnected all servers")
+        self._closing = True
+        async with self._lifecycle_lock:
+            for conn in list(self._servers.values()):
+                self._record_boundary(conn, LifecycleState.DISCONNECTED)
+                conn.connected = False
+                conn._shutdown.set()
+                if conn._task is not None and not conn._task.done():
+                    try:
+                        await asyncio.wait_for(conn._task, timeout=3)
+                    except TimeoutError:
+                        conn._task.cancel()
+                        await conn._task
+                    except (Exception, BaseException):
+                        pass
+            self._servers.clear()
+            self._tool_routing.clear()
+            if self._trace_client is not None and self._owns_trace_client:
+                self._trace_client.close()
+            self._trace_client = None
+            self._owns_trace_client = False
+            logger.info("MCP client disconnected all servers")
 
 
 async def connect_external_servers(
