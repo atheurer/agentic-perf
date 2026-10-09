@@ -168,6 +168,71 @@ def test_connect_params_repr_hides_argument_values():
     assert "environment-secret" not in rendered
 
 
+@pytest.mark.asyncio
+async def test_connect_command_snapshots_mutable_args(monkeypatch):
+    client = AgentMCPClient()
+    caller_args = ["--mode", "original"]
+    transport_started = asyncio.Event()
+    release_transport = asyncio.Event()
+    launched_args = []
+
+    class _ArgsTransport:
+        def __init__(self, args):
+            self.args = args
+
+        async def __aenter__(self):
+            transport_started.set()
+            await release_transport.wait()
+            launched_args.extend(self.args)
+            return (SimpleNamespace(), SimpleNamespace())
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _ArgsSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    monkeypatch.setattr(
+        "agents.mcp_client.audited_stdio_client",
+        lambda params, *_args, **_kwargs: _ArgsTransport(params.args),
+    )
+    monkeypatch.setattr("agents.mcp_client.ClientSession", _ArgsSession)
+
+    connect_task = asyncio.create_task(
+        client.connect_command(
+            command="mcp-server",
+            args=caller_args,
+            name="args-server",
+            env={},
+        )
+    )
+    try:
+        await asyncio.wait_for(transport_started.wait(), timeout=1)
+        caller_args[:] = ["--mode", "mutated", "--new-flag"]
+        release_transport.set()
+        await connect_task
+
+        assert launched_args == ["--mode", "original"]
+        assert client._servers["args-server"]._connect_params.args == [
+            "--mode",
+            "original",
+        ]
+    finally:
+        release_transport.set()
+        await asyncio.gather(connect_task, return_exceptions=True)
+        await client.disconnect()
+
+
 def _trace_context() -> TraceContext:
     return TraceContext(ticket_id="PERF-TEST", agent_id="test-agent")
 
@@ -211,6 +276,7 @@ async def test_reconnect_on_broken_pipe_during_call_tool():
             agent_id=agent_id,
             connected=True,
             reconnect_generation=1,
+            _reconnect_origin_session_id=client._servers[name].session_id,
             _connect_params=params,
         )
         client._servers[name] = new_conn
@@ -257,6 +323,7 @@ async def test_reconnect_on_connection_reset_during_call_tool():
             agent_id=agent_id,
             connected=True,
             reconnect_generation=1,
+            _reconnect_origin_session_id=client._servers[name].session_id,
             _connect_params=params,
         )
         client._servers[name] = new_conn
@@ -292,6 +359,7 @@ async def test_reconnect_on_mcp_connection_closed_error():
         agent_id=None,
         **_kwargs,
     ):
+        old_conn = client._servers[name]
         client._servers[name] = _ServerConnection(
             name=name,
             session=success_session,
@@ -301,6 +369,7 @@ async def test_reconnect_on_mcp_connection_closed_error():
             agent_id=agent_id,
             connected=True,
             reconnect_generation=1,
+            _reconnect_origin_session_id=old_conn.session_id,
             _connect_params=params,
         )
         client._tool_routing["check_host"] = name
@@ -713,6 +782,7 @@ async def test_reconnect_on_closed_session():
             agent_id=agent_id,
             connected=True,
             reconnect_generation=1,
+            _reconnect_origin_session_id=conn.session_id,
             _connect_params=params,
         )
         client._servers[name] = new_conn
@@ -725,6 +795,60 @@ async def test_reconnect_on_closed_session():
 
     # Pre-dispatch reconnect is safe to retry (no ambiguity)
     assert "result:check_host" in result
+
+
+@pytest.mark.asyncio
+async def test_pre_send_reconnect_does_not_dispatch_a_removed_tool(monkeypatch):
+    params = _default_connect_params()
+    client, old_conn = _make_connected_client(connect_params=params)
+    old_conn.session = None
+    replacement_call_count = 0
+
+    class _ReadyTransport:
+        async def __aenter__(self):
+            return (SimpleNamespace(), SimpleNamespace())
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _ReplacementSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[_make_tool("replacement_tool")])
+
+        async def call_tool(self, name, arguments, meta=None):
+            nonlocal replacement_call_count
+            replacement_call_count += 1
+            return SimpleNamespace(
+                content=[SimpleNamespace(text=f"unexpected:{name}")],
+                isError=False,
+            )
+
+    monkeypatch.setattr(
+        "agents.mcp_client.audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr("agents.mcp_client.ClientSession", _ReplacementSession)
+
+    try:
+        with pytest.raises(MCPToolCallError) as exc_info:
+            await client.call_tool("check_host", {}, trace_context=_trace_context())
+
+        replacement = client._servers[old_conn.name]
+        assert replacement._reconnect_origin_session_id == old_conn.session_id
+        assert client._tool_routing == {"replacement_tool": old_conn.name}
+        assert exc_info.value.retry_classification == "transport_before_send"
+        assert replacement_call_count == 0
+    finally:
+        await client.disconnect()
 
 
 @pytest.mark.asyncio
@@ -787,6 +911,7 @@ async def test_concurrent_calls_share_one_reconnect():
             agent_id=agent_id,
             connected=True,
             reconnect_generation=1,
+            _reconnect_origin_session_id=conn.session_id,
             _connect_params=params,
         )
         client._tool_routing["check_host"] = name
@@ -834,6 +959,7 @@ async def test_reconnect_audit_trail():
             agent_id=agent_id,
             connected=True,
             reconnect_generation=1,
+            _reconnect_origin_session_id=client._servers[name].session_id,
             _connect_params=params,
         )
         client._servers[name] = new_conn
@@ -903,6 +1029,7 @@ async def test_disconnect_closes_connection_installed_by_inflight_reconnect():
             agent_id=agent_id,
             connected=True,
             reconnect_generation=1,
+            _reconnect_origin_session_id=client._servers[name].session_id,
             _connect_params=params,
         )
         installed_connections.append(new_conn)
@@ -1025,7 +1152,7 @@ async def test_queued_reconnect_skips_connection_replaced_before_lock_acquisitio
         startup_lock.release()
 
         await public_startup
-        assert await reconnect_task is True
+        assert await reconnect_task is False
 
         replacement = client._servers[old_conn.name]
         assert replacement is not old_conn
@@ -1042,6 +1169,118 @@ async def test_queued_reconnect_skips_connection_replaced_before_lock_acquisitio
         ]
         if startup_tasks:
             await asyncio.gather(*startup_tasks, return_exceptions=True)
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("public_tools", "expected_route"),
+    [
+        pytest.param(["check_host"], {"check_host": "test-server"}, id="same-tool"),
+        pytest.param(
+            ["replacement_tool"],
+            {"replacement_tool": "test-server"},
+            id="removed-tool",
+        ),
+    ],
+)
+async def test_queued_call_rejects_public_same_name_replacement(
+    monkeypatch,
+    public_tools,
+    expected_route,
+):
+    params = _default_connect_params()
+    client, old_conn = _make_connected_client(connect_params=params)
+    old_conn.session = None
+    startup_lock = asyncio.Lock()
+    await startup_lock.acquire()
+    client._connection_startup_locks[old_conn.name] = startup_lock
+    replacement_sessions = []
+
+    class _KeyedTransport:
+        def __init__(self, command):
+            self.command = command
+
+        async def __aenter__(self):
+            return (SimpleNamespace(command=self.command), SimpleNamespace())
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _ReplacementSession:
+        def __init__(self, read_stream, *_args):
+            self.command = read_stream.command
+            self.call_count = 0
+            if self.command == "public-replacement":
+                replacement_sessions.append(self)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[_make_tool(name) for name in public_tools])
+
+        async def call_tool(self, name, arguments, meta=None):
+            self.call_count += 1
+            return SimpleNamespace(
+                content=[SimpleNamespace(text=f"unexpected:{name}")],
+                isError=False,
+            )
+
+    monkeypatch.setattr(
+        "agents.mcp_client.audited_stdio_client",
+        lambda server_params, *_args, **_kwargs: _KeyedTransport(server_params.command),
+    )
+    monkeypatch.setattr("agents.mcp_client.ClientSession", _ReplacementSession)
+
+    public_startup = None
+    queued_call = None
+    try:
+        public_startup = asyncio.create_task(
+            client.connect_command(
+                command="public-replacement",
+                args=["server.py"],
+                name=old_conn.name,
+                env={},
+            )
+        )
+        await asyncio.sleep(0)
+        assert public_startup in client._connection_startup_tasks
+
+        queued_call = asyncio.create_task(
+            client.call_tool("check_host", {}, trace_context=_trace_context())
+        )
+
+        async def _wait_for_queued_reconnect_child():
+            while len(client._connection_startup_tasks) < 2:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_wait_for_queued_reconnect_child(), timeout=1)
+        startup_lock.release()
+        await public_startup
+
+        with pytest.raises(MCPToolCallError) as exc_info:
+            await queued_call
+
+        replacement = client._servers[old_conn.name]
+        assert replacement.endpoint == "public-replacement"
+        assert replacement._reconnect_origin_session_id is None
+        assert client._tool_routing == expected_route
+        assert exc_info.value.retry_classification == "transport_before_send"
+        assert len(replacement_sessions) == 1
+        assert replacement_sessions[0].call_count == 0
+    finally:
+        if startup_lock.locked():
+            startup_lock.release()
+        tasks = [task for task in (public_startup, queued_call) if task is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await client.disconnect()
 
 
@@ -1081,6 +1320,7 @@ async def test_wrapped_disconnect_error_triggers_reconnect():
             agent_id=agent_id,
             connected=True,
             reconnect_generation=1,
+            _reconnect_origin_session_id=client._servers[name].session_id,
             _connect_params=params,
         )
         client._servers[name] = new_conn

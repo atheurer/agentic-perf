@@ -1389,7 +1389,8 @@ async def test_disconnect_cancels_reconnect_stuck_in_initialize(monkeypatch):
 
     reconnect_task = asyncio.create_task(client._reconnect_server(conn))
     await asyncio.wait_for(initialize_started.wait(), timeout=1)
-    assert client._servers == {}
+    assert client._servers["local"] is conn
+    assert client._tool_routing["check_host"] == "local"
 
     await asyncio.wait_for(client.disconnect(), timeout=1)
     with pytest.raises(asyncio.CancelledError):

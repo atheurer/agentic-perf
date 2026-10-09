@@ -170,6 +170,7 @@ class _ServerConnection:
     transport: str = "unknown"
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     reconnect_generation: int = 0
+    _reconnect_origin_session_id: str | None = None
     endpoint: str | None = None
     client_process_identity: str | None = None
     subprocess_pid: int | None = None
@@ -354,10 +355,11 @@ class AgentMCPClient:
                 f"{project_root}{os.pathsep}{existing}" if existing else project_root
             )
         merged_env = {**base_env, **(env or {})}
+        args_snapshot = list(args) if args is not None else []
 
         params = StdioServerParameters(
             command=command,
-            args=args or [],
+            args=args_snapshot.copy(),
             env=merged_env,
         )
         process_holder: list[Any] = []
@@ -368,7 +370,7 @@ class AgentMCPClient:
         )
         connect_params = _ConnectParams(
             command=command,
-            args=args or [],
+            args=args_snapshot.copy(),
             env=merged_env,
             ticket_id=ticket_id,
             agent_id=agent_id,
@@ -530,6 +532,7 @@ class AgentMCPClient:
                     agent_id=agent_id,
                     subprocess_process_holder=subprocess_process_holder,
                     connect_params=connect_params,
+                    expected_connection=expected_connection,
                 )
         finally:
             async with self._lifecycle_lock:
@@ -546,6 +549,7 @@ class AgentMCPClient:
         agent_id: str | None = None,
         subprocess_process_holder: list[Any] | None = None,
         connect_params: _ConnectParams | None = None,
+        expected_connection: _ServerConnection | None = None,
     ) -> None:
         """Shared connection logic for all transports.
 
@@ -574,6 +578,11 @@ class AgentMCPClient:
             transport=transport,
             session_id=uuid.uuid4().hex,
             reconnect_generation=generation,
+            _reconnect_origin_session_id=(
+                expected_connection.session_id
+                if expected_connection is not None
+                else None
+            ),
             endpoint=endpoint,
             client_process_identity=f"pid:{os.getpid()}",
             ticket_id=ticket_id,
@@ -1034,6 +1043,7 @@ class AgentMCPClient:
                 if current is not conn:
                     return (
                         current is not None
+                        and current._reconnect_origin_session_id == conn.session_id
                         and current.connected
                         and current.session is not None
                     )
@@ -1062,6 +1072,7 @@ class AgentMCPClient:
                 if current is not conn:
                     return (
                         current is not None
+                        and current._reconnect_origin_session_id == conn.session_id
                         and current.connected
                         and current.session is not None
                     )
@@ -1105,6 +1116,7 @@ class AgentMCPClient:
                 new_conn = self._servers.get(conn.name)
                 if (
                     new_conn is None
+                    or new_conn._reconnect_origin_session_id != conn.session_id
                     or not new_conn.connected
                     or new_conn.session is None
                 ):
@@ -1179,7 +1191,12 @@ class AgentMCPClient:
                     raise
                 if reconnected:
                     new_conn = self._servers.get(conn.name)
-                    if new_conn is not None and new_conn.session is not None:
+                    if (
+                        new_conn is not None
+                        and new_conn.session is not None
+                        and new_conn._reconnect_origin_session_id == conn.session_id
+                        and self._tool_routing.get(name) == new_conn.name
+                    ):
                         return await self._dispatch_mcp_request(
                             new_conn,
                             name,
