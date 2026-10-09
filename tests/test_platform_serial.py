@@ -19,6 +19,7 @@ class FakeProvisionResult:
     flash_duration_s: float = 10.0
     boot_duration_s: float = 30.0
     serial_log_path: str = ""
+    infrastructure_error: bool = False
 
 
 class TestProvisionSerialCapture:

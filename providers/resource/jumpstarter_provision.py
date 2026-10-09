@@ -34,6 +34,40 @@ _TCP_TIMEOUT = 30
 _SSH_TIMEOUT = 30
 
 
+# Exception types that indicate infrastructure failures (not image problems).
+# When a flash fails with one of these, retrying with a different image variant
+# will not help — the error is in the environment, not the artifact.
+_INFRASTRUCTURE_ERROR_PATTERNS = (
+    "failed to get u-boot prompt",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "broken pipe",
+    "transport endpoint is not connected",
+    "network is unreachable",
+    "no route to host",
+    "grpc",
+    "lease expired",
+    "exporter disconnected",
+)
+
+
+def is_infrastructure_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like an infrastructure error.
+
+    Infrastructure errors are failures in the test environment (network,
+    board firmware, gRPC tunnel, lease management) rather than problems
+    with the OS image being flashed.  Retrying with a different image
+    variant will not fix them.
+    """
+    # ExceptionGroup / TaskGroup wrappers are always infrastructure.
+    if isinstance(exc, (ExceptionGroup, BaseExceptionGroup)):
+        return True
+
+    msg = repr(exc).lower()
+    return any(p in msg for p in _INFRASTRUCTURE_ERROR_PATTERNS)
+
+
 @dataclass
 class ProvisionResult:
     """Structured result from deterministic provisioning."""
@@ -47,6 +81,7 @@ class ProvisionResult:
     flash_duration_s: float = 0.0
     boot_duration_s: float = 0.0
     serial_log_path: str = ""
+    infrastructure_error: bool = False
 
 
 _DEFAULT_PROVISION_LEASE_DURATION_SECONDS = 14_400
@@ -302,6 +337,13 @@ async def provision_jumpstarter(
             diag.append(f"Provisioning failed: {'; '.join(real_errors)}")
         else:
             diag.append(f"Provisioning exception: {exc}")
+        if is_infrastructure_error(exc):
+            result.infrastructure_error = True
+            diag.append(
+                "INFRASTRUCTURE_ERROR: This failure is caused by the test "
+                "environment (not the OS image). Retrying with a different "
+                "image variant will not help."
+            )
         logger.error(
             "[platform] Provisioning failed: %s",
             exc,
@@ -541,6 +583,13 @@ async def _run_provision_steps(
                 retry_duration,
                 safe_exc2,
             )
+            if is_infrastructure_error(exc) or is_infrastructure_error(exc2):
+                result.infrastructure_error = True
+                diag.append(
+                    "INFRASTRUCTURE_ERROR: This failure is caused by the "
+                    "test environment (not the OS image). Retrying with "
+                    "a different image variant will not help."
+                )
             # Write diagnostics directly to artifact so they
             # survive even if the LLM is unavailable to process
             # the tool result.
