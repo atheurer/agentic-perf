@@ -19,7 +19,7 @@ from paths import get_default_ssh_key
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.resource.base import has_reservation_metadata, reservation_failed
-from providers.resource.registry import ResourceProviderRegistry
+from providers.resource.registry import PROVIDER_REGISTRY, ResourceProviderRegistry
 from providers.secrets.base import SecretsProvider
 from providers.ssh import SSHExecutor
 
@@ -417,6 +417,7 @@ def _explicit_provider_selection(
     provider: str, fields: dict[str, Any], directives: dict[str, Any]
 ) -> dict[str, Any]:
     allowed = {
+        "jumpstarter": {"lease_duration_seconds"},
         "aws": {
             "instance_specs",
             "instance_type",
@@ -513,6 +514,39 @@ def _saved_selection_records(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def _duration_requirement_changed(
+    requested: Any, metadata: dict[str, Any], key: str
+) -> bool:
+    """Require saved selection history to verify an explicit lease duration."""
+    if requested is None:
+        return False
+
+    def parse_duration(value: Any) -> int | None:
+        if isinstance(value, bool) or (
+            isinstance(value, float) and not value.is_integer()
+        ):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    requested_duration = parse_duration(requested)
+    if requested_duration is None:
+        return True
+
+    records = _saved_selection_records(metadata)
+    if not records:
+        return True
+    for record in records:
+        saved_duration = parse_duration(record.get(key))
+        if saved_duration is None:
+            return True
+        if saved_duration != requested_duration:
+            return True
+    return False
+
+
 def _provider_selection_changed(
     provider: str, fields: dict[str, Any], directives: dict[str, Any]
 ) -> bool:
@@ -522,7 +556,14 @@ def _provider_selection_changed(
         return True
 
     if provider == "jumpstarter":
-        return _jumpstarter_selector_changed(fields, directives)
+        requested = _explicit_provider_selection(provider, fields, directives)
+        return _jumpstarter_selector_changed(fields, directives) or (
+            _duration_requirement_changed(
+                requested.get("lease_duration_seconds"),
+                metadata,
+                "lease_duration_seconds",
+            )
+        )
 
     if provider == "aws":
         requested = _explicit_provider_selection(provider, fields, directives)
@@ -588,6 +629,10 @@ def _provider_selection_changed(
 
     if provider == "quads":
         requested = _explicit_provider_selection(provider, fields, directives)
+        if _duration_requirement_changed(
+            requested.get("duration_hours"), metadata, "duration_hours"
+        ):
+            return True
         requested_hostnames = requested.get("hostnames")
         if requested_hostnames is None:
             try:
@@ -626,9 +671,12 @@ def _provider_selection_changed(
                 return True
 
     if provider == "psap-cc":
-        requested = _explicit_provider_selection(provider, fields, directives).get(
-            "cluster_id"
-        )
+        selection = _explicit_provider_selection(provider, fields, directives)
+        if _duration_requirement_changed(
+            selection.get("duration_hours"), metadata, "duration_hours"
+        ):
+            return True
+        requested = selection.get("cluster_id")
         active = metadata.get("cluster_id")
         if requested is not None and requested != active:
             return True
@@ -828,8 +876,35 @@ class ResourceAgent(AgentBase):
         current_provider = recorded_provider
         if not current_provider and fields.get("quads_assignment_id"):
             current_provider = "quads"
+        if current_provider and (
+            not isinstance(current_provider, str)
+            or current_provider not in {*PROVIDER_REGISTRY, "user_provided"}
+        ):
+            return await pause(
+                "**Resource provider reconciliation paused:** The recorded provider "
+                f"({current_provider}) is unknown. Allocation details were retained; "
+                "identify the provider and reconcile the old allocation before retrying.",
+            )
         requested_provider = directives.get("resource_provider") or current_provider
         if not requested_provider:
+            metadata = fields.get("resource_provider_metadata") or {}
+            metadata = metadata if isinstance(metadata, dict) else {}
+            has_unknown_allocation = bool(fields.get("resource_reservation_id")) or any(
+                metadata.get(key)
+                for key in (
+                    "reservation_id",
+                    "lease_id",
+                    "assignment_id",
+                    "instance_ids",
+                )
+            )
+            if has_unknown_allocation:
+                return await pause(
+                    "**Resource provider reconciliation paused:** A prior reservation "
+                    "identity is present, but its provider is unknown. Allocation "
+                    "details were retained; identify the provider and reconcile the "
+                    "old allocation before retrying.",
+                )
             return True
 
         changed = current_provider != requested_provider
@@ -1188,6 +1263,28 @@ class ResourceAgent(AgentBase):
                 ticket_id, str(provider_name), str(reservation_id), provider_metadata
             )
 
+        has_allocation_identity = bool(
+            reservation_id
+            or fields.get("quads_assignment_id")
+            or any(
+                provider_metadata.get(key)
+                for key in (
+                    "reservation_id",
+                    "lease_id",
+                    "assignment_id",
+                    "instance_ids",
+                )
+            )
+        )
+        if has_allocation_identity:
+            await self._add_comment(
+                ticket_id,
+                "Cannot safely confirm teardown because allocation identity is "
+                "present but no managed provider is recorded. Allocation details "
+                "were retained for provider reconciliation.",
+            )
+            return False
+
         await self._add_comment(
             ticket_id,
             "Resources released (no managed reservation to terminate).",
@@ -1285,6 +1382,23 @@ class ResourceAgent(AgentBase):
             teardown_set = set(teardown_hosts)
             if assigned_targets:
                 teardown_set.update(teardown_assigned_targets)
+            mapped_hosts = set()
+            for i in range(len(all_instance_ids)):
+                pub = all_public_ips[i] if i < len(all_public_ips) else ""
+                priv = all_private_ips[i] if i < len(all_private_ips) else ""
+                if pub:
+                    mapped_hosts.add(pub)
+                if priv:
+                    mapped_hosts.add(priv)
+            unmapped_hosts = teardown_set - mapped_hosts
+            if unmapped_hosts:
+                await self._add_comment(
+                    ticket_id,
+                    "Selective teardown could not map every requested host to a "
+                    "provider instance ID. Allocation details were retained.",
+                )
+                return False
+
             terminate_ids = []
             keep_ids = []
             for i, iid in enumerate(all_instance_ids):

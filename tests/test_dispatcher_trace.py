@@ -153,7 +153,10 @@ async def test_lifecycle_image_resolution_uses_complete_claim_fence(
     dispatcher.create_agent = MagicMock(return_value=Agent())
 
     mock_client = MagicMock()
-    mock_client.get = AsyncMock()
+    get_response = MagicMock(status_code=200)
+    get_response.json.return_value = {"status": status, "custom_fields": {}}
+    get_response.raise_for_status = MagicMock()
+    mock_client.get = AsyncMock(return_value=get_response)
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
     resolve_images = AsyncMock()
@@ -175,6 +178,68 @@ async def test_lifecycle_image_resolution_uses_complete_claim_fence(
             "X-Agentic-Perf-Claim-Id": "claim-1",
         },
         image_config={},
+    )
+
+
+@pytest.mark.parametrize("status", ("preparing_platform", "awaiting_provision"))
+async def test_changed_provider_selection_resume_reroutes_to_resource_agent(
+    monkeypatch, status: str
+) -> None:
+    """Changed allocations return to resource reconciliation before downstream work."""
+    import orchestrator.main as mod
+
+    dispatcher, _ = _dispatcher()
+    dispatcher._claim_ids["PERF-1"] = "claim-1"
+    dispatcher.create_agent = MagicMock()
+    dispatcher.mark_done = AsyncMock()
+    ticket = {
+        "id": "PERF-1",
+        "status": status,
+        "custom_fields": {
+            "resource_provider": "jumpstarter",
+            "resource_reservation_id": "lease-1",
+            "resource_provider_metadata": {
+                "lease_id": "lease-1",
+                "selector": "board-type=ride4",
+                "reservation_selections": [
+                    {"jumpstarter_selector": "board-type=ride4"}
+                ],
+            },
+            "directives": {"board_selector": "board-type=ride5"},
+        },
+    }
+    get_response = MagicMock(status_code=200)
+    get_response.json.return_value = ticket
+    get_response.raise_for_status = MagicMock()
+    transition_response = MagicMock()
+    transition_response.raise_for_status = MagicMock()
+    client = MagicMock()
+    client.get = AsyncMock(return_value=get_response)
+    client.post = AsyncMock(return_value=transition_response)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch.object(mod, "AuditedAsyncHTTPClient", lambda **_kwargs: client),
+        patch.object(mod, "_record_dispatch_retry_outcome", AsyncMock()),
+    ):
+        await mod.run_agent_task(
+            dispatcher,
+            status,
+            "PERF-1",
+            ticket_data=ticket,
+        )
+
+    dispatcher.create_agent.assert_not_called()
+    client.post.assert_awaited_once_with(
+        "http://store/api/v1/tickets/PERF-1/transition",
+        json={
+            "status": "awaiting_hardware",
+            "comment": (
+                "The active allocation requires reconciliation "
+                f"before resuming {status}; returning to resource allocation."
+            ),
+        },
     )
 
 

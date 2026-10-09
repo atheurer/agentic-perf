@@ -917,8 +917,8 @@ class TestAWSResourceProvider:
         assert "agentic-perf-instance" not in tag_map
 
     @pytest.mark.asyncio
-    async def test_terminate_filters_by_instance_name(self):
-        """terminate() skips instances not tagged with own instance_name."""
+    async def test_terminate_reports_partial_when_some_instances_are_unowned(self):
+        """A filtered multi-instance termination must retain skipped identities."""
         from providers.resource.aws import AWSResourceProvider
 
         provider = AWSResourceProvider(
@@ -961,7 +961,8 @@ class TestAWSResourceProvider:
             provider_metadata={"instance_ids": ["i-own", "i-foreign"]},
         )
 
-        assert result["status"] == "terminated"
+        assert result["status"] == "partial"
+        assert result["details"]["outstanding_instance_ids"] == ["i-foreign"]
         # Only i-own passed the filter
         terminate_call = mock_ec2.terminate_instances.call_args
         assert terminate_call.kwargs["InstanceIds"] == ["i-own"]
@@ -1879,6 +1880,63 @@ class TestProviderCorrectAutoReservation:
         assert transitions[0].kwargs["json"]["status"] == ("awaiting_customer_guidance")
 
     @pytest.mark.asyncio
+    async def test_unknown_allocation_without_provider_directive_pauses(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "status": "awaiting_hardware",
+            "custom_fields": {
+                "resource_reservation_id": "orphaned-lease",
+                "resource_provider_metadata": {"lease_id": "orphaned-lease"},
+            },
+        }
+        original_fields = dict(ticket["custom_fields"])
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        agent._registry = MagicMock()
+
+        assert not await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        agent._registry.get_provider.assert_not_called()
+        agent._client.patch.assert_not_awaited()
+        assert ticket["custom_fields"] == original_fields
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        transition = transitions[0].kwargs["json"]
+        assert transition["status"] == "awaiting_customer_guidance"
+        assert "provider is unknown" in transition["comment"]
+
+    @pytest.mark.asyncio
+    async def test_recorded_unknown_provider_identity_pauses(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "status": "awaiting_hardware",
+            "custom_fields": {
+                "resource_provider": "removed-provider",
+                "resource_reservation_id": "orphaned-lease",
+                "resource_provider_metadata": {"lease_id": "orphaned-lease"},
+            },
+        }
+        original_fields = dict(ticket["custom_fields"])
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        agent._registry = MagicMock()
+
+        assert not await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        agent._registry.get_provider.assert_not_called()
+        agent._client.patch.assert_not_awaited()
+        assert ticket["custom_fields"] == original_fields
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        assert transitions[0].kwargs["json"]["status"] == "awaiting_customer_guidance"
+
+    @pytest.mark.asyncio
     async def test_changed_jumpstarter_selector_releases_old_lease(self):
         ticket = {
             "id": "PERF-TEST",
@@ -1906,6 +1964,80 @@ class TestProviderCorrectAutoReservation:
 
         agent._registry.get_provider.assert_awaited_once_with("jumpstarter")
         old_provider.terminate.assert_awaited_once_with("old-lease", old_metadata)
+        clearing = agent._client.patch.await_args.kwargs["json"]["fields"]
+        assert clearing["resource_reservation_id"] is None
+        assert clearing["resource_provider_metadata"] == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("provider", "reservation_id", "metadata", "directives"),
+        [
+            (
+                "jumpstarter",
+                "lease-1",
+                {
+                    "lease_id": "lease-1",
+                    "selector": "board-type=ride4",
+                    "reservation_selections": [
+                        {
+                            "jumpstarter_selector": "board-type=ride4",
+                            "lease_duration_seconds": 3600,
+                            "duration_hours": 36,
+                        }
+                    ],
+                },
+                {
+                    "board_selector": "board-type=ride4",
+                    "lease_duration_seconds": 7200,
+                },
+            ),
+            (
+                "quads",
+                "42",
+                {
+                    "assignment_id": 42,
+                    "reservation_selections": [
+                        {"hostnames": ["host-1.example.com"], "duration_hours": 36}
+                    ],
+                },
+                {"hostnames": ["host-1.example.com"], "duration_hours": 48},
+            ),
+            (
+                "psap-cc",
+                "psap-1",
+                {
+                    "reservation_id": "psap-1",
+                    "cluster_id": "cluster-1",
+                    "reservation_selections": [
+                        {"cluster_id": "cluster-1", "duration_hours": 36}
+                    ],
+                },
+                {"cluster_id": "cluster-1", "duration_hours": 48},
+            ),
+        ],
+    )
+    async def test_changed_lease_duration_releases_old_allocation(
+        self, provider, reservation_id, metadata, directives
+    ):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": provider,
+                "resource_reservation_id": reservation_id,
+                "resource_provider_metadata": metadata,
+                "directives": directives,
+            },
+        }
+        old_metadata = dict(metadata)
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        old_provider.terminate.assert_awaited_once_with(reservation_id, old_metadata)
         clearing = agent._client.patch.await_args.kwargs["json"]["fields"]
         assert clearing["resource_reservation_id"] is None
         assert clearing["resource_provider_metadata"] == {}
@@ -2570,6 +2702,71 @@ class TestTeardownDispatch:
         ]
         assert len(transitions) == 1
         assert transitions[0].kwargs["json"]["status"] == ("awaiting_customer_guidance")
+
+    @pytest.mark.asyncio
+    async def test_full_teardown_pauses_for_unknown_provider_identity(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "status": "awaiting_teardown",
+            "custom_fields": {
+                "resource_reservation_id": "orphaned-lease",
+                "resource_provider_metadata": {"lease_id": "orphaned-lease"},
+                "directives": {"skip_teardown": False, "host_cleanup": "optional"},
+            },
+        }
+        original_fields = dict(ticket["custom_fields"])
+        agent = TestProviderCorrectAutoReservation._make_agent(
+            ticket, lambda _name, _args: "{}"
+        )
+        agent._registry = MagicMock()
+
+        await agent._run_teardown("PERF-TEST")
+
+        agent._registry.get_provider.assert_not_called()
+        agent._client.patch.assert_not_awaited()
+        assert ticket["custom_fields"] == original_fields
+        transitions = [
+            call
+            for call in agent._client.post.call_args_list
+            if "/transition" in str(call.args[0])
+        ]
+        assert len(transitions) == 1
+        assert transitions[0].kwargs["json"]["status"] == "awaiting_customer_guidance"
+
+    @pytest.mark.asyncio
+    async def test_selective_teardown_requires_complete_host_mapping(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "aws",
+                "resource_reservation_id": "i-controller,i-target",
+                "resource_provider_metadata": {
+                    "instance_ids": ["i-controller", "i-target"],
+                    "public_ips": ["198.51.100.1", "198.51.100.2"],
+                    "private_ips": ["10.0.0.1", ""],
+                },
+                "ssh_hardware_ips": {
+                    "controller": "198.51.100.1",
+                    "targets": ["198.51.100.2"],
+                },
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.1",
+                    "targets": ["10.0.0.2"],
+                },
+            },
+        }
+        agent = TestProviderCorrectAutoReservation._make_agent(
+            ticket, lambda _name, _args: "{}"
+        )
+        agent._registry = MagicMock()
+        agent._terminate_provider_resources = AsyncMock(return_value=True)
+
+        assert not await agent._run_selective_teardown(
+            "PERF-TEST", ticket["custom_fields"], ["controller"], "optional"
+        )
+
+        agent._terminate_provider_resources.assert_not_awaited()
+        agent._client.patch.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_legacy_quads_fields_detected(self):
