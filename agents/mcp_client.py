@@ -555,43 +555,13 @@ class AgentMCPClient:
         whenever the agent awaits asyncio.to_thread (LLM calls),
         burning 100% CPU on one core.
         """
-        previous = self._servers.pop(name, None)
+        previous = self._servers.get(name)
         generation = 0
-        previous_routes: tuple[str, ...] = ()
-        if previous is not None:
-            previous_routes = tuple(
-                tool for tool, server in self._tool_routing.items() if server == name
-            )
-
-        async def _restore_previous_connection() -> None:
-            if previous is None or previous._connect_params is None:
-                return
-            async with self._lifecycle_lock:
-                if self._closing or self._servers.get(name) is not None:
-                    return
-                previous.session = None
-                previous.connected = False
-                self._servers[name] = previous
-                for tool in previous_routes:
-                    if tool not in self._tool_routing:
-                        self._tool_routing[tool] = name
-
+        previous_routes: set[str] = set()
         if previous is not None:
             generation = previous.reconnect_generation + 1
-            self._record_boundary(previous, LifecycleState.DISCONNECTED)
-            previous.connected = False
-            previous._shutdown.set()
-            if previous._task is not None:
-                previous._task.cancel()
-                try:
-                    await asyncio.gather(previous._task, return_exceptions=True)
-                except BaseException:
-                    await _restore_previous_connection()
-                    raise
-            self._tool_routing = {
-                tool: server
-                for tool, server in self._tool_routing.items()
-                if server != name
+            previous_routes = {
+                tool for tool, server in self._tool_routing.items() if server == name
             }
         ready: asyncio.Future[ClientSession] = (
             asyncio.get_running_loop().create_future()
@@ -618,6 +588,7 @@ class AgentMCPClient:
         startup_cancellation_state = LifecycleState.CANCELLED
         conflicting_tool: str | None = None
         conflicting_server: str | None = None
+        previous_task: asyncio.Task[None] | None = None
 
         def _cancellation_state(exc: asyncio.CancelledError) -> LifecycleState:
             return (
@@ -699,10 +670,10 @@ class AgentMCPClient:
 
         async def _cleanup_connection() -> None:
             owns_current_connection = self._servers.get(name) is conn
+            if conn.connected:
+                self._record_boundary(conn, LifecycleState.DISCONNECTED)
+                conn.connected = False
             if owns_current_connection:
-                if conn.connected:
-                    self._record_boundary(conn, LifecycleState.DISCONNECTED)
-                    conn.connected = False
                 self._servers.pop(name, None)
                 self._tool_routing = {
                     tool: server
@@ -733,22 +704,19 @@ class AgentMCPClient:
                     error=exc,
                 )
             await _cleanup_connection()
-            await _restore_previous_connection()
             raise
         except (Exception, BaseException):
             await _cleanup_connection()
-            await _restore_previous_connection()
             raise
 
         try:
             async with self._lifecycle_lock:
-                connection_rejected = self._closing
+                connection_rejected = (
+                    self._closing or self._servers.get(name) is not previous
+                )
                 if not connection_rejected:
                     conn.session = session
-                    self._servers[name] = conn
                     self._record_boundary(conn, LifecycleState.CONNECTED)
-                    # Installation and shutdown admission share the lifecycle
-                    # lock, so a connection cannot appear after teardown starts.
                     conn.connected = True
                     if generation:
                         self._record_boundary(conn, LifecycleState.RECONNECTED)
@@ -759,7 +727,7 @@ class AgentMCPClient:
                 raise asyncio.CancelledError()
             result = await session.list_tools()
             async with self._lifecycle_lock:
-                if self._closing or self._servers.get(name) is not conn:
+                if self._closing or self._servers.get(name) is not previous:
                     raise asyncio.CancelledError()
                 self._record_boundary(
                     conn,
@@ -767,12 +735,38 @@ class AgentMCPClient:
                     tool_name="list_tools",
                     outcome=OperationOutcome.SUCCESS,
                 )
+                seen_tools: set[str] = set()
                 for tool in result.tools:
-                    if tool.name in self._tool_routing:
+                    if tool.name in seen_tools:
                         conflicting_tool = tool.name
-                        conflicting_server = self._tool_routing[tool.name]
+                        conflicting_server = name
                         break
-                    self._tool_routing[tool.name] = name
+                    seen_tools.add(tool.name)
+                    existing_server = self._tool_routing.get(tool.name)
+                    if existing_server is not None and not (
+                        existing_server == name and tool.name in previous_routes
+                    ):
+                        conflicting_tool = tool.name
+                        conflicting_server = existing_server
+                        break
+                if conflicting_tool is None:
+                    if previous is not None:
+                        if previous.connected:
+                            self._record_boundary(previous, LifecycleState.DISCONNECTED)
+                        previous.connected = False
+                        previous._shutdown.set()
+                        previous_task = previous._task
+                        if previous_task is not None and not previous_task.done():
+                            previous_task.cancel()
+                    self._servers[name] = conn
+                    self._tool_routing = {
+                        tool_name: server
+                        for tool_name, server in self._tool_routing.items()
+                        if server != name
+                    }
+                    for tool in result.tools:
+                        self._tool_routing[tool.name] = name
+                    conn._task = task
         except asyncio.CancelledError as exc:
             cancellation_state = _cancellation_state(exc)
             self._record_boundary(
@@ -787,7 +781,6 @@ class AgentMCPClient:
                 error=exc,
             )
             await _cleanup_connection()
-            await _restore_previous_connection()
             raise
         except Exception as exc:
             self._record_boundary(
@@ -798,18 +791,17 @@ class AgentMCPClient:
                 error=exc,
             )
             await _cleanup_connection()
-            await _restore_previous_connection()
             raise
         if conflicting_tool is not None:
             await _cleanup_connection()
-            await _restore_previous_connection()
             raise ValueError(
                 f"Tool {conflicting_tool!r} from server "
                 f"{name!r} conflicts with server "
                 f"{conflicting_server!r}"
             )
 
-        conn._task = task
+        if previous_task is not None:
+            await asyncio.gather(previous_task, return_exceptions=True)
         logger.info(
             "MCP client connected to %s (%d tools)",
             name,
@@ -1045,6 +1037,10 @@ class AgentMCPClient:
                     )
                     return False
 
+                if conn.connected:
+                    conn.connected = False
+                conn.session = None
+
                 connect_task = asyncio.create_task(
                     self.connect_command(
                         command=params.command,
@@ -1139,7 +1135,8 @@ class AgentMCPClient:
                 # the terminal event with the internal dispatch.
                 setattr(exc, "mcp_audit_recorded", True)
 
-        if conn.session is None:
+        session = conn.session
+        if session is None:
             # Attempt reconnect if we have stored connection parameters.
             if conn._connect_params is not None:
                 logger.warning(
@@ -1192,7 +1189,7 @@ class AgentMCPClient:
             self._record_boundary(
                 conn, LifecycleState.REQUEST_SENT, context=context, tool_name=name
             )
-            result = await conn.session.call_tool(
+            result = await session.call_tool(
                 name,
                 arguments,
                 meta=self._mcp_metadata(conn, context),
@@ -1243,6 +1240,8 @@ class AgentMCPClient:
                     retry_kind=RetryKind.AMBIGUOUS_AFTER_SEND,
                     error=exc,
                 )
+                conn.connected = False
+                conn.session = None
                 logger.warning(
                     "MCP server %s disconnected during tool %s; attempting reconnect",
                     conn.name,

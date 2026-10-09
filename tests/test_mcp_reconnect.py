@@ -352,7 +352,7 @@ async def test_reconnect_failure_returns_clear_error_without_logging_details(cap
 
 
 @pytest.mark.asyncio
-async def test_failed_reconnect_restores_route_for_a_later_retry(monkeypatch):
+async def test_failed_reconnect_keeps_route_for_a_later_retry(monkeypatch):
     params = _default_connect_params()
     client, old_conn = _make_connected_client(connect_params=params)
     old_conn.session = None
@@ -423,6 +423,159 @@ async def test_failed_reconnect_restores_route_for_a_later_retry(monkeypatch):
         assert transport_enter_count == 2
         assert session_count == 1
     finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_call_waits_for_reconnect_with_route_reserved(monkeypatch):
+    params = _default_connect_params()
+    client, old_conn = _make_connected_client(connect_params=params)
+    old_conn.session = None
+    list_tools_started = asyncio.Event()
+    finish_list_tools = asyncio.Event()
+
+    class _ReconnectTransport:
+        async def __aenter__(self):
+            return (SimpleNamespace(), SimpleNamespace())
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _ReconnectSession:
+        def __init__(self, *_args):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            list_tools_started.set()
+            await finish_list_tools.wait()
+            return SimpleNamespace(tools=[_make_tool("check_host")])
+
+        async def call_tool(self, name, arguments, meta=None):
+            return SimpleNamespace(
+                content=[SimpleNamespace(text=f"recovered:{name}")],
+                isError=False,
+            )
+
+    monkeypatch.setattr(
+        "agents.mcp_client.audited_stdio_client",
+        lambda *_args, **_kwargs: _ReconnectTransport(),
+    )
+    monkeypatch.setattr("agents.mcp_client.ClientSession", _ReconnectSession)
+
+    first_call = asyncio.create_task(
+        client.call_tool("check_host", {}, trace_context=_trace_context())
+    )
+    second_call = None
+    try:
+        await asyncio.wait_for(list_tools_started.wait(), timeout=1)
+        assert client._servers[old_conn.name] is old_conn
+        assert client._tool_routing["check_host"] == old_conn.name
+
+        second_call = asyncio.create_task(
+            client.call_tool("check_host", {}, trace_context=_trace_context())
+        )
+        await asyncio.sleep(0)
+        assert not second_call.done()
+        assert client._servers[old_conn.name] is old_conn
+        assert client._tool_routing["check_host"] == old_conn.name
+
+        finish_list_tools.set()
+        results = await asyncio.gather(first_call, second_call)
+        assert results == ["recovered:check_host", "recovered:check_host"]
+        assert client._servers[old_conn.name] is not old_conn
+        assert client._tool_routing["check_host"] == old_conn.name
+    finally:
+        finish_list_tools.set()
+        await asyncio.gather(
+            first_call,
+            *([second_call] if second_call is not None else []),
+            return_exceptions=True,
+        )
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_reserves_tool_route_until_atomic_replacement(monkeypatch):
+    params = _default_connect_params()
+    client, old_conn = _make_connected_client(
+        server_name="server-a",
+        tools=["shared_tool"],
+        connect_params=params,
+    )
+    old_conn.session = None
+    reconnect_list_tools_started = asyncio.Event()
+    finish_reconnect_list_tools = asyncio.Event()
+
+    class _KeyedTransport:
+        def __init__(self, server_key):
+            self.server_key = server_key
+
+        async def __aenter__(self):
+            stream = SimpleNamespace(server_key=self.server_key)
+            return (stream, SimpleNamespace())
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _KeyedSession:
+        def __init__(self, read_stream, *_args):
+            self.server_key = read_stream.server_key
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            if self.server_key == params.command:
+                reconnect_list_tools_started.set()
+                await finish_reconnect_list_tools.wait()
+            return SimpleNamespace(tools=[_make_tool("shared_tool")])
+
+    monkeypatch.setattr(
+        "agents.mcp_client.audited_stdio_client",
+        lambda server_params, *_args, **_kwargs: _KeyedTransport(server_params.command),
+    )
+    monkeypatch.setattr("agents.mcp_client.ClientSession", _KeyedSession)
+
+    reconnect_task = asyncio.create_task(client._reconnect_server(old_conn))
+    try:
+        await asyncio.wait_for(reconnect_list_tools_started.wait(), timeout=1)
+        assert client._servers[old_conn.name] is old_conn
+        assert client._tool_routing["shared_tool"] == old_conn.name
+
+        with pytest.raises(ValueError, match="conflicts"):
+            await client.connect_command(
+                command="server-b-command",
+                args=["server.py"],
+                name="server-b",
+                env={},
+            )
+
+        assert client._servers[old_conn.name] is old_conn
+        assert "server-b" not in client._servers
+        assert client._tool_routing["shared_tool"] == old_conn.name
+
+        finish_reconnect_list_tools.set()
+        assert await reconnect_task is True
+        assert client._servers[old_conn.name] is not old_conn
+        assert client._tool_routing == {"shared_tool": old_conn.name}
+    finally:
+        finish_reconnect_list_tools.set()
+        await asyncio.gather(reconnect_task, return_exceptions=True)
         await client.disconnect()
 
 
