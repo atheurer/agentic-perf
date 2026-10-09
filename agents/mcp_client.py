@@ -210,6 +210,7 @@ class AgentMCPClient:
         self._lifecycle_lock = asyncio.Lock()
         self._closing = False
         self._reconnect_startup_tasks: set[asyncio.Task[None]] = set()
+        self._connection_startup_tasks: set[asyncio.Task[None]] = set()
         self.trace_context = trace_context
         # Optional hook for provider-specific call_tool behavior (e.g.,
         # Jumpstarter connect guards). It may return a string for a local
@@ -488,6 +489,42 @@ class AgentMCPClient:
         subprocess_process_holder: list[Any] | None = None,
         connect_params: _ConnectParams | None = None,
     ) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("MCP connection startup requires an asyncio task")
+
+        async with self._lifecycle_lock:
+            if self._closing:
+                raise asyncio.CancelledError()
+            self._connection_startup_tasks.add(task)
+
+        try:
+            await self._connect_transport_impl(
+                name,
+                transport_cm,
+                transport=transport,
+                endpoint=endpoint,
+                ticket_id=ticket_id,
+                agent_id=agent_id,
+                subprocess_process_holder=subprocess_process_holder,
+                connect_params=connect_params,
+            )
+        finally:
+            async with self._lifecycle_lock:
+                self._connection_startup_tasks.discard(task)
+
+    async def _connect_transport_impl(
+        self,
+        name: str,
+        transport_cm: Any,
+        *,
+        transport: str,
+        endpoint: str | None,
+        ticket_id: str | None = None,
+        agent_id: str | None = None,
+        subprocess_process_holder: list[Any] | None = None,
+        connect_params: _ConnectParams | None = None,
+    ) -> None:
         """Shared connection logic for all transports.
 
         Runs the transport and session context managers in a
@@ -536,6 +573,8 @@ class AgentMCPClient:
         self._record_boundary(conn, LifecycleState.CONNECTING)
         startup_terminal_recorded = False
         startup_cancellation_state = LifecycleState.CANCELLED
+        conflicting_tool: str | None = None
+        conflicting_server: str | None = None
 
         def _cancellation_state(exc: asyncio.CancelledError) -> LifecycleState:
             return (
@@ -673,6 +712,21 @@ class AgentMCPClient:
             if connection_rejected:
                 raise asyncio.CancelledError()
             result = await session.list_tools()
+            async with self._lifecycle_lock:
+                if self._closing or self._servers.get(name) is not conn:
+                    raise asyncio.CancelledError()
+                self._record_boundary(
+                    conn,
+                    LifecycleState.RESPONSE_RECEIVED,
+                    tool_name="list_tools",
+                    outcome=OperationOutcome.SUCCESS,
+                )
+                for tool in result.tools:
+                    if tool.name in self._tool_routing:
+                        conflicting_tool = tool.name
+                        conflicting_server = self._tool_routing[tool.name]
+                        break
+                    self._tool_routing[tool.name] = name
         except asyncio.CancelledError as exc:
             cancellation_state = _cancellation_state(exc)
             self._record_boundary(
@@ -698,22 +752,13 @@ class AgentMCPClient:
             )
             await _cleanup_connection()
             raise
-        self._record_boundary(
-            conn,
-            LifecycleState.RESPONSE_RECEIVED,
-            tool_name="list_tools",
-            outcome=OperationOutcome.SUCCESS,
-        )
-        for t in result.tools:
-            if t.name in self._tool_routing:
-                existing_server = self._tool_routing[t.name]
-                await _cleanup_connection()
-                raise ValueError(
-                    f"Tool {t.name!r} from server "
-                    f"{name!r} conflicts with server "
-                    f"{existing_server!r}"
-                )
-            self._tool_routing[t.name] = name
+        if conflicting_tool is not None:
+            await _cleanup_connection()
+            raise ValueError(
+                f"Tool {conflicting_tool!r} from server "
+                f"{name!r} conflicts with server "
+                f"{conflicting_server!r}"
+            )
 
         conn._task = task
         logger.info(
@@ -1605,15 +1650,18 @@ class AgentMCPClient:
     async def disconnect(self) -> None:
         async with self._lifecycle_lock:
             self._closing = True
-            reconnect_tasks = tuple(self._reconnect_startup_tasks)
+            startup_tasks = tuple(
+                self._reconnect_startup_tasks | self._connection_startup_tasks
+            )
 
-        for task in reconnect_tasks:
+        for task in startup_tasks:
             task.cancel()
-        if reconnect_tasks:
-            await asyncio.gather(*reconnect_tasks, return_exceptions=True)
+        if startup_tasks:
+            await asyncio.gather(*startup_tasks, return_exceptions=True)
 
         async with self._lifecycle_lock:
-            self._reconnect_startup_tasks.difference_update(reconnect_tasks)
+            self._reconnect_startup_tasks.difference_update(startup_tasks)
+            self._connection_startup_tasks.difference_update(startup_tasks)
             for conn in list(self._servers.values()):
                 self._record_boundary(conn, LifecycleState.DISCONNECTED)
                 conn.connected = False

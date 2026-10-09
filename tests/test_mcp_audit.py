@@ -1417,6 +1417,133 @@ async def test_disconnect_cancels_reconnect_stuck_in_initialize(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_disconnect_cancels_direct_connect_stuck_in_initialize(monkeypatch):
+    initialize_started = asyncio.Event()
+    client = AgentMCPClient()
+
+    class _HangingInitializeSession(_TestClientSession):
+        async def initialize(self):
+            initialize_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(
+        mcp_client_module,
+        "ClientSession",
+        _HangingInitializeSession,
+    )
+
+    connect_task = asyncio.create_task(
+        client.connect_command(
+            command="python",
+            args=["server.py"],
+            name="local",
+            env={},
+        )
+    )
+    await asyncio.wait_for(initialize_started.wait(), timeout=1)
+    assert connect_task in client._connection_startup_tasks
+
+    await asyncio.wait_for(client.disconnect(), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await connect_task
+
+    assert client._connection_startup_tasks == set()
+    assert client._servers == {}
+    assert client._tool_routing == {}
+    assert not any(
+        child.get_name() == "mcp:local" and not child.done()
+        for child in asyncio.all_tasks()
+    )
+    terminal_events = [
+        event
+        for event in client.audit_events
+        if event.lifecycle.state
+        in {
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+            LifecycleState.TIMED_OUT,
+            LifecycleState.REJECTED,
+            LifecycleState.SHORT_CIRCUITED,
+        }
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].lifecycle.state == LifecycleState.CANCELLED
+    assert terminal_events[0].outcome == OperationOutcome.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_direct_connect_stuck_in_list_tools(monkeypatch):
+    list_tools_started = asyncio.Event()
+    cancellation_suppressed = asyncio.Event()
+    client = AgentMCPClient()
+
+    class _HangingListToolsSession(_TestClientSession):
+        async def list_tools(self):
+            list_tools_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_suppressed.set()
+            return SimpleNamespace(tools=[SimpleNamespace(name="late_tool")])
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(
+        mcp_client_module,
+        "ClientSession",
+        _HangingListToolsSession,
+    )
+
+    connect_task = asyncio.create_task(
+        client.connect_command(
+            command="python",
+            args=["server.py"],
+            name="local",
+            env={},
+        )
+    )
+    await asyncio.wait_for(list_tools_started.wait(), timeout=1)
+    assert connect_task in client._connection_startup_tasks
+    assert client._servers["local"].connected
+    assert "late_tool" not in client._tool_routing
+
+    await asyncio.wait_for(client.disconnect(), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await connect_task
+
+    assert cancellation_suppressed.is_set()
+    assert client._connection_startup_tasks == set()
+    assert client._servers == {}
+    assert client._tool_routing == {}
+    terminal_events = [
+        event
+        for event in client.audit_events
+        if event.lifecycle.state
+        in {
+            LifecycleState.FAILED,
+            LifecycleState.CANCELLED,
+            LifecycleState.TIMED_OUT,
+            LifecycleState.REJECTED,
+            LifecycleState.SHORT_CIRCUITED,
+        }
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].lifecycle.state == LifecycleState.CANCELLED
+    assert not any(
+        child.get_name() == "mcp:local" and not child.done()
+        for child in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
 async def test_client_timeout_during_connect_is_audited_as_timed_out():
     entered = asyncio.Event()
     release = asyncio.Event()
