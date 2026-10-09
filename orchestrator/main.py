@@ -92,7 +92,11 @@ async def _normalize_ticket_directives(
 
     normalized, applied, unrecognized = normalize_directives(raw_directives)
     fingerprint_payload = json.dumps(
-        {"directives": normalized, "unrecognized": unrecognized},
+        {
+            "source_directives": raw_directives,
+            "directives": normalized,
+            "unrecognized": unrecognized,
+        },
         sort_keys=True,
         default=str,
     )

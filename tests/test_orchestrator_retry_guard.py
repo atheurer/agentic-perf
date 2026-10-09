@@ -147,6 +147,62 @@ async def test_ambiguous_directive_patch_waits_for_canonical_snapshot(
     events.emit.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_changed_alias_source_gets_a_new_normalization_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import orchestrator.main as main
+
+    delivery_states = {}
+    events = MagicMock()
+    patch_payloads = []
+    comment_bodies = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            patch_payloads.append(deepcopy(json["fields"]["directives"]))
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+        async def post(self, url, *, json):
+            comment_bodies.append(json["body"])
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: Client())
+    canonical = {"power_off_delay": 5}
+
+    first, first_ready = await main._normalize_ticket_directives(
+        "http://store",
+        "PERF-alias-change",
+        {"power_off_delay_seconds": 5},
+        events,
+        delivery_states,
+    )
+    second, second_ready = await main._normalize_ticket_directives(
+        "http://store",
+        "PERF-alias-change",
+        {"power_off_delay_s": 5},
+        events,
+        delivery_states,
+    )
+
+    assert first_ready is True and second_ready is True
+    assert first == second == canonical
+    assert patch_payloads == [canonical, canonical]
+    assert len(comment_bodies) == 2
+    assert "power_off_delay_seconds" in comment_bodies[0]
+    assert "power_off_delay_s" in comment_bodies[1]
+    assert events.emit.call_count == 2
+    assert (
+        events.emit.call_args_list[0].args[3] != events.emit.call_args_list[1].args[3]
+    )
+
+
 def test_handoff_backoff_is_exponential_and_bounded() -> None:
     custom_fields: dict = {}
     delays = []
