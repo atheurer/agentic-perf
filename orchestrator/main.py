@@ -66,6 +66,13 @@ MODEL_CHECK_MAX_TOKENS = 1024
 _NORMALIZATION_FEEDBACK_MAX_ATTEMPTS = 3
 
 
+def _directive_mappings_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Compare JSON directive mappings without Python's bool/number coercion."""
+    return json.dumps(left, sort_keys=True, default=str) == json.dumps(
+        right, sort_keys=True, default=str
+    )
+
+
 def _directives_for_triage(
     directives: dict[str, Any], unrecognized: list[str]
 ) -> dict[str, Any]:
@@ -104,7 +111,9 @@ async def _normalize_ticket_directives(
     delivery = delivery_states.get(ticket_id)
     has_feedback = bool(applied or unrecognized)
 
-    if delivery is not None and raw_directives == delivery["normalized"]:
+    if delivery is not None and _directive_mappings_equal(
+        raw_directives, delivery["normalized"]
+    ):
         # An earlier PATCH may have committed even if its response was lost.
         # Keep the original report while a later poll confirms persisted state.
         delivery["patch_confirmed"] = True
@@ -113,18 +122,20 @@ async def _normalize_ticket_directives(
         unrecognized = delivery["event_payload"]["unrecognized"]
         has_feedback = bool(applied or unrecognized)
     elif delivery is not None and delivery["fingerprint"] != fingerprint:
-        if has_feedback or normalized != raw_directives:
+        if has_feedback or not _directive_mappings_equal(normalized, raw_directives):
             delivery = None
         else:
             delivery_states.pop(ticket_id, None)
             delivery = None
 
-    if delivery is None and (has_feedback or normalized != raw_directives):
+    if delivery is None and (
+        has_feedback or not _directive_mappings_equal(normalized, raw_directives)
+    ):
         comment_body = format_normalization_report(applied, unrecognized)
         delivery = {
             "fingerprint": fingerprint,
             "normalized": normalized,
-            "patch_confirmed": normalized == raw_directives,
+            "patch_confirmed": _directive_mappings_equal(normalized, raw_directives),
             "event_attempts": 0,
             "event_delivered": not has_feedback,
             "event_payload": {"applied": applied, "unrecognized": unrecognized},
@@ -140,7 +151,10 @@ async def _normalize_ticket_directives(
     if delivery is None:
         return _directives_for_triage(normalized, unrecognized), True
 
-    if normalized != raw_directives and not delivery["patch_confirmed"]:
+    if (
+        not _directive_mappings_equal(normalized, raw_directives)
+        and not delivery["patch_confirmed"]
+    ):
         context_token = bind_trace_context(
             new_trace_context(ticket_id=ticket_id, agent_id="orchestrator")
         )

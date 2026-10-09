@@ -95,6 +95,90 @@ async def test_invalid_sample_count_is_omitted_from_persisted_triage_directives(
 
 
 @pytest.mark.asyncio
+async def test_integral_float_sample_count_is_patched_as_integer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import orchestrator.main as main
+
+    patch_payloads = []
+    events = MagicMock()
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            patch_payloads.append(deepcopy(json["fields"]["directives"]))
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+        async def post(self, url, *, json):
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: Client())
+    triage_directives, ready = await main._normalize_ticket_directives(
+        "http://store", "PERF-float-count", {"sample_count": 1.0}, events, {}
+    )
+
+    assert ready is True
+    assert patch_payloads == [{"sample_count": 1}]
+    assert type(triage_directives["sample_count"]) is int
+
+
+@pytest.mark.asyncio
+async def test_boolean_sample_count_does_not_confirm_prior_integer_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import orchestrator.main as main
+    from providers.skills import boot_time  # noqa: F401
+
+    patch_payloads = []
+    delivery_states = {}
+    events = MagicMock()
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            patch_payloads.append(deepcopy(json["fields"]["directives"]))
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+        async def post(self, url, *, json):
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: Client())
+    first_directives, first_ready = await main._normalize_ticket_directives(
+        "http://store",
+        "PERF-bool-count",
+        {"reboot_count": 1},
+        events,
+        delivery_states,
+    )
+    next_directives, next_ready = await main._normalize_ticket_directives(
+        "http://store",
+        "PERF-bool-count",
+        {"sample_count": True},
+        events,
+        delivery_states,
+    )
+
+    assert first_ready is True
+    assert first_directives == {"sample_count": 1}
+    assert next_ready is True
+    assert next_directives == {}
+    assert patch_payloads == [{"sample_count": 1}, {}]
+    invalid_warning = events.emit.call_args.args[3]["unrecognized"][0]
+    assert "'sample_count'" in invalid_warning
+    assert "True" in invalid_warning
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_directive_patch_waits_for_canonical_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
