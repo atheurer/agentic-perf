@@ -18,7 +18,7 @@ from agents.mcp_client import (
     _is_disconnect_error,
     _ServerConnection,
 )
-from providers.tracing import LifecycleState, TraceContext
+from providers.tracing import LifecycleState, RetryKind, TraceContext
 
 # ---------------------------------------------------------------------------
 # Unit tests for _is_disconnect_error
@@ -149,6 +149,23 @@ def _default_connect_params() -> _ConnectParams:
         ticket_id="PERF-TEST",
         agent_id="test-agent",
     )
+
+
+def test_connect_params_repr_hides_argument_values():
+    params = _ConnectParams(
+        command="mcp-server",
+        args=["--api-token", "credential-value"],
+        env={"TOKEN": "environment-secret"},
+        ticket_id="PERF-TEST",
+        agent_id="test-agent",
+    )
+
+    rendered = repr(params)
+
+    assert "args=<2 args>" in rendered
+    assert "--api-token" not in rendered
+    assert "credential-value" not in rendered
+    assert "environment-secret" not in rendered
 
 
 def _trace_context() -> TraceContext:
@@ -384,6 +401,36 @@ async def test_reconnect_on_closed_session():
 
     # Pre-dispatch reconnect is safe to retry (no ambiguity)
     assert "result:check_host" in result
+
+
+@pytest.mark.asyncio
+async def test_direct_call_cancellation_during_reconnect_is_pre_send():
+    reconnect_started = asyncio.Event()
+    params = _default_connect_params()
+    client, conn = _make_connected_client(connect_params=params)
+    conn.session = None
+
+    async def block_reconnect(*args, **kwargs):
+        reconnect_started.set()
+        await asyncio.Event().wait()
+
+    with patch.object(client, "connect_command", side_effect=block_reconnect):
+        task = asyncio.create_task(
+            client.call_tool("check_host", {}, trace_context=_trace_context())
+        )
+        await reconnect_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+    assert getattr(exc_info.value, "mcp_audit_recorded", False) is True
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.CANCELLED,
+    ]
+    assert (
+        client.audit_events[-1].lifecycle.retry_kind == RetryKind.TRANSPORT_BEFORE_SEND
+    )
 
 
 @pytest.mark.asyncio

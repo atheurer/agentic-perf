@@ -1150,6 +1150,48 @@ async def test_jumpstarter_connect_timeout_has_one_timed_out_boundary(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_jumpstarter_reconnect_timeout_is_pre_send_transport_failure(monkeypatch):
+    async def block_reconnect(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=None,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+        _connect_params=_ConnectParams(
+            command="mcp-server",
+            args=["--api-token=secret"],
+            env={},
+            ticket_id="PERF-1",
+            agent_id="benchmark-agent",
+        ),
+    )
+    client.pre_call_hook = _JmpCallHook(client).pre_call
+    monkeypatch.setattr(jumpstarter_mcp, "_JMP_CONNECT_TIMEOUT", 0.01)
+    monkeypatch.setattr(client, "connect_command", block_reconnect)
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.call_tool(
+            "jmp_connect",
+            {"lease_id": "lease-1"},
+            TraceContext(ticket_id="PERF-1"),
+        )
+
+    assert exc_info.value.retry_classification == "transport_before_send"
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.TIMED_OUT,
+    ]
+    assert client.audit_events[-1].outcome == OperationOutcome.TIMED_OUT
+    assert (
+        client.audit_events[-1].lifecycle.retry_kind == RetryKind.TRANSPORT_BEFORE_SEND
+    )
+
+
+@pytest.mark.asyncio
 async def test_client_audits_hook_rejection_without_request():
     client = AgentMCPClient()
     client._tool_routing["tool"] = "local"

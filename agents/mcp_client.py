@@ -92,6 +92,16 @@ class _MCPDispatchAuditState:
     """Mutable ownership handoff for a provider-owned dispatch task."""
 
     terminal_recorded: bool = False
+    request_sent: bool | None = None
+    retry_classification: (
+        Literal[
+            "validation",
+            "intentional_agent_retry",
+            "transport_before_send",
+            "ambiguous_after_send",
+        ]
+        | None
+    ) = None
 
 
 # Exception types that indicate an MCP subprocess or network transport has
@@ -134,8 +144,8 @@ def _is_disconnect_error(exc: BaseException) -> bool:
 class _ConnectParams:
     """Immutable snapshot of the arguments needed to re-establish a connection.
 
-    The env dict may contain credentials. __repr__ is overridden
-    to prevent accidental exposure in logs or crash dumps.
+    The args and env may contain credentials. __repr__ is overridden to
+    prevent accidental exposure in logs or crash dumps.
     """
 
     command: str
@@ -147,7 +157,7 @@ class _ConnectParams:
     def __repr__(self) -> str:
         return (
             f"_ConnectParams(command={self.command!r}, "
-            f"args={self.args!r}, env=<{len(self.env)} vars>, "
+            f"args=<{len(self.args)} args>, env=<{len(self.env)} vars>, "
             f"ticket_id={self.ticket_id!r}, "
             f"agent_id={self.agent_id!r})"
         )
@@ -990,8 +1000,14 @@ class AgentMCPClient:
                 retry_kind=retry_kind,
                 error=exc,
             )
-            if audit_state is not None and terminal_recorded:
-                audit_state.terminal_recorded = True
+            if audit_state is not None:
+                audit_state.terminal_recorded = terminal_recorded
+                audit_state.request_sent = retry_kind == RetryKind.AMBIGUOUS_AFTER_SEND
+                audit_state.retry_classification = (
+                    "ambiguous_after_send"
+                    if audit_state.request_sent
+                    else "transport_before_send"
+                )
             if terminal_recorded:
                 # Provider hook wrappers use this marker to leave ownership of
                 # the terminal event with the internal dispatch.
@@ -1036,6 +1052,8 @@ class AgentMCPClient:
             )
             if audit_state is not None:
                 audit_state.terminal_recorded = terminal_recorded
+                audit_state.request_sent = False
+                audit_state.retry_classification = "transport_before_send"
             return MCPHookResult(
                 content=self._redact_client_message(conn, context, str(error)),
                 is_error=True,
@@ -1078,6 +1096,8 @@ class AgentMCPClient:
             )
             if audit_state is not None and terminal_recorded:
                 audit_state.terminal_recorded = terminal_recorded
+                audit_state.request_sent = True
+                audit_state.retry_classification = "ambiguous_after_send"
             # An internal provider dispatch is awaited inside the pre-call
             # hook. Mark the cancellation so call_tool does not record the
             # same terminal boundary again in its hook wrapper.
