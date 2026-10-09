@@ -4102,6 +4102,7 @@ function renderEvent(evt) {
       return '<div class="event" style="border-left:3px solid #7b1fa2;padding-left:8px">' +
         '<span class="event-ts">' + ts + '</span>' +
         '<span class="event-label" style="background:#7b1fa2;color:#fff">USER INTERJECTION</span>' +
+        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ')</span>' +
         '<span>' + escHtml(data.message || '') + '</span>' +
       '</div>';
 
@@ -4109,6 +4110,7 @@ function renderEvent(evt) {
       return '<div class="event" style="border-left:3px solid #00695c;padding-left:8px">' +
         '<span class="event-ts">' + ts + '</span>' +
         '<span class="event-label" style="background:#00695c;color:#fff">USER REPLY</span>' +
+        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ')</span>' +
         '<span>' + escHtml(data.message || '') + '</span>' +
       '</div>';
 

@@ -79,6 +79,29 @@ assert.equal(maxRenderedSeq, 3);
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
+def test_user_event_cards_render_the_actor() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    start = html.index("function renderEvent(evt)")
+    end = html.index("\nfunction renderAgentStarted", start)
+    renderer = html[start:end]
+    script = (
+        "function fmtTimeShort() { return 'now'; }\n"
+        "function isAuditEvent() { return false; }\n"
+        "function renderAuditEvent() { return ''; }\n"
+        "function escHtml(value) { return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;'); }\n"
+        + renderer
+        + r"""
+const assert = require('node:assert/strict');
+const reply = renderEvent({event_type: 'user_reply', agent: 'alice', data: {message: '<ok>'}});
+const interjection = renderEvent({event_type: 'user_interjection', agent: 'chat-agent', data: {message: 'hello'}});
+assert.match(reply, /\(alice\)/);
+assert.match(reply, /&lt;ok&gt;/);
+assert.match(interjection, /\(chat-agent\)/);
+"""
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 def test_dashboard_restores_expansion_by_stable_element_key() -> None:
     html = INDEX.read_text(encoding="utf-8")
     helpers = html[

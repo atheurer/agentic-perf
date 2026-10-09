@@ -995,6 +995,16 @@ def test_directive_normalization_boundary_is_system_only() -> None:
     assert INVENTORY_DISPOSITIONS[entry][0] == "system_only"
 
 
+def test_user_reply_inventory_allows_owner_user_principals() -> None:
+    entry = (
+        "state_store/api/interject.py",
+        "user_reply",
+        "mutating_http_state",
+    )
+    assert entry in INVENTORIED_SIDE_EFFECTS
+    assert INVENTORY_DISPOSITIONS[entry][0] == "audited"
+
+
 def test_tool_audit_exemptions_and_side_effect_owners_are_reviewable() -> None:
     """Exemptions may be necessary, but cannot become silent permanent bypasses."""
     used_owners = set()

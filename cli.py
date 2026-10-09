@@ -569,6 +569,7 @@ def cmd_reply(args):
                 json={"author": "user", "body": args.message},
             )
             comment.raise_for_status()
+            _emit_user_reply(client, args.ticket_id, args.message)
             comment_id = comment.json().get("id")
             resolved = client.post(
                 f"/api/v1/tickets/{args.ticket_id}/approvals/"
@@ -597,6 +598,7 @@ def cmd_reply(args):
         },
     )
     r.raise_for_status()
+    _emit_user_reply(client, args.ticket_id, args.message)
 
     if args.abort:
         r = client.post(
@@ -667,6 +669,21 @@ def cmd_reply(args):
     if overrides:
         msg += f" ({', '.join(overrides)})"
     print(msg)
+
+
+def _emit_user_reply(client: httpx.Client, ticket_id: str, message: str) -> None:
+    """Best-effort feed event after the reply comment has been accepted."""
+    try:
+        response = client.post(
+            f"/api/v1/tickets/{ticket_id}/user-reply",
+            json={"message": message},
+        )
+        response.raise_for_status()
+    except Exception:
+        print(
+            "Warning: reply was accepted but its activity event could not be recorded.",
+            file=sys.stderr,
+        )
 
 
 def cmd_approve(args):

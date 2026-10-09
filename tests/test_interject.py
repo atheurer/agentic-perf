@@ -111,7 +111,33 @@ class TestInterjectEndpoint:
         ]
         assert len(interjection_events) == 1
         assert interjection_events[0]["data"]["message"] == ("switch to latency mode")
-        assert interjection_events[0]["agent"] == "user"
+        assert interjection_events[0]["agent"] == "chat-agent"
+
+    def test_interject_event_failure_does_not_queue_message(
+        self,
+        client,
+        store,
+        event_bus,
+        active_ticket,
+        monkeypatch,
+    ):
+        def fail_emit(*_args, **_kwargs):
+            raise OSError("event store unavailable")
+
+        monkeypatch.setattr(event_bus, "emit", fail_emit)
+        failing_client = TestClient(client.app, raise_server_exceptions=False)
+        ticket_id = active_ticket.id
+
+        response = failing_client.post(
+            f"/api/v1/tickets/{ticket_id}/interject",
+            json={"message": "switch to latency mode"},
+            headers=client.headers,
+        )
+
+        assert response.status_code == 500
+        ticket = store.get_ticket(ticket_id)
+        assert ticket.custom_fields.get("pending_interject") is None
+        assert not any(comment.author == "user" for comment in ticket.comments)
 
     def test_interject_404_unknown_ticket(self, client):
         r = client.post(
@@ -202,7 +228,7 @@ class TestUserReplyEndpoint:
         reply_events = [e for e in events if e.get("event_type") == "user_reply"]
         assert len(reply_events) == 1
         assert reply_events[0]["data"]["message"] == "approved, proceed"
-        assert reply_events[0]["agent"] == "user"
+        assert reply_events[0]["agent"] == "chat-agent"
 
     def test_user_reply_404_unknown_ticket(self, client):
         r = client.post(

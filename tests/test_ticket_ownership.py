@@ -340,6 +340,13 @@ class TestInterjectGating:
             json={"message": "hello"},
         )
         assert r.status_code == 200
+        interjections = [
+            event
+            for event in app.state.event_bus.get_events(tid, since=0, limit=100)
+            if event["event_type"] == "user_interjection"
+        ]
+        assert len(interjections) == 1
+        assert interjections[0]["agent"] == "alice"
 
     def test_non_owner_cannot_interject(self, admin_client, app):
         token_alice = _create_user(admin_client, "alice")
@@ -365,6 +372,13 @@ class TestInterjectGating:
         )
 
         assert response.status_code == 200
+        replies = [
+            event
+            for event in app.state.event_bus.get_events(ticket_id, since=0, limit=100)
+            if event["event_type"] == "user_reply"
+        ]
+        assert len(replies) == 1
+        assert replies[0]["agent"] == "alice"
 
     def test_non_owner_cannot_record_user_reply(self, admin_client, app):
         alice = _user_client(app, _create_user(admin_client, "alice"))

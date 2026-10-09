@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from state_store.auth import require_write_access
+from state_store.auth import Principal, require_write_access
 from state_store.models import (
     PAUSED_STATUSES,
     TERMINAL_STATUSES,
@@ -15,6 +15,10 @@ from state_store.models import (
 from state_store.store import TicketNotFound
 
 router = APIRouter(prefix="/tickets", tags=["interject"])
+
+
+def _event_actor(principal: Principal) -> str:
+    return principal.username if principal.kind == "user" else "chat-agent"
 
 
 class InterjectRequest(BaseModel):
@@ -64,6 +68,15 @@ def interject(
             },
         )
 
+    event_bus = getattr(request.app.state, "event_bus", None)
+    if event_bus is not None:
+        event_bus.emit(
+            ticket_id,
+            _event_actor(principal),
+            "user_interjection",
+            {"message": body.message},
+        )
+
     store.add_comment(
         ticket_id,
         AddCommentRequest(author="user", body=body.message),
@@ -78,15 +91,6 @@ def interject(
             },
         },
     )
-
-    event_bus = getattr(request.app.state, "event_bus", None)
-    if event_bus is not None:
-        event_bus.emit(
-            ticket_id,
-            "user",
-            "user_interjection",
-            {"message": body.message},
-        )
 
     return JSONResponse(
         status_code=200,
@@ -126,7 +130,7 @@ def user_reply(
     if event_bus is not None:
         event_bus.emit(
             ticket_id,
-            "user",
+            _event_actor(principal),
             "user_reply",
             {"message": body.message},
         )
