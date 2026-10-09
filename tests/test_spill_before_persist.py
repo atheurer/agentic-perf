@@ -388,7 +388,13 @@ async def test_tool_results_survive_subsequent_llm_crash(tmp_path):
 
     saved_messages_calls: list[list[dict[str, Any]]] = []
 
-    async def capture_save(tid: str, msgs: list[dict[str, Any]]) -> None:
+    async def capture_save(
+        tid: str,
+        msgs: list[dict[str, Any]],
+        *,
+        required: bool = False,
+    ) -> None:
+        assert required
         saved_messages_calls.append([dict(m) for m in msgs])
 
     agent._save_messages = AsyncMock(side_effect=capture_save)
