@@ -1475,6 +1475,10 @@ class AgentBase(ABC):
                                 ticket_id,
                             )
 
+                # Persist messages immediately so tool results survive
+                # crashes or LLM failures between iterations (#920).
+                await self._save_messages(ticket_id, messages)
+
             else:
                 # while loop exhausted (max_iterations reached)
                 await self._save_messages(ticket_id, messages)
