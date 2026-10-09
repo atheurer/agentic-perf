@@ -663,6 +663,36 @@ class TicketStore:
                         reason="ticket resumed without resolving approval",
                     )
 
+                # When resuming from HITL guidance back into the
+                # pipeline, clear cached provisioning / resource
+                # fields so that deterministic resolution steps
+                # re-run against whatever the user changed in
+                # directives.  Without this, stale results from
+                # the previous failed attempt persist and agents
+                # flash the wrong image or allocate the wrong
+                # resource.  See #1162.
+                if (
+                    current == TicketStatus.AWAITING_CUSTOMER_GUIDANCE
+                    and new_status != TicketStatus.AWAITING_TEARDOWN
+                    and new_status != TicketStatus.CLOSED
+                ):
+                    _STALE_PIPELINE_FIELDS = (
+                        "jumpstarter_flash",
+                        "resource_provider_metadata",
+                        "platform_ready",
+                    )
+                    cleared = []
+                    for field in _STALE_PIPELINE_FIELDS:
+                        if field in ticket.custom_fields:
+                            del ticket.custom_fields[field]
+                            cleared.append(field)
+                    if cleared:
+                        self._trace_mutation(
+                            ticket_id,
+                            "clear_stale_pipeline_fields",
+                            attributes={"cleared_fields": cleared},
+                        )
+
             old_status = current.value
             ticket.status = new_status
             ticket.status_trail.append(new_status.value)
