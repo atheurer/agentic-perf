@@ -354,6 +354,34 @@ class TestInterjectGating:
         )
         assert r.status_code == 403
 
+    def test_owner_can_record_user_reply(self, admin_client, app):
+        token = _create_user(admin_client, "alice")
+        client = _user_client(app, token)
+        ticket_id = _create_ticket(client)
+
+        response = client.post(
+            f"/api/v1/tickets/{ticket_id}/user-reply",
+            json={"message": "approved"},
+        )
+
+        assert response.status_code == 200
+
+    def test_non_owner_cannot_record_user_reply(self, admin_client, app):
+        alice = _user_client(app, _create_user(admin_client, "alice"))
+        bob = _user_client(app, _create_user(admin_client, "bob"))
+        ticket_id = _create_ticket(alice)
+
+        response = bob.post(
+            f"/api/v1/tickets/{ticket_id}/user-reply",
+            json={"message": "approved"},
+        )
+
+        assert response.status_code == 403
+        assert not any(
+            event["event_type"] == "user_reply"
+            for event in app.state.event_bus.get_events(ticket_id, since=0, limit=100)
+        )
+
 
 class TestOwnerManagement:
     def test_add_owner(self, admin_client, app):

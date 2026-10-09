@@ -215,22 +215,21 @@ class TestUserReplyEndpoint:
 class TestAgentInterjectPickup:
     """Test the agent-side pickup of pending_interject."""
 
-    async def test_pickup_clears_field_and_emits(self, store, event_bus):
+    async def test_pickup_clears_field_without_duplicate_event(
+        self,
+        client,
+        store,
+        event_bus,
+        active_ticket,
+    ):
         from agents.base import AgentBase
 
-        ticket = store.create_ticket(
-            CreateTicketRequest(summary="t", description="t"),
+        tid = active_ticket.id
+        response = client.post(
+            f"/api/v1/tickets/{tid}/interject",
+            json={"message": "focus on latency"},
         )
-        tid = ticket.id
-        store.update_fields(
-            tid,
-            {
-                "pending_interject": {
-                    "message": "focus on latency",
-                    "timestamp": "2024-01-01T00:00:00Z",
-                },
-            },
-        )
+        assert response.status_code == 200
 
         class TestAgent(AgentBase):
             def _system_prompt(self, ticket):
@@ -328,3 +327,57 @@ class TestAgentInterjectPickup:
 
         result = await agent._check_interject(tid)
         assert result is None
+
+
+async def test_approval_reply_is_emitted_after_resolution_and_resume() -> None:
+    import json
+
+    import httpx
+
+    from agents.chat.tools import _reply_to_guidance
+
+    ticket_id = "PERF-APPROVAL-1"
+    approval_id = "apr-123"
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, payload))
+        if request.url.path.endswith("/approvals"):
+            return httpx.Response(
+                200,
+                json={
+                    "approvals": [
+                        {"approval_request_id": approval_id, "status": "pending"}
+                    ]
+                },
+            )
+        if request.url.path.endswith(f"/approvals/{approval_id}/resolve"):
+            return httpx.Response(200, json={"status": "approved"})
+        if request.method == "GET" and request.url.path.endswith(ticket_id):
+            return httpx.Response(
+                200,
+                json={"previous_status": "executing_benchmark"},
+            )
+        if request.url.path.endswith("/transition"):
+            return httpx.Response(200, json={"status": "executing_benchmark"})
+        if request.url.path.endswith("/user-reply"):
+            return httpx.Response(200, json={"status": "recorded"})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle_request),
+    ) as client:
+        result = await _reply_to_guidance(
+            client,
+            "http://state-store",
+            {"Authorization": "Bearer service-token"},
+            {"ticket_id": ticket_id, "message": "approved"},
+        )
+
+    assert json.loads(result) == {"status": "approval_resolved", "decision": "approved"}
+    assert [call[1].rsplit("/", 1)[-1] for call in calls[-2:]] == [
+        "transition",
+        "user-reply",
+    ]
+    assert calls[-1][2] == {"message": "approved"}

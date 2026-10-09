@@ -1045,11 +1045,12 @@ async def _emit_user_reply(
 ) -> None:
     """Emit a user_reply event so the reply appears in the live feed."""
     try:
-        await client.post(
+        response = await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/user-reply",
             headers=headers,
             json={"message": message},
         )
+        response.raise_for_status()
     except Exception:
         # Best-effort: the reply itself already succeeded.
         logger.warning(
@@ -1154,6 +1155,7 @@ async def _reply_to_guidance(
                 },
             )
             resumed.raise_for_status()
+        await _emit_user_reply(client, store_url, headers, ticket_id, message)
         if decision != "approved":
             return json.dumps({"status": "approval_resolved", "decision": decision})
         return json.dumps({"status": "approval_resolved", "decision": decision})

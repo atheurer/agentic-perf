@@ -40,9 +40,6 @@ def interject(
     principal = request.state.principal
     multi_user = getattr(request.app.state, "multi_user", False)
     require_write_access(principal, ticket, multi_user)
-    principal = request.state.principal
-    multi_user = getattr(request.app.state, "multi_user", False)
-    require_write_access(principal, ticket, multi_user)
 
     if ticket.status in TERMINAL_STATUSES:
         return JSONResponse(
