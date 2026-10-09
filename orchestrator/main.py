@@ -2697,6 +2697,14 @@ async def _poll_loop_after_lease(
 
     skills = await make_skill_provider(defer_organization_sources=True)
 
+    # Collect harness-contributed directive schemas so the normalization
+    # framework knows about harness-specific keys. Standalone harnesses
+    # register their directives at module import.
+    import providers.skills.boot_time  # noqa: F401
+    from providers.directives import collect_from_providers
+
+    collect_from_providers(skills)
+
     async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
         if phase not in {
             "triage",
