@@ -196,6 +196,7 @@ class TestPostHITLNudge:
             tools=[_make_regular_tool(), _make_submit_tool()],
             max_iterations=10,
         )
+        agent._save_messages = AsyncMock()
 
         post_response = MagicMock()
         post_response.raise_for_status = MagicMock()
@@ -246,6 +247,7 @@ class TestPostHITLNudge:
             tools=[_make_regular_tool(), _make_submit_tool()],
             max_iterations=10,
         )
+        agent._save_messages = AsyncMock()
 
         post_response = MagicMock()
         post_response.raise_for_status = MagicMock()
@@ -460,6 +462,7 @@ class TestPostHITLNudge:
             tools=[_make_regular_tool(), _make_submit_tool()],
             max_iterations=10,
         )
+        agent._save_messages = AsyncMock()
 
         post_response = MagicMock()
         post_response.raise_for_status = MagicMock()

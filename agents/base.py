@@ -1199,6 +1199,7 @@ class AgentBase(ABC):
                                 ],
                             }
                         )
+                        await self._save_messages(ticket_id, messages, required=True)
                         continue
                     self._emit(
                         ticket_id,
@@ -1474,6 +1475,10 @@ class AgentBase(ABC):
                                 consec,
                                 ticket_id,
                             )
+
+                # Persist messages immediately so tool results survive
+                # crashes or LLM failures between iterations (#920).
+                await self._save_messages(ticket_id, messages, required=True)
 
             else:
                 # while loop exhausted (max_iterations reached)
@@ -2500,6 +2505,8 @@ class AgentBase(ABC):
         self,
         ticket_id: str,
         messages: list[dict[str, Any]],
+        *,
+        required: bool = False,
     ) -> None:
         try:
             await self._update_fields(
@@ -2508,6 +2515,8 @@ class AgentBase(ABC):
             )
         except Exception:
             logger.debug(f"Failed to save messages for {ticket_id}")
+            if required:
+                raise
 
     async def _update_fields(
         self, ticket_id: str, fields: dict[str, Any]

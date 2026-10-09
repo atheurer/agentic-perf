@@ -1579,6 +1579,7 @@ async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
         state_store_url="http://state-store.invalid",
         max_iterations=2,
     )
+    agent._save_messages = AsyncMock()
     agent._tool_min_interval = 0
     events = []
     agent._trace = TraceRecorder(client=SimpleNamespace(record=events.append))
