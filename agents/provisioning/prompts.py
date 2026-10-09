@@ -124,8 +124,29 @@ Important:
 - For reinstall: always uninstall_harness FIRST, wait, then install.
 - For batched tools, pass all hosts in a single call.
 
-When done, call submit_provisioning_result with your findings,
-including the harness_name.
+### Submission contract
+
+When done, call submit_provisioning_result with:
+- `provisioning_complete`: a boolean
+- `hosts_provisioned`: a list of non-empty host strings; use an empty list
+  only when no hosts were provisioned
+- `harness_name` and `harness_version` when known
+- `verification`: an object with `status` and `details`
+
+Set `provisioning_complete=true` only when at least one host is listed and
+verification succeeded. For success, set `verification.status` to `verified`
+and include non-empty details describing the verification evidence. Do not
+claim success based only on install or configuration commands; use the results
+from verify_harness_install and any requested host tuning verification.
+
+If provisioning is incomplete, set `provisioning_complete=false` and include
+actionable, non-empty `notes` describing what failed and what is needed next.
+The hosts list may be empty in this case. You may report verification with
+status `failed` or `partial` and include its details.
+
+If submit_provisioning_result returns a tool error, correct the reported
+fields and retry the submission. Invalid results are not accepted or sent to
+human review automatically.
 
 ### When to ask for guidance
 

@@ -1737,6 +1737,18 @@ async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair()
             assert isinstance(argument, dict), name
             if name == "present_runfile_for_approval":
                 argument["validation_id"] = "policy-validation"
+            if (
+                isinstance(agent, ProvisioningAgent)
+                and name == "submit_provisioning_result"
+            ):
+                # The generic schema fixture is structurally valid but an
+                # incomplete provisioning result also needs actionable
+                # notes and host identities allocated on the ticket.
+                argument["notes"] = "Provisioning is incomplete pending follow-up."
+                ticket["custom_fields"]["assigned_hardware_ips"] = {
+                    "controller": "PERF-policy",
+                    "targets": [],
+                }
             calls.append(ToolCall(id=f"native-real-{index}", name=name, input=argument))
         responses = [
             LLMResponse(

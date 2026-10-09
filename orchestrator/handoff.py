@@ -156,7 +156,7 @@ def _check_executing_benchmark(ticket: dict[str, Any]) -> tuple[bool, str]:
     """Validate provisioning before benchmark execution."""
     cf = ticket.get("custom_fields", {})
 
-    if not cf.get("provisioning_complete", False):
+    if cf.get("provisioning_complete") is not True:
         hosts = cf.get("hosts_provisioned", [])
         harness = cf.get("harness_name", "unknown")
         return (
@@ -165,15 +165,58 @@ def _check_executing_benchmark(ticket: dict[str, Any]) -> tuple[bool, str]:
             f"(harness={harness}, hosts_provisioned={hosts})",
         )
 
-    # Reject when provisioning_complete is True but no hosts
-    # were actually provisioned (#1012). An empty hosts list
-    # means the provisioning agent produced no actionable result.
+    # Require actionable host identities even if the stored field is truthy.
     hosts = cf.get("hosts_provisioned", [])
-    if not hosts:
+    if (
+        not isinstance(hosts, list)
+        or not hosts
+        or any(
+            not isinstance(host, str) or not host.strip() or host != host.strip()
+            for host in hosts
+        )
+    ):
         return (
             False,
-            "Provisioning marked complete but hosts_provisioned is empty "
-            "— no actionable provisioning result",
+            "Provisioning marked complete but hosts_provisioned must contain "
+            "at least one non-empty host string — no actionable provisioning result",
+        )
+
+    allocation = cf.get("assigned_hardware_ips", {})
+    allocated_hosts: set[str] = set()
+    if isinstance(allocation, dict):
+        controller = allocation.get("controller")
+        targets = allocation.get("targets", [])
+        if isinstance(controller, str) and controller.strip():
+            allocated_hosts.add(controller)
+        if isinstance(targets, list):
+            allocated_hosts.update(
+                target
+                for target in targets
+                if isinstance(target, str) and target.strip()
+            )
+    if not allocated_hosts:
+        return (
+            False,
+            "Provisioning marked complete but the ticket has no assigned host identities",
+        )
+    unallocated_hosts = sorted(set(hosts) - allocated_hosts)
+    if unallocated_hosts:
+        return (
+            False,
+            "Provisioned hosts do not match assigned_hardware_ips: "
+            + ", ".join(unallocated_hosts),
+        )
+
+    verification = cf.get("provisioning_verification")
+    if (
+        not isinstance(verification, dict)
+        or verification.get("status") != "verified"
+        or not isinstance(verification.get("details"), str)
+        or not verification["details"].strip()
+    ):
+        return (
+            False,
+            "Provisioning marked complete without successful verification details",
         )
 
     return True, ""

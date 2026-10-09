@@ -8,7 +8,7 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
 
 from .prompts import PROVISIONING_BASE_PROMPT
 
@@ -30,14 +30,39 @@ _LOCAL_TOOLS = [
     ),
     ToolDefinition(
         name="submit_provisioning_result",
-        description="Submit the provisioning result when all hosts are prepared.",
+        description=(
+            "Submit a provisioning result. Set provisioning_complete=true only "
+            "when at least one host is provisioned and verification.status is "
+            "'verified' with non-empty details. For incomplete work, set it to "
+            "false and provide actionable notes. Invalid submissions are returned "
+            "as tool errors so you can correct and retry."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "provisioning_complete": {"type": "boolean"},
+                "provisioning_complete": {
+                    "type": "boolean",
+                    "description": "True only after hosts are prepared and verified",
+                },
                 "hosts_provisioned": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": ".*\\S.*",
+                    },
+                },
+                "verification": {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["verified", "failed", "partial"],
+                        },
+                        "details": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["status", "details"],
+                    "additionalProperties": False,
                 },
                 "harness_version": {"type": "string"},
                 "harness_name": {"type": "string"},
@@ -53,6 +78,7 @@ _LOCAL_TOOLS = [
                 "notes": {"type": "string"},
             },
             "required": ["provisioning_complete", "hosts_provisioned"],
+            "additionalProperties": False,
         },
     ),
 ]
@@ -93,6 +119,167 @@ class ProvisioningAgent(AgentBase):
         if self._ticket_id:
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
+
+    async def _validate_submit_call(
+        self, ticket_id: str, submit_call: ToolCall
+    ) -> str | None:
+        """Reject malformed provisioning results while the agent can still retry."""
+        payload = submit_call.input
+        errors: list[str] = []
+        if not isinstance(payload, dict):
+            payload = {}
+            errors.append("the submission must be a JSON object")
+        else:
+            allowed_fields = {
+                "provisioning_complete",
+                "hosts_provisioned",
+                "verification",
+                "harness_version",
+                "harness_name",
+                "configuration_applied",
+                "k3s_installed",
+                "k3s_version",
+                "notes",
+            }
+            unexpected_fields = sorted(set(payload) - allowed_fields)
+            if unexpected_fields:
+                errors.append("unsupported fields: " + ", ".join(unexpected_fields))
+
+        complete = payload.get("provisioning_complete")
+        if type(complete) is not bool:
+            errors.append("provisioning_complete must be a boolean")
+
+        hosts = payload.get("hosts_provisioned")
+        valid_hosts = isinstance(hosts, list) and all(
+            isinstance(host, str) and host.strip() and host == host.strip()
+            for host in hosts
+        )
+        if not valid_hosts:
+            errors.append(
+                "hosts_provisioned must be a list of non-empty host strings "
+                "without surrounding whitespace"
+            )
+        elif complete is True and not hosts:
+            errors.append(
+                "a completed result must include at least one provisioned host"
+            )
+
+        string_fields = (
+            "harness_name",
+            "harness_version",
+            "k3s_version",
+            "notes",
+        )
+        for field in string_fields:
+            if field in payload and not isinstance(payload[field], str):
+                errors.append(f"{field} must be a string")
+
+        if "configuration_applied" in payload and not isinstance(
+            payload["configuration_applied"], dict
+        ):
+            errors.append("configuration_applied must be an object")
+        if "k3s_installed" in payload and type(payload["k3s_installed"]) is not bool:
+            errors.append("k3s_installed must be a boolean")
+
+        verification = payload.get("verification")
+        if complete is True or "verification" in payload:
+            if not isinstance(verification, dict):
+                errors.append("verification must be an object with status and details")
+            else:
+                status = verification.get("status")
+                details = verification.get("details")
+                if not isinstance(status, str) or status not in {
+                    "verified",
+                    "failed",
+                    "partial",
+                }:
+                    errors.append(
+                        "verification.status must be 'verified', 'failed', or 'partial'"
+                    )
+                if not isinstance(details, str) or not details.strip():
+                    errors.append("verification.details must be a non-empty string")
+                if complete is True and status != "verified":
+                    errors.append(
+                        "a completed result requires verification.status='verified'"
+                    )
+
+        if complete is False:
+            notes = payload.get("notes")
+            if not isinstance(notes, str) or not notes.strip():
+                errors.append(
+                    "an incomplete result must include actionable, non-empty notes"
+                )
+
+        if valid_hosts and hosts and not errors:
+            try:
+                ticket = await self._get_ticket(ticket_id)
+                custom_fields = ticket.get("custom_fields", {})
+                allocation = custom_fields.get("assigned_hardware_ips", {})
+            except Exception as exc:
+                logger.warning(
+                    "[provisioning] %s: unable to verify submitted hosts against "
+                    "ticket allocation: %s",
+                    ticket_id,
+                    exc,
+                )
+                errors.append(
+                    "could not verify hosts_provisioned against the ticket allocation"
+                )
+            else:
+                allocated_hosts: set[str] = set()
+                if isinstance(allocation, dict):
+                    controller = allocation.get("controller")
+                    targets = allocation.get("targets", [])
+                    if isinstance(controller, str) and controller.strip():
+                        allocated_hosts.add(controller)
+                    if isinstance(targets, list):
+                        allocated_hosts.update(
+                            target
+                            for target in targets
+                            if isinstance(target, str) and target.strip()
+                        )
+                if not allocated_hosts:
+                    errors.append(
+                        "the ticket has no assigned_hardware_ips host identities; "
+                        "request a resource or platform allocation before completing"
+                    )
+                else:
+                    unallocated_hosts = sorted(set(hosts) - allocated_hosts)
+                    if unallocated_hosts:
+                        errors.append(
+                            "hosts_provisioned contains hosts not allocated to this "
+                            "ticket: "
+                            + ", ".join(unallocated_hosts)
+                            + ". Use only assigned_hardware_ips identities"
+                        )
+
+        if not errors:
+            return None
+
+        # Invalidate stale provisioning output before returning the error to the
+        # same agent. Keep hosts and SSH/allocation identity intact because the
+        # resource and platform agents may own those fields.
+        await self._update_fields(
+            ticket_id,
+            {
+                "provisioning_complete": False,
+                "provisioning_verification": {
+                    "status": "not_verified",
+                    "details": "The latest provisioning submission was rejected.",
+                },
+                "harness_version": "unknown",
+                "configuration_applied": {},
+                "k3s_installed": False,
+                "k3s_version": "",
+            },
+        )
+        return (
+            "Invalid provisioning result: "
+            + "; ".join(errors)
+            + ". Correct the submission and call submit_provisioning_result again. "
+            + "If provisioning is incomplete, set provisioning_complete=false and "
+            + "include actionable notes."
+        )
 
     async def _is_self_installing(self, harness: str) -> bool:
         """Check whether a harness needs host-side installation.
@@ -358,6 +545,10 @@ class ProvisioningAgent(AgentBase):
             "provisioning_complete": True,
             "harness_name": harness,
             "harness_version": "platform-provisioned",
+            "provisioning_verification": {
+                "status": "verified",
+                "details": "The platform agent flashed and verified the board.",
+            },
         }
         if cf.get("ssh_user"):
             fields["ssh_user"] = cf["ssh_user"]
@@ -631,43 +822,19 @@ class ProvisioningAgent(AgentBase):
                 "notes": "Could not produce structured output",
             }
 
-        # Reject empty or near-empty results that claim success.
-        # The LLM sometimes calls submit_provisioning_result with
-        # an empty object or with provisioning_complete=True but
-        # no hosts — this leaves the ticket stuck (#1012).
-        hosts_list = result.get("hosts_provisioned", [])
-        if result.get("provisioning_complete") and not hosts_list:
-            logger.warning(
-                "[provisioning] %s: rejecting empty provisioning "
-                "result — provisioning_complete=True but no "
-                "hosts_provisioned",
-                ticket_id,
-            )
-            await self._add_comment(
-                ticket_id,
-                "**Provisioning Rejected:** result marked complete "
-                "but no hosts were provisioned. The agent must "
-                "provision at least one host before completing.",
-            )
-            await self._transition_ticket(
-                ticket_id,
-                "awaiting_customer_guidance",
-                comment=(
-                    "Provisioning submitted an empty result. Review and retry or abort."
-                ),
-            )
-            return
-
         # Self-installing harnesses don't need
         # provisioning to install them. If the LLM
         # reports incomplete because install_harness
-        # failed, override when hosts were provisioned.
+        # failed, override only when verification succeeded.
         harness = result.get("harness_name", "unknown")
         prov_complete = result.get("provisioning_complete", False)
+        verification = result.get("verification")
         if (
             not prov_complete
             and getattr(self, "_harness_self_installing", False)
             and result.get("hosts_provisioned")
+            and isinstance(verification, dict)
+            and verification.get("status") == "verified"
         ):
             prov_complete = True
             logger.info(
@@ -677,39 +844,76 @@ class ProvisioningAgent(AgentBase):
 
         fields = {
             "provisioning_complete": prov_complete,
-            "hosts_provisioned": result.get("hosts_provisioned", []),
             "harness_version": result.get("harness_version", "unknown"),
             "harness_name": harness,
             "configuration_applied": result.get("configuration_applied", {}),
+            "k3s_installed": result.get("k3s_installed", False),
+            "k3s_version": result.get("k3s_version", ""),
+            "provisioning_verification": verification
+            or {
+                "status": "incomplete",
+                "details": result.get("notes", "Provisioning is incomplete."),
+            },
         }
+        # hosts_provisioned can be owned by the resource or platform agent.
+        # Keep its existing allocation when an incomplete report has no hosts.
+        if result.get("hosts_provisioned"):
+            fields["hosts_provisioned"] = result["hosts_provisioned"]
         if result.get("k3s_installed"):
-            fields["k3s_installed"] = True
             fields["k3s_version"] = result.get("k3s_version", "unknown")
 
-        # Derive ssh_hardware_ips from hosts_provisioned by
-        # projecting onto assigned_hardware_ips role map.  The
-        # resource agent owns the role assignments; provisioning
-        # only narrows to hosts that were actually SSH-provisioned.
-        ssh_ips = result.get("ssh_hardware_ips")
-        if not ssh_ips and fields.get("hosts_provisioned"):
+        # Project the resource-owned SSH endpoints onto the
+        # assigned host roles reported as provisioned. Submitted
+        # host identities never replace the SSH addresses.
+        ssh_ips = None
+        if fields.get("hosts_provisioned"):
+            allocation_loaded = False
             try:
                 ticket = await self._get_ticket(ticket_id)
-                assigned = ticket.get("custom_fields", {}).get(
-                    "assigned_hardware_ips", {}
-                )
+                custom_fields = ticket.get("custom_fields", {})
+                assigned = custom_fields.get("assigned_hardware_ips", {})
+                ssh_assigned = custom_fields.get("ssh_hardware_ips", {})
+                allocation_loaded = True
             except Exception:
                 assigned = {}
+                ssh_assigned = {}
             hosts = [str(h) for h in fields["hosts_provisioned"]]
             host_set = set(hosts)
-            if assigned:
-                ssh_ips = {}
-                if assigned.get("controller") in host_set:
-                    ssh_ips["controller"] = assigned["controller"]
-                ssh_ips["targets"] = [
-                    t for t in assigned.get("targets", []) if t in host_set
-                ]
-                if not ssh_ips.get("controller") and not ssh_ips.get("targets"):
-                    ssh_ips = {}
+            if not allocation_loaded:
+                # Preserve the existing SSH identity when the ticket lookup
+                # fails; submitted hosts may be private allocation addresses.
+                ssh_ips = None
+            elif assigned:
+                ssh_ips = {"targets": []}
+                controller = assigned.get("controller")
+                if controller in host_set:
+                    ssh_ips["controller"] = (
+                        (ssh_assigned.get("controller") or controller)
+                        if isinstance(ssh_assigned, dict)
+                        else controller
+                    )
+                assigned_targets = assigned.get("targets", [])
+                if not isinstance(assigned_targets, list):
+                    assigned_targets = []
+                ssh_targets = (
+                    ssh_assigned.get("targets", [])
+                    if isinstance(ssh_assigned, dict)
+                    else []
+                )
+                if not isinstance(ssh_targets, list):
+                    ssh_targets = []
+                for index, target in enumerate(assigned_targets):
+                    if target in host_set:
+                        ssh_target = (
+                            ssh_targets[index] if index < len(ssh_targets) else None
+                        )
+                        ssh_ips["targets"].append(ssh_target or target)
+                if not ssh_ips.get("controller") and not ssh_ips["targets"]:
+                    ssh_ips = None
+            elif isinstance(ssh_assigned, dict) and ssh_assigned:
+                # Without private role identities, do not replace a separate
+                # resource-owned SSH map with submitted host strings.
+                ssh_ips = None
             else:
                 # No role map available — fall back to first
                 # provisioned host as controller (role-blind
@@ -735,11 +939,6 @@ class ProvisioningAgent(AgentBase):
                 "(field owned by resource/platform agent)",
                 ticket_id,
             )
-        if result.get("ssh_user"):
-            fields["ssh_user"] = result["ssh_user"]
-        if result.get("ssh_key_path"):
-            fields["ssh_key_path"] = result["ssh_key_path"]
-
         await self._update_fields(ticket_id, fields)
 
         try:
@@ -752,6 +951,7 @@ class ProvisioningAgent(AgentBase):
                 "harness_name": harness,
                 "harness_version": fields.get("harness_version", "unknown"),
                 "configuration_applied": fields.get("configuration_applied", {}),
+                "verification": fields["provisioning_verification"],
                 "ssh_hardware_ips": fields.get("ssh_hardware_ips", {}),
                 "notes": result.get("notes", ""),
             }
@@ -767,13 +967,22 @@ class ProvisioningAgent(AgentBase):
 
         hosts = [
             str(h) if not isinstance(h, dict) else h.get("host", h.get("ip", str(h)))
-            for h in fields["hosts_provisioned"]
+            for h in fields.get("hosts_provisioned", [])
         ]
-        summary = (
-            f"**Provisioning Complete**\n\n"
-            f"- **Hosts:** {', '.join(hosts)}\n"
-            f"- **Harness:** {fields['harness_name']} (version: {fields['harness_version']})\n"
-        )
+        if prov_complete:
+            summary = (
+                f"**Provisioning Complete**\n\n"
+                f"- **Hosts:** {', '.join(hosts)}\n"
+                f"- **Harness:** {fields['harness_name']} "
+                f"(version: {fields['harness_version']})\n"
+                f"- **Verification:** {verification['details']}\n"
+            )
+        else:
+            summary = (
+                "**Provisioning Incomplete**\n\n"
+                f"- **Hosts:** {', '.join(hosts) if hosts else 'none reported'}\n"
+                f"- **Harness:** {fields['harness_name']}\n"
+            )
         config = fields["configuration_applied"]
         if config:
             summary += "- **Configuration:**\n"
@@ -786,6 +995,13 @@ class ProvisioningAgent(AgentBase):
             summary += f"- **Notes:** {result['notes']}\n"
 
         await self._add_comment(ticket_id, summary)
+        if not prov_complete:
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_customer_guidance",
+                comment="Provisioning is incomplete. Review the notes and decide how to proceed.",
+            )
+            return
         if await self._plan_controls_next_transition(ticket_id):
             return
         await self._transition_ticket(

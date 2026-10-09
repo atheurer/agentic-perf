@@ -1160,12 +1160,17 @@ class AgentBase(ABC):
                             ticket_id, submit_call
                         )
                     if block_msg:
+                        input_keys = (
+                            list(submit_call.input.keys())
+                            if isinstance(submit_call.input, dict)
+                            else []
+                        )
                         self._emit(
                             ticket_id,
                             "tool_called",
                             {
                                 "tool": submit_call.name,
-                                "input_keys": list(submit_call.input.keys()),
+                                "input_keys": input_keys,
                                 "blocked": True,
                             },
                         )
