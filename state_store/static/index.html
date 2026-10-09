@@ -2074,7 +2074,7 @@ function ticketOutcome(ticket) {
 
   // Evaluation result (pre-synthesis) — only show for terminal tickets so
   // in-progress tickets don't display a stale intermediate result.
-  if (evalR && isTerminalStatus(status)) {
+  if (evalR && isTicketTerminal(status)) {
     var eOutcome = String(evalR.decision || '').toUpperCase();
     var eCls = 'inconclusive';
     if (eOutcome === 'CONVERGED') eCls = 'pass';
@@ -2085,7 +2085,7 @@ function ticketOutcome(ticket) {
 
   // Analysis-only conclusion — only show for terminal tickets to avoid
   // displaying an intermediate analysis result while later stages run.
-  if (analysis && isTerminalStatus(status)) {
+  if (analysis && isTicketTerminal(status)) {
     if (analysis.conclusive) {
       return '<span class="outcome outcome-pass">ANALYSIS CONCLUSIVE</span>';
     }
