@@ -181,7 +181,10 @@ async def test_lifecycle_image_resolution_uses_complete_claim_fence(
     )
 
 
-@pytest.mark.parametrize("status", ("preparing_platform", "awaiting_provision"))
+@pytest.mark.parametrize(
+    "status",
+    ("preparing_platform", "awaiting_provision", "executing_benchmark"),
+)
 async def test_changed_provider_selection_resume_reroutes_to_resource_agent(
     monkeypatch, status: str
 ) -> None:
@@ -241,6 +244,61 @@ async def test_changed_provider_selection_resume_reroutes_to_resource_agent(
             ),
         },
     )
+
+
+async def test_unchanged_benchmark_resume_keeps_agent_dispatch() -> None:
+    """An unchanged lease with a pending approval still reaches benchmark."""
+    import orchestrator.main as mod
+
+    dispatcher, _ = _dispatcher()
+    dispatcher.create_agent = MagicMock()
+    dispatcher.mark_done = AsyncMock()
+    ticket = {
+        "id": "PERF-1",
+        "status": "executing_benchmark",
+        "custom_fields": {
+            "resource_provider": "jumpstarter",
+            "resource_reservation_id": "lease-1",
+            "resource_provider_metadata": {
+                "lease_id": "lease-1",
+                "selector": "board-type=ride4",
+            },
+            "directives": {"board_selector": "board-type=ride4"},
+            "approval_requests": {
+                "apr-1": {
+                    "approval_request_id": "apr-1",
+                    "status": "pending",
+                }
+            },
+        },
+    }
+    get_response = MagicMock(status_code=200)
+    get_response.json.return_value = ticket
+    get_response.raise_for_status = MagicMock()
+    client = MagicMock()
+    client.get = AsyncMock(return_value=get_response)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    agent = MagicMock()
+    agent.trace_context = None
+    agent.run = AsyncMock()
+    agent.close = AsyncMock()
+    dispatcher.create_agent.return_value = agent
+
+    with (
+        patch.object(mod, "AuditedAsyncHTTPClient", lambda **_kwargs: client),
+        patch.object(mod, "_record_dispatch_retry_outcome", AsyncMock()),
+        patch.object(mod, "_advance_plan", AsyncMock()),
+    ):
+        await mod.run_agent_task(
+            dispatcher,
+            "executing_benchmark",
+            "PERF-1",
+            ticket_data=ticket,
+        )
+
+    dispatcher.create_agent.assert_called_once()
+    agent.run.assert_awaited_once_with("PERF-1")
 
 
 async def test_resume_creates_a_new_invocation_linked_to_prior_dispatch() -> None:

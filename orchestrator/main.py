@@ -1039,7 +1039,11 @@ def _cancellation_reason(dispatcher: Dispatcher, ticket_id: str) -> str:
 
 def _resource_reconciliation_required_before_resume(status: str, ticket: dict) -> bool:
     """Whether a downstream resume must pass through resource allocation first."""
-    if status not in {"preparing_platform", "awaiting_provision"}:
+    if status not in {
+        "preparing_platform",
+        "awaiting_provision",
+        "executing_benchmark",
+    }:
         return False
 
     from agents.resource.agent import _provider_selection_changed
@@ -1104,7 +1108,11 @@ async def run_agent_task(
     mutation_headers = _mutation_headers(claim_id)
 
     try:
-        if status in ("preparing_platform", "awaiting_provision"):
+        if status in (
+            "preparing_platform",
+            "awaiting_provision",
+            "executing_benchmark",
+        ):
             async with AuditedAsyncHTTPClient(
                 timeout=10.0, headers=mutation_headers
             ) as client:
