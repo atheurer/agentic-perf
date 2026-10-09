@@ -1238,6 +1238,17 @@ class TriageAgent(AgentBase):
                 if host_val and "." not in host_val:
                     entry.pop("host", None)
 
+        # Re-normalize directives before writing.  The orchestrator
+        # normalizes user-submitted directives before triage, but the
+        # triage LLM may produce its own directive keys using the
+        # user's original terminology (e.g. "delay_seconds" instead
+        # of "power_off_delay").  The merge above reintroduces those
+        # raw keys.  Running normalization here ensures the ticket
+        # always has canonical keys regardless of LLM output.
+        from providers.directives import normalize_directives as _norm_dir
+
+        directives, _applied, _unrec = _norm_dir(directives)
+
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),
