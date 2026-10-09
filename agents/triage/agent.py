@@ -1227,15 +1227,23 @@ class TriageAgent(AgentBase):
         # required_hosts "host" field, which tells the resource
         # agent it's a pre-existing machine and to SSH to it.
         #
-        # Strip "host" when it looks like a board name copied
-        # from the selector (no dots — not an IP or FQDN).
-        # If the user provides a real IP or FQDN as host, they
-        # have a pre-provisioned board and want to skip flash;
-        # keep it so the resource agent treats it as user-provided.
-        if directives.get("board_selector"):
+        # Strip "host" only when it matches a name extracted from
+        # the board_selector (e.g. "name=nxp-s32g-vnp-rdb3-02"
+        # → "nxp-s32g-vnp-rdb3-02").  If the user provides a real
+        # IP or FQDN, they have a pre-provisioned board and want
+        # to skip flash; keep it as user-provided.
+        _board_sel = directives.get("board_selector", "")
+        if _board_sel:
+            # Extract board name from selector formats:
+            #   "name=nxp-s32g-vnp-rdb3-02" → "nxp-s32g-vnp-rdb3-02"
+            #   "board-type=nxp-s32g-vnp-rdb3" → "nxp-s32g-vnp-rdb3"
+            #   "nxp-s32g-vnp-rdb3-02" → "nxp-s32g-vnp-rdb3-02"
+            _board_names = {
+                part.split("=", 1)[-1]
+                for part in _board_sel.split(",")
+            }
             for entry in required_hosts:
-                host_val = entry.get("host", "")
-                if host_val and "." not in host_val:
+                if entry.get("host", "") in _board_names:
                     entry.pop("host", None)
 
         # Re-normalize directives before writing.  The orchestrator
