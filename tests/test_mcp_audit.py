@@ -41,7 +41,7 @@ from providers.tracing import (
     new_trace_context,
     reset_trace_context,
 )
-from providers.tracing.client import TraceClient
+from providers.tracing.client import TraceClient, TraceDeliveryError
 from state_store.trace_store import TraceStore
 
 
@@ -1404,6 +1404,74 @@ async def test_reused_client_recreates_owned_trace_recording(monkeypatch):
     assert recorders[1][2].record.call_count >= 4
     await client.disconnect()
     recorders[1][2].close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_owned_trace_flush_failure_still_allows_client_reuse(monkeypatch):
+    class _Session(_TestClientSession):
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    class _Recorder:
+        def __init__(self, fail_close):
+            self.record = MagicMock()
+            self.fail_close = fail_close
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+            if self.fail_close:
+                raise TraceDeliveryError("trace spool delivery failed")
+
+    monkeypatch.setattr(
+        mcp_client_module,
+        "audited_stdio_client",
+        lambda *_args, **_kwargs: _ReadyTransport(),
+    )
+    monkeypatch.setattr(mcp_client_module, "ClientSession", _Session)
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+    monkeypatch.setenv("STATE_STORE_URL", "https://state-store.invalid")
+    recorders = []
+
+    def _make_recorder(_url, _token):
+        recorder = _Recorder(fail_close=not recorders)
+        recorders.append(recorder)
+        return recorder
+
+    monkeypatch.setattr(mcp_client_module, "TraceClient", _make_recorder)
+    client = AgentMCPClient()
+    first_recorder = client._trace_client
+
+    try:
+        await client.connect_command(
+            command="python",
+            args=["server.py"],
+            name="local",
+            ticket_id="PERF-1",
+        )
+        with pytest.raises(TraceDeliveryError, match="trace spool delivery failed"):
+            await client.disconnect()
+
+        assert first_recorder is recorders[0]
+        assert first_recorder.closed
+        assert client._trace_client is None
+        assert client._servers == {}
+        assert client._tool_routing == {}
+        assert not client._closing
+
+        await client.connect_command(
+            command="python",
+            args=["server.py"],
+            name="local",
+            ticket_id="PERF-1",
+        )
+
+        assert len(recorders) == 2
+        assert client._trace_client is recorders[1]
+        assert recorders[1].record.call_count >= 2
+    finally:
+        await client.disconnect()
+    assert recorders[1].closed
 
 
 @pytest.mark.asyncio

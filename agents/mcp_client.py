@@ -37,7 +37,7 @@ from providers.tracing import (
     reset_trace_context,
     trace_context_environment,
 )
-from providers.tracing.client import TraceClient
+from providers.tracing.client import TraceClient, TraceDeliveryError
 
 logger = logging.getLogger(__name__)
 
@@ -1764,15 +1764,17 @@ class AgentMCPClient:
         completed = False
         try:
             async with self._disconnect_lock:
-                await self._disconnect_impl()
+                close_error = await self._disconnect_impl()
             completed = True
+            if close_error is not None:
+                raise close_error
         finally:
             async with self._lifecycle_lock:
                 self._disconnect_requests -= 1
                 if completed and self._disconnect_requests == 0:
                     self._closing = False
 
-    async def _disconnect_impl(self) -> None:
+    async def _disconnect_impl(self) -> TraceDeliveryError | None:
         async with self._lifecycle_lock:
             self._closing = True
             startup_tasks = tuple(
@@ -1805,11 +1807,17 @@ class AgentMCPClient:
                         pass
             self._servers.clear()
             self._tool_routing.clear()
-            if self._trace_client is not None and self._owns_trace_client:
-                self._trace_client.close()
-            self._trace_client = None
-            self._owns_trace_client = False
+            trace_close_error = None
+            try:
+                if self._trace_client is not None and self._owns_trace_client:
+                    self._trace_client.close()
+            except TraceDeliveryError as exc:
+                trace_close_error = exc
+            finally:
+                self._trace_client = None
+                self._owns_trace_client = False
             logger.info("MCP client disconnected all servers")
+            return trace_close_error
 
 
 async def connect_external_servers(
