@@ -23,7 +23,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from providers.execution import AuditedSubprocessRunner, FilesystemAuditError
+from providers.execution import FilesystemAuditError
 
 logger = logging.getLogger(__name__)
 
@@ -212,82 +212,29 @@ async def provision_jumpstarter(
         ssh_key_path=ssh_key_path,
     )
 
-    # ── Serial capture during provisioning ────────────
-    # Capture firmware, bootloader, and kernel messages
-    # during flash/boot/verify. Non-blocking: if serial
-    # fails to start, provisioning continues normally.
-    serial_proc = None
-    serial_log_fh = None
-    serial_log_path = ""
-    serial_filesystem = None
-
+    # NOTE: serial capture (j serial pipe) is intentionally NOT
+    # started during provisioning.  The serial pipe subprocess
+    # opens a gRPC tunnel to the board's serial port, which
+    # conflicts with the flash tool's own serial/pexpect
+    # connection inside reboot_to_console().  Running both
+    # concurrently on the same lease causes pexpect EOF — the
+    # flash tool's TCP port-forward gets closed because the
+    # serial port is already held by the pipe subprocess.
+    #
+    # Diagnosed by reproducing: "jmp shell -- j storage flash"
+    # succeeds from the pod when no serial pipe is running, but
+    # provision code that started serial pipe first failed
+    # consistently with pexpect EOF on the U-Boot '=>' prompt.
+    #
+    # Flash diagnostics come from _format_exception_chain() and
+    # flash-diagnostics.json.  Boot-phase serial capture is the
+    # benchmark agent's responsibility.
     if serial_capture and lease_name:
-        if artifact_dir:
-            if ticket_id:
-                from providers.execution import (
-                    AuditedFilesystem,
-                    RootedPath,
-                    durable_filesystem_emitter,
-                )
-
-                serial_filesystem = AuditedFilesystem(
-                    RootedPath(
-                        artifact_dir, "artifact", logical_prefix="platform-provision"
-                    ),
-                    ticket_id=ticket_id,
-                    emit=durable_filesystem_emitter(),
-                    critical=True,
-                )
-            else:
-                from providers.execution import AuditedFilesystem
-
-                serial_filesystem = AuditedFilesystem.system(artifact_dir)
-            serial_log_path = str(Path(artifact_dir) / "serial-capture.log")
-            serial_log_relative = "serial-capture.log"
-        else:
-            import tempfile
-
-            from providers.execution import AuditedFilesystem
-
-            serial_filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
-            serial_log_path = str(
-                serial_filesystem.temporary_file(
-                    prefix="serial-capture-", suffix=".log", mode=0o644
-                )
-            )
-            serial_log_relative = serial_log_path
-        try:
-            serial_log_fh = serial_filesystem.open_stream(
-                serial_log_relative, mode=0o644 if not ticket_id else 0o600
-            )
-            serial_proc = await AuditedSubprocessRunner().start(
-                [
-                    "jmp",
-                    "shell",
-                    f"--lease={lease_name}",
-                    "--",
-                    "j",
-                    "serial",
-                    "pipe",
-                ],
-                stdout=serial_log_fh,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            logger.info(
-                "[platform] Serial capture started (lease=%s, pid=%s, log=%s)",
-                lease_name,
-                serial_proc.pid,
-                serial_log_path,
-            )
-        except Exception as e:
-            logger.warning(
-                "[platform] Failed to start serial capture: %s",
-                e,
-            )
-            serial_proc = None
-            if serial_log_fh:
-                serial_log_fh.close()
-                serial_log_fh = None
+        logger.info(
+            "[platform] Skipping pre-flash serial capture (conflicts "
+            "with flash tool serial access); boot-phase capture is "
+            "handled by the benchmark agent"
+        )
 
     try:
         # Run the blocking Jumpstarter SDK calls in a
@@ -336,40 +283,7 @@ async def provision_jumpstarter(
             exc_info=True,
         )
     finally:
-        # ── Stop serial capture ──────────────────────
-        if serial_proc:
-            try:
-                serial_proc.terminate()
-                await serial_proc.wait(timeout=5)
-            except Exception:
-                # The tracked wait has already escalated to kill.
-                pass
-        if serial_log_fh:
-            serial_log_fh.close()
-
-    # ── Process serial output ─────────────────────
-    if serial_proc and serial_log_path:
-        result.serial_log_path = serial_log_path
-        logger.info(
-            "[platform] Serial capture saved to %s",
-            serial_log_path,
-        )
-        if not result.success:
-            try:
-                log_text = Path(serial_log_path).read_text(
-                    encoding="utf-8", errors="replace"
-                )
-                if log_text.strip():
-                    tail = log_text[-2000:]
-                    result.diagnostics.append(
-                        f"Serial output (last 2000 chars):\n{tail}"
-                    )
-                else:
-                    result.diagnostics.append(
-                        "Serial: no output captured (board may not have booted)"
-                    )
-            except Exception:
-                pass
+        pass
 
     if diag:
         result.diagnostics.extend(diag)
