@@ -19,7 +19,7 @@ from paths import get_default_ssh_key
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.resource.base import has_reservation_metadata, reservation_failed
-from providers.resource.registry import ResourceProviderRegistry
+from providers.resource.registry import PROVIDER_REGISTRY, ResourceProviderRegistry
 from providers.secrets.base import SecretsProvider
 from providers.ssh import SSHExecutor
 
@@ -350,6 +350,340 @@ def _reservation_id_from_metadata(provider: str, metadata: dict[str, Any]) -> st
     return str(value) if value is not None else ""
 
 
+def _jumpstarter_selector_changed(
+    fields: dict[str, Any], directives: dict[str, Any]
+) -> bool:
+    """Return whether an explicit board selector differs from the active lease."""
+    requested = (
+        directives.get("jumpstarter_selector")
+        or directives.get("board_selector")
+        or fields.get("jumpstarter_selector")
+        or fields.get("board_selector")
+    )
+    requested_exporter = directives.get("exporter_name") or fields.get("exporter_name")
+    metadata = fields.get("resource_provider_metadata") or {}
+    if not isinstance(metadata, dict):
+        return True
+    if requested_exporter and metadata.get("exporter_name") != requested_exporter:
+        return True
+    if not isinstance(requested, str) or not requested.strip():
+        return False
+
+    selector = metadata.get("selector") or metadata.get("jumpstarter_selector")
+    exporter_name = metadata.get("exporter_name")
+    requested_terms = {}
+    for term in requested.split(","):
+        key, separator, value = term.strip().partition("=")
+        if not separator or not key or not value:
+            return True
+        requested_terms[key] = value
+
+    if len(requested_terms) == 1:
+        key, value = next(iter(requested_terms.items()))
+        if key in {"name", "device"}:
+            return exporter_name != value
+
+    if not isinstance(selector, str):
+        return True
+    actual_terms = {}
+    for term in selector.split(","):
+        key, separator, value = term.strip().partition("=")
+        if separator and key not in {"enabled", "pool"}:
+            actual_terms[key] = value
+
+    for key, value in requested_terms.items():
+        actual_key = "board-type" if key == "target" else key
+        if actual_terms.get(actual_key) != value:
+            return True
+    return False
+
+
+def _selection_sources(
+    provider: str, fields: dict[str, Any], directives: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return provider-specific selection maps in directive precedence order."""
+    sources: list[dict[str, Any]] = []
+    for source in (fields, directives):
+        for key in ("resource_selection", f"{provider}_selection", provider):
+            value = source.get(key)
+            if isinstance(value, dict):
+                nested = value.get(provider)
+                sources.append(nested if isinstance(nested, dict) else value)
+        sources.append(source)
+    return sources
+
+
+def _explicit_provider_selection(
+    provider: str, fields: dict[str, Any], directives: dict[str, Any]
+) -> dict[str, Any]:
+    allowed = {
+        "jumpstarter": {"lease_duration_seconds"},
+        "aws": {
+            "instance_specs",
+            "instance_type",
+            "instance_count",
+            "count",
+            "ami",
+            "os",
+            "root_volume_gb",
+        },
+        "quads": {"hostnames", "duration_hours"},
+        "psap-cc": {"cluster_id", "duration_hours"},
+    }.get(provider, set())
+    selection: dict[str, Any] = {}
+    for source in _selection_sources(provider, fields, directives):
+        for key in allowed:
+            if key in source and source[key] is not None:
+                selection[key] = source[key]
+    return selection
+
+
+def _saved_aws_specs(
+    metadata: dict[str, Any],
+) -> tuple[tuple[str, str, int], ...] | None:
+    selections = metadata.get("reservation_selections")
+    if not isinstance(selections, list) or not selections:
+        return None
+
+    totals: dict[tuple[str, str], int] = {}
+    for selection in selections:
+        if not isinstance(selection, dict):
+            return None
+        specs = selection.get("instance_specs")
+        if isinstance(specs, list) and specs:
+            entries = specs
+        elif selection.get("instance_type"):
+            entries = [
+                {
+                    "instance_type": selection["instance_type"],
+                    "count": selection.get("count", selection.get("instance_count", 1)),
+                    "role": selection.get("role"),
+                }
+            ]
+        else:
+            return None
+
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("instance_type"):
+                return None
+            try:
+                count = int(entry.get("count", 1))
+            except (TypeError, ValueError):
+                return None
+            if count < 1:
+                return None
+            key = (str(entry.get("role") or ""), str(entry["instance_type"]))
+            totals[key] = totals.get(key, 0) + count
+    return tuple(
+        sorted(
+            (role, instance_type, count)
+            for (role, instance_type), count in totals.items()
+        )
+    )
+
+
+def _requested_aws_specs(
+    fields: dict[str, Any], directives: dict[str, Any]
+) -> tuple[tuple[str, str, int], ...] | None:
+    ticket_fields = dict(fields)
+    ticket_fields["directives"] = directives
+    try:
+        selection = _auto_reservation_selection("aws", {"custom_fields": ticket_fields})
+    except ValueError:
+        return None
+
+    specs = selection.get("instance_specs")
+    if not isinstance(specs, list):
+        return None
+    return tuple(
+        sorted(
+            (
+                str(spec.get("role") or ""),
+                str(spec["instance_type"]),
+                int(spec["count"]),
+            )
+            for spec in specs
+        )
+    )
+
+
+def _saved_selection_records(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    records = metadata.get("reservation_selections")
+    if isinstance(records, list):
+        return [item for item in records if isinstance(item, dict)]
+    return []
+
+
+def _duration_requirement_changed(
+    requested: Any, metadata: dict[str, Any], key: str
+) -> bool:
+    """Require saved selection history to verify an explicit lease duration."""
+    if requested is None:
+        return False
+
+    def parse_duration(value: Any) -> int | None:
+        if isinstance(value, bool) or (
+            isinstance(value, float) and not value.is_integer()
+        ):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    requested_duration = parse_duration(requested)
+    if requested_duration is None:
+        return True
+
+    records = _saved_selection_records(metadata)
+    if not records:
+        return True
+    for record in records:
+        saved_duration = parse_duration(record.get(key))
+        if saved_duration is None:
+            return True
+        if saved_duration != requested_duration:
+            return True
+    return False
+
+
+def _provider_selection_changed(
+    provider: str, fields: dict[str, Any], directives: dict[str, Any]
+) -> bool:
+    """Detect material provider requirements that differ from the saved lease."""
+    metadata = fields.get("resource_provider_metadata") or {}
+    if not isinstance(metadata, dict):
+        return True
+
+    if provider == "jumpstarter":
+        requested = _explicit_provider_selection(provider, fields, directives)
+        return _jumpstarter_selector_changed(fields, directives) or (
+            _duration_requirement_changed(
+                requested.get("lease_duration_seconds"),
+                metadata,
+                "lease_duration_seconds",
+            )
+        )
+
+    if provider == "aws":
+        requested = _explicit_provider_selection(provider, fields, directives)
+        for key in ("ami",):
+            if requested.get(key) is not None and requested[key] != metadata.get(key):
+                return True
+
+        records = _saved_selection_records(metadata)
+        for key in ("os", "root_volume_gb"):
+            if requested.get(key) is not None and (
+                not records
+                or any(record.get(key) != requested[key] for record in records)
+            ):
+                return True
+
+        requested_specs = _requested_aws_specs(fields, directives)
+        if requested_specs is not None:
+            saved_specs = _saved_aws_specs(metadata)
+            if saved_specs is None or saved_specs != requested_specs:
+                return True
+        elif requested.get("instance_specs") is not None:
+            # Malformed or incomplete requirements cannot safely reuse a lease.
+            return True
+
+        requested_type = requested.get("instance_type")
+        if requested_type:
+            active_types = set()
+            if metadata.get("instance_type"):
+                active_types.add(str(metadata["instance_type"]))
+            instance_types = metadata.get("instance_types")
+            if isinstance(instance_types, dict):
+                active_types.update(str(value) for value in instance_types.values())
+            if requested_type not in active_types:
+                return True
+
+        requested_count = requested.get("count", requested.get("instance_count"))
+        if requested_count is None and fields.get("required_hosts"):
+            required_hosts = fields.get("required_hosts") or []
+            requested_count = sum(
+                1
+                for host in required_hosts
+                if isinstance(host, dict) and not host.get("host")
+            )
+        if requested_count is not None:
+            try:
+                expected_count = int(requested_count)
+            except (TypeError, ValueError):
+                return True
+            instance_ids = metadata.get("instance_ids")
+            if isinstance(instance_ids, str):
+                actual_count = len(
+                    [value for value in instance_ids.split(",") if value]
+                )
+            elif isinstance(instance_ids, (list, tuple, set)):
+                actual_count = len(instance_ids)
+            else:
+                saved_specs = _saved_aws_specs(metadata)
+                actual_count = (
+                    sum(item[2] for item in saved_specs) if saved_specs else None
+                )
+            if actual_count is None or actual_count != expected_count:
+                return True
+
+    if provider == "quads":
+        requested = _explicit_provider_selection(provider, fields, directives)
+        if _duration_requirement_changed(
+            requested.get("duration_hours"), metadata, "duration_hours"
+        ):
+            return True
+        requested_hostnames = requested.get("hostnames")
+        if requested_hostnames is None:
+            try:
+                ticket_fields = dict(fields)
+                ticket_fields["directives"] = directives
+                requested_hostnames = _auto_reservation_selection(
+                    "quads", {"custom_fields": ticket_fields}
+                ).get("hostnames")
+            except ValueError:
+                if fields.get("required_hosts"):
+                    return True
+        if requested_hostnames is not None:
+            if isinstance(requested_hostnames, str):
+                requested_hostnames = [
+                    name.strip()
+                    for name in requested_hostnames.split(",")
+                    if name.strip()
+                ]
+            if not isinstance(requested_hostnames, list) or any(
+                not isinstance(name, str) or not name.strip()
+                for name in requested_hostnames
+            ):
+                return True
+            records = _saved_selection_records(metadata)
+            saved_hostnames = [
+                hostname
+                for record in records
+                for hostname in record.get("hostnames", [])
+                if isinstance(hostname, str)
+            ]
+            if not saved_hostnames and isinstance(metadata.get("hostnames"), list):
+                saved_hostnames = metadata["hostnames"]
+            if not saved_hostnames or sorted(saved_hostnames) != sorted(
+                requested_hostnames
+            ):
+                return True
+
+    if provider == "psap-cc":
+        selection = _explicit_provider_selection(provider, fields, directives)
+        if _duration_requirement_changed(
+            selection.get("duration_hours"), metadata, "duration_hours"
+        ):
+            return True
+        requested = selection.get("cluster_id")
+        active = metadata.get("cluster_id")
+        if requested is not None and requested != active:
+            return True
+
+    return False
+
+
 def _assigned_hardware_from_reservation(
     ticket: dict[str, Any], hosts: Any, selection: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -520,6 +854,194 @@ class ResourceAgent(AgentBase):
         await self._check_fleet_exhaustion(question)
         return await super()._request_human_input(ticket_id, question)
 
+    async def _reconcile_provider_directive(
+        self, ticket_id: str, ticket: dict[str, Any]
+    ) -> bool:
+        """Release a prior allocation before honoring changed provider intent."""
+
+        async def pause(message: str) -> bool:
+            if ticket.get("status") == "awaiting_customer_guidance":
+                await self._add_comment(ticket_id, message)
+            else:
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=message,
+                )
+            return False
+
+        fields = ticket.get("custom_fields", {})
+        directives = fields.get("directives", {})
+        recorded_provider = fields.get("resource_provider")
+        current_provider = recorded_provider
+        if not current_provider and fields.get("quads_assignment_id"):
+            current_provider = "quads"
+        if current_provider and (
+            not isinstance(current_provider, str)
+            or current_provider not in {*PROVIDER_REGISTRY, "user_provided"}
+        ):
+            return await pause(
+                "**Resource provider reconciliation paused:** The recorded provider "
+                f"({current_provider}) is unknown. Allocation details were retained; "
+                "identify the provider and reconcile the old allocation before retrying.",
+            )
+        requested_provider = directives.get("resource_provider") or current_provider
+        if not requested_provider:
+            metadata = fields.get("resource_provider_metadata") or {}
+            metadata = metadata if isinstance(metadata, dict) else {}
+            has_unknown_allocation = bool(fields.get("resource_reservation_id")) or any(
+                metadata.get(key)
+                for key in (
+                    "reservation_id",
+                    "lease_id",
+                    "assignment_id",
+                    "instance_ids",
+                )
+            )
+            if has_unknown_allocation:
+                return await pause(
+                    "**Resource provider reconciliation paused:** A prior reservation "
+                    "identity is present, but its provider is unknown. Allocation "
+                    "details were retained; identify the provider and reconcile the "
+                    "old allocation before retrying.",
+                )
+            return True
+
+        changed = current_provider != requested_provider
+        if current_provider == requested_provider:
+            changed = _provider_selection_changed(
+                str(current_provider), fields, directives
+            )
+        if not changed:
+            return True
+
+        if (
+            requested_provider != current_provider
+            and requested_provider != "user_provided"
+        ):
+            if not self._registry:
+                return await pause(
+                    "**Resource provider change paused:** The requested provider "
+                    f"({requested_provider}) cannot be verified because no provider "
+                    "registry is available. The previous allocation was retained.",
+                )
+            try:
+                # Resolve the target before releasing the active allocation. This
+                # verifies that it is a known, configured provider while preserving
+                # the old resources if the requested provider cannot be used.
+                await self._registry.get_provider(str(requested_provider))
+            except Exception as exc:
+                logger.warning(
+                    "[resource] Requested provider %s is unavailable: %s",
+                    requested_provider,
+                    type(exc).__name__,
+                )
+                return await pause(
+                    "**Resource provider change paused:** The requested provider "
+                    f"({requested_provider}) is unknown or not configured. The "
+                    "previous allocation was retained; configure the provider or "
+                    "choose another directive before retrying.",
+                )
+
+        metadata = fields.get("resource_provider_metadata") or {}
+        metadata = metadata if isinstance(metadata, dict) else {}
+        reservation_id = fields.get("resource_reservation_id")
+        if not reservation_id and current_provider:
+            reservation_id = _reservation_id_from_metadata(
+                str(current_provider), metadata
+            )
+        allocations: list[tuple[str, str, dict[str, Any]]] = []
+        if current_provider and current_provider != "user_provided":
+            if not reservation_id and current_provider == "quads":
+                reservation_id = fields.get("quads_assignment_id")
+                if reservation_id:
+                    metadata = {
+                        **metadata,
+                        "assignment_id": reservation_id,
+                        "cloud_name": fields.get("quads_cloud_name"),
+                    }
+            if not reservation_id:
+                return await pause(
+                    "**Resource provider change paused:** The previous managed "
+                    f"provider ({current_provider}) has no verifiable reservation "
+                    "ID. Its allocation details were retained, and no new provider "
+                    "was selected. Reconcile the old allocation before retrying.",
+                )
+            allocations.append((str(current_provider), str(reservation_id), metadata))
+        elif not current_provider and (
+            fields.get("resource_reservation_id")
+            or any(
+                metadata.get(key)
+                for key in (
+                    "reservation_id",
+                    "lease_id",
+                    "assignment_id",
+                    "instance_ids",
+                )
+            )
+        ):
+            return await pause(
+                "**Resource provider change paused:** A prior reservation identity "
+                "is present but its provider is unknown. Allocation details were "
+                "retained, and no new provider was selected.",
+            )
+
+        legacy_assignment_id = fields.get("quads_assignment_id")
+        if legacy_assignment_id and not (
+            current_provider == "quads"
+            and reservation_id is not None
+            and str(reservation_id) == str(legacy_assignment_id)
+        ):
+            allocations.append(
+                (
+                    "quads",
+                    str(legacy_assignment_id),
+                    {
+                        "assignment_id": legacy_assignment_id,
+                        "cloud_name": fields.get("quads_cloud_name"),
+                    },
+                )
+            )
+
+        for provider_name, allocation_id, allocation_metadata in allocations:
+            if not self._registry:
+                return await pause(
+                    "**Resource provider change paused:** The previous managed "
+                    f"reservation ({provider_name} {allocation_id}) cannot be "
+                    "released because no provider registry is available. Its "
+                    "allocation details were retained, and no new provider was "
+                    "selected.",
+                )
+            if not await self._terminate_provider_resources(
+                ticket_id,
+                provider_name,
+                allocation_id,
+                allocation_metadata,
+            ):
+                return await pause(
+                    "**Resource provider change paused:** Release of the previous "
+                    f"{provider_name} reservation {allocation_id} was not "
+                    "confirmed. Its allocation details were retained, and no new "
+                    "provider was selected.",
+                )
+
+        reset_fields = {
+            "resource_provider": None,
+            "resource_reservation_id": None,
+            "resource_provider_metadata": {},
+            "quads_assignment_id": None,
+            "quads_cloud_name": None,
+            "assigned_hardware_ips": {"controller": "", "targets": []},
+            "ssh_hardware_ips": {"controller": "", "targets": []},
+            "lease_expiration": None,
+            "fresh_host": False,
+            "jumpstarter_flash": None,
+            "platform_ready": False,
+        }
+        await self._update_fields(ticket_id, reset_fields)
+        fields.update(reset_fields)
+        return True
+
     async def run(self, ticket_id: str) -> None:
         if self._mode == "teardown":
             await self._run_teardown(ticket_id)
@@ -563,6 +1085,8 @@ class ResourceAgent(AgentBase):
                         "awaiting_customer_guidance",
                         comment="Provider reservation requires human reconciliation",
                     )
+                return
+            if not await self._reconcile_provider_directive(ticket_id, ticket):
                 return
         finally:
             reset_trace_context(trace_token)
@@ -624,6 +1148,14 @@ class ResourceAgent(AgentBase):
         fields = ticket.get("custom_fields", {})
         directives = fields.get("directives", {})
 
+        async def pause_teardown(message: str) -> None:
+            if ticket.get("status") != "awaiting_customer_guidance":
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=message,
+                )
+
         skip_teardown = directives.get("skip_teardown")
         if skip_teardown is None:
             # Ticket did not express a preference; fall back to
@@ -658,16 +1190,27 @@ class ResourceAgent(AgentBase):
         selective = bool(preserve_roles)
 
         if selective:
-            await self._run_selective_teardown(
+            teardown_confirmed = await self._run_selective_teardown(
                 ticket_id,
                 fields,
                 preserve_roles,
                 host_cleanup,
             )
+            if not teardown_confirmed:
+                await pause_teardown(
+                    "Resource teardown could not confirm release; allocation "
+                    "details were retained for manual reconciliation."
+                )
+                return
         else:
             if host_cleanup == "required":
                 await self._run_host_cleanup(ticket_id, fields)
-            await self._terminate_all(ticket_id, fields)
+            if not await self._terminate_all(ticket_id, fields):
+                await pause_teardown(
+                    "Resource teardown could not confirm release; allocation "
+                    "details were retained for manual reconciliation."
+                )
+                return
 
         # Clear the transient flag
         if selective:
@@ -690,10 +1233,12 @@ class ResourceAgent(AgentBase):
         self,
         ticket_id: str,
         fields: dict,
-    ) -> None:
+    ) -> bool:
         provider_name = fields.get("resource_provider")
         reservation_id = fields.get("resource_reservation_id")
-        provider_metadata = fields.get("resource_provider_metadata", {})
+        provider_metadata = fields.get("resource_provider_metadata") or {}
+        if not isinstance(provider_metadata, dict):
+            provider_metadata = {}
 
         if not provider_name and fields.get("quads_assignment_id"):
             provider_name = "quads"
@@ -703,15 +1248,48 @@ class ResourceAgent(AgentBase):
                 "cloud_name": fields.get("quads_cloud_name"),
             }
 
-        if provider_name and provider_name != "user_provided" and reservation_id:
-            await self._terminate_provider_resources(
-                ticket_id, provider_name, reservation_id, provider_metadata
+        if provider_name and provider_name != "user_provided":
+            reservation_id = reservation_id or _reservation_id_from_metadata(
+                str(provider_name), provider_metadata
             )
-        else:
+            if not reservation_id:
+                await self._add_comment(
+                    ticket_id,
+                    f"Cannot confirm teardown for {provider_name}: no reservation "
+                    "ID is available. Allocation details were retained.",
+                )
+                return False
+            return await self._terminate_provider_resources(
+                ticket_id, str(provider_name), str(reservation_id), provider_metadata
+            )
+
+        has_allocation_identity = bool(
+            reservation_id
+            or fields.get("quads_assignment_id")
+            or any(
+                provider_metadata.get(key)
+                for key in (
+                    "reservation_id",
+                    "lease_id",
+                    "assignment_id",
+                    "instance_ids",
+                )
+            )
+        )
+        if has_allocation_identity:
             await self._add_comment(
                 ticket_id,
-                "Resources released (no managed reservation to terminate).",
+                "Cannot safely confirm teardown because allocation identity is "
+                "present but no managed provider is recorded. Allocation details "
+                "were retained for provider reconciliation.",
             )
+            return False
+
+        await self._add_comment(
+            ticket_id,
+            "Resources released (no managed reservation to terminate).",
+        )
+        return True
 
     async def _run_selective_teardown(
         self,
@@ -719,7 +1297,7 @@ class ResourceAgent(AgentBase):
         fields: dict,
         preserve_roles: list[str],
         host_cleanup: str,
-    ) -> None:
+    ) -> bool:
         """Teardown only hosts whose roles are NOT in preserve_roles."""
         hw = fields.get("ssh_hardware_ips") or fields.get(
             "assigned_hardware_ips",
@@ -781,13 +1359,21 @@ class ResourceAgent(AgentBase):
 
         # Terminate only the non-preserved instances
         provider_name = fields.get("resource_provider")
-        provider_metadata = fields.get("resource_provider_metadata", {})
+        if not provider_name and fields.get("quads_assignment_id"):
+            provider_name = "quads"
+        provider_metadata = fields.get("resource_provider_metadata") or {}
+        if not isinstance(provider_metadata, dict):
+            provider_metadata = {}
         if (
             provider_name
             and provider_name != "user_provided"
             and provider_metadata.get("instance_ids")
         ):
             all_instance_ids = provider_metadata["instance_ids"]
+            if isinstance(all_instance_ids, str):
+                all_instance_ids = [
+                    item.strip() for item in all_instance_ids.split(",") if item.strip()
+                ]
             all_public_ips = provider_metadata.get("public_ips", [])
             all_private_ips = provider_metadata.get("private_ips", [])
 
@@ -796,6 +1382,23 @@ class ResourceAgent(AgentBase):
             teardown_set = set(teardown_hosts)
             if assigned_targets:
                 teardown_set.update(teardown_assigned_targets)
+            mapped_hosts = set()
+            for i in range(len(all_instance_ids)):
+                pub = all_public_ips[i] if i < len(all_public_ips) else ""
+                priv = all_private_ips[i] if i < len(all_private_ips) else ""
+                if pub:
+                    mapped_hosts.add(pub)
+                if priv:
+                    mapped_hosts.add(priv)
+            unmapped_hosts = teardown_set - mapped_hosts
+            if unmapped_hosts:
+                await self._add_comment(
+                    ticket_id,
+                    "Selective teardown could not map every requested host to a "
+                    "provider instance ID. Allocation details were retained.",
+                )
+                return False
+
             terminate_ids = []
             keep_ids = []
             for i, iid in enumerate(all_instance_ids):
@@ -809,12 +1412,20 @@ class ResourceAgent(AgentBase):
             if terminate_ids:
                 teardown_metadata = dict(provider_metadata)
                 teardown_metadata["instance_ids"] = terminate_ids
-                await self._terminate_provider_resources(
+                if not await self._terminate_provider_resources(
                     ticket_id,
                     provider_name,
-                    ",".join(terminate_ids),
+                    ",".join(str(item) for item in terminate_ids),
                     teardown_metadata,
+                ):
+                    return False
+            elif teardown_hosts:
+                await self._add_comment(
+                    ticket_id,
+                    "Selective teardown could not match the requested hosts to "
+                    "provider instance IDs. Allocation details were retained.",
                 )
+                return False
 
             # Update assigned_hardware_ips to reflect preserved hosts
             new_hw: dict[str, Any] = {}
@@ -843,11 +1454,42 @@ class ResourceAgent(AgentBase):
                     "resource_provider_metadata": new_metadata,
                 },
             )
+            return True
         else:
+            if provider_name and provider_name != "user_provided":
+                await self._add_comment(
+                    ticket_id,
+                    f"Cannot safely perform selective teardown for provider "
+                    f"{provider_name}; allocation details were retained.",
+                )
+                return False
+            if fields.get("quads_assignment_id"):
+                await self._add_comment(
+                    ticket_id,
+                    "Cannot safely perform selective teardown for the legacy QUADS "
+                    "assignment; allocation details were retained.",
+                )
+                return False
+            if fields.get("resource_reservation_id") or any(
+                provider_metadata.get(key)
+                for key in (
+                    "reservation_id",
+                    "lease_id",
+                    "assignment_id",
+                    "instance_ids",
+                )
+            ):
+                await self._add_comment(
+                    ticket_id,
+                    "Cannot safely perform selective teardown because the previous "
+                    "provider is unknown. Allocation details were retained.",
+                )
+                return False
             await self._add_comment(
                 ticket_id,
                 "Selective teardown: no managed instances to terminate.",
             )
+            return True
 
     async def _terminate_provider_resources(
         self,
@@ -855,18 +1497,27 @@ class ResourceAgent(AgentBase):
         provider_name: str,
         reservation_id: str,
         provider_metadata: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         if not self._registry:
             await self._add_comment(
                 ticket_id,
                 f"Cannot terminate {provider_name} reservation {reservation_id}: "
                 f"no secrets provider configured. Manual cleanup required.",
             )
-            return
+            return False
 
         try:
             provider = await self._registry.get_provider(provider_name)
             result = await provider.terminate(reservation_id, provider_metadata)
+            status = str(result.get("status", "")).strip().lower()
+            if status not in {"terminated", "released"}:
+                await self._add_comment(
+                    ticket_id,
+                    f"Could not confirm release of {provider_name} reservation "
+                    f"{reservation_id} (provider status: {status or 'missing'}). "
+                    "Allocation details were retained.",
+                )
+                return False
             await self._add_comment(
                 ticket_id,
                 f"{provider_name} reservation {reservation_id} terminated.",
@@ -875,6 +1526,7 @@ class ResourceAgent(AgentBase):
                 f"[resource-agent] {provider_name} reservation "
                 f"{reservation_id} terminated: {result}"
             )
+            return True
         except Exception as e:
             logger.exception(
                 f"[resource-agent] Failed to terminate {provider_name} "
@@ -885,6 +1537,7 @@ class ResourceAgent(AgentBase):
                 f"Failed to terminate {provider_name} reservation "
                 f"{reservation_id}: {e}",
             )
+            return False
 
     async def _run_host_cleanup(self, ticket_id: str, fields: dict) -> None:
         hw = fields.get("ssh_hardware_ips") or fields.get("assigned_hardware_ips", {})
@@ -988,7 +1641,7 @@ class ResourceAgent(AgentBase):
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         cf = ticket.get("custom_fields", {})
         directives = cf.get("directives", {})
-        provider = cf.get("resource_provider") or directives.get("resource_provider")
+        provider = directives.get("resource_provider") or cf.get("resource_provider")
         endpoint = directives.get("endpoint_type", "remotehosts")
 
         fragments = self._load_prompt_fragments(
@@ -1109,20 +1762,10 @@ class ResourceAgent(AgentBase):
         ticket_context = await self._get_ticket(ticket_id)
         ticket_cf = ticket_context.get("custom_fields", {})
         ticket_directives = ticket_cf.get("directives", {})
-        configured_provider = ticket_cf.get("resource_provider")
         directed_provider = ticket_directives.get("resource_provider")
-        managed_ticket_provider = next(
-            (
-                provider
-                for provider in (configured_provider, directed_provider)
-                if provider and provider != "user_provided"
-            ),
-            None,
-        )
         rp = (
-            managed_ticket_provider
-            or configured_provider
-            or directed_provider
+            directed_provider
+            or ticket_cf.get("resource_provider")
             or result.get("resource_provider")
             or "user_provided"
         )
@@ -1244,7 +1887,11 @@ class ResourceAgent(AgentBase):
                     )
                     return
 
+                selection_record = dict(selection)
                 duration_hours = selection.pop("duration_hours", None)
+                selection_record["duration_hours"] = (
+                    duration_hours if duration_hours is not None else 36
+                )
                 reserve_args: dict[str, Any] = {
                     "provider": rp,
                     "selection": selection,
@@ -1354,6 +2001,25 @@ class ResourceAgent(AgentBase):
                         )
                     if not reservation_metadata:
                         reservation_metadata = result_metadata
+                    selection_history = reservation_metadata.get(
+                        "reservation_selections"
+                    )
+                    selection_history = (
+                        list(selection_history)
+                        if isinstance(selection_history, list)
+                        else []
+                    )
+                    if not selection_history:
+                        result_history = result_metadata.get("reservation_selections")
+                        if isinstance(result_history, list):
+                            selection_history = list(result_history)
+                    if not selection_history:
+                        # The resource server persists its normalized request
+                        # (including inferred OS and provider defaults). Keep
+                        # that history authoritative; this fallback supports
+                        # older servers that return no selection history.
+                        selection_history.append(selection_record)
+                    reservation_metadata["reservation_selections"] = selection_history
                     if fallback_id and not has_reservation_metadata(
                         rp, reservation_metadata
                     ):

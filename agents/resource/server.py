@@ -155,6 +155,21 @@ def _reservation_identity(result: dict[str, Any]) -> str | None:
     return str(reservation_id)
 
 
+def _record_reservation_selection(
+    result: dict[str, Any], selection: dict[str, Any], duration_hours: int
+) -> None:
+    """Persist the exact request inputs alongside provider allocation identity."""
+    metadata = result.get("provider_metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    history = metadata.get("reservation_selections")
+    history = list(history) if isinstance(history, list) else []
+    record = dict(selection)
+    record["duration_hours"] = duration_hours
+    history.append(record)
+    metadata["reservation_selections"] = history
+    result["provider_metadata"] = metadata
+
+
 def _split_reservation_ids(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         values = [str(item).strip() for item in value if str(item).strip()]
@@ -192,7 +207,10 @@ def _combined_reservation_outcome(
     metadata = dict(previous_metadata)
     for key, value in current_metadata.items():
         old_value = metadata.get(key)
-        if isinstance(old_value, list) and isinstance(value, list):
+        if key == "reservation_selections" and isinstance(value, list):
+            prior_selections = old_value if isinstance(old_value, list) else []
+            metadata[key] = [*prior_selections, *value]
+        elif isinstance(old_value, list) and isinstance(value, list):
             metadata[key] = list(dict.fromkeys([*old_value, *value]))
         elif (
             key == "ip_mapping"
@@ -834,6 +852,7 @@ async def reserve_resources(
             ),
             "provider_metadata": prior_metadata,
         }
+        _record_reservation_selection(cancelled_result, selection, duration_hours)
         _last_reservation.clear()
         _last_reservation.update(cancelled_result)
         try:
@@ -868,6 +887,8 @@ async def reserve_resources(
             ),
             "provider_metadata": dict(_last_reservation.get("provider_metadata") or {}),
         }
+
+    _record_reservation_selection(result, selection, duration_hours)
 
     # Provider argument is the selected registry key and remains authoritative
     # if a provider response includes its own provider field.

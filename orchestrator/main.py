@@ -1037,6 +1037,62 @@ def _cancellation_reason(dispatcher: Dispatcher, ticket_id: str) -> str:
     return "Agent stopped: task cancelled"
 
 
+def _resource_reconciliation_required_before_resume(status: str, ticket: dict) -> bool:
+    """Whether a downstream resume must pass through resource allocation first."""
+    if status not in {
+        "preparing_platform",
+        "awaiting_provision",
+        "executing_benchmark",
+    }:
+        return False
+
+    from agents.resource.agent import _provider_selection_changed
+    from providers.resource.registry import PROVIDER_REGISTRY
+
+    fields = ticket.get("custom_fields", {})
+    if not isinstance(fields, dict):
+        return True
+    directives = fields.get("directives", {})
+    directives = directives if isinstance(directives, dict) else {}
+    provider = fields.get("resource_provider")
+    if not provider and fields.get("quads_assignment_id"):
+        provider = "quads"
+    requested_provider = directives.get("resource_provider")
+    metadata = fields.get("resource_provider_metadata") or {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    has_allocation_identity = bool(
+        fields.get("resource_reservation_id")
+        or fields.get("quads_assignment_id")
+        or any(
+            metadata.get(key)
+            for key in (
+                "reservation_id",
+                "lease_id",
+                "assignment_id",
+                "instance_ids",
+            )
+        )
+    )
+
+    if not provider:
+        return bool(requested_provider or has_allocation_identity)
+    if not isinstance(provider, str) or provider not in {
+        *PROVIDER_REGISTRY,
+        "user_provided",
+    }:
+        return True
+    if requested_provider and requested_provider != provider:
+        return True
+    if provider == "user_provided":
+        return False
+    try:
+        return _provider_selection_changed(provider, fields, directives)
+    except Exception:
+        # Unparseable requirements are not safe evidence that the old lease
+        # still satisfies the request. Route to the resource agent to fail closed.
+        return True
+
+
 async def run_agent_task(
     dispatcher: Dispatcher,
     status: str,
@@ -1052,6 +1108,38 @@ async def run_agent_task(
     mutation_headers = _mutation_headers(claim_id)
 
     try:
+        if status in (
+            "preparing_platform",
+            "awaiting_provision",
+            "executing_benchmark",
+        ):
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0, headers=mutation_headers
+            ) as client:
+                response = await client.get(
+                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                )
+                response.raise_for_status()
+                current_ticket = response.json()
+                if current_ticket.get("status") != status:
+                    return
+                if _resource_reconciliation_required_before_resume(
+                    status, current_ticket
+                ):
+                    transition = await client.post(
+                        f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
+                        json={
+                            "status": "awaiting_hardware",
+                            "comment": (
+                                "The active allocation requires reconciliation "
+                                f"before resuming {status}; returning to resource "
+                                "allocation."
+                            ),
+                        },
+                    )
+                    transition.raise_for_status()
+                    return
+
         ticket_secrets = dispatcher._get_secrets_for_ticket(ticket_data)
         agent_type = STATUS_AGENT_MAP.get(status, "")
         api_key = (
