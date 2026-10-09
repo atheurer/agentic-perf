@@ -211,6 +211,7 @@ class AgentMCPClient:
         self._closing = False
         self._reconnect_startup_tasks: set[asyncio.Task[None]] = set()
         self._connection_startup_tasks: set[asyncio.Task[None]] = set()
+        self._retiring_connection_tasks: set[asyncio.Task[None]] = set()
         self._connection_startup_locks: dict[str, asyncio.Lock] = {}
         self.trace_context = trace_context
         # Optional hook for provider-specific call_tool behavior (e.g.,
@@ -757,6 +758,10 @@ class AgentMCPClient:
                         previous._shutdown.set()
                         previous_task = previous._task
                         if previous_task is not None and not previous_task.done():
+                            self._retiring_connection_tasks.add(previous_task)
+                            previous_task.add_done_callback(
+                                self._retiring_connection_tasks.discard
+                            )
                             previous_task.cancel()
                     self._servers[name] = conn
                     self._tool_routing = {
@@ -801,7 +806,7 @@ class AgentMCPClient:
             )
 
         if previous_task is not None:
-            await asyncio.gather(previous_task, return_exceptions=True)
+            await asyncio.shield(asyncio.gather(previous_task, return_exceptions=True))
         logger.info(
             "MCP client connected to %s (%d tools)",
             name,
@@ -823,7 +828,10 @@ class AgentMCPClient:
         """
         tools = []
         for conn in self._servers.values():
-            result = await conn.session.list_tools()
+            session = conn.session
+            if session is None:
+                continue
+            result = await session.list_tools()
             for t in result.tools:
                 if include is not None and t.name not in include:
                     continue
@@ -1040,6 +1048,23 @@ class AgentMCPClient:
                 if conn.connected:
                     conn.connected = False
                 conn.session = None
+                previous_task = conn._task
+                conn._shutdown.set()
+
+            if previous_task is not None:
+                await asyncio.gather(previous_task, return_exceptions=True)
+
+            async with self._lifecycle_lock:
+                if self._closing:
+                    return False
+
+                current = self._servers.get(conn.name)
+                if current is not conn:
+                    return (
+                        current is not None
+                        and current.connected
+                        and current.session is not None
+                    )
 
                 connect_task = asyncio.create_task(
                     self.connect_command(
@@ -1707,15 +1732,19 @@ class AgentMCPClient:
             startup_tasks = tuple(
                 self._reconnect_startup_tasks | self._connection_startup_tasks
             )
+            retiring_tasks = tuple(self._retiring_connection_tasks)
 
         for task in startup_tasks:
             task.cancel()
         if startup_tasks:
             await asyncio.gather(*startup_tasks, return_exceptions=True)
+        if retiring_tasks:
+            await asyncio.gather(*retiring_tasks, return_exceptions=True)
 
         async with self._lifecycle_lock:
             self._reconnect_startup_tasks.difference_update(startup_tasks)
             self._connection_startup_tasks.difference_update(startup_tasks)
+            self._retiring_connection_tasks.difference_update(retiring_tasks)
             for conn in list(self._servers.values()):
                 self._record_boundary(conn, LifecycleState.DISCONNECTED)
                 conn.connected = False

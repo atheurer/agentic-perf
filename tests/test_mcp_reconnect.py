@@ -410,6 +410,7 @@ async def test_failed_reconnect_keeps_route_for_a_later_retry(monkeypatch):
         assert old_conn.connected is False
         assert old_conn._connect_params is params
         assert client._tool_routing == {"check_host": old_conn.name}
+        assert await client.list_tools() == []
 
         result = await client.call_tool(
             "check_host", {}, trace_context=_trace_context()
@@ -422,6 +423,70 @@ async def test_failed_reconnect_keeps_route_for_a_later_retry(monkeypatch):
         assert client._tool_routing == {"check_host": old_conn.name}
         assert transport_enter_count == 2
         assert session_count == 1
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_stops_old_transport_holder_before_relaunch(monkeypatch):
+    client = AgentMCPClient()
+    params = _default_connect_params()
+    old_session_exited = asyncio.Event()
+
+    class _HolderTransport:
+        async def __aenter__(self):
+            return (SimpleNamespace(), SimpleNamespace())
+
+        async def __aexit__(self, *_):
+            return False
+
+    class _HolderSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            old_session_exited.set()
+            return False
+
+        async def initialize(self):
+            return None
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[_make_tool("check_host")])
+
+    monkeypatch.setattr(
+        "agents.mcp_client.audited_stdio_client",
+        lambda *_args, **_kwargs: _HolderTransport(),
+    )
+    monkeypatch.setattr("agents.mcp_client.ClientSession", _HolderSession)
+
+    await client._connect_transport(
+        "test-server",
+        _HolderTransport(),
+        transport="stdio",
+        endpoint="old-server.py",
+        connect_params=params,
+    )
+    old_conn = client._servers["test-server"]
+    old_task = old_conn._task
+    assert old_task is not None and not old_task.done()
+    old_conn.session = None
+
+    async def failing_relaunch(*_args, **_kwargs):
+        assert old_task.done()
+        assert old_session_exited.is_set()
+        assert client._servers["test-server"] is old_conn
+        assert client._tool_routing["check_host"] == "test-server"
+        raise RuntimeError("relaunch failed")
+
+    try:
+        with patch.object(client, "connect_command", side_effect=failing_relaunch):
+            assert await client._reconnect_server(old_conn) is False
+
+        assert old_task.done()
+        assert old_conn.session is None
+        assert client._servers["test-server"] is old_conn
+        assert client._tool_routing["check_host"] == "test-server"
     finally:
         await client.disconnect()
 
@@ -479,6 +544,7 @@ async def test_concurrent_call_waits_for_reconnect_with_route_reserved(monkeypat
         await asyncio.wait_for(list_tools_started.wait(), timeout=1)
         assert client._servers[old_conn.name] is old_conn
         assert client._tool_routing["check_host"] == old_conn.name
+        assert await client.list_tools() == []
 
         second_call = asyncio.create_task(
             client.call_tool("check_host", {}, trace_context=_trace_context())

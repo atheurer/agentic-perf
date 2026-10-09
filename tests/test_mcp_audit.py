@@ -1686,10 +1686,19 @@ async def test_disconnect_cancellation_propagates_during_previous_cleanup(monkey
             endpoint="replacement-server.py",
         )
     )
-    await asyncio.wait_for(previous_exit_started.wait(), timeout=1)
-
-    disconnect_task = asyncio.create_task(client.disconnect())
+    disconnect_task = None
     try:
+        await asyncio.wait_for(replacement_initialize_started.wait(), timeout=1)
+        assert client._servers["local"] is previous_connection
+
+        release_replacement_initialize.set()
+        await asyncio.wait_for(previous_exit_started.wait(), timeout=1)
+        replacement_connection = client._servers["local"]
+        assert replacement_connection is not previous_connection
+        assert replacement_connection.endpoint == "replacement-server.py"
+        assert client._tool_routing == {"replacement_tool": "local"}
+
+        disconnect_task = asyncio.create_task(client.disconnect())
         await asyncio.sleep(0)
         assert replacement_startup.cancelling() > 0
         release_previous_exit.set()
@@ -1698,9 +1707,10 @@ async def test_disconnect_cancellation_propagates_during_previous_cleanup(monkey
         with pytest.raises(asyncio.CancelledError):
             await replacement_startup
 
-        assert not replacement_initialize_started.is_set()
         assert previous_connection._task is not None
         assert previous_connection._task.done()
+        assert replacement_connection._task is not None
+        assert replacement_connection._task.done()
         assert client._servers == {}
         assert client._tool_routing == {}
         assert client._connection_startup_tasks == set()
@@ -1712,7 +1722,7 @@ async def test_disconnect_cancellation_propagates_during_previous_cleanup(monkey
         release_previous_exit.set()
         release_replacement_initialize.set()
         await asyncio.gather(
-            disconnect_task,
+            *([disconnect_task] if disconnect_task is not None else []),
             replacement_startup,
             return_exceptions=True,
         )
