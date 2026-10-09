@@ -774,7 +774,9 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     client = Client()
     monkeypatch.setattr(main, "Dispatcher", lambda *_args, **_kwargs: dispatcher)
     monkeypatch.setattr(main, "RepoCache", lambda: object())
-    monkeypatch.setattr(main, "build_skill_provider", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        main, "build_skill_provider_async", AsyncMock(return_value=object())
+    )
     monkeypatch.setattr(main, "LocalSecretsProvider", lambda: object())
     monkeypatch.setattr(
         main,
