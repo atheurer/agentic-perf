@@ -943,9 +943,9 @@ class AgentMCPClient:
                 )
             except Exception as exc:
                 logger.warning(
-                    "Failed to reconnect MCP server %s: %s",
+                    "Failed to reconnect MCP server %s (error_type=%s)",
                     conn.name,
-                    exc,
+                    type(exc).__name__,
                 )
                 return False
 
@@ -968,6 +968,35 @@ class AgentMCPClient:
         context: TraceContext,
         audit_state: _MCPDispatchAuditState | None = None,
     ) -> MCPHookResult:
+        def record_reconnect_cancellation(
+            exc: asyncio.CancelledError,
+            retry_kind: RetryKind,
+        ) -> None:
+            cancellation_state = (
+                LifecycleState.TIMED_OUT
+                if exc.args == (_MCP_TIMEOUT_CANCELLATION,)
+                else LifecycleState.CANCELLED
+            )
+            terminal_recorded = self._record_boundary(
+                conn,
+                cancellation_state,
+                context=context,
+                tool_name=name,
+                outcome=(
+                    OperationOutcome.TIMED_OUT
+                    if cancellation_state == LifecycleState.TIMED_OUT
+                    else OperationOutcome.CANCELLED
+                ),
+                retry_kind=retry_kind,
+                error=exc,
+            )
+            if audit_state is not None and terminal_recorded:
+                audit_state.terminal_recorded = True
+            if terminal_recorded:
+                # Provider hook wrappers use this marker to leave ownership of
+                # the terminal event with the internal dispatch.
+                setattr(exc, "mcp_audit_recorded", True)
+
         if conn.session is None:
             # Attempt reconnect if we have stored connection parameters.
             if conn._connect_params is not None:
@@ -976,7 +1005,15 @@ class AgentMCPClient:
                     conn.name,
                     name,
                 )
-                if await self._reconnect_server(conn):
+                try:
+                    reconnected = await self._reconnect_server(conn)
+                except asyncio.CancelledError as exc:
+                    record_reconnect_cancellation(
+                        exc,
+                        RetryKind.TRANSPORT_BEFORE_SEND,
+                    )
+                    raise
+                if reconnected:
                     new_conn = self._servers.get(conn.name)
                     if new_conn is not None and new_conn.session is not None:
                         return await self._dispatch_mcp_request(
@@ -1069,7 +1106,14 @@ class AgentMCPClient:
                 # this call — the previous request state is
                 # ambiguous (AMBIGUOUS_AFTER_SEND) and retrying
                 # non-idempotent tools could duplicate side effects.
-                reconnected = await self._reconnect_server(conn)
+                try:
+                    reconnected = await self._reconnect_server(conn)
+                except asyncio.CancelledError as cancel_exc:
+                    record_reconnect_cancellation(
+                        cancel_exc,
+                        RetryKind.AMBIGUOUS_AFTER_SEND,
+                    )
+                    raise
                 if reconnected:
                     message = (
                         f"MCP server {conn.name!r} disconnected during "

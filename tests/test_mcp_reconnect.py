@@ -280,7 +280,7 @@ async def test_reconnect_on_mcp_connection_closed_error():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_failure_returns_clear_error():
+async def test_reconnect_failure_returns_clear_error_without_logging_details(caplog):
     """If reconnect fails, a clear MCPToolCallError is raised."""
     failing_session = _FakeSession(
         tools=[_make_tool("check_host")],
@@ -295,14 +295,19 @@ async def test_reconnect_failure_returns_clear_error():
     async def failing_reconnect(
         command, args=None, name=None, env=None, ticket_id=None, agent_id=None
     ):
-        raise RuntimeError("Cannot relaunch subprocess")
+        raise RuntimeError("server echoed --password=secret-value")
 
-    with patch.object(client, "connect_command", side_effect=failing_reconnect):
-        with pytest.raises(MCPToolCallError) as exc_info:
-            await client.call_tool("check_host", {}, trace_context=_trace_context())
+    with caplog.at_level("WARNING", logger="agents.mcp_client"):
+        with patch.object(client, "connect_command", side_effect=failing_reconnect):
+            with pytest.raises(MCPToolCallError) as exc_info:
+                await client.call_tool("check_host", {}, trace_context=_trace_context())
 
     assert "disconnected" in str(exc_info.value).lower()
     assert "reconnection failed" in str(exc_info.value).lower()
+    assert "error_type=RuntimeError" in caplog.text
+    assert "server echoed" not in caplog.text
+    assert "--password" not in caplog.text
+    assert "secret-value" not in caplog.text
 
 
 @pytest.mark.asyncio

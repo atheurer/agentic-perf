@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastmcp.server.middleware import MiddlewareContext
@@ -28,6 +28,7 @@ from agents.mcp_client import (
     AgentMCPClient,
     MCPHookResult,
     MCPToolCallError,
+    _ConnectParams,
     _ServerConnection,
 )
 from providers.redaction import get_shared_redactor
@@ -824,6 +825,140 @@ async def test_jumpstarter_internal_dispatch_cancellation_has_one_terminal_bound
         LifecycleState.REQUEST_SENT,
         LifecycleState.CANCELLED,
     ]
+
+
+@pytest.mark.asyncio
+async def test_jumpstarter_reconnect_cancellation_before_send_has_one_boundary():
+    reconnect_started = asyncio.Event()
+
+    async def block_reconnect(*args, **kwargs):
+        reconnect_started.set()
+        await asyncio.Event().wait()
+
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=None,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+        _connect_params=_ConnectParams(
+            command="mcp-server",
+            args=["--api-token=secret"],
+            env={},
+            ticket_id="PERF-1",
+            agent_id="benchmark-agent",
+        ),
+    )
+    client.pre_call_hook = _JmpCallHook(client).pre_call
+
+    with patch.object(client, "connect_command", side_effect=block_reconnect):
+        task = asyncio.create_task(
+            client.call_tool(
+                "jmp_connect",
+                {"lease_id": "lease-1"},
+                TraceContext(ticket_id="PERF-1"),
+            )
+        )
+        await reconnect_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+    assert getattr(exc_info.value, "mcp_audit_recorded", False) is True
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.CANCELLED,
+    ]
+    assert (
+        sum(
+            event.lifecycle.state
+            in {
+                LifecycleState.FAILED,
+                LifecycleState.CANCELLED,
+                LifecycleState.TIMED_OUT,
+                LifecycleState.REJECTED,
+                LifecycleState.SHORT_CIRCUITED,
+                LifecycleState.RESPONSE_RECEIVED,
+            }
+            for event in client.audit_events
+        )
+        == 1
+    )
+    assert client.audit_events[-1].outcome == OperationOutcome.CANCELLED
+    assert (
+        client.audit_events[-1].lifecycle.retry_kind == RetryKind.TRANSPORT_BEFORE_SEND
+    )
+
+
+@pytest.mark.asyncio
+async def test_jumpstarter_reconnect_cancellation_after_send_is_ambiguous_once():
+    reconnect_started = asyncio.Event()
+    session = AsyncMock()
+    session.call_tool = AsyncMock(side_effect=BrokenPipeError("pipe closed"))
+
+    async def block_reconnect(*args, **kwargs):
+        reconnect_started.set()
+        await asyncio.Event().wait()
+
+    client = AgentMCPClient()
+    client._tool_routing["jmp_connect"] = "jumpstarter"
+    client._servers["jumpstarter"] = _ServerConnection(
+        name="jumpstarter",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+        _connect_params=_ConnectParams(
+            command="mcp-server",
+            args=["--api-token=secret"],
+            env={},
+            ticket_id="PERF-1",
+            agent_id="benchmark-agent",
+        ),
+    )
+    client.pre_call_hook = _JmpCallHook(client).pre_call
+
+    with patch.object(client, "connect_command", side_effect=block_reconnect):
+        task = asyncio.create_task(
+            client.call_tool(
+                "jmp_connect",
+                {"lease_id": "lease-1"},
+                TraceContext(ticket_id="PERF-1"),
+            )
+        )
+        await reconnect_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+
+    assert getattr(exc_info.value, "mcp_audit_recorded", False) is True
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.DISCONNECTED,
+        LifecycleState.CANCELLED,
+    ]
+    assert (
+        sum(
+            event.lifecycle.state
+            in {
+                LifecycleState.FAILED,
+                LifecycleState.CANCELLED,
+                LifecycleState.TIMED_OUT,
+                LifecycleState.REJECTED,
+                LifecycleState.SHORT_CIRCUITED,
+                LifecycleState.RESPONSE_RECEIVED,
+            }
+            for event in client.audit_events
+        )
+        == 1
+    )
+    assert client.audit_events[-1].outcome == OperationOutcome.CANCELLED
+    assert (
+        client.audit_events[-1].lifecycle.retry_kind == RetryKind.AMBIGUOUS_AFTER_SEND
+    )
 
 
 @pytest.mark.asyncio
