@@ -40,6 +40,7 @@ from agents.server_utils import (
     build_ssh_from_ticket,
     controller_context_gateway,
     read_skill_documents,
+    ticket_controller_host,
     tool_progress,
 )
 from agents.skill_gateway import (
@@ -918,16 +919,7 @@ def _get_validated_runfile(
 
 def _controller_host() -> str | None:
     """Return the ticket's explicit Crucible controller host."""
-    fields = _ticket.get("custom_fields", {}) if _ticket else {}
-    context = fields.get("crucible_controller_context")
-    if isinstance(context, dict):
-        for key in ("host", "controller"):
-            if isinstance(context.get(key), str) and context[key].strip():
-                return context[key].strip()
-    assigned = fields.get("assigned_hardware_ips")
-    if isinstance(assigned, dict) and isinstance(assigned.get("controller"), str):
-        return assigned["controller"].strip() or None
-    return None
+    return ticket_controller_host(_ticket)
 
 
 async def _read_controller_file(host: str, path: str) -> str | None:
