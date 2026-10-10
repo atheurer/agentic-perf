@@ -140,10 +140,8 @@ def build_skill_provider(
         )
 
     private = PrivateSkillProvider(resolver=organization_resolver)
-    ticket_id = os.environ.get("TICKET_ID", "")
-    if ticket_id:
-        phase = skill_phase or os.environ.get("AGENT_NAME", "").removesuffix("-agent")
-        private.bind_attempt(ticket_id, "initial", phase)
+    phase = skill_phase or os.environ.get("AGENT_NAME", "").removesuffix("-agent")
+    private.bind_current_attempt(phase)
 
     if zathras_home:
         harnesses["zathras"] = ZathrasSkillProvider(zathras_home)
