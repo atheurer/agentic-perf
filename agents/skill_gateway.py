@@ -23,10 +23,7 @@ _LOCAL_SUBJECT_DIRS = {
     "resource/aws": "resource/aws",
 }
 _UPSTREAM_REPOS = {
-    "harness/kube-burner": (
-        "kube-burner",
-        "https://github.com/kube-burner/kube-burner.git",
-    ),
+    "harness/kube-burner": "kube-burner",
 }
 _MAX_SOURCE_DOCUMENT_BYTES = 1024 * 1024
 _MAX_SOURCE_SEARCH_BYTES = 4 * 1024 * 1024
@@ -40,6 +37,11 @@ expression (no backreferences); from_ref optionally restricts the source. Reads 
 provenance remain visible, while source paths, credentials, identity and phase
 are server-owned. Organization practices cannot alter installed software facts
 or code-enforced requirements. Service-only configuration is never a document.
+
+Search without from_ref searches every applicable source, including project-local
+and upstream documents. For local and upstream searches, from_ref scopes the
+search to that source and subject; it does not limit the search to the referenced
+document. Organization and software references retain their own source semantics.
 
 The organization entry may include several named sources. Read and compare
 applicable entrypoints across sources, including same-path variants; exact
@@ -309,13 +311,24 @@ def _read_local_document(
     }
 
 
+def _upstream_provenance(repo_cache: Any, subject: str) -> tuple[str, str]:
+    repo_name = _UPSTREAM_REPOS.get(subject)
+    if not repo_name:
+        return "unknown cached repository", "unverified"
+    get_origin = getattr(repo_cache, "get_origin", None)
+    origin = get_origin(repo_name) if callable(get_origin) else None
+    if isinstance(origin, str) and origin:
+        return origin, "configured-cache-origin-unverified"
+    return f"cached repository: {repo_name}", "unverified"
+
+
 def _list_upstream_documents(repo_cache: Any, subject: str) -> list[dict[str, Any]]:
-    binding = _UPSTREAM_REPOS.get(subject)
-    if not binding or repo_cache is None:
+    repo_name = _UPSTREAM_REPOS.get(subject)
+    if not repo_name or repo_cache is None:
         return []
-    repo_name, repo_url = binding
     if repo_cache.get_path(repo_name) is None:
         return []
+    source, provenance_status = _upstream_provenance(repo_cache, subject)
     results = []
     for item in repo_cache.list_docs(repo_name, subdirs=["docs", "config"]):
         path = item.get("path")
@@ -327,8 +340,9 @@ def _list_upstream_documents(repo_cache: Any, subject: str) -> list[dict[str, An
                 "ref": ref,
                 "uri": ref,
                 "path": path,
-                "source": repo_url,
+                "source": source,
                 "scope": "upstream",
+                "provenance_status": provenance_status,
                 "role": "software-reference",
                 "size_bytes": item.get("size_bytes", 0),
             }
@@ -345,10 +359,9 @@ def _read_upstream_document(
     max_bytes: int,
     full_content: bool = False,
 ) -> dict[str, Any]:
-    binding = _UPSTREAM_REPOS.get(subject)
-    if not binding or repo_cache is None:
+    repo_name = _UPSTREAM_REPOS.get(subject)
+    if not repo_name or repo_cache is None:
         raise SkillGatewayError("source_unavailable", "Upstream cache is unavailable")
-    repo_name, repo_url = binding
     root = repo_cache.get_path(repo_name)
     if root is None:
         raise SkillGatewayError("source_unavailable", "Upstream cache is unavailable")
@@ -379,12 +392,14 @@ def _read_upstream_document(
         else OrganizationSkillResolver._page(content, offset_bytes, max_bytes)
     )
     ref = _source_ref("upstream", subject, relative)
+    source, provenance_status = _upstream_provenance(repo_cache, subject)
     return {
         "ref": ref,
         "uri": ref,
         "path": relative,
-        "source": repo_url,
+        "source": source,
         "scope": "upstream",
+        "provenance_status": provenance_status,
         "role": "software-reference",
         **page,
         "offset_bytes": page["offset"],
@@ -471,10 +486,14 @@ async def skill_context_gateway(
                 upstream_documents = _list_upstream_documents(repo_cache, subject)
                 upstream = _UPSTREAM_REPOS.get(subject)
                 if upstream:
+                    source, provenance_status = _upstream_provenance(
+                        repo_cache, subject
+                    )
                     sources.append(
                         {
-                            "source": upstream[1],
+                            "source": source,
                             "scope": "upstream",
+                            "provenance_status": provenance_status,
                             "status": "available"
                             if upstream_documents
                             else "unavailable",
@@ -751,84 +770,99 @@ async def skill_context_gateway(
             or from_ref.startswith(_LOCAL_PREFIX)
             or from_ref.startswith(_UPSTREAM_PREFIX)
         ):
-            source_kind = (
-                "local"
-                if not from_ref or from_ref.startswith(_LOCAL_PREFIX)
-                else "upstream"
+            source_kinds = (
+                ["local", "upstream"]
+                if not from_ref
+                else ["local"]
+                if from_ref.startswith(_LOCAL_PREFIX)
+                else ["upstream"]
             )
-            source_documents = (
-                _list_local_documents(local_skills_dir, subject)
-                if source_kind == "local"
-                else _list_upstream_documents(repo_cache, subject)
-            )
-            if from_ref:
-                origin_subject, _origin_path = _parse_source_ref(from_ref, source_kind)
-                if origin_subject != subject:
-                    raise SkillGatewayError(
-                        "invalid_origin", "Subject does not match source ref"
-                    )
-                source_documents = [
-                    item for item in source_documents if item["ref"] == from_ref
-                ]
             alternatives = [
                 term.casefold().strip() for term in query.split("|") if term.strip()
             ]
-            matches = []
-            scanned_bytes = 0
-            for item in source_documents:
-                size_bytes = item.get("size_bytes", 0)
-                if not isinstance(size_bytes, int) or size_bytes < 0:
-                    continue
-                if scanned_bytes + size_bytes > _MAX_SOURCE_SEARCH_BYTES:
-                    break
-                scanned_bytes += size_bytes
-                try:
-                    document_result = (
-                        _read_local_document(
-                            local_skills_dir,
-                            subject,
-                            item["path"],
-                            offset_bytes=0,
-                            max_bytes=16384,
-                            full_content=True,
-                        )
-                        if source_kind == "local"
-                        else _read_upstream_document(
-                            repo_cache,
-                            subject,
-                            item["path"],
-                            offset_bytes=0,
-                            max_bytes=16384,
-                            full_content=True,
-                        )
-                    )
-                    content = document_result.get("content", "")
-                    if not alternatives or any(
-                        alternative in content.casefold()
-                        for alternative in alternatives
-                    ):
-                        matches.append(
-                            {key: value for key, value in item.items() if key != "uri"}
-                        )
-                except (OSError, ValueError, TypeError):
-                    continue
-                if len(matches) >= 100:
-                    break
-            result["sources"].append(
-                {
-                    "source": "agentic-perf"
+            for source_kind in source_kinds:
+                source_documents = (
+                    _list_local_documents(local_skills_dir, subject)
                     if source_kind == "local"
-                    else _UPSTREAM_REPOS[subject][1],
-                    "scope": source_kind,
-                    "found": bool(matches),
-                    "matches_count": len(matches),
-                    "results": matches,
-                    "pagination": "bounded",
-                    "query_mode": "literal-alternatives",
-                    "scanned_bytes": scanned_bytes,
-                }
-            )
-            result["found"] = result["found"] or bool(matches)
+                    else _list_upstream_documents(repo_cache, subject)
+                )
+                if from_ref:
+                    origin_subject, _origin_path = _parse_source_ref(
+                        from_ref, source_kind
+                    )
+                    if origin_subject != subject:
+                        raise SkillGatewayError(
+                            "invalid_origin", "Subject does not match source ref"
+                        )
+                    if not any(item["ref"] == from_ref for item in source_documents):
+                        raise SkillGatewayError(
+                            "invalid_origin", "Source reference is not available"
+                        )
+                matches = []
+                scanned_bytes = 0
+                for item in source_documents:
+                    size_bytes = item.get("size_bytes", 0)
+                    if not isinstance(size_bytes, int) or size_bytes < 0:
+                        continue
+                    if scanned_bytes + size_bytes > _MAX_SOURCE_SEARCH_BYTES:
+                        break
+                    scanned_bytes += size_bytes
+                    try:
+                        document_result = (
+                            _read_local_document(
+                                local_skills_dir,
+                                subject,
+                                item["path"],
+                                offset_bytes=0,
+                                max_bytes=16384,
+                                full_content=True,
+                            )
+                            if source_kind == "local"
+                            else _read_upstream_document(
+                                repo_cache,
+                                subject,
+                                item["path"],
+                                offset_bytes=0,
+                                max_bytes=16384,
+                                full_content=True,
+                            )
+                        )
+                        content = document_result.get("content", "")
+                        if not alternatives or any(
+                            alternative in content.casefold()
+                            for alternative in alternatives
+                        ):
+                            matches.append(
+                                {
+                                    key: value
+                                    for key, value in item.items()
+                                    if key != "uri"
+                                }
+                            )
+                    except (OSError, ValueError, TypeError):
+                        continue
+                    if len(matches) >= 100:
+                        break
+                source = "agentic-perf"
+                provenance_status = "checked-in-project-context"
+                if source_kind == "upstream":
+                    source, provenance_status = _upstream_provenance(
+                        repo_cache, subject
+                    )
+                result["sources"].append(
+                    {
+                        "source": source,
+                        "scope": source_kind,
+                        "provenance_status": provenance_status,
+                        "found": bool(matches),
+                        "matches_count": len(matches),
+                        "results": matches,
+                        "pagination": "bounded",
+                        "query_mode": "literal-alternatives",
+                        "scanned_bytes": scanned_bytes,
+                    }
+                )
+                result["found"] = result["found"] or bool(matches)
         return json.dumps(result)
     except SkillGatewayError as exc:
         return json.dumps(

@@ -20,6 +20,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 _project_root = str(Path(__file__).resolve().parents[2])
@@ -28,8 +29,8 @@ if _project_root not in sys.path:
 
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
+    build_organization_skill_resolver_async,
     build_secrets_provider,
-    build_skill_provider_async,
     build_ssh_from_ticket,
     get_board_selector,
 )
@@ -96,10 +97,16 @@ async def _ensure_init():
 
 
 async def _get_skill_provider():
-    """Initialize the context resolver without constructing resource clients."""
+    """Build the docs-only gateway resolver without loading AWS credentials.
+
+    The only secrets lookup this path can perform is authentication explicitly
+    configured for an organization Git source. Resource-provider secrets remain
+    exclusive to ``_ensure_init`` and are never read to retrieve guidance.
+    """
     global _skill_provider
     if _skill_provider is None:
-        _skill_provider = await build_skill_provider_async(skill_phase="resource")
+        resolver = await build_organization_skill_resolver_async()
+        _skill_provider = SimpleNamespace(organization_resolver=resolver)
     return _skill_provider
 
 

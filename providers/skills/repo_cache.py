@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import configparser
 import logging
+import re
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from paths import SKILL_CACHE_DIR as DEFAULT_CACHE_DIR
 from providers.execution import AuditedSubprocessRunner
@@ -55,6 +58,35 @@ class RepoCache:
         if repo_path.exists():
             return repo_path
         return None
+
+    def get_origin(self, name: str) -> str | None:
+        """Return a credential-redacted configured origin for a cached clone.
+
+        This reads only the clone's local ``.git/config``. The result records
+        the configured origin, not a verified claim about the contents of the
+        cache, so callers must label its provenance accordingly.
+        """
+        cache_root = self._dir.resolve()
+        repo_path = self._dir / name
+        git_dir = repo_path / ".git"
+        config_path = git_dir / "config"
+        try:
+            if (
+                repo_path.is_symlink()
+                or git_dir.is_symlink()
+                or config_path.is_symlink()
+                or not repo_path.is_dir()
+                or not git_dir.is_dir()
+                or not config_path.is_file()
+                or not repo_path.resolve().is_relative_to(cache_root)
+            ):
+                return None
+            parser = configparser.RawConfigParser()
+            parser.read(config_path, encoding="utf-8")
+            configured = parser.get('remote "origin"', "url", fallback="")
+        except (OSError, ValueError, configparser.Error):
+            return None
+        return _redacted_origin(configured)
 
     def list_docs(
         self,
@@ -141,3 +173,34 @@ class RepoCache:
                                 continue
 
         return None
+
+
+_SCP_ORIGIN = re.compile(
+    r"^(?:[^@/:\s]+@)?(?P<host>[A-Za-z0-9.-]+):(?P<path>[^?#\s]+)$"
+)
+
+
+def _redacted_origin(value: str) -> str | None:
+    """Keep repository provenance while dropping credentials and query data."""
+    value = value.strip()
+    if not value:
+        return None
+    scp = _SCP_ORIGIN.fullmatch(value) if "://" not in value else None
+    if scp:
+        return f"ssh://{scp.group('host')}/{scp.group('path')}"
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https", "ssh", "git"}
+        or not host
+        or (port is not None and not 1 <= port <= 65535)
+        or not parsed.path
+    ):
+        return None
+    rendered_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    netloc = f"{rendered_host}:{port}" if port is not None else rendered_host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))

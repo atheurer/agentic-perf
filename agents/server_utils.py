@@ -155,10 +155,16 @@ def build_skill_provider(
     return MultiHarnessSkillProvider(harnesses, private, default_harness="crucible")
 
 
-async def build_skill_provider_async(
-    *, secrets_provider: Any | None = None, **kwargs: Any
+async def build_organization_skill_resolver_async(
+    *, secrets_provider: Any | None = None
 ):
-    """Build skills after resolving authenticated organization Git sources."""
+    """Resolve only organization skill sources, loading Git auth if required.
+
+    This narrow path is suitable for context-only callers such as the resource
+    gateway. Its secrets provider is used solely by configured organization
+    Git sources; it does not construct resource providers or load their service
+    credentials (for example ``aws/config.json``).
+    """
     from paths import CONFIG_PATH
     from providers.skills.gateway import (
         OrganizationSkillResolver,
@@ -189,6 +195,16 @@ async def build_skill_provider_async(
     resolver = await OrganizationSkillResolver.from_instance_config_async(
         raw_config=raw_config,
         secrets_provider=secrets_provider,
+    )
+    return resolver
+
+
+async def build_skill_provider_async(
+    *, secrets_provider: Any | None = None, **kwargs: Any
+):
+    """Build skills after resolving authenticated organization Git sources."""
+    resolver = await build_organization_skill_resolver_async(
+        secrets_provider=secrets_provider
     )
     return build_skill_provider(organization_resolver=resolver, **kwargs)
 
