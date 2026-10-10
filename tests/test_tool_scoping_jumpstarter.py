@@ -141,7 +141,10 @@ class TestProvisioningToolScoping:
         auto_complete.assert_not_awaited()
         base_run.assert_awaited_once_with(ticket["id"])
         assert any(tool.name == "install_harness" for tool in agent.tools)
-        assert "## Crucible Provisioning Notes" in agent._system_prompt(ticket)
+        assert (
+            'get_skill_context(subject="harness/crucible", operation="bootstrap")'
+            in agent._system_prompt(ticket)
+        )
 
 
 class TestBenchmarkToolScoping:
@@ -213,13 +216,18 @@ class TestBenchmarkToolScoping:
         # execute_benchmark is not in boot-time (uses its own tool).
         assert "execute_benchmark" not in allowed
 
-    def test_crucible_scoping_includes_validation_before_execution(self):
+    def test_crucible_scoping_excludes_legacy_docs_but_keeps_validation(self):
         from agents.benchmark.agent import BenchmarkAgent
 
         allowed = BenchmarkAgent._HARNESS_TOOLS.get("crucible")
-        assert allowed is not None
-        assert "validate_benchmark" in allowed
-        assert "execute_benchmark" in allowed
+        excluded = BenchmarkAgent._HARNESS_EXCLUDED_TOOLS.get("crucible")
+        assert allowed is None
+        assert excluded is not None
+        assert "read_skills" in excluded
+        assert "list_harness_docs" in excluded
+        assert "read_harness_doc" in excluded
+        assert "validate_benchmark" not in excluded
+        assert "execute_benchmark" not in excluded
 
 
 @pytest.mark.asyncio

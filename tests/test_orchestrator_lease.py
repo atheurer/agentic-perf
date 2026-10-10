@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import httpx
@@ -406,7 +407,9 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
 
     monkeypatch.setattr(orchestrator_main, "RepoCache", lambda: object())
     monkeypatch.setattr(
-        orchestrator_main, "build_skill_provider", lambda **_kwargs: object()
+        orchestrator_main,
+        "build_skill_provider_async",
+        AsyncMock(return_value=object()),
     )
     monkeypatch.setattr(orchestrator_main, "LocalSecretsProvider", lambda: object())
     monkeypatch.setattr(
