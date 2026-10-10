@@ -17,6 +17,7 @@ def test_benchmark_crucible_prompt_and_tool_scope_with_default_or_explicit_harne
     agent = BenchmarkAgent.__new__(BenchmarkAgent)
     agent._skill_provider = SimpleNamespace(default_harness="crucible")
     agent.tools = [
+        SimpleNamespace(name="get_skill_context"),
         SimpleNamespace(name="read_skills"),
         SimpleNamespace(name="list_harness_docs"),
         SimpleNamespace(name="read_harness_doc"),
@@ -28,12 +29,21 @@ def test_benchmark_crucible_prompt_and_tool_scope_with_default_or_explicit_harne
     prompt = agent._system_prompt(ticket)
     agent._apply_tool_scoping(ticket)
 
-    assert "## Crucible Benchmark Execution" in prompt
-    assert "Read harness-specific documentation" in prompt
+    assert (
+        'get_skill_context(subject="harness/crucible", operation="bootstrap")' in prompt
+    )
+    assert "Read returned entrypoint documents from each available source" in prompt
+    assert "Secret values are never context documents." in prompt
+    assert "provider-owned `runfile_contract`" in prompt
+    assert "`tags` as `{}` when no tags apply" in prompt
     assert "list_harness_docs" not in prompt
     assert "read_harness_doc" not in prompt
-    # Crucible's configured tool policy is applied in both cases.
-    assert [tool.name for tool in agent.tools] == ["validate_benchmark"]
+    # Crucible keeps the context gateway, execution config, and validation tools.
+    assert [tool.name for tool in agent.tools] == [
+        "get_skill_context",
+        "get_execution_config",
+        "validate_benchmark",
+    ]
 
 
 @pytest.mark.parametrize("directives", [{}, {"harness": "crucible"}])
@@ -46,7 +56,9 @@ def test_provisioning_crucible_prompt_with_default_or_explicit_harness(
 
     prompt = agent._system_prompt(ticket)
 
-    assert "## Crucible Provisioning Notes" in prompt
+    assert (
+        'get_skill_context(subject="harness/crucible", operation="bootstrap")' in prompt
+    )
 
 
 def test_non_crucible_ticket_keeps_available_harness_documentation_guidance():
@@ -64,6 +76,9 @@ def test_non_crucible_ticket_keeps_available_harness_documentation_guidance():
     }
 
     message = agent._build_messages(ticket)[0]["content"]
+    prompt = agent._system_prompt(ticket)
 
     assert "Available zathras Documentation" in message
     assert "read_harness_doc" in message
+    assert 'get_skill_context(subject="harness/crucible"' not in prompt
+    assert 'get_skill_context(subject="harness/kube-burner"' not in prompt

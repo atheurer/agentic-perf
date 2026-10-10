@@ -525,6 +525,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/skills/repo_cache.py", "get_path", "github"),
     ("providers/skills/repo_cache.py", "list_docs", "github"),
     ("providers/skills/repo_cache.py", "read_file", "github"),
+    ("providers/skills/repo_cache.py", "_redacted_origin", "github"),
+    ("providers/skills/repo_cache.py", "get_origin", "github"),
     ("providers/ssh.py", "_run_with_progress_impl", "filesystem"),
     ("providers/ssh.py", "_run_with_progress_impl", "ssh"),
     ("providers/ssh.py", "copy_from", "subprocess"),
@@ -3145,6 +3147,18 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/skills/repo_cache.py:read_file",
+        "2027-12-31",
+    ),
+    ("providers/skills/repo_cache.py", "_redacted_origin", "github"): (
+        "audited",
+        "observability-maintainers",
+        "providers/skills/repo_cache.py:_redacted_origin",
+        "2027-12-31",
+    ),
+    ("providers/skills/repo_cache.py", "get_origin", "github"): (
+        "audited",
+        "observability-maintainers",
+        "providers/skills/repo_cache.py:get_origin",
         "2027-12-31",
     ),
     ("providers/ssh.py", "_run_with_progress_impl", "filesystem"): (

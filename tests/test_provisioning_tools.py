@@ -660,6 +660,7 @@ async def test_all_tools_use_hosts_or_targets():
             "request_clarification",
             "submit_provisioning_result",
             # Skill doc tools — no host param at all
+            "get_skill_context",
             "list_skill_docs",
             "read_skills",
             # Per-host tuning tools — parameters vary per host (CPU, interface)

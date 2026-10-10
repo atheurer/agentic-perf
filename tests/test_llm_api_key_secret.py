@@ -200,6 +200,7 @@ class TestAPIKeySecretHandoff:
             return provider
 
         dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
         dispatcher.store_url = "http://state-store"
         dispatcher.events = None
         dispatcher._session_id = None
@@ -296,6 +297,7 @@ class TestAPIKeySecretHandoff:
             return provider
 
         dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
         dispatcher.store_url = "http://state-store"
         dispatcher.events = None
         dispatcher._session_id = None

@@ -671,6 +671,7 @@ class TestRunAgentTaskTimeout:
         slow_agent.close = AsyncMock()
 
         dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
         dispatcher.create_agent.return_value = slow_agent
         dispatcher.store_url = "http://localhost:9999"
         dispatcher.events = events
@@ -708,6 +709,7 @@ class TestRunAgentTaskTimeout:
         slow_agent.run = slow_run
         slow_agent.close = AsyncMock()
         dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
         dispatcher.create_agent.return_value = slow_agent
         dispatcher.store_url = "http://localhost:9999"
         dispatcher.events = events
@@ -741,6 +743,7 @@ class TestRunAgentTaskTimeout:
         agent.close = AsyncMock()
 
         dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
         dispatcher.create_agent.return_value = agent
         dispatcher.store_url = "http://localhost:9999"
         dispatcher.events = None

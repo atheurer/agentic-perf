@@ -481,6 +481,7 @@ class TestSkippedPlanSteps:
         mock_agent.close = AsyncMock()
 
         dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
         dispatcher.create_agent.return_value = mock_agent
         dispatcher.store_url = "http://localhost:8090"
         dispatcher.events = None
@@ -533,6 +534,7 @@ class TestSkippedPlanSteps:
         mock_agent.close = AsyncMock()
 
         dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
         dispatcher.create_agent.return_value = mock_agent
         dispatcher.store_url = "http://localhost:8090"
         dispatcher.events = None

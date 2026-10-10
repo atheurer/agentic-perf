@@ -157,6 +157,7 @@ class TestHardstopGuidanceIntegration:
         agent.close = AsyncMock()
 
         dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
         dispatcher.create_agent.return_value = agent
         dispatcher.store_url = "http://localhost:9999"
         dispatcher.events = None
@@ -232,6 +233,7 @@ class TestHardstopGuidanceIntegration:
         agent.close = AsyncMock()
 
         dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
         dispatcher.create_agent.return_value = agent
         dispatcher.store_url = "http://localhost:9999"
         dispatcher.events = None
@@ -424,6 +426,7 @@ class TestHardstopGuidanceIntegration:
         agent.close = AsyncMock()
 
         dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
         dispatcher.create_agent.return_value = agent
         dispatcher.store_url = "http://ticket-store"
         dispatcher.events = None

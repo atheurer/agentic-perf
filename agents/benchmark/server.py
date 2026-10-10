@@ -1379,7 +1379,7 @@ async def get_skill_context(
 ) -> str:
     """Retrieve guidance through server-owned subject and source bindings."""
     await _ensure_init()
-    return await skill_context_gateway(
+    response = await skill_context_gateway(
         _skill_provider,
         ticket_id=os.environ.get("TICKET_ID", ""),
         agent_name="benchmark-agent",
@@ -1397,6 +1397,9 @@ async def get_skill_context(
         local_skills_dir=SKILLS_DIR,
         repo_cache=_repo_cache,
     )
+    if subject == "harness/crucible":
+        return _with_crucible_runfile_contract(response)
+    return response
 
 
 @mcp.tool()

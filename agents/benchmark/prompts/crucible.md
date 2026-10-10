@@ -4,7 +4,9 @@ Retrieve the subject's phase guidance and software documentation through the
 skill gateway before constructing the run-file. Follow the returned pointers
 for the selected benchmark, endpoint, tools, and execution environment. Use
 `get_execution_config` for the approved execution settings view; verify runtime
-capabilities with the available controller discovery tools.
+capabilities with the available controller discovery tools. Crucible gateway
+responses also include the provider-owned `runfile_contract`; satisfy its
+required top-level fields, including `tags` as `{}` when no tags apply.
 
 ### Benchmark-specific parameter guidance
 
