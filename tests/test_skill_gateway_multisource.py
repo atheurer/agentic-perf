@@ -23,6 +23,7 @@ def _write_package(
     instruction: str,
     shared_note: str = "Shared note from maintainers.\n",
     runtime_config: dict | None = None,
+    document_phases: dict[str, list[str]] | None = None,
 ) -> None:
     package = repository / "skills" / namespace / name
     package.mkdir(parents=True)
@@ -37,13 +38,16 @@ def _write_package(
     )
     (package / "SKILL.md").write_text(skill)
     (package / "notes.md").write_text(shared_note)
+    documents = []
+    for path, entrypoint in (("SKILL.md", True), ("notes.md", False)):
+        document = {"path": path, "entrypoint": entrypoint}
+        if document_phases and path in document_phases:
+            document["phases"] = document_phases[path]
+        documents.append(document)
     manifest = {
         "schema_version": 1,
         "subject": subject,
-        "documents": [
-            {"path": "SKILL.md", "entrypoint": True},
-            {"path": "notes.md", "entrypoint": False},
-        ],
+        "documents": documents,
     }
     (package / "skill.json").write_text(json.dumps(manifest))
     if runtime_config is not None:
@@ -277,6 +281,7 @@ async def test_resource_gateway_tool_does_not_initialize_cloud_providers(
         name="aws",
         subject="resource/aws",
         instruction="Organization AWS allocation guidance.",
+        document_phases={"SKILL.md": ["resource"], "notes.md": ["*"]},
     )
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -351,6 +356,26 @@ async def test_resource_gateway_tool_does_not_initialize_cloud_providers(
     assert result["found"] is True
     assert any(item["scope"] == "local" for item in result["sources"])
     assert secrets.calls == ["org/skills-token"]
+    resolver = resource_server._skill_provider.organization_resolver
+    assert (resolver.ticket_id, resolver.attempt_id, resolver.phase) == (
+        "TEST-AWS-CONTEXT",
+        "initial",
+        "resource",
+    )
+    organization_docs = [
+        item for item in result["documents"] if item["scope"] == "organization"
+    ]
+    assert any(item["path"].endswith("SKILL.md") for item in organization_docs)
+    assert any(item["path"].endswith("notes.md") for item in organization_docs)
+    skill_ref = next(
+        item["ref"] for item in organization_docs if item["path"].endswith("SKILL.md")
+    )
+    skill_document = json.loads(
+        await resource_server.get_skill_context(
+            subject="resource/aws", operation="read", ref=skill_ref
+        )
+    )["document"]
+    assert "Organization AWS allocation guidance" in skill_document["content"]
 
 
 def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
