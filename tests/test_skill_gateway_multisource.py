@@ -262,23 +262,86 @@ async def test_resource_gateway_tool_does_not_initialize_cloud_providers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import agents.resource.server as resource_server
+    import agents.server_utils as server_utils
+    import paths
+    import providers.skills.git_source as git_source
 
     skills = tmp_path / "skills"
     aws = skills / "resource" / "aws"
     aws.mkdir(parents=True)
     (aws / "SKILL.md").write_text("AWS guidance stays context only.\n")
-    resolver = OrganizationSkillResolver.from_instance_config({})
+    organization = tmp_path / "organization"
+    _write_package(
+        organization,
+        namespace="resource",
+        name="aws",
+        subject="resource/aws",
+        instruction="Organization AWS allocation guidance.",
+    )
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "skill_gateway": {
+                    "organization": {
+                        "source": {
+                            "kind": "git",
+                            "url": "https://git.example.org/skills.git",
+                            "ref": "main",
+                            "auth": {
+                                "kind": "https-token",
+                                "secret_ref": "org/skills-token",
+                            },
+                        }
+                    }
+                }
+            }
+        )
+    )
 
-    class Provider:
-        organization_resolver = resolver
+    class OrgSkillSecrets:
+        calls: list[str] = []
 
-    async def get_skill_provider():
-        return Provider()
+        async def get_secret(self, name: str) -> str | None:
+            self.calls.append(name)
+            if name == "aws/config.json":
+                raise AssertionError("AWS service credentials are not context")
+            return "org-token" if name == "org/skills-token" else None
+
+        async def secret_file(self, name: str):
+            self.calls.append(name)
+            if name == "aws/config.json":
+                raise AssertionError("AWS service credentials are not context")
+            assert name == "org/skills-token"
+
+            class _SecretFile:
+                async def __aenter__(self):
+                    return tmp_path / "org-token"
+
+                async def __aexit__(self, *_exc_info):
+                    return None
+
+            return _SecretFile()
+
+    secrets = OrgSkillSecrets()
+
+    async def prepare_org_source(source, *, secrets_provider=None, **_kwargs):
+        assert source["auth"]["secret_ref"] == "org/skills-token"
+        async with await secrets_provider.secret_file("org/skills-token"):
+            pass
+        return git_source.PreparedGitSource(
+            root=organization,
+            commit="a" * 40,
+            identity="org-source-identity",
+        )
 
     async def unexpected_resource_init():
         raise AssertionError("context retrieval must not initialize providers")
 
-    monkeypatch.setattr(resource_server, "_get_skill_provider", get_skill_provider)
+    monkeypatch.setattr(paths, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(server_utils, "build_secrets_provider", lambda: secrets)
+    monkeypatch.setattr(git_source, "prepare_git_source", prepare_org_source)
+    monkeypatch.setattr(resource_server, "_skill_provider", None)
     monkeypatch.setattr(resource_server, "_ensure_init", unexpected_resource_init)
     monkeypatch.setattr(resource_server, "SKILLS_DIR", skills)
     monkeypatch.setenv("TICKET_ID", "TEST-AWS-CONTEXT")
@@ -287,6 +350,7 @@ async def test_resource_gateway_tool_does_not_initialize_cloud_providers(
 
     assert result["found"] is True
     assert any(item["scope"] == "local" for item in result["sources"])
+    assert secrets.calls == ["org/skills-token"]
 
 
 def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
@@ -300,6 +364,14 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
     upstream = cache_root / "kube-burner" / "docs"
     upstream.mkdir(parents=True)
     (upstream / "getting-started.md").write_text("Upstream usage reference.\n")
+    (upstream / "advanced.md").write_text(
+        "This separate document describes the specialmode operation.\n"
+    )
+    git_config = cache_root / "kube-burner" / ".git" / "config"
+    git_config.parent.mkdir()
+    git_config.write_text(
+        '[remote "origin"]\n\turl = https://gitlab.example.org/team/kube-burner.git\n'
+    )
 
     from providers.skills.repo_cache import RepoCache
 
@@ -332,10 +404,13 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
         item for item in bootstrap["documents"] if item["scope"] == "local"
     )
     upstream_doc = next(
-        item for item in bootstrap["documents"] if item["scope"] == "upstream"
+        item
+        for item in bootstrap["documents"]
+        if item["scope"] == "upstream" and item["path"] == "docs/getting-started.md"
     )
     assert local_doc["source"] == "agentic-perf"
-    assert upstream_doc["source"].endswith("kube-burner.git")
+    assert upstream_doc["source"] == "https://gitlab.example.org/team/kube-burner.git"
+    assert upstream_doc["provenance_status"] == "configured-cache-origin-unverified"
 
     upstream_read = json.loads(
         asyncio.run(
@@ -363,7 +438,7 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
                 phase="benchmark",
                 subject="harness/kube-burner",
                 operation="search",
-                query="usage",
+                query="specialmode",
                 from_ref=upstream_doc["ref"],
                 local_skills_dir=skills,
                 repo_cache=cache,
@@ -372,6 +447,50 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
     )
     assert upstream_search["found"] is True
     assert upstream_search["sources"][0]["scope"] == "upstream"
+    assert [item["path"] for item in upstream_search["sources"][0]["results"]] == [
+        "docs/advanced.md"
+    ]
+    default_upstream_search = json.loads(
+        asyncio.run(
+            skill_context_gateway(
+                Provider(),
+                ticket_id="TEST-KUBE-BURNER-CONTEXT",
+                agent_name="benchmark-agent",
+                phase="benchmark",
+                subject="harness/kube-burner",
+                operation="search",
+                query="specialmode",
+                local_skills_dir=skills,
+                repo_cache=cache,
+            )
+        )
+    )
+    assert default_upstream_search["found"] is True
+    assert [item["scope"] for item in default_upstream_search["sources"]] == [
+        "local",
+        "upstream",
+    ]
+    assert default_upstream_search["sources"][1]["found"] is True
+    upstream_only_search = json.loads(
+        asyncio.run(
+            skill_context_gateway(
+                Provider(),
+                ticket_id="TEST-KUBE-BURNER-CONTEXT",
+                agent_name="benchmark-agent",
+                phase="benchmark",
+                subject="harness/kube-burner",
+                operation="search",
+                query="specialmode",
+                local_skills_dir=tmp_path / "no-local-skills",
+                repo_cache=cache,
+            )
+        )
+    )
+    assert upstream_only_search["found"] is True
+    assert any(
+        item["scope"] == "upstream" and item["found"]
+        for item in upstream_only_search["sources"]
+    )
 
     unlisted_upstream_read = json.loads(
         asyncio.run(
@@ -390,6 +509,78 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
     )
     assert unlisted_upstream_read["found"] is False
     assert unlisted_upstream_read["reason"] == "invalid_document"
+
+
+def test_repo_cache_origin_redacts_credentials(tmp_path: Path) -> None:
+    from providers.skills.repo_cache import RepoCache
+
+    git_config = tmp_path / "kube-burner" / ".git" / "config"
+    git_config.parent.mkdir(parents=True)
+    git_config.write_text(
+        '[remote "origin"]\n'
+        "\turl = https://reader:top-secret@git.example.org/group/repo.git\n"
+    )
+
+    assert RepoCache(cache_dir=tmp_path).get_origin("kube-burner") == (
+        "https://git.example.org/group/repo.git"
+    )
+
+
+@pytest.mark.asyncio
+async def test_kube_burner_provenance_uses_harness_repos_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agents.server_utils as server_utils
+    import providers.skills.repo_cache as repo_cache_module
+
+    override = "https://gitlab.example.org/perf/kube-burner-fork.git"
+    cache_root = tmp_path / "cache"
+
+    class OfflineRepoCache(repo_cache_module.RepoCache):
+        requested: dict[str, str] = {}
+
+        def __init__(self):
+            super().__init__(cache_dir=cache_root)
+
+        async def ensure_repo(self, name: str, url: str) -> Path:
+            self.requested[name] = url
+            if name == "kube-burner":
+                repo = cache_root / name
+                (repo / "docs").mkdir(parents=True)
+                (repo / ".git").mkdir()
+                (repo / "docs" / "usage.md").write_text("Fork usage docs.\n")
+                (repo / ".git" / "config").write_text(
+                    f'[remote "origin"]\n\turl = {url}\n'
+                )
+            return cache_root / name
+
+    monkeypatch.setattr(repo_cache_module, "RepoCache", OfflineRepoCache)
+    monkeypatch.setenv("HARNESS_REPOS", json.dumps({"kube-burner": override}))
+    cache = await server_utils.build_repo_cache()
+
+    assert cache.requested["kube-burner"] == override
+    assert cache.get_origin("kube-burner") == override
+
+    resolver = OrganizationSkillResolver.from_instance_config({})
+
+    class Provider:
+        organization_resolver = resolver
+
+    result = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="TEST-KUBE-BURNER-OVERRIDE",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            repo_cache=cache,
+        )
+    )
+    upstream = next(
+        source for source in result["sources"] if source["scope"] == "upstream"
+    )
+    assert upstream["source"] == override
+    assert upstream["provenance_status"] == "configured-cache-origin-unverified"
 
 
 @pytest.mark.asyncio

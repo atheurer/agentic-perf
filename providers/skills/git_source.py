@@ -354,8 +354,9 @@ async def _acquire_lock(fd: int) -> None:
             await asyncio.sleep(0.05)
 
 
-def _remove_tree(filesystem: AuditedFilesystem, relative: Path, root: Path) -> None:
+def _remove_tree(relative: Path, root: Path) -> None:
     """Remove a failed temporary checkout through the audited filesystem."""
+    filesystem = AuditedFilesystem.system(root)
     path = root / relative
     if not path.exists() and not path.is_symlink():
         return
@@ -375,10 +376,9 @@ def _remove_tree(filesystem: AuditedFilesystem, relative: Path, root: Path) -> N
     filesystem.rmdir(relative)
 
 
-def _make_tree_read_only(
-    filesystem: AuditedFilesystem, relative: Path, root: Path
-) -> None:
+def _make_tree_read_only(relative: Path, root: Path) -> None:
     """Prevent accidental edits to a commit checkout reused from the cache."""
+    filesystem = AuditedFilesystem.system(root)
     path = root / relative
     for current, directories, files in os.walk(path, topdown=False, followlinks=False):
         current_path = Path(current)
@@ -470,7 +470,7 @@ async def prepare_git_source(
                 except GitSourceError:
                     initialize = True
                 if initialize:
-                    _remove_tree(filesystem, mirror_rel, home)
+                    _remove_tree(mirror_rel, home)
             if initialize:
                 await initialize_mirror()
 
@@ -552,7 +552,7 @@ async def prepare_git_source(
                 except GitSourceError:
                     checkout_valid = False
                 if not checkout_valid:
-                    _remove_tree(filesystem, checkout_rel, home)
+                    _remove_tree(checkout_rel, home)
             if not checkout_valid:
                 temp_rel = filesystem.temporary_directory(
                     relative_root / "checkouts", prefix="checkout-"
@@ -590,11 +590,11 @@ async def prepare_git_source(
                         ),
                         env,
                     )
-                    _make_tree_read_only(filesystem, temp_rel, home)
+                    _make_tree_read_only(temp_rel, home)
                     filesystem.rename(temp_rel, checkout_rel)
                 except Exception:
                     try:
-                        _remove_tree(filesystem, temp_rel, home)
+                        _remove_tree(temp_rel, home)
                     except OSError:
                         pass
                     raise
