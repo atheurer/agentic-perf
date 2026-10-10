@@ -61,6 +61,12 @@ class PrivateSkillProvider(SkillProvider):
         self._resolver = self._resolver.for_attempt(ticket_id, attempt_id, phase)
         self._cache.clear()
 
+    def bind_current_attempt(self, phase: str) -> None:
+        """Bind using server-owned ticket and attempt metadata."""
+        ticket_id = os.environ.get("TICKET_ID", "")
+        if ticket_id:
+            self.bind_attempt(ticket_id, "initial", phase)
+
     @property
     def organization_resolver(self) -> OrganizationSkillResolver:
         return self._resolver

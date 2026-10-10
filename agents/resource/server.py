@@ -20,7 +20,6 @@ import os
 import re
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 _project_root = str(Path(__file__).resolve().parents[2])
@@ -37,6 +36,7 @@ from agents.server_utils import (
 from agents.skill_gateway import SKILL_GATEWAY_TOOL_DESCRIPTION, skill_context_gateway
 from paths import get_default_ssh_key
 from providers.resource.base import has_reservation_metadata, reservation_failed
+from providers.skills.private import PrivateSkillProvider
 from providers.tracing import (
     bind_trace_context,
     child_context,
@@ -106,7 +106,9 @@ async def _get_skill_provider():
     global _skill_provider
     if _skill_provider is None:
         resolver = await build_organization_skill_resolver_async()
-        _skill_provider = SimpleNamespace(organization_resolver=resolver)
+        skill_provider = PrivateSkillProvider(resolver=resolver)
+        skill_provider.bind_current_attempt("resource")
+        _skill_provider = skill_provider
     return _skill_provider
 
 
