@@ -102,6 +102,8 @@ async def get_skill_context(
         query=query,
         max_bytes=max_bytes,
         offset_bytes=offset_bytes,
+        local_skills_dir=SKILLS_DIR,
+        repo_cache=_repo_cache,
     )
 
 
@@ -109,7 +111,25 @@ async def get_skill_context(
 async def read_skills(docs: list[dict]) -> str:
     """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'zathras', 'filename': 'local-config-guide.md'}]). These may contain guidance on interpreting results for specific harnesses or benchmarks."""
     await _ensure_init()
-    return json.dumps(read_skill_documents(SKILLS_DIR, docs))
+    results = []
+    for doc in docs:
+        harness = doc.get("harness") or doc.get("category", "")
+        filename = doc.get("filename") or doc.get("name", "")
+        if harness == "kube-burner":
+            results.append(
+                {
+                    "found": False,
+                    "harness": harness,
+                    "filename": filename,
+                    "message": (
+                        "Use get_skill_context(subject='harness/kube-burner', "
+                        "operation='bootstrap')."
+                    ),
+                }
+            )
+        else:
+            results.extend(read_skill_documents(SKILLS_DIR, [doc]))
+    return json.dumps(results)
 
 
 async def _get_crucible_benchmark_context_tool(
@@ -207,6 +227,14 @@ async def list_harness_docs(harness: str) -> str:
                 "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
             }
         )
+    if harness == "kube-burner":
+        return json.dumps(
+            {
+                "harness": harness,
+                "docs": [],
+                "message": "Use get_skill_context(subject='harness/kube-burner', operation='bootstrap').",
+            }
+        )
     if not _repo_cache:
         return json.dumps({"status": "error", "message": "No repo cache configured"})
     docs = _repo_cache.list_docs(harness, subdirs=["docs", "config"])
@@ -226,6 +254,13 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
             {
                 "found": False,
                 "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
+    if harness == "kube-burner":
+        return json.dumps(
+            {
+                "status": "gateway_required",
+                "message": "Use get_skill_context(subject='harness/kube-burner', operation='bootstrap').",
             }
         )
     content = _repo_cache.read_file(harness, doc_path)

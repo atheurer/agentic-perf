@@ -45,3 +45,26 @@ def test_boot_time_review_keeps_artifact_tools_and_describes_artifact_analysis()
     assert "## Boot-Time Results" in prompt
     assert "list_benchmark_artifacts and read_benchmark_artifact" in prompt
     assert "There are no external result files" not in prompt
+
+
+def test_kube_burner_review_routes_context_through_gateway():
+    from agents.review.agent import ReviewAgent
+
+    agent = ReviewAgent.__new__(ReviewAgent)
+    agent._skill_provider = None
+    agent.tools = [
+        type("Tool", (), {"name": name})()
+        for name in (
+            "get_skill_context",
+            "read_skills",
+            "list_harness_docs",
+            "read_harness_doc",
+        )
+    ]
+    ticket = {"custom_fields": {"directives": {"harness": "kube-burner"}}}
+
+    prompt = agent._system_prompt(ticket)
+    agent._apply_review_tool_scoping(ticket)
+
+    assert 'get_skill_context(subject="harness/kube-burner"' in prompt
+    assert {tool.name for tool in agent.tools} == {"get_skill_context", "read_skills"}
