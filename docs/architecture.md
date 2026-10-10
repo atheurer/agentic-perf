@@ -171,6 +171,12 @@ agents. `awaiting_customer_guidance` resumes to the previous status when the
 user replies. The `planning_investigation` agent is a stub that auto-advances;
 all other investigation loop agents are fully implemented.
 
+If an agent finishes without advancing the ticket from its dispatched status,
+the orchestrator backs off and retries that stage up to five times. This
+includes `triage_pending`; exhausted retries pause automatic dispatch and add a
+ticket comment for human review. Moving the ticket to another status clears
+the retry limit.
+
 ### Analysis Agent (Data-First Investigation)
 
 The analysis agent investigates performance questions by querying
