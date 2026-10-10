@@ -218,6 +218,7 @@ or a user identity. User-scoped packages remain a future extension. See the
         "port": 8090
     },
     "poll_interval": 3.0,
+    "jumpstarter_lease_sweep_interval_seconds": 60,
     "ssh_key": "~/.ssh/id_ed25519",
     "crucible_home": "/opt/crucible",
     "zathras_home": "/opt/zathras",
@@ -859,6 +860,7 @@ stops automatically when the ticket reaches a terminal status. See
 | Field | Type | Default | Env override | Description |
 |---|---|---|---|---|
 | `poll_interval` | float | `3.0` | `POLL_INTERVAL` | Seconds between orchestrator dispatch cycles |
+| `jumpstarter_lease_sweep_interval_seconds` | float | `60` | — | Seconds between Jumpstarter orphan lease sweeps; `0` disables the sweep |
 | `ssh_key` | string | — | `SSH_KEY` | Path to SSH private key for remote host access |
 | `ssh_key_vault_secret` | string | — | `SSH_KEY_VAULT_SECRET` | Vault secret name for SSH key fallback (see below) |
 | `crucible_home` | string | `"/opt/crucible"` | `CRUCIBLE_HOME` | Path to crucible installation |
