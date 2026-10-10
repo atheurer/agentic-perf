@@ -608,9 +608,7 @@ PLAN_AGENT_STATUS = {
 }
 # Triage advances the ticket itself instead of using the execution-plan loop,
 # but it needs the same no-progress retry protection as plan-managed stages.
-DISPATCH_RETRY_STATUSES = frozenset(
-    {*PLAN_AGENT_STATUS.values(), "triage_pending"}
-)
+DISPATCH_RETRY_STATUSES = frozenset({*PLAN_AGENT_STATUS.values(), "triage_pending"})
 
 
 def _capture_step_results(agent_type: str, cf: dict) -> dict:
