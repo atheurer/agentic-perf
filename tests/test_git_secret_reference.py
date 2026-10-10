@@ -1,19 +1,13 @@
 from __future__ import annotations
 
-import io
+import asyncio
 import json
 import ssl
-from email.message import Message
+import time
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.error import HTTPError, URLError
-from urllib.request import (
-    HTTPBasicAuthHandler,
-    HTTPDigestAuthHandler,
-    HTTPSHandler,
-    Request,
-)
 
+import httpx
 import pytest
 
 import providers.secrets.git_reference as git_reference
@@ -26,7 +20,7 @@ from providers.secrets.git_reference import (
 from providers.skills.git_source import GitSourceError, parse_git_source
 
 _POINTER = (
-    "git-secret+https://gitlab.example/group/repo.git"
+    "git-secret+https://gitlab.cee.redhat.com/group/repo.git"
     "?ref=master&path=service-config/harness/config.json"
 )
 _TOKEN = "mocked-git-secret-value"
@@ -43,75 +37,85 @@ class _EmptySecrets(SecretsProvider):
         return []
 
 
-class _MockResponse:
+class _MockStream(httpx.AsyncByteStream):
     def __init__(
         self,
-        content: bytes,
-        *,
-        headers: dict[str, str] | None = None,
-        status: int = 200,
+        chunks: list[bytes],
+        delay: float = 0,
+        started: asyncio.Event | None = None,
     ) -> None:
-        self._content = content
-        self._position = 0
-        self.read_calls: list[int] = []
-        self.headers = Message()
-        for key, value in (headers or {}).items():
-            self.headers[key] = value
-        self.status = status
+        self.chunks = chunks
+        self.delay = delay
+        self.started = started
+        self.bytes_yielded = 0
+        self.iterated = False
         self.closed = False
 
-    def __enter__(self) -> _MockResponse:
-        return self
+    async def __aiter__(self):
+        self.iterated = True
+        if self.started is not None:
+            self.started.set()
+        for chunk in self.chunks:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            self.bytes_yielded += len(chunk)
+            yield chunk
 
-    def __exit__(self, *_exc_info) -> None:
-        self.close()
-
-    def getcode(self) -> int:
-        return self.status
-
-    def read(self, size: int) -> bytes:
-        self.read_calls.append(size)
-        result = self._content[self._position : self._position + size]
-        self._position += len(result)
-        return result
-
-    def close(self) -> None:
+    async def aclose(self) -> None:
         self.closed = True
 
 
-class _MockOpener:
+class _MockTransport(httpx.AsyncBaseTransport):
     def __init__(
         self,
-        response: _MockResponse | None = None,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+        stream: _MockStream | None = None,
         error: Exception | None = None,
     ) -> None:
-        self.response = response or _MockResponse(_TOKEN.encode())
+        self.status = status
+        self.headers = headers or {}
+        self.stream = stream or _MockStream([_TOKEN.encode()])
         self.error = error
         self.request = None
-        self.timeout = None
+        self.closed = False
 
-    def open(self, request, *, timeout: float) -> _MockResponse:
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.request = request
-        self.timeout = timeout
         if self.error is not None:
             raise self.error
-        return self.response
+        return httpx.Response(
+            status_code=self.status,
+            headers=self.headers,
+            stream=self.stream,
+            request=request,
+        )
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def _provider(
     tmp_path: Path,
     *,
-    response: _MockResponse | None = None,
+    status: int = 200,
+    headers: dict[str, str] | None = None,
+    stream: _MockStream | None = None,
     error: Exception | None = None,
-) -> tuple[GitSecretReferenceProvider, _MockOpener]:
-    opener = _MockOpener(response=response, error=error)
+) -> tuple[GitSecretReferenceProvider, _MockTransport]:
+    transport = _MockTransport(
+        status=status,
+        headers=headers,
+        stream=stream,
+        error=error,
+    )
 
     provider = GitSecretReferenceProvider(
         _EmptySecrets(),
         temp_root=tmp_path,
-        opener_factory=lambda: opener,
+        transport_factory=lambda: transport,
     )
-    return provider, opener
+    return provider, transport
 
 
 def test_pointer_parser_converts_marker_to_https_and_validates_file() -> None:
@@ -119,16 +123,18 @@ def test_pointer_parser_converts_marker_to_https_and_validates_file() -> None:
 
     assert parsed is not None
     assert parsed.file_url == (
-        "https://gitlab.example/api/v4/projects/group%2Frepo"
+        "https://gitlab.cee.redhat.com/api/v4/projects/group%2Frepo"
         "/repository/files/service-config%2Fharness%2Fconfig.json/raw?ref=master"
     )
-    assert parsed.repository == "gitlab.example/group/repo.git"
+    assert parsed.repository == "gitlab.cee.redhat.com/group/repo.git"
     assert parsed.ref == "master"
     assert parsed.path == "service-config/harness/config.json"
 
 
 def test_pointer_parser_rejects_non_gitlab_hosts() -> None:
-    pointer = _POINTER.replace("gitlab.example", "github.com")
+    pointer = _POINTER.replace(
+        "gitlab.cee.redhat.com", "gitlab.cee.redhat.com.evil.example"
+    )
 
     with pytest.raises(GitSecretReferenceError, match="only GitLab"):
         parse_git_secret_reference(pointer)
@@ -137,7 +143,7 @@ def test_pointer_parser_rejects_non_gitlab_hosts() -> None:
 def test_organization_git_auth_accepts_https_pointer_and_rejects_ssh_pointer() -> None:
     source = {
         "kind": "git",
-        "url": "https://gitlab.example/group/skills.git",
+        "url": "https://gitlab.cee.redhat.com/group/skills.git",
         "ref": "main",
         "auth": {"kind": "https-token", "secret_ref": _POINTER},
     }
@@ -195,15 +201,16 @@ def test_dispatcher_wraps_shared_and_user_ticket_providers(tmp_path: Path) -> No
 @pytest.mark.parametrize(
     "pointer",
     [
-        "git-secret+ssh://git@gitlab.example/group/repo.git?ref=main&path=token",
-        "git-secret+https://user:pass@gitlab.example/group/repo.git?ref=main&path=token",
-        "git-secret+https://gitlab.example/group/repo.git?ref=main&ref=other&path=token",
-        "git-secret+https://gitlab.example/group/repo.git?ref=main&path=../token",
-        "git-secret+https://gitlab.example/group/repo.git?ref=main&path=%2e%2e%2ftoken",
-        "git-secret+https://gitlab.example/group/repo.git?ref=main&path=token%GG",
-        "git-secret+https://gitlab.example/group/repo.git?ref=../main&path=token",
-        "git-secret+https://gitlab.example/group/repo.git?ref=main&path=token#fragment",
+        "git-secret+ssh://git@gitlab.cee.redhat.com/group/repo.git?ref=main&path=token",
+        "git-secret+https://user:pass@gitlab.cee.redhat.com/group/repo.git?ref=main&path=token",
+        "git-secret+https://gitlab.cee.redhat.com/group/repo.git?ref=main&ref=other&path=token",
+        "git-secret+https://gitlab.cee.redhat.com/group/repo.git?ref=main&path=../token",
+        "git-secret+https://gitlab.cee.redhat.com/group/repo.git?ref=main&path=%2e%2e%2ftoken",
+        "git-secret+https://gitlab.cee.redhat.com/group/repo.git?ref=main&path=token%GG",
+        "git-secret+https://gitlab.cee.redhat.com/group/repo.git?ref=../main&path=token",
+        "git-secret+https://gitlab.cee.redhat.com/group/repo.git?ref=main&path=token#fragment",
         "git-secret+https://github.com/group/repo.git?ref=main&path=token",
+        "git-secret+https://gitlab.cee.redhat.com.evil.example/group/repo.git?ref=main&path=token",
     ],
 )
 def test_invalid_pointer_is_rejected(pointer: str) -> None:
@@ -216,28 +223,31 @@ async def test_get_secret_requests_only_the_encoded_gitlab_file_over_verified_ht
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    provider, opener = _provider(tmp_path)
+    provider, transport = _provider(tmp_path)
 
     assert await provider.get_secret(_POINTER) == _TOKEN
-    assert opener.request.full_url == parse_git_secret_reference(_POINTER).file_url
-    assert opener.request.get_header("Accept-encoding") == "identity"
-    assert opener.request.get_header("Authorization") is None
-    assert opener.timeout == 30
-    assert opener.response.closed
+    assert str(transport.request.url) == parse_git_secret_reference(_POINTER).file_url
+    assert transport.request.headers["accept-encoding"] == "identity"
+    assert "authorization" not in transport.request.headers
+    assert transport.stream.closed
+    assert transport.closed
     assert list(tmp_path.iterdir()) == []
 
-    monkeypatch.setattr(git_reference, "getproxies", lambda: {})
-    real_opener = git_reference._build_https_opener()
-    assert any(
-        isinstance(handler, HTTPSHandler)
-        and handler._context.verify_mode == ssl.CERT_REQUIRED
-        and handler._context.check_hostname
-        for handler in real_opener.handlers
-    )
-    assert not any(
-        isinstance(handler, (HTTPBasicAuthHandler, HTTPDigestAuthHandler))
-        for handler in real_opener.handlers
-    )
+    settings = {}
+    original_client = httpx.AsyncClient
+
+    def record_client(**kwargs):
+        settings.update(kwargs)
+        return original_client(**kwargs)
+
+    monkeypatch.setattr(git_reference.httpx, "AsyncClient", record_client)
+    client = git_reference._build_http_client()
+    assert isinstance(settings["verify"], ssl.SSLContext)
+    assert settings["verify"].verify_mode == ssl.CERT_REQUIRED
+    assert settings["verify"].check_hostname
+    assert settings["trust_env"] is False
+    assert settings["follow_redirects"] is False
+    await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -248,15 +258,18 @@ async def test_home_netrc_and_git_config_are_not_used_for_credentials(
     home = tmp_path / "home"
     home.mkdir()
     (home / ".netrc").write_text(
-        "machine gitlab.example login ambient-user password ambient-secret\n"
+        "machine gitlab.cee.redhat.com login ambient-user password ambient-secret\n"
     )
     (home / ".gitconfig").write_text("[credential]\n\thelper = store\n")
     monkeypatch.setenv("HOME", str(home))
-    provider, opener = _provider(tmp_path)
+    monkeypatch.setenv(
+        "HTTPS_PROXY", "http://ambient-user:ambient-secret@proxy.invalid"
+    )
+    provider, transport = _provider(tmp_path)
 
     assert await provider.get_secret(_POINTER) == _TOKEN
-    assert opener.request.get_header("Authorization") is None
-    assert "ambient-secret" not in opener.request.full_url
+    assert "authorization" not in transport.request.headers
+    assert "ambient-secret" not in str(transport.request.url)
 
 
 @pytest.mark.asyncio
@@ -264,95 +277,105 @@ async def test_oversized_stream_is_closed_after_reading_only_limit_plus_one(
     tmp_path: Path,
 ) -> None:
     size_limit = 64 * 1024
-    response = _MockResponse(b"x" * (size_limit + 100_000))
-    provider, _opener = _provider(tmp_path, response=response)
+    stream = _MockStream([b"x" * 8192 for _ in range(20)])
+    provider, _transport = _provider(tmp_path, stream=stream)
 
     with pytest.raises(GitSecretReferenceError, match="64 KiB size limit"):
         await provider.get_secret(_POINTER)
 
-    assert response._position == size_limit + 1
-    assert sum(response.read_calls) == size_limit + 1
-    assert response.closed
+    assert stream.bytes_yielded == size_limit + 8192
+    assert stream.closed
 
 
 @pytest.mark.asyncio
 async def test_oversized_content_length_is_rejected_before_reading_body(
     tmp_path: Path,
 ) -> None:
-    response = _MockResponse(b"secret", headers={"Content-Length": "65537"})
-    provider, _opener = _provider(tmp_path, response=response)
+    stream = _MockStream([b"secret"])
+    provider, _transport = _provider(
+        tmp_path, headers={"Content-Length": "65537"}, stream=stream
+    )
 
     with pytest.raises(GitSecretReferenceError, match="64 KiB size limit"):
         await provider.get_secret(_POINTER)
 
-    assert response.read_calls == []
-    assert response.closed
+    assert not stream.iterated
+    assert stream.closed
 
 
 @pytest.mark.asyncio
 async def test_compressed_response_is_rejected_and_identity_is_requested(
     tmp_path: Path,
 ) -> None:
-    response = _MockResponse(
-        b"compressed-secret",
+    stream = _MockStream([b"compressed-secret"])
+    provider, transport = _provider(
+        tmp_path,
         headers={"Content-Encoding": "gzip", "Content-Length": "17"},
+        stream=stream,
     )
-    provider, opener = _provider(tmp_path, response=response)
 
     with pytest.raises(GitSecretReferenceError, match="non-identity encoded"):
         await provider.get_secret(_POINTER)
 
-    assert opener.request.get_header("Accept-encoding") == "identity"
-    assert response.read_calls == []
-    assert response.closed
+    assert transport.request.headers["accept-encoding"] == "identity"
+    assert not stream.iterated
+    assert stream.closed
 
 
-def test_redirect_handler_allows_only_credential_free_https_redirects() -> None:
-    handler = git_reference._HTTPSOnlyRedirectHandler()
-    request = Request("https://gitlab.example/api/v4/file")
-
-    assert (
-        handler.redirect_request(
-            request, None, 302, "Found", {}, "http://files.example/token"
-        )
-        is None
-    )
-    assert (
-        handler.redirect_request(
-            request,
-            None,
-            302,
-            "Found",
-            {},
-            "https://user:pass@files.example/token",
-        )
-        is None
-    )
-    redirected = handler.redirect_request(
-        request, None, 302, "Found", {}, "https://files.example/token"
-    )
-    assert redirected is not None
-    assert redirected.get_header("Authorization") is None
-
-
-def test_credential_bearing_proxy_configuration_is_rejected(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.asyncio
+async def test_redirect_is_rejected_without_reading_its_unbounded_body(
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(
-        git_reference,
-        "getproxies",
-        lambda: {"https": "http://proxy-user:proxy-secret@proxy.example:8080"},
-    )
+    stream = _MockStream([b"x" * 1_000_000])
+    provider, _transport = _provider(tmp_path, status=302, stream=stream)
 
-    with pytest.raises(GitSecretReferenceError, match="Credential-bearing proxies"):
-        git_reference._build_https_opener()
+    with pytest.raises(GitSecretReferenceError, match="redirect HTTP 302"):
+        await provider.get_secret(_POINTER)
+
+    assert not stream.iterated
+    assert stream.bytes_yielded == 0
+    assert stream.closed
+
+
+@pytest.mark.asyncio
+async def test_overall_deadline_stops_a_trickling_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(git_reference, "_MAX_TOTAL_TIMEOUT", 0.06)
+    stream = _MockStream([b"a", b"b", b"c"], delay=0.04)
+    provider, _transport = _provider(tmp_path, stream=stream)
+    started_at = time.monotonic()
+
+    with pytest.raises(GitSecretReferenceError, match="overall HTTPS request deadline"):
+        await provider.get_secret(_POINTER)
+
+    assert time.monotonic() - started_at < 0.5
+    assert stream.closed
+
+
+@pytest.mark.asyncio
+async def test_cancellation_closes_an_in_progress_response(
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    stream = _MockStream([b"secret"], delay=60, started=started)
+    provider, _transport = _provider(tmp_path, stream=stream)
+    task = asyncio.create_task(provider.get_secret(_POINTER))
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert stream.closed
 
 
 @pytest.mark.asyncio
 async def test_secret_file_materializes_securely_only_for_context_lifetime(
     tmp_path: Path,
 ) -> None:
-    provider, _opener = _provider(tmp_path)
+    provider, _transport = _provider(tmp_path)
 
     async with provider.secret_file(_POINTER) as secret_file:
         assert secret_file is not None
@@ -367,10 +390,10 @@ async def test_secret_file_materializes_securely_only_for_context_lifetime(
 async def test_get_secret_file_never_returns_a_pointer_path(
     tmp_path: Path,
 ) -> None:
-    provider, opener = _provider(tmp_path)
+    provider, transport = _provider(tmp_path)
 
     assert await provider.get_secret_file(_POINTER) is None
-    assert opener.request is None
+    assert transport.request is None
 
 
 @pytest.mark.asyncio
@@ -380,7 +403,7 @@ async def test_get_secret_file_never_returns_a_pointer_path(
         (401, "HTTP 401; anonymous read access is required"),
         (403, "HTTP 403; confirm the project allows anonymous reads"),
         (404, "HTTP 404; check the project, ref, and file path"),
-        (302, "redirect was rejected"),
+        (302, "redirect HTTP 302 was rejected"),
     ],
 )
 async def test_resolution_failure_is_actionable_and_never_reports_missing(
@@ -389,14 +412,14 @@ async def test_resolution_failure_is_actionable_and_never_reports_missing(
     expected: str,
 ) -> None:
     body = b"response body with secret payload that must not leak"
-    error = HTTPError(_POINTER, status, "mock status", {}, io.BytesIO(body))
-    provider, _opener = _provider(tmp_path, error=error)
+    stream = _MockStream([body])
+    provider, _transport = _provider(tmp_path, status=status, stream=stream)
 
     with pytest.raises(GitSecretReferenceError) as error:
         await provider.get_secret(_POINTER)
 
     message = str(error.value)
-    assert "gitlab.example/group/repo.git@master" in message
+    assert "gitlab.cee.redhat.com/group/repo.git@master" in message
     assert "anonymous HTTPS read access" in message
     assert "TLS trust" in message
     assert "network access" in message
@@ -405,6 +428,8 @@ async def test_resolution_failure_is_actionable_and_never_reports_missing(
     assert body.decode() not in message
     assert "not found" not in message.lower()
     assert list(tmp_path.iterdir()) == []
+    assert not stream.iterated
+    assert stream.closed
 
 
 @pytest.mark.asyncio
@@ -413,7 +438,7 @@ async def test_network_error_is_actionable_without_response_details(
 ) -> None:
     provider, _opener = _provider(
         tmp_path,
-        error=URLError("mock failure with secret payload that must not leak"),
+        error=RuntimeError("mock failure with secret payload that must not leak"),
     )
 
     with pytest.raises(GitSecretReferenceError) as error:
@@ -431,10 +456,7 @@ async def test_install_harness_tool_surfaces_git_secret_source_failure(
 ) -> None:
     from agents.provisioning import server as provisioning_server
 
-    provider, _opener = _provider(
-        tmp_path,
-        error=HTTPError(_POINTER, 404, "mock not found", {}, io.BytesIO(b"")),
-    )
+    provider, _transport = _provider(tmp_path, status=404)
     monkeypatch.setattr(provisioning_server, "_secrets_provider", provider)
 
     class SkillProvider:
