@@ -89,7 +89,7 @@ class TestHarnessToolScoping:
             {"custom_fields": {"directives": {"harness": "crucible"}}}
         )
         assert {tool.name for tool in agent.tools} == {
-            "get_crucible_benchmark_context",
+            "get_execution_config",
             "execute_benchmark",
         }
 
@@ -108,6 +108,35 @@ class TestHarnessToolScoping:
         )[0]["content"]
         assert "uperf-run-file.md" not in content
         assert "read_skills" not in content
+
+    def test_kube_burner_routes_guidance_through_gateway(self):
+        agent = self._make_agent()
+        agent.tools = self._make_tools(
+            [
+                "get_skill_context",
+                "read_skills",
+                "list_harness_docs",
+                "read_harness_doc",
+                "execute_benchmark",
+            ]
+        )
+        ticket = {
+            "custom_fields": {
+                "directives": {"harness": "kube-burner", "endpoint_type": "kube"},
+            },
+        }
+
+        agent._apply_tool_scoping(ticket)
+        prompt = agent._system_prompt(ticket)
+
+        assert {tool.name for tool in agent.tools} == {
+            "get_skill_context",
+            "read_skills",
+            "execute_benchmark",
+        }
+        assert 'get_skill_context(subject="harness/kube-burner"' in prompt
+        assert "config-guide.md" not in prompt
+        assert "workloads.md" not in prompt
 
     def test_no_harness_directive_keeps_all_tools(self):
         agent = self._make_agent()

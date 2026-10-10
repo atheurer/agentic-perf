@@ -214,6 +214,7 @@ TOOL_AUDIT_POLICY = (
         "agents/provisioning/server.py:ensure_harness_installed",
     ),
     *_read_only(
+        "agents/resource/server.py:get_skill_context",
         "agents/resource/server.py:parse_host_config",
         "agents/resource/server.py:list_resource_providers",
         "agents/resource/server.py:check_available_resources",

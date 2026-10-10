@@ -641,6 +641,10 @@ class BenchmarkAgent(AgentBase):
             "get_example_runfile",
             "get_crucible_benchmark_context",
         },
+        "kube-burner": {
+            "list_harness_docs",
+            "read_harness_doc",
+        },
     }
 
     def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:
@@ -711,6 +715,8 @@ class BenchmarkAgent(AgentBase):
         prompt = BENCHMARK_BASE_PROMPT
         if harness == "crucible":
             prompt += "\n\n" + skill_context_prompt("harness/crucible")
+        elif harness == "kube-burner":
+            prompt += "\n\n" + skill_context_prompt("harness/kube-burner")
 
         if self._ticket_execution_model(ticket) == EXECUTION_MODEL_DIRECT:
             prompt += (
@@ -1114,7 +1120,7 @@ class BenchmarkAgent(AgentBase):
         )
 
         skills_dir = Path(__file__).resolve().parent.parent.parent / "skills" / harness
-        if harness != "crucible" and skills_dir.is_dir():
+        if harness not in {"crucible", "kube-burner"} and skills_dir.is_dir():
             content += f"\n## {harness} Skills (read these first)\n"
             content += "These contain critical lessons from prior runs:\n\n"
             for f in sorted(skills_dir.glob("*.md")):
@@ -1138,7 +1144,7 @@ class BenchmarkAgent(AgentBase):
 
         # Crucible documentation is served by the source-aware gateway.  Keep
         # the generic cache path for harnesses that have not adopted it yet.
-        if self._repo_cache and harness != "crucible":
+        if self._repo_cache and harness not in {"crucible", "kube-burner"}:
             docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])
             if docs:
                 content += f"\n## Available {harness} Documentation\n"
