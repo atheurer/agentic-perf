@@ -101,11 +101,13 @@ and standard `user@host:path` SSH clone URLs are accepted. HTTPS URL credentials
 query strings, and fragments are rejected. A private-key secret must be usable
 non-interactively; passphrase-protected keys can use the existing SSH agent.
 
-For an anonymously readable token file stored in Git, `secret_ref` may use a
-`git-secret+https://host/group/repo.git?ref=branch&path=relative/file` pointer.
-The pointer fetches one file over HTTPS with TLS verification enabled, without
-SSH or Git credentials. See [HTTPS Git file references](secrets.md#https-git-file-references)
-for limits and error handling.
+For an anonymously readable token file stored in GitLab, `secret_ref` may use a
+`git-secret+https://gitlab.example/group/repo.git?ref=branch&path=relative/file`
+pointer. It reads one file through the GitLab API v4 at the host root, over
+verified HTTPS, with no SSH, Git, or `.netrc` credentials. Other Git hosts and
+GitLab URL-prefix installations are unsupported. See
+[HTTPS Git file references](secrets.md#https-git-file-references) for limits
+and error handling.
 
 Each named source refreshes its configured branch during provider initialization
 and reads from an immutable commit checkout. Existing ticket snapshots keep
