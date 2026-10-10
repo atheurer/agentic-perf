@@ -78,6 +78,23 @@ def test_no_host_mounts_directive_removes_the_key_from_nested_runfile(monkeypatc
     assert original["remotes"][0]["config"]["settings"]["host-mounts"] == []
 
 
+def test_controller_host_prefers_ssh_address_to_assigned_address(monkeypatch):
+    import agents.benchmark.server as srv
+
+    monkeypatch.setattr(
+        srv,
+        "_ticket",
+        {
+            "custom_fields": {
+                "ssh_hardware_ips": {"controller": "public-controller"},
+                "assigned_hardware_ips": {"controller": "private-controller"},
+            }
+        },
+    )
+
+    assert srv._controller_host() == "public-controller"
+
+
 @pytest.mark.asyncio
 async def test_get_execution_config_crucible(handlers):
     result = await handlers["get_execution_config"](harness_name="crucible")
