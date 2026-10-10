@@ -10,17 +10,9 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urlencode, urlsplit, urlunsplit
-from urllib.request import (
-    HTTPRedirectHandler,
-    HTTPSHandler,
-    OpenerDirector,
-    ProxyHandler,
-    Request,
-    build_opener,
-    getproxies,
-)
+
+import httpx
 
 from providers.execution import AuditedFilesystem
 
@@ -28,10 +20,11 @@ from .base import SecretsBackendError, SecretsProvider
 
 _MAX_REFERENCE_LENGTH = 2048
 _MAX_SECRET_BYTES = 64 * 1024
-_MAX_REQUEST_TIMEOUT = 30
+_MAX_SOCKET_TIMEOUT = 10
+_MAX_TOTAL_TIMEOUT = 30
+_SUPPORTED_GITLAB_HOST = "gitlab.cee.redhat.com"
 _REF_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
-_GITLAB_HOST_LABEL = re.compile(r"(?:^|[.-])gitlab(?:[.-]|$)", re.IGNORECASE)
 
 
 class GitSecretReferenceError(SecretsBackendError):
@@ -79,10 +72,12 @@ def parse_git_secret_reference(value: object) -> GitSecretReference | None:
         or _BAD_PERCENT_ESCAPE.search(parsed.path)
     ):
         raise GitSecretReferenceError("Invalid Git secret repository URI")
-    if _GITLAB_HOST_LABEL.search(parsed.hostname) is None:
+    if parsed.hostname.lower() != _SUPPORTED_GITLAB_HOST or (
+        port is not None and port != 443
+    ):
         raise GitSecretReferenceError(
-            "Unsupported Git secret host; only GitLab HTTPS repository URLs are "
-            "supported"
+            "Unsupported Git secret host; only GitLab HTTPS repository URLs on "
+            f"{_SUPPORTED_GITLAB_HOST} are supported"
         )
 
     repo_parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
@@ -162,46 +157,16 @@ def parse_git_secret_reference(value: object) -> GitSecretReference | None:
     return GitSecretReference(file_url, repository, ref, path)
 
 
-class _HTTPSOnlyRedirectHandler(HTTPRedirectHandler):
-    """Allow HTTPS storage redirects without forwarding credentials."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        try:
-            target = urlsplit(newurl)
-        except ValueError:
-            return None
-        if (
-            target.scheme.lower() != "https"
-            or not target.hostname
-            or target.username is not None
-            or target.password is not None
-        ):
-            return None
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-def _anonymous_proxies() -> dict[str, str]:
-    """Honor proxy routing without accepting credentials embedded in its URL."""
-    proxies = getproxies()
-    for proxy in proxies.values():
-        candidate = proxy if "://" in proxy else f"//{proxy}"
-        try:
-            parsed = urlsplit(candidate)
-        except ValueError:
-            raise GitSecretReferenceError("Invalid HTTPS proxy configuration") from None
-        if parsed.username is not None or parsed.password is not None:
-            raise GitSecretReferenceError(
-                "Credential-bearing proxies are not supported for Git secrets"
-            )
-    return proxies
-
-
-def _build_https_opener() -> OpenerDirector:
-    """Build a HOME-independent opener with default certificate validation."""
-    return build_opener(
-        ProxyHandler(_anonymous_proxies()),
-        HTTPSHandler(context=ssl.create_default_context()),
-        _HTTPSOnlyRedirectHandler(),
+def _build_http_client(
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> httpx.AsyncClient:
+    """Build an anonymous client that ignores ambient auth and proxy settings."""
+    return httpx.AsyncClient(
+        transport=transport,
+        verify=ssl.create_default_context(),
+        trust_env=False,
+        follow_redirects=False,
+        timeout=httpx.Timeout(_MAX_SOCKET_TIMEOUT),
     )
 
 
@@ -213,11 +178,11 @@ class GitSecretReferenceProvider(SecretsProvider):
         inner: SecretsProvider,
         *,
         temp_root: str | Path | None = None,
-        opener_factory: Callable[[], OpenerDirector] = _build_https_opener,
+        transport_factory: Callable[[], httpx.AsyncBaseTransport] | None = None,
     ) -> None:
         self._inner = inner
         self._temp_root = Path(temp_root or tempfile.gettempdir())
-        self._opener_factory = opener_factory
+        self._transport_factory = transport_factory
 
     def _parse(self, path: str) -> GitSecretReference | None:
         try:
@@ -245,70 +210,68 @@ class GitSecretReferenceProvider(SecretsProvider):
 
     async def _fetch(self, reference: GitSecretReference) -> bytes:
         try:
-            return await asyncio.to_thread(self._download, reference.file_url)
+            return await self._download(reference.file_url)
+        except TimeoutError:
+            raise self._fetch_error(
+                reference, "the overall HTTPS request deadline was exceeded"
+            ) from None
         except GitSecretReferenceError as exc:
             raise self._fetch_error(reference, str(exc)) from None
         except Exception:
             raise self._fetch_error(reference) from None
 
-    def _download(self, file_url: str) -> bytes:
-        request = Request(
-            file_url,
-            headers={
-                "Accept": "application/octet-stream",
-                "Accept-Encoding": "identity",
-                "User-Agent": "agentic-perf-secret-reader/1",
-            },
-            method="GET",
-        )
-        opener = self._opener_factory()
-        try:
-            response = opener.open(request, timeout=_MAX_REQUEST_TIMEOUT)
-        except HTTPError as exc:
-            status = exc.code
-            exc.close()
-            raise GitSecretReferenceError(self._http_status_reason(status)) from None
-        with response:
-            if response.getcode() != 200:
-                raise GitSecretReferenceError(
-                    self._http_status_reason(response.getcode())
-                )
-            encoding = (
-                response.headers.get("Content-Encoding", "identity").strip().lower()
-            )
-            if encoding not in {"", "identity"}:
-                raise GitSecretReferenceError(
-                    "GitLab returned a non-identity encoded secret response"
-                )
-            content_length = response.headers.get("Content-Length")
-            if content_length is not None:
-                try:
-                    declared_size = int(content_length)
-                except ValueError:
-                    raise GitSecretReferenceError(
-                        "GitLab returned an invalid secret content length"
-                    ) from None
-                if declared_size < 0 or declared_size > _MAX_SECRET_BYTES:
-                    raise GitSecretReferenceError(
-                        "Git secret file exceeds the 64 KiB size limit"
+    async def _download(self, file_url: str) -> bytes:
+        transport = self._transport_factory() if self._transport_factory else None
+        async with asyncio.timeout(_MAX_TOTAL_TIMEOUT):
+            async with _build_http_client(transport) as client:
+                async with client.stream(
+                    "GET",
+                    file_url,
+                    headers={
+                        "Accept": "application/octet-stream",
+                        "Accept-Encoding": "identity",
+                        "User-Agent": "agentic-perf-secret-reader/1",
+                    },
+                ) as response:
+                    if response.status_code != 200:
+                        raise GitSecretReferenceError(
+                            self._http_status_reason(response.status_code)
+                        )
+                    encoding = (
+                        response.headers.get("Content-Encoding", "identity")
+                        .strip()
+                        .lower()
                     )
+                    if encoding not in {"", "identity"}:
+                        raise GitSecretReferenceError(
+                            "GitLab returned a non-identity encoded secret response"
+                        )
+                    content_length = response.headers.get("Content-Length")
+                    declared_size: int | None = None
+                    if content_length is not None:
+                        try:
+                            declared_size = int(content_length)
+                        except ValueError:
+                            raise GitSecretReferenceError(
+                                "GitLab returned an invalid secret content length"
+                            ) from None
+                        if declared_size < 0 or declared_size > _MAX_SECRET_BYTES:
+                            raise GitSecretReferenceError(
+                                "Git secret file exceeds the 64 KiB size limit"
+                            )
 
-            content = bytearray()
-            while len(content) <= _MAX_SECRET_BYTES:
-                remaining = _MAX_SECRET_BYTES + 1 - len(content)
-                chunk = response.read(min(8192, remaining))
-                if not chunk:
-                    break
-                content.extend(chunk)
-            if len(content) > _MAX_SECRET_BYTES:
-                raise GitSecretReferenceError(
-                    "Git secret file exceeds the 64 KiB size limit"
-                )
-            if content_length is not None and len(content) != declared_size:
-                raise GitSecretReferenceError(
-                    "GitLab returned an incomplete secret file"
-                )
-            return bytes(content)
+                    content = bytearray()
+                    async for chunk in response.aiter_raw(chunk_size=8192):
+                        if len(content) + len(chunk) > _MAX_SECRET_BYTES:
+                            raise GitSecretReferenceError(
+                                "Git secret file exceeds the 64 KiB size limit"
+                            )
+                        content.extend(chunk)
+                    if declared_size is not None and len(content) != declared_size:
+                        raise GitSecretReferenceError(
+                            "GitLab returned an incomplete secret file"
+                        )
+                    return bytes(content)
 
     @staticmethod
     def _http_status_reason(status: int) -> str:
@@ -328,8 +291,9 @@ class GitSecretReferenceProvider(SecretsProvider):
             )
         if 300 <= status < 400:
             return (
-                "GitLab HTTPS redirect was rejected; only credential-free HTTPS "
-                "redirects are allowed"
+                f"GitLab HTTPS redirect HTTP {status} was rejected before reading "
+                "its body; configure the raw API endpoint to serve the file "
+                "without redirects"
             )
         return f"GitLab HTTPS API returned HTTP {status}"
 
