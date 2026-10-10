@@ -103,6 +103,9 @@ class OrchestratorConfig:
             or cfg.get("poll_interval")
             or 3.0
         )
+        self.jumpstarter_lease_sweep_interval_seconds: float = float(
+            cfg.get("jumpstarter_lease_sweep_interval_seconds", 60.0)
+        )
         lease_cfg = cfg.get("orchestrator_lease", {})
         self.leader_lease_ttl_seconds = float(
             os.environ.get(
@@ -521,6 +524,9 @@ def build_redacted_config(
         },
         "orchestrator": {
             "poll_interval": config.poll_interval,
+            "jumpstarter_lease_sweep_interval_seconds": (
+                config.jumpstarter_lease_sweep_interval_seconds
+            ),
             "global_max_iterations": config.global_max_iterations,
             "agent_task_timeout": config.agent_task_timeout,
             "stale_task_timeout": config.stale_task_timeout,
