@@ -148,14 +148,12 @@ async def sweep_orphaned_leases(
                         status = r.json().get("status", "")
                     else:
                         failures.append(
-                            f"ticket {ticket_id} lookup returned HTTP "
-                            f"{r.status_code}"
+                            f"ticket {ticket_id} lookup returned HTTP {r.status_code}"
                         )
                         continue
                 except Exception as exc:
                     failures.append(
-                        f"ticket {ticket_id} lookup failed "
-                        f"({type(exc).__name__})"
+                        f"ticket {ticket_id} lookup failed ({type(exc).__name__})"
                     )
                     continue
 
@@ -187,8 +185,7 @@ async def sweep_orphaned_leases(
                             )
                     except Exception as exc:
                         failures.append(
-                            f"lease {lease_name} release failed "
-                            f"({type(exc).__name__})"
+                            f"lease {lease_name} release failed ({type(exc).__name__})"
                         )
 
         if failures:
