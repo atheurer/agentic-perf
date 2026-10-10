@@ -39,7 +39,7 @@ types across namespaces.
 | burst | int | 20 | API burst limit |
 | gc | bool | true | Delete created resources after run |
 | timeout | string | "30m" | Global timeout |
-| podWait | bool | true | Wait for pods to reach Running state |
+| podWait | bool | false | Wait for each iteration's pods/jobs before moving to the next iteration |
 
 ## Critical Config Rules
 

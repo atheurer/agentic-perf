@@ -625,9 +625,26 @@ class OrganizationSkillResolver:
         return sorted(self.bindings)
 
     def uses_organization_config(self, subject: str) -> bool:
+        """Return whether organization service config is canonical for a subject."""
         group = self.bindings.get(_subject(subject))
         if group is not None:
-            return not any(binding.legacy_config for binding in group)
+            return any(binding.service_config is not None for binding in group)
+        return self.has_subject(subject)
+
+    def has_runtime_config(self, subject: str) -> bool:
+        """Return whether a subject binds organization or explicit legacy config.
+
+        Document-only packages do not own runtime settings and must leave the
+        harness defaults and legacy settings available to existing tools.
+        Removed pinned subjects remain fail-closed because their former config
+        binding cannot be safely inferred from the current source tree.
+        """
+        group = self.bindings.get(_subject(subject))
+        if group is not None:
+            return any(
+                binding.service_config is not None or binding.legacy_config
+                for binding in group
+            )
         return self.has_subject(subject)
 
     def uses_legacy_config(self, subject: str) -> bool:
