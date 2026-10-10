@@ -387,6 +387,38 @@ async def test_secret_file_materializes_securely_only_for_context_lifetime(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("root_kind", ["relative", "symlink"])
+async def test_secret_file_canonicalizes_relative_and_symlink_tmpdir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    root_kind: str,
+) -> None:
+    actual_root = tmp_path / "temp-root"
+    actual_root.mkdir()
+    if root_kind == "relative":
+        monkeypatch.chdir(tmp_path)
+        configured_root = Path("temp-root")
+    else:
+        configured_root = tmp_path / "temp-root-link"
+        configured_root.symlink_to(actual_root, target_is_directory=True)
+
+    monkeypatch.setenv("TMPDIR", str(configured_root))
+    monkeypatch.setattr(git_reference.tempfile, "tempdir", None)
+    transport = _MockTransport()
+    provider = GitSecretReferenceProvider(
+        _EmptySecrets(),
+        transport_factory=lambda: transport,
+    )
+
+    async with provider.secret_file(_POINTER) as secret_file:
+        assert secret_file is not None
+        assert secret_file.read_text() == _TOKEN
+        assert secret_file.parent.parent == actual_root
+
+    assert list(actual_root.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_get_secret_file_never_returns_a_pointer_path(
     tmp_path: Path,
 ) -> None:
