@@ -147,7 +147,15 @@ Once you have the benchmark data:
    root causes.
 4. Proceed directly to Step 5 (submit your review).
 
-Do NOT call request_clarification.
+Do not call request_clarification for ordinary review judgments; use an
+inconclusive verdict when evidence is insufficient. Exception: if scoped
+context sources provide materially conflicting instructions that cannot be
+resolved using the ticket's task-specific guidance, verified software behavior,
+and mandatory organization policy, call request_clarification before submitting.
+This includes unresolved conflicts between sources at the same level; locality
+does not break ties between peer sources, including organization sources.
+Identify the conflicting source ids and document paths, and ask only for the
+decision needed to continue.
 
 **Verdict rules:**
 - **Use inconclusive when the available evidence is insufficient

@@ -160,7 +160,10 @@ async def build_skill_provider_async(
 ):
     """Build skills after resolving authenticated organization Git sources."""
     from paths import CONFIG_PATH
-    from providers.skills.gateway import OrganizationSkillResolver
+    from providers.skills.gateway import (
+        OrganizationSkillResolver,
+        organization_source_descriptors,
+    )
 
     raw_config = None
     try:
@@ -170,16 +173,18 @@ async def build_skill_provider_async(
         pass
     gateway = raw_config.get("skill_gateway") if isinstance(raw_config, dict) else None
     organization = gateway.get("organization") if isinstance(gateway, dict) else None
-    source = organization.get("source") if isinstance(organization, dict) else None
-    auth = source.get("auth", {}) if isinstance(source, dict) else {}
-    auth_kind = auth.get("kind", "default") if isinstance(auth, dict) else None
-    if (
-        secrets_provider is None
-        and isinstance(source, dict)
-        and source.get("kind") == "git"
-        and isinstance(auth_kind, str)
-        and auth_kind in {"https-token", "ssh-key-secret"}
-    ):
+    try:
+        sources = organization_source_descriptors(organization or {})
+    except (TypeError, ValueError):
+        sources = []
+    needs_secret_provider = any(
+        item["source"].get("kind") == "git"
+        and isinstance(item["source"].get("auth", {}), dict)
+        and item["source"].get("auth", {}).get("kind", "default")
+        in {"https-token", "ssh-key-secret"}
+        for item in sources
+    )
+    if secrets_provider is None and needs_secret_provider:
         secrets_provider = build_secrets_provider()
     resolver = await OrganizationSkillResolver.from_instance_config_async(
         raw_config=raw_config,
