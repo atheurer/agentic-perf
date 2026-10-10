@@ -181,7 +181,7 @@ class GitSecretReferenceProvider(SecretsProvider):
         transport_factory: Callable[[], httpx.AsyncBaseTransport] | None = None,
     ) -> None:
         self._inner = inner
-        self._temp_root = Path(temp_root or tempfile.gettempdir())
+        self._temp_root = Path(temp_root or tempfile.gettempdir()).resolve()
         self._transport_factory = transport_factory
 
     def _parse(self, path: str) -> GitSecretReference | None:
