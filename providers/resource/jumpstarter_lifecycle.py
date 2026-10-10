@@ -81,8 +81,8 @@ async def sweep_orphaned_leases(
     - Failsafe: this sweep catches orphans from crashed
       orchestrators, skipped teardown, or manual intervention.
 
-    Runs each poll cycle. jmp get leases is a lightweight
-    gRPC call; ticket status checks are batched.
+    The orchestrator runs this on its own configurable interval,
+    independently of ticket polling. Ticket status checks are batched.
     """
     try:
         result = await AuditedSubprocessRunner().run(
@@ -90,11 +90,18 @@ async def sweep_orphaned_leases(
             timeout=15,
         )
         if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace").strip()
+            logger.warning(
+                "[lease-sweep] jmp get leases failed (exit=%d): %s",
+                result.returncode,
+                stderr[:500] or "no error output",
+            )
             return
 
         try:
             data = json.loads(result.stdout.decode(errors="replace"))
         except (ValueError, TypeError):
+            logger.warning("[lease-sweep] jmp get leases returned invalid JSON")
             return
         # jmp get leases -o json returns
         # {"leases": [...]} or a bare list.
@@ -103,6 +110,10 @@ async def sweep_orphaned_leases(
         elif isinstance(data, list):
             leases = data
         else:
+            logger.warning("[lease-sweep] jmp get leases returned an unexpected shape")
+            return
+        if not isinstance(leases, list):
+            logger.warning("[lease-sweep] jmp get leases returned a non-list lease set")
             return
 
         # Extract ticket IDs from lease names.
@@ -123,6 +134,7 @@ async def sweep_orphaned_leases(
         if not to_release:
             return
 
+        failures: list[str] = []
         # Check ticket statuses in batch.
         async with AuditedAsyncHTTPClient(
             timeout=10.0, headers=auth_headers or {}
@@ -135,8 +147,14 @@ async def sweep_orphaned_leases(
                     elif r.status_code == 200:
                         status = r.json().get("status", "")
                     else:
+                        failures.append(
+                            f"ticket {ticket_id} lookup returned HTTP {r.status_code}"
+                        )
                         continue
-                except Exception:
+                except Exception as exc:
+                    failures.append(
+                        f"ticket {ticket_id} lookup failed ({type(exc).__name__})"
+                    )
                     continue
 
                 if status in LEASE_RELEASE_STATUSES:
@@ -158,11 +176,30 @@ async def sweep_orphaned_leases(
                                 f" (ticket {ticket_id} at "
                                 f"{status})"
                             )
-                    except Exception:
-                        pass
+                        else:
+                            stderr = _dr.stderr.decode(errors="replace").strip()
+                            failures.append(
+                                f"lease {lease_name} release exited "
+                                f"{_dr.returncode}: "
+                                f"{stderr[:250] or 'no error output'}"
+                            )
+                    except Exception as exc:
+                        failures.append(
+                            f"lease {lease_name} release failed ({type(exc).__name__})"
+                        )
+
+        if failures:
+            summary = "; ".join(failures[:10])
+            if len(failures) > 10:
+                summary += f"; and {len(failures) - 10} more"
+            logger.warning(
+                "[lease-sweep] Completed with %d failure(s): %s",
+                len(failures),
+                summary,
+            )
 
     except Exception:
-        logger.debug(
+        logger.warning(
             "[lease-sweep] Sweep failed",
             exc_info=True,
         )

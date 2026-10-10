@@ -58,7 +58,7 @@ class PlatformAgent(AgentBase):
 
         ticket = await self._get_ticket(ticket_id)
         cf = ticket.get("custom_fields", {})
-        flash_info = cf.get("jumpstarter_flash", {})
+        flash_info = cf.get("jumpstarter_flash") or {}
         flash_error = flash_info.get("error", "")
         if flash_error and "image_version" in flash_error.lower():
             self._emit(
@@ -113,7 +113,7 @@ class PlatformAgent(AgentBase):
         cf = ticket.get("custom_fields", {})
         provider = cf.get("resource_provider", "unknown")
         metadata = cf.get("resource_provider_metadata", {})
-        flash_info = cf.get("jumpstarter_flash", {})
+        flash_info = cf.get("jumpstarter_flash") or {}
         cf.get("directives", {})
 
         content = f"## Platform Setup for {ticket['id']}\n\n"
