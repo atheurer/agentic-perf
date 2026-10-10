@@ -1,26 +1,37 @@
-"""Resolve one secret file from an anonymous HTTPS Git source."""
+"""Resolve one secret file through GitLab's anonymous HTTPS API."""
 
 from __future__ import annotations
 
-import os
+import asyncio
 import re
-import shutil
+import ssl
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.error import HTTPError
+from urllib.parse import quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.request import (
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    OpenerDirector,
+    ProxyHandler,
+    Request,
+    build_opener,
+    getproxies,
+)
 
-from providers.execution import AuditedFilesystem, AuditedSubprocessRunner
+from providers.execution import AuditedFilesystem
 
 from .base import SecretsBackendError, SecretsProvider
 
 _MAX_REFERENCE_LENGTH = 2048
 _MAX_SECRET_BYTES = 64 * 1024
-_MAX_GIT_TIMEOUT = 90
+_MAX_REQUEST_TIMEOUT = 30
 _REF_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_GITLAB_HOST_LABEL = re.compile(r"(?:^|[.-])gitlab(?:[.-]|$)", re.IGNORECASE)
 
 
 class GitSecretReferenceError(SecretsBackendError):
@@ -31,7 +42,7 @@ class GitSecretReferenceError(SecretsBackendError):
 class GitSecretReference:
     """Validated identity and requested file for one Git secret pointer."""
 
-    transport_url: str
+    file_url: str
     repository: str
     ref: str
     path: str
@@ -68,6 +79,11 @@ def parse_git_secret_reference(value: object) -> GitSecretReference | None:
         or _BAD_PERCENT_ESCAPE.search(parsed.path)
     ):
         raise GitSecretReferenceError("Invalid Git secret repository URI")
+    if _GITLAB_HOST_LABEL.search(parsed.hostname) is None:
+        raise GitSecretReferenceError(
+            "Unsupported Git secret host; only GitLab HTTPS repository URLs are "
+            "supported"
+        )
 
     repo_parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
     if any(
@@ -122,134 +138,86 @@ def parse_git_secret_reference(value: object) -> GitSecretReference | None:
         raise GitSecretReferenceError("Invalid Git secret file path")
 
     netloc = parsed.netloc
-    transport_url = urlunsplit(("https", netloc, parsed.path, "", ""))
+    project_path = "/".join(repo_parts)
+    if project_path.lower().endswith(".git"):
+        project_path = project_path[:-4]
+    if not project_path:
+        raise GitSecretReferenceError("Invalid Git secret repository URI")
+    file_url = urlunsplit(
+        (
+            "https",
+            netloc,
+            "/api/v4/projects/"
+            + quote(project_path, safe="")
+            + "/repository/files/"
+            + quote(path, safe="")
+            + "/raw",
+            urlencode({"ref": ref}),
+            "",
+        )
+    )
     display_host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
     repository = f"{display_host}{f':{port}' if port is not None else ''}/"
     repository += "/".join(repo_parts)
-    return GitSecretReference(transport_url, repository, ref, path)
+    return GitSecretReference(file_url, repository, ref, path)
 
 
-def _git_argv(*args: str) -> list[str]:
-    git = shutil.which("git")
-    if git is None:
-        raise GitSecretReferenceError("Git is unavailable for HTTPS secret lookup")
-    return [
-        git,
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "init.templateDir=/dev/null",
-        "-c",
-        "credential.helper=",
-        "-c",
-        "credential.interactive=never",
-        "-c",
-        "http.sslVerify=true",
-        "-c",
-        "http.followRedirects=false",
-        *args,
-    ]
+class _HTTPSOnlyRedirectHandler(HTTPRedirectHandler):
+    """Allow HTTPS storage redirects without forwarding credentials."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            target = urlsplit(newurl)
+        except ValueError:
+            return None
+        if (
+            target.scheme.lower() != "https"
+            or not target.hostname
+            or target.username is not None
+            or target.password is not None
+        ):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _git_environment() -> dict[str, str]:
-    """Pass only transport settings; ignore ambient Git credentials/config."""
-    env = {
-        key: os.environ[key]
-        for key in (
-            "PATH",
-            "HOME",
-            "TMPDIR",
-            "LANG",
-            "LC_ALL",
-            "SSL_CERT_FILE",
-            "SSL_CERT_DIR",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "no_proxy",
-        )
-        if key in os.environ
-    }
-    env.update(
-        {
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_LFS_SKIP_SMUDGE": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-        }
+def _anonymous_proxies() -> dict[str, str]:
+    """Honor proxy routing without accepting credentials embedded in its URL."""
+    proxies = getproxies()
+    for proxy in proxies.values():
+        candidate = proxy if "://" in proxy else f"//{proxy}"
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            raise GitSecretReferenceError("Invalid HTTPS proxy configuration") from None
+        if parsed.username is not None or parsed.password is not None:
+            raise GitSecretReferenceError(
+                "Credential-bearing proxies are not supported for Git secrets"
+            )
+    return proxies
+
+
+def _build_https_opener() -> OpenerDirector:
+    """Build a HOME-independent opener with default certificate validation."""
+    return build_opener(
+        ProxyHandler(_anonymous_proxies()),
+        HTTPSHandler(context=ssl.create_default_context()),
+        _HTTPSOnlyRedirectHandler(),
     )
-    return env
-
-
-class _SecretOutputRunner(AuditedSubprocessRunner):
-    """Audit process output sizes without persisting secret digests."""
-
-    def _output_descriptors(self, stdout: bytes, stderr: bytes) -> dict[str, object]:
-        return {
-            "stdout_size": len(stdout),
-            "stdout_sensitive": bool(stdout),
-            "stderr_size": len(stderr),
-            "stderr_sensitive": bool(stderr),
-            "stdout_truncated": len(stdout) > self._output_limit,
-            "stderr_truncated": len(stderr) > self._output_limit,
-        }
-
-
-async def _run_git(
-    runner: AuditedSubprocessRunner,
-    argv: list[str],
-    env: dict[str, str],
-    *,
-    cwd: Path | None = None,
-) -> tuple[bytes, bytes]:
-    try:
-        result = await runner.run(
-            argv,
-            cwd=cwd,
-            env=env,
-            timeout=_MAX_GIT_TIMEOUT,
-            system_context=True,
-        )
-    except Exception:
-        raise GitSecretReferenceError("HTTPS Git secret retrieval failed") from None
-    if result.returncode != 0 or result.timed_out:
-        raise GitSecretReferenceError("HTTPS Git secret retrieval failed")
-    return result.stdout, result.stderr
-
-
-def _remove_tree(path: Path, root: Path, filesystem: AuditedFilesystem) -> None:
-    """Remove a temporary object database through the system filesystem facade."""
-    if not path.exists() and not path.is_symlink():
-        return
-    for current, directories, files in os.walk(path, topdown=False, followlinks=False):
-        current_path = Path(current)
-        for name in files:
-            filesystem.unlink((current_path / name).relative_to(root), missing_ok=True)
-        for name in directories:
-            child = current_path / name
-            if child.is_symlink():
-                filesystem.unlink(child.relative_to(root), missing_ok=True)
-            else:
-                filesystem.rmdir(child.relative_to(root))
-    filesystem.rmdir(path.relative_to(root))
 
 
 class GitSecretReferenceProvider(SecretsProvider):
-    """Interpret HTTPS Git pointers, delegating ordinary names unchanged."""
+    """Resolve GitLab HTTPS pointers, delegating ordinary names unchanged."""
 
     def __init__(
         self,
         inner: SecretsProvider,
         *,
         temp_root: str | Path | None = None,
-        runner_factory: Callable[..., AuditedSubprocessRunner] = _SecretOutputRunner,
+        opener_factory: Callable[[], OpenerDirector] = _build_https_opener,
     ) -> None:
         self._inner = inner
         self._temp_root = Path(temp_root or tempfile.gettempdir())
-        self._runner_factory = runner_factory
+        self._opener_factory = opener_factory
 
     def _parse(self, path: str) -> GitSecretReference | None:
         try:
@@ -262,147 +230,108 @@ class GitSecretReferenceProvider(SecretsProvider):
     def _display_source(self, reference: GitSecretReference) -> str:
         return f"{reference.repository}@{reference.ref}"
 
-    def _fetch_error(self, reference: GitSecretReference) -> GitSecretReferenceError:
+    def _fetch_error(
+        self,
+        reference: GitSecretReference,
+        reason: str = "",
+    ) -> GitSecretReferenceError:
+        detail = f" {reason}." if reason else ""
         return GitSecretReferenceError(
-            f"Git secret source '{self._display_source(reference)}' could not be "
-            "resolved. Check anonymous HTTPS read access, TLS trust, network "
-            "access, the configured ref/path, and server support for Git blob "
-            "filtering."
+            f"GitLab HTTPS secret source '{self._display_source(reference)}' could "
+            f"not be resolved.{detail} Check anonymous HTTPS read access, TLS "
+            "trust, network access, the project/ref/file path, and the 64 KiB "
+            "file limit."
         )
 
     async def _fetch(self, reference: GitSecretReference) -> bytes:
-        filesystem = AuditedFilesystem.system(self._temp_root)
-        temp_dir: Path | None = None
         try:
-            temp_dir = filesystem.temporary_directory(prefix="git-secret-")
-            filesystem.chmod(temp_dir.relative_to(self._temp_root), 0o700)
-            repository = temp_dir / "source.git"
-            env = _git_environment()
-            runner = self._runner_factory(output_limit=_MAX_SECRET_BYTES + 1)
-            await _run_git(
-                runner,
-                _git_argv("init", "--bare", "--quiet", str(repository)),
-                env,
-            )
-            git_dir = ["--git-dir", str(repository)]
-            await _run_git(
-                runner,
-                _git_argv(*git_dir, "remote", "add", "origin", reference.transport_url),
-                env,
-            )
-            await _run_git(
-                runner,
-                _git_argv(*git_dir, "config", "remote.origin.promisor", "true"),
-                env,
-            )
-            await _run_git(
-                runner,
-                _git_argv(
-                    *git_dir,
-                    "config",
-                    "remote.origin.partialclonefilter",
-                    "blob:none",
-                ),
-                env,
-            )
-            _, fetch_stderr = await _run_git(
-                runner,
-                _git_argv(
-                    *git_dir,
-                    "fetch",
-                    "--quiet",
-                    "--depth=1",
-                    "--filter=blob:none",
-                    "--no-tags",
-                    "origin",
-                    f"+refs/heads/{reference.ref}:refs/heads/secret-source",
-                ),
-                env,
-            )
-            fetch_warning = fetch_stderr.decode(errors="replace").lower()
-            if any(
-                warning in fetch_warning
-                for warning in (
-                    "filtering not recognized",
-                    "does not support filter",
-                    "filtering is not supported",
-                    "ignoring filter",
-                )
-            ):
-                raise GitSecretReferenceError(
-                    "HTTPS Git server does not support filtered secret retrieval"
-                )
-            object_types, _ = await _run_git(
-                runner,
-                _git_argv(
-                    *git_dir,
-                    "cat-file",
-                    "--batch-all-objects",
-                    "--batch-check=%(objecttype)",
-                ),
-                env,
-            )
-            if len(object_types) >= _MAX_SECRET_BYTES + 1:
-                raise GitSecretReferenceError(
-                    "Git secret repository metadata exceeds the size limit"
-                )
-            if b"blob\n" in object_types:
-                raise GitSecretReferenceError(
-                    "HTTPS Git server did not honor filtered secret retrieval"
-                )
-            commit_raw, _ = await _run_git(
-                runner,
-                _git_argv(
-                    *git_dir,
-                    "rev-parse",
-                    "--verify",
-                    "refs/heads/secret-source^{commit}",
-                ),
-                env,
-            )
-            commit = commit_raw.decode("ascii", errors="ignore").strip()
-            if not re.fullmatch(r"[a-f0-9]{40,64}", commit):
-                raise GitSecretReferenceError("Git secret branch resolved invalidly")
-            secret_raw, _ = await _run_git(
-                runner,
-                _git_argv(
-                    *git_dir,
-                    "cat-file",
-                    "blob",
-                    f"{commit}:{reference.path}",
-                ),
-                env,
-            )
-            if len(secret_raw) > _MAX_SECRET_BYTES:
-                raise GitSecretReferenceError("Git secret file exceeds the size limit")
-            object_types, _ = await _run_git(
-                runner,
-                _git_argv(
-                    *git_dir,
-                    "cat-file",
-                    "--batch-all-objects",
-                    "--batch-check=%(objecttype)",
-                ),
-                env,
-            )
-            if (
-                len(object_types) >= _MAX_SECRET_BYTES + 1
-                or object_types.splitlines().count(b"blob") != 1
-            ):
-                raise GitSecretReferenceError(
-                    "HTTPS Git server returned more than the requested secret blob"
-                )
-            return secret_raw
-        except GitSecretReferenceError:
-            raise self._fetch_error(reference) from None
+            return await asyncio.to_thread(self._download, reference.file_url)
+        except GitSecretReferenceError as exc:
+            raise self._fetch_error(reference, str(exc)) from None
         except Exception:
             raise self._fetch_error(reference) from None
-        finally:
-            if temp_dir is not None:
+
+    def _download(self, file_url: str) -> bytes:
+        request = Request(
+            file_url,
+            headers={
+                "Accept": "application/octet-stream",
+                "Accept-Encoding": "identity",
+                "User-Agent": "agentic-perf-secret-reader/1",
+            },
+            method="GET",
+        )
+        opener = self._opener_factory()
+        try:
+            response = opener.open(request, timeout=_MAX_REQUEST_TIMEOUT)
+        except HTTPError as exc:
+            status = exc.code
+            exc.close()
+            raise GitSecretReferenceError(self._http_status_reason(status)) from None
+        with response:
+            if response.getcode() != 200:
+                raise GitSecretReferenceError(
+                    self._http_status_reason(response.getcode())
+                )
+            encoding = (
+                response.headers.get("Content-Encoding", "identity").strip().lower()
+            )
+            if encoding not in {"", "identity"}:
+                raise GitSecretReferenceError(
+                    "GitLab returned a non-identity encoded secret response"
+                )
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
                 try:
-                    _remove_tree(temp_dir, self._temp_root, filesystem)
-                except Exception:
-                    raise self._fetch_error(reference) from None
+                    declared_size = int(content_length)
+                except ValueError:
+                    raise GitSecretReferenceError(
+                        "GitLab returned an invalid secret content length"
+                    ) from None
+                if declared_size < 0 or declared_size > _MAX_SECRET_BYTES:
+                    raise GitSecretReferenceError(
+                        "Git secret file exceeds the 64 KiB size limit"
+                    )
+
+            content = bytearray()
+            while len(content) <= _MAX_SECRET_BYTES:
+                remaining = _MAX_SECRET_BYTES + 1 - len(content)
+                chunk = response.read(min(8192, remaining))
+                if not chunk:
+                    break
+                content.extend(chunk)
+            if len(content) > _MAX_SECRET_BYTES:
+                raise GitSecretReferenceError(
+                    "Git secret file exceeds the 64 KiB size limit"
+                )
+            if content_length is not None and len(content) != declared_size:
+                raise GitSecretReferenceError(
+                    "GitLab returned an incomplete secret file"
+                )
+            return bytes(content)
+
+    @staticmethod
+    def _http_status_reason(status: int) -> str:
+        if status == 401:
+            return (
+                "GitLab HTTPS API returned HTTP 401; anonymous read access is required"
+            )
+        if status == 403:
+            return (
+                "GitLab HTTPS API returned HTTP 403; confirm the project allows "
+                "anonymous reads"
+            )
+        if status == 404:
+            return (
+                "GitLab HTTPS API returned HTTP 404; check the project, ref, and "
+                "file path"
+            )
+        if 300 <= status < 400:
+            return (
+                "GitLab HTTPS redirect was rejected; only credential-free HTTPS "
+                "redirects are allowed"
+            )
+        return f"GitLab HTTPS API returned HTTP {status}"
 
     async def get_secret(self, path: str) -> str | None:
         reference = self._parse(path)
@@ -433,6 +362,7 @@ class GitSecretReferenceProvider(SecretsProvider):
         content = await self._fetch(reference)
         filesystem = AuditedFilesystem.system(self._temp_root)
         temp_dir: Path | None = None
+        secret_file: Path | None = None
         try:
             temp_dir = filesystem.temporary_directory(prefix="git-secret-file-")
             filesystem.chmod(temp_dir.relative_to(self._temp_root), 0o700)
@@ -445,15 +375,23 @@ class GitSecretReferenceProvider(SecretsProvider):
         except Exception:
             if temp_dir is not None:
                 try:
-                    _remove_tree(temp_dir, self._temp_root, filesystem)
+                    if secret_file is not None:
+                        filesystem.unlink(
+                            secret_file.relative_to(self._temp_root), missing_ok=True
+                        )
+                    filesystem.rmdir(temp_dir.relative_to(self._temp_root))
                 except Exception:
                     pass
             raise self._fetch_error(reference) from None
+        assert secret_file is not None
         try:
             yield secret_file
         finally:
             try:
-                _remove_tree(temp_dir, self._temp_root, filesystem)
+                filesystem.unlink(
+                    secret_file.relative_to(self._temp_root), missing_ok=True
+                )
+                filesystem.rmdir(temp_dir.relative_to(self._temp_root))
             except Exception:
                 raise self._fetch_error(reference) from None
 

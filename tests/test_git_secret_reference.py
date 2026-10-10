@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import io
 import json
+import ssl
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
+from urllib.request import (
+    HTTPBasicAuthHandler,
+    HTTPDigestAuthHandler,
+    HTTPSHandler,
+    Request,
+)
 
 import pytest
 
@@ -33,106 +43,95 @@ class _EmptySecrets(SecretsProvider):
         return []
 
 
-class _MockGitRunner:
-    instances: list[_MockGitRunner] = []
+class _MockResponse:
+    def __init__(
+        self,
+        content: bytes,
+        *,
+        headers: dict[str, str] | None = None,
+        status: int = 200,
+    ) -> None:
+        self._content = content
+        self._position = 0
+        self.read_calls: list[int] = []
+        self.headers = Message()
+        for key, value in (headers or {}).items():
+            self.headers[key] = value
+        self.status = status
+        self.closed = False
 
-    def __init__(self, *, output_limit: int, failure: str | None = None) -> None:
-        self.output_limit = output_limit
-        self.failure = failure
-        self.calls: list[dict] = []
-        type(self).instances.append(self)
+    def __enter__(self) -> _MockResponse:
+        return self
 
-    async def run(self, argv: list[str], **kwargs) -> SimpleNamespace:
-        command_index = 1
-        while argv[command_index] == "-c":
-            command_index += 2
-        if argv[command_index] == "--git-dir":
-            command_index += 2
-        command = argv[command_index:]
-        self.calls.append({"argv": argv, "command": command, **kwargs})
-        if self.failure == "fetch" and "fetch" in command:
-            return SimpleNamespace(
-                returncode=128,
-                timed_out=False,
-                stdout=b"",
-                stderr=b"mock failure with secret payload that must not leak",
-            )
-        if "fetch" in command and self.failure == "filter-warning":
-            return SimpleNamespace(
-                returncode=0,
-                timed_out=False,
-                stdout=b"",
-                stderr=b"warning: filtering not recognized by server, ignoring",
-            )
-        if command[:2] == ["cat-file", "--batch-all-objects"]:
-            count = sum(
-                call["command"][:2] == ["cat-file", "--batch-all-objects"]
-                for call in self.calls
-            )
-            object_types = b"commit\ntree\n" if count == 1 else b"commit\ntree\nblob\n"
-            result = SimpleNamespace(
-                returncode=0,
-                timed_out=False,
-                stdout=object_types,
-                stderr=b"",
-            )
-        elif command and command[0] == "rev-parse":
-            result = SimpleNamespace(
-                returncode=0,
-                timed_out=False,
-                stdout=b"a" * 40 + b"\n",
-                stderr=b"",
-            )
-        elif command[:2] == ["cat-file", "blob"]:
-            output = (
-                b"x" * (self.output_limit + 1)
-                if self.failure == "large"
-                else _TOKEN.encode()
-            )
-            result = SimpleNamespace(
-                returncode=0,
-                timed_out=False,
-                stdout=output[: self.output_limit],
-                stderr=b"",
-            )
-        else:
-            result = SimpleNamespace(
-                returncode=0,
-                timed_out=False,
-                stdout=b"",
-                stderr=b"",
-            )
+    def __exit__(self, *_exc_info) -> None:
+        self.close()
+
+    def getcode(self) -> int:
+        return self.status
+
+    def read(self, size: int) -> bytes:
+        self.read_calls.append(size)
+        result = self._content[self._position : self._position + size]
+        self._position += len(result)
         return result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _MockOpener:
+    def __init__(
+        self,
+        response: _MockResponse | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.response = response or _MockResponse(_TOKEN.encode())
+        self.error = error
+        self.request = None
+        self.timeout = None
+
+    def open(self, request, *, timeout: float) -> _MockResponse:
+        self.request = request
+        self.timeout = timeout
+        if self.error is not None:
+            raise self.error
+        return self.response
 
 
 def _provider(
     tmp_path: Path,
     *,
-    failure: str | None = None,
-) -> tuple[GitSecretReferenceProvider, _MockGitRunner]:
-    runners = []
-
-    def runner_factory(*, output_limit: int) -> _MockGitRunner:
-        runner = _MockGitRunner(output_limit=output_limit, failure=failure)
-        runners.append(runner)
-        return runner
+    response: _MockResponse | None = None,
+    error: Exception | None = None,
+) -> tuple[GitSecretReferenceProvider, _MockOpener]:
+    opener = _MockOpener(response=response, error=error)
 
     provider = GitSecretReferenceProvider(
         _EmptySecrets(),
         temp_root=tmp_path,
-        runner_factory=runner_factory,
+        opener_factory=lambda: opener,
     )
-    return provider, runners
+    return provider, opener
 
 
 def test_pointer_parser_converts_marker_to_https_and_validates_file() -> None:
     parsed = parse_git_secret_reference(_POINTER)
 
     assert parsed is not None
-    assert parsed.transport_url == "https://gitlab.example/group/repo.git"
+    assert parsed.file_url == (
+        "https://gitlab.example/api/v4/projects/group%2Frepo"
+        "/repository/files/service-config%2Fharness%2Fconfig.json/raw?ref=master"
+    )
     assert parsed.repository == "gitlab.example/group/repo.git"
     assert parsed.ref == "master"
     assert parsed.path == "service-config/harness/config.json"
+
+
+def test_pointer_parser_rejects_non_gitlab_hosts() -> None:
+    pointer = _POINTER.replace("gitlab.example", "github.com")
+
+    with pytest.raises(GitSecretReferenceError, match="only GitLab"):
+        parse_git_secret_reference(pointer)
 
 
 def test_organization_git_auth_accepts_https_pointer_and_rejects_ssh_pointer() -> None:
@@ -204,6 +203,7 @@ def test_dispatcher_wraps_shared_and_user_ticket_providers(tmp_path: Path) -> No
         "git-secret+https://gitlab.example/group/repo.git?ref=main&path=token%GG",
         "git-secret+https://gitlab.example/group/repo.git?ref=../main&path=token",
         "git-secret+https://gitlab.example/group/repo.git?ref=main&path=token#fragment",
+        "git-secret+https://github.com/group/repo.git?ref=main&path=token",
     ],
 )
 def test_invalid_pointer_is_rejected(pointer: str) -> None:
@@ -212,47 +212,147 @@ def test_invalid_pointer_is_rejected(pointer: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_secret_requests_only_the_configured_https_branch_and_blob(
+async def test_get_secret_requests_only_the_encoded_gitlab_file_over_verified_https(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(git_reference.shutil, "which", lambda _name: "/usr/bin/git")
-    monkeypatch.setenv("GIT_SSL_NO_VERIFY", "1")
-    _MockGitRunner.instances.clear()
-    provider, runners = _provider(tmp_path)
+    provider, opener = _provider(tmp_path)
 
     assert await provider.get_secret(_POINTER) == _TOKEN
-    runner = runners[0]
-    calls = runner.calls
-    argv = [call["argv"] for call in calls]
-    remote_add = next(command for command in argv if "remote" in command)
-    fetch = next(command for command in argv if "fetch" in command)
-    read_blob = next(command for command in argv if command[-2:-1] == ["blob"])
-
-    assert remote_add[-1] == "https://gitlab.example/group/repo.git"
-    assert "+refs/heads/master:refs/heads/secret-source" in fetch
-    assert "--filter=blob:none" in fetch
-    assert "--depth=1" in fetch
-    assert read_blob[-1] == f"{'a' * 40}:service-config/harness/config.json"
-    assert all("http.sslVerify=true" in command for command in argv)
-    assert not any("sslVerify=false" in command for command in argv)
-    assert all("credential.helper=" in command for command in argv)
-    env = calls[0]["env"]
-    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
-    assert env["GIT_CONFIG_GLOBAL"]
-    assert env["GIT_TERMINAL_PROMPT"] == "0"
-    assert "GIT_SSL_NO_VERIFY" not in env
-    assert "GIT_ASKPASS" not in env
+    assert opener.request.full_url == parse_git_secret_reference(_POINTER).file_url
+    assert opener.request.get_header("Accept-encoding") == "identity"
+    assert opener.request.get_header("Authorization") is None
+    assert opener.timeout == 30
+    assert opener.response.closed
     assert list(tmp_path.iterdir()) == []
+
+    monkeypatch.setattr(git_reference, "getproxies", lambda: {})
+    real_opener = git_reference._build_https_opener()
+    assert any(
+        isinstance(handler, HTTPSHandler)
+        and handler._context.verify_mode == ssl.CERT_REQUIRED
+        and handler._context.check_hostname
+        for handler in real_opener.handlers
+    )
+    assert not any(
+        isinstance(handler, (HTTPBasicAuthHandler, HTTPDigestAuthHandler))
+        for handler in real_opener.handlers
+    )
+
+
+@pytest.mark.asyncio
+async def test_home_netrc_and_git_config_are_not_used_for_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".netrc").write_text(
+        "machine gitlab.example login ambient-user password ambient-secret\n"
+    )
+    (home / ".gitconfig").write_text("[credential]\n\thelper = store\n")
+    monkeypatch.setenv("HOME", str(home))
+    provider, opener = _provider(tmp_path)
+
+    assert await provider.get_secret(_POINTER) == _TOKEN
+    assert opener.request.get_header("Authorization") is None
+    assert "ambient-secret" not in opener.request.full_url
+
+
+@pytest.mark.asyncio
+async def test_oversized_stream_is_closed_after_reading_only_limit_plus_one(
+    tmp_path: Path,
+) -> None:
+    size_limit = 64 * 1024
+    response = _MockResponse(b"x" * (size_limit + 100_000))
+    provider, _opener = _provider(tmp_path, response=response)
+
+    with pytest.raises(GitSecretReferenceError, match="64 KiB size limit"):
+        await provider.get_secret(_POINTER)
+
+    assert response._position == size_limit + 1
+    assert sum(response.read_calls) == size_limit + 1
+    assert response.closed
+
+
+@pytest.mark.asyncio
+async def test_oversized_content_length_is_rejected_before_reading_body(
+    tmp_path: Path,
+) -> None:
+    response = _MockResponse(b"secret", headers={"Content-Length": "65537"})
+    provider, _opener = _provider(tmp_path, response=response)
+
+    with pytest.raises(GitSecretReferenceError, match="64 KiB size limit"):
+        await provider.get_secret(_POINTER)
+
+    assert response.read_calls == []
+    assert response.closed
+
+
+@pytest.mark.asyncio
+async def test_compressed_response_is_rejected_and_identity_is_requested(
+    tmp_path: Path,
+) -> None:
+    response = _MockResponse(
+        b"compressed-secret",
+        headers={"Content-Encoding": "gzip", "Content-Length": "17"},
+    )
+    provider, opener = _provider(tmp_path, response=response)
+
+    with pytest.raises(GitSecretReferenceError, match="non-identity encoded"):
+        await provider.get_secret(_POINTER)
+
+    assert opener.request.get_header("Accept-encoding") == "identity"
+    assert response.read_calls == []
+    assert response.closed
+
+
+def test_redirect_handler_allows_only_credential_free_https_redirects() -> None:
+    handler = git_reference._HTTPSOnlyRedirectHandler()
+    request = Request("https://gitlab.example/api/v4/file")
+
+    assert (
+        handler.redirect_request(
+            request, None, 302, "Found", {}, "http://files.example/token"
+        )
+        is None
+    )
+    assert (
+        handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://user:pass@files.example/token",
+        )
+        is None
+    )
+    redirected = handler.redirect_request(
+        request, None, 302, "Found", {}, "https://files.example/token"
+    )
+    assert redirected is not None
+    assert redirected.get_header("Authorization") is None
+
+
+def test_credential_bearing_proxy_configuration_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        git_reference,
+        "getproxies",
+        lambda: {"https": "http://proxy-user:proxy-secret@proxy.example:8080"},
+    )
+
+    with pytest.raises(GitSecretReferenceError, match="Credential-bearing proxies"):
+        git_reference._build_https_opener()
 
 
 @pytest.mark.asyncio
 async def test_secret_file_materializes_securely_only_for_context_lifetime(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(git_reference.shutil, "which", lambda _name: "/usr/bin/git")
-    provider, _runners = _provider(tmp_path)
+    provider, _opener = _provider(tmp_path)
 
     async with provider.secret_file(_POINTER) as secret_file:
         assert secret_file is not None
@@ -265,25 +365,32 @@ async def test_secret_file_materializes_securely_only_for_context_lifetime(
 
 @pytest.mark.asyncio
 async def test_get_secret_file_never_returns_a_pointer_path(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(git_reference.shutil, "which", lambda _name: "/usr/bin/git")
-    provider, runners = _provider(tmp_path)
+    provider, opener = _provider(tmp_path)
 
     assert await provider.get_secret_file(_POINTER) is None
-    assert runners == []
+    assert opener.request is None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["fetch", "filter-warning", "large"])
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (401, "HTTP 401; anonymous read access is required"),
+        (403, "HTTP 403; confirm the project allows anonymous reads"),
+        (404, "HTTP 404; check the project, ref, and file path"),
+        (302, "redirect was rejected"),
+    ],
+)
 async def test_resolution_failure_is_actionable_and_never_reports_missing(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    failure: str,
+    status: int,
+    expected: str,
 ) -> None:
-    monkeypatch.setattr(git_reference.shutil, "which", lambda _name: "/usr/bin/git")
-    provider, _runners = _provider(tmp_path, failure=failure)
+    body = b"response body with secret payload that must not leak"
+    error = HTTPError(_POINTER, status, "mock status", {}, io.BytesIO(body))
+    provider, _opener = _provider(tmp_path, error=error)
 
     with pytest.raises(GitSecretReferenceError) as error:
         await provider.get_secret(_POINTER)
@@ -293,10 +400,28 @@ async def test_resolution_failure_is_actionable_and_never_reports_missing(
     assert "anonymous HTTPS read access" in message
     assert "TLS trust" in message
     assert "network access" in message
-    assert "ref/path" in message
-    assert "secret payload that must not leak" not in message
+    assert "project/ref/file path" in message
+    assert expected in message
+    assert body.decode() not in message
     assert "not found" not in message.lower()
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_network_error_is_actionable_without_response_details(
+    tmp_path: Path,
+) -> None:
+    provider, _opener = _provider(
+        tmp_path,
+        error=URLError("mock failure with secret payload that must not leak"),
+    )
+
+    with pytest.raises(GitSecretReferenceError) as error:
+        await provider.get_secret(_POINTER)
+
+    assert "GitLab HTTPS secret source" in str(error.value)
+    assert "TLS trust" in str(error.value)
+    assert "secret payload that must not leak" not in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -306,8 +431,10 @@ async def test_install_harness_tool_surfaces_git_secret_source_failure(
 ) -> None:
     from agents.provisioning import server as provisioning_server
 
-    monkeypatch.setattr(git_reference.shutil, "which", lambda _name: "/usr/bin/git")
-    provider, _runners = _provider(tmp_path, failure="fetch")
+    provider, _opener = _provider(
+        tmp_path,
+        error=HTTPError(_POINTER, 404, "mock not found", {}, io.BytesIO(b"")),
+    )
     monkeypatch.setattr(provisioning_server, "_secrets_provider", provider)
 
     class SkillProvider:
@@ -336,6 +463,6 @@ async def test_install_harness_tool_surfaces_git_secret_source_failure(
 
     result = json.loads(await provisioning_server.install_harness(["host"], "demo"))
     message = result["results"]["host"]["message"]
-    assert "Git secret source" in message
+    assert "GitLab HTTPS secret source" in message
     assert "anonymous HTTPS read access" in message
-    assert "not found" not in message.lower()
+    assert "HTTP 404" in message

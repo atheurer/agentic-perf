@@ -69,23 +69,28 @@ A secret path can point to one file in a Git repository with this marker URI:
 git-secret+https://gitlab.example/group/repo.git?ref=master&path=secret.json
 ```
 
-The provider removes the `git-secret+` marker and uses the resulting HTTPS Git
-URL. `ref` names a branch and `path` is one repository-relative file path.
-The repository must allow anonymous HTTPS reads; this source does not use SSH,
-Git credential helpers, or configured credentials. TLS certificate checks stay
-enabled. Only the requested branch and file are resolved. Git servers must
-support Git's `blob:none` filter; the provider fails instead of retrying with a
-full blob download if filtering is unavailable.
+`ref` names a branch and `path` is one repository-relative file path. This
+currently supports GitLab repositories whose hostname contains a `gitlab` DNS
+label and whose GitLab API v4 is available at the host root (`/api/v4`). Other
+Git hosting services and GitLab instances mounted below a URL prefix are not
+supported.
 
-Git secret values are not cached. Each lookup uses a shallow temporary Git
-repository that is removed after the requested value is read. `get_secret()`
-keeps the value in memory; `secret_file()` creates a mode-0600 file inside a
-mode-0700 temporary directory and removes it when the context exits.
-`get_secret_file()` returns `None` for Git references because they have no
-stable file path. Other schemes, including `git-secret+ssh://`, are rejected.
-Resolution failures raise `SecretsBackendError` with the sanitized repository
-and branch plus checks for anonymous HTTPS access, TLS trust, network access,
-and the branch or file path.
+The provider resolves exactly that project/ref/file through GitLab's
+repository-files raw API. It does not fetch a Git pack or other repository
+blobs. The project must allow anonymous HTTPS reads. The request does not use
+Git credentials, Git configuration, SSH, `.netrc`, or credentials embedded in
+proxy URLs. TLS certificate and hostname verification stay enabled. Redirects
+are accepted only when their target uses HTTPS and contains no credentials;
+response bytes are requested with identity encoding and streamed with a hard
+64 KiB cap.
+
+Git secret values are not cached. `get_secret()` keeps the bounded value in
+memory; `secret_file()` creates a mode-0600 file inside a mode-0700 temporary
+directory and removes it when the context exits. `get_secret_file()` returns
+`None` for Git references because they have no stable file path. Other schemes,
+including `git-secret+ssh://`, are rejected. Resolution errors identify the
+sanitized repository and branch and distinguish anonymous access failures,
+invalid project/ref/file paths, rejected redirects, and oversized files.
 
 **Requirements:**
 
