@@ -20,3 +20,12 @@ and provisioning paths are #789 transport exceptions.  Local `ssh-keygen`,
 
 This document is the exception allowlist until each historical helper is
 migrated; additions require a documented reason and an inventory test update.
+
+`providers/skills/gateway.py:search` uses the existing audited subprocess runner
+for GNU grep. Its argv is constructed without a shell; POSIX extended
+expressions reject backreferences and run with a two-second deadline. The
+input is a temporary export containing only phase-visible pinned Markdown,
+with no runtime configuration or credentials. The temporary file is created
+and removed through the ticket's critical filesystem facade. This is an
+audited caller, with no raw subprocess exception. Deployment images must
+provide GNU grep.

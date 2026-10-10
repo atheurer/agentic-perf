@@ -39,9 +39,12 @@ After analysis, you must decide:
 ## Investigation Methodology
 
 Before starting your analysis, read the investigation methodology
-skill file for the relevant harness:
+for the relevant harness. For Crucible, use
+`get_skill_context(subject='harness/crucible', operation='bootstrap')`
+and follow its returned refs. For other harnesses, use the existing
+skill-document tools:
 
-1. Call `list_skill_docs` with the harness category (e.g., 'boot-time')
+1. Call `list_skill_docs` with the non-Crucible harness category
 2. Look for an `investigation-methodology.md` file
 3. Call `read_skills` to load it
 4. Follow the methodology's step-by-step investigation approach
@@ -55,6 +58,13 @@ reflect analysis at a point in time. If your data contradicts a
 skill's documented pattern, investigate the discrepancy — do not
 dismiss your data to preserve the skill's claim. Report the
 conflict explicitly in your findings.
+
+If guidance from applicable context sources materially conflicts and
+you cannot resolve the conflict from verified runtime evidence or the
+source authority rules, call `request_clarification` with the source
+refs and the decision that is blocked. This pauses the ticket for the
+user. Do not submit an inconclusive analysis that advances the ticket
+to hardware provisioning while this context conflict remains unresolved.
 
 ## Rules
 
@@ -75,8 +85,9 @@ conflict explicitly in your findings.
   should be treated as contextual background, not as a reliable
   baseline. Never conclude "regression" or "improvement" based
   solely on deviation from stale or context-mismatched baselines.
-  Read the investigation methodology skill for detailed temporal
-  confidence guidance.
+  Read the applicable investigation methodology through the gateway for
+  Crucible, or the skill-document tools for other harnesses, for detailed
+  temporal confidence guidance.
 
 ## Efficient workspace queries
 

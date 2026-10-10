@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import shlex
 import sys
@@ -39,9 +40,15 @@ from agents.ethtool import (
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     build_secrets_provider,
-    build_skill_provider,
+    build_skill_provider_async,
     build_ssh_from_ticket,
     read_skill_documents,
+)
+from agents.skill_gateway import (
+    SKILL_GATEWAY_TOOL_DESCRIPTION,
+    organization_manages_harness,
+    skill_config_view,
+    skill_context_gateway,
 )
 from providers.llm.base import ToolDefinition
 from providers.ssh import SSHExecutor
@@ -76,8 +83,12 @@ async def _ensure_init():
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = build_skill_provider(resolve_source=False)
     _secrets_provider = build_secrets_provider()
+    _skill_provider = await build_skill_provider_async(
+        secrets_provider=_secrets_provider,
+        resolve_source=False,
+        skill_phase="provisioning",
+    )
     _initialized = True
 
 
@@ -849,10 +860,38 @@ async def _verify_harness_install_one(
     path = install_path or provisioning.get(
         "install_target_path", f"/opt/{harness_name}"
     )
-    verify_cmd = provisioning.get("verify_command", f"{path}/bin/{harness_name} help")
+    default_verify_cmd = (
+        f"{path}/bin/burden -h"
+        if harness_name == "zathras"
+        else f"{path}/bin/{harness_name} help"
+    )
+    verify_cmd = provisioning.get("verify_command", default_verify_cmd)
+    zathras_help_command = False
+    if harness_name == "zathras":
+        try:
+            verify_args = shlex.split(verify_cmd)
+        except ValueError:
+            verify_args = []
+        if (
+            len(verify_args) == 2
+            and Path(verify_args[0]).name == "burden"
+            and verify_args[-1] in {"-h", "--usage"}
+        ):
+            zathras_help_command = True
+            # Older organization config used --usage; normalize it to the
+            # documented short help flag while that config is updated.
+            if verify_args[-1] == "--usage":
+                verify_args[-1] = "-h"
+                verify_cmd = shlex.join(verify_args)
 
     result = await _ssh.run(host, verify_cmd)
-    harness_verified = result.exit_code == 0
+    help_output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    zathras_help_succeeded = (
+        zathras_help_command
+        and result.exit_code == 1
+        and re.search(r"\busage\b", help_output, re.IGNORECASE) is not None
+    )
+    harness_verified = result.exit_code == 0 or zathras_help_succeeded
     context: dict[str, Any] | None = None
 
     # The context gateway bootstraps Crucible from the controller's installed
@@ -1343,7 +1382,17 @@ async def install_k3s(hosts: list[str], user: str = "root") -> str:
 
 @mcp.tool()
 async def list_skill_docs(harness: str) -> str:
-    """List available skill documents for a topic. Use 'general' for host-tuning, connectivity, and network-perf guides. Use a harness name (e.g. 'crucible') for harness-specific docs."""
+    """List legacy local skill documents for topics not yet routed through the context gateway. For general host-tuning, use get_skill_context(subject='general/host-tuning')."""
+    harness_root = (
+        harness.strip().strip("/").removeprefix("skills/").split("/", 1)[0].lower()
+    )
+    if harness_root == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
     skill_dir = _SKILLS_DIR / harness
     if not skill_dir.is_dir():
         return json.dumps(
@@ -1355,7 +1404,7 @@ async def list_skill_docs(harness: str) -> str:
 
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
-    """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'general', 'filename': 'host-tuning.md'}]). Always read 'host-tuning.md' in the 'general' harness before applying any host tuning — it defines the required tool ordering, BBR+fq dependency, and irqbalance strategy."""
+    """Read local legacy skill documents not yet exposed through the context gateway. Use get_skill_context for manifest-backed guidance such as general/host-tuning."""
     return json.dumps(read_skill_documents(_SKILLS_DIR, docs))
 
 
@@ -3076,10 +3125,53 @@ async def ensure_harness_installed(
     return json.dumps(_summarize(results))
 
 
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    benchmark: str = "",
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+) -> str:
+    """Retrieve guidance through server-owned subject and source bindings."""
+    await _ensure_init()
+    return await skill_context_gateway(
+        _skill_provider,
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="provisioning-agent",
+        phase="provisioning",
+        subject=subject,
+        benchmark=benchmark,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+    )
+
+
 @mcp.tool()
 async def get_private_config(harness_name: str, key: str) -> str:
-    """Fetch private configuration for a benchmark harness. Returns organization-specific data like install method, repo paths, registry URLs, and constraints (supported OS, prerequisites). Use key='constraints' to check OS and platform requirements before attempting installation."""
+    """Get legacy approved settings for a harness. For Crucible, use the matching configuration view returned by get_skill_context. Commands, secret bindings, and installation contracts remain service-only."""
     await _ensure_init()
+    if harness_name == "crucible" or organization_manages_harness(
+        _skill_provider, harness_name
+    ):
+        try:
+            result = await skill_config_view(
+                _skill_provider, harness_name, key, "provisioning"
+            )
+        except Exception:
+            return json.dumps(
+                {"key": key, "value": None, "reason": "configuration_view_unavailable"}
+            )
+        return json.dumps({"key": key, "value": result})
     result = await _skill_provider.get_private_config(harness_name, key)
     if result is None:
         return json.dumps(

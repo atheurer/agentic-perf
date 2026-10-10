@@ -11,6 +11,7 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,9 +22,10 @@ if _project_root not in sys.path:
 
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
-    build_skill_provider,
+    build_skill_provider_async,
     read_skill_documents,
 )
+from agents.skill_gateway import SKILL_GATEWAY_TOOL_DESCRIPTION, skill_context_gateway
 
 mcp = create_ticket_mcp("triage-agent")
 
@@ -32,14 +34,45 @@ SKILLS_DIR = Path(_project_root) / "skills"
 _skill_provider = None
 
 
-def _get_provider():
+async def _get_provider():
     global _skill_provider
     if _skill_provider is None:
-        _skill_provider = build_skill_provider(
+        _skill_provider = await build_skill_provider_async(
             resolve_source=False,
             catalog_only=True,
+            skill_phase="triage",
         )
     return _skill_provider
+
+
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    benchmark: str = "",
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+) -> str:
+    """Retrieve guidance through server-owned subject and source bindings."""
+    return await skill_context_gateway(
+        await _get_provider(),
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="triage-agent",
+        phase="triage",
+        subject=subject,
+        benchmark=benchmark,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+    )
 
 
 @mcp.tool()
@@ -53,7 +86,7 @@ async def list_benchmarks() -> str:
     """List all available benchmark suites with their descriptions and supported parameters."""
     from providers.skills.catalog import list_benchmark_catalog
 
-    result, _unavailable = await list_benchmark_catalog(_get_provider())
+    result, _unavailable = await list_benchmark_catalog(await _get_provider())
     return json.dumps(result, indent=2)
 
 
@@ -62,7 +95,7 @@ async def get_benchmark_details(name: str) -> str:
     """Get detailed information about a specific benchmark suite including supported parameters and endpoint types."""
     from providers.skills.catalog import get_catalog_benchmark
 
-    detail = await get_catalog_benchmark(_get_provider(), name)
+    detail = await get_catalog_benchmark(await _get_provider(), name)
     if detail is None:
         return json.dumps({"error": f"Benchmark '{name}' not found"})
     # Arcaflow plugins: include the container image ref
@@ -100,7 +133,7 @@ async def resolve_benchmark(
                 }
             )
 
-    sp = _get_provider()
+    sp = await _get_provider()
     reqs: dict[str, Any] = {
         "description": description,
         "workload_type": workload_type,

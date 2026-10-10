@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
+from .gateway import OrganizationSkillResolver
+from .local_context import LocalContextSource
 from .private import PrivateSkillProvider
 
 
@@ -31,10 +33,12 @@ class MultiHarnessSkillProvider(SkillProvider):
         harnesses: dict[str, SkillProvider],
         private: PrivateSkillProvider | None = None,
         default_harness: str = "crucible",
+        project_context_source: LocalContextSource | None = None,
     ) -> None:
         self._harnesses = harnesses
         self._private = private or PrivateSkillProvider()
         self._default = default_harness
+        self._project_context_source = project_context_source
 
     @property
     def default_harness(self) -> str:
@@ -46,6 +50,19 @@ class MultiHarnessSkillProvider(SkillProvider):
 
     def get_provider(self, harness_name: str) -> SkillProvider | None:
         return self._harnesses.get(harness_name)
+
+    def bind_attempt(self, ticket_id: str, attempt_id: str, phase: str) -> None:
+        """Use the server-selected attempt for all private-config consumers."""
+        self._private.bind_attempt(ticket_id, attempt_id, phase)
+
+    @property
+    def organization_resolver(self) -> OrganizationSkillResolver:
+        return self._private.organization_resolver
+
+    @property
+    def project_context_source(self) -> LocalContextSource | None:
+        """Return the manifest-scoped documents bundled with this project."""
+        return self._project_context_source
 
     def get_source_provenance(self, harness: str = "crucible") -> dict[str, Any]:
         """Return source resolution provenance for ticket recording."""
@@ -125,6 +142,8 @@ class MultiHarnessSkillProvider(SkillProvider):
         return await self._private.get_private_config(suite_name, key)
 
     async def get_all_private_config(self, suite_name: str) -> dict[str, Any]:
+        if self._private.uses_organization_config(suite_name):
+            return await self._private.get_all_private_config(suite_name)
         provider = self._harnesses.get(suite_name)
         defaults = await provider.get_default_config() if provider else {}
         private = await self._private.get_all_private_config(suite_name)

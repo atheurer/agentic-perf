@@ -82,11 +82,13 @@ class Dispatcher:
         introspection_llm: bool = True,
         session_id: str | None = None,
         fencing_epoch: int | None = None,
+        skill_provider_factory: Any | None = None,
     ) -> None:
         self.store_url = state_store_url
         self._introspection_llm = introspection_llm
         self.llm = llm_provider
         self.skills = skill_provider
+        self._skill_provider_factory = skill_provider_factory
         self.secrets = secrets_provider
         self.events = event_bus
         self.repo_cache = repo_cache
@@ -383,6 +385,14 @@ class Dispatcher:
     def clear_agent(self, ticket_id: str) -> None:
         self._agents.pop(ticket_id, None)
 
+    async def get_skill_provider_for_ticket(
+        self, ticket_id: str, phase: str
+    ) -> SkillProvider:
+        """Return a ticket-bound provider when a refresh factory is configured."""
+        if self._skill_provider_factory is None:
+            return self.skills
+        return await self._skill_provider_factory(ticket_id, phase)
+
     def is_handoff_blocked(self, ticket_id: str, status: str) -> bool:
         return (ticket_id, status) in self._handoff_blocked
 
@@ -636,6 +646,9 @@ class Dispatcher:
                         secrets_root=self._secrets_root,
                         vault_config=self._vault_config,
                     )
+                    from providers.secrets.git import GitSecretsProvider
+
+                    provider = GitSecretsProvider(fallback=provider)
 
         if provider is not None and self._redactor is not None:
             ticket_id = (ticket_data or {}).get("id", "")
@@ -657,6 +670,7 @@ class Dispatcher:
         llm_factory: Any | None = None,
         iterations_factory: Any | None = None,
         secrets_provider: SecretsProvider | None = None,
+        skill_provider: SkillProvider | None = None,
     ) -> Any:
         agent_type = STATUS_AGENT_MAP.get(status)
         if agent_type is None:
@@ -669,13 +683,14 @@ class Dispatcher:
             else self._get_secrets_for_ticket(ticket_data)
         )
         llm = factory(agent_type) if factory is not None else self.llm
+        selected_skills = skill_provider or self.skills
         agent: Any = None
 
         if agent_type == "triage":
             agent = TriageAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
-                skill_provider=self.skills,
+                skill_provider=selected_skills,
                 event_bus=self.events,
             )
         elif agent_type == "resource_create":
@@ -694,13 +709,13 @@ class Dispatcher:
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
-                skill_provider=self.skills,
+                skill_provider=selected_skills,
             )
         elif agent_type == "provisioning":
             agent = ProvisioningAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
-                skill_provider=self.skills,
+                skill_provider=selected_skills,
                 secrets_provider=ticket_secrets,
                 event_bus=self.events,
             )
@@ -708,7 +723,7 @@ class Dispatcher:
             agent = BenchmarkAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
-                skill_provider=self.skills,
+                skill_provider=selected_skills,
                 secrets_provider=ticket_secrets,
                 event_bus=self.events,
                 repo_cache=self.repo_cache,
@@ -717,7 +732,7 @@ class Dispatcher:
             agent = ReviewAgent(
                 llm_provider=llm,
                 state_store_url=self.store_url,
-                skill_provider=self.skills,
+                skill_provider=selected_skills,
                 event_bus=self.events,
                 repo_cache=self.repo_cache,
             )

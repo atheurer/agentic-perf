@@ -141,7 +141,9 @@ class TestProvisioningToolScoping:
         auto_complete.assert_not_awaited()
         base_run.assert_awaited_once_with(ticket["id"])
         assert any(tool.name == "install_harness" for tool in agent.tools)
-        assert "## Crucible Provisioning Notes" in agent._system_prompt(ticket)
+        assert "## Provisioning Configuration and Host Scope" in agent._system_prompt(
+            ticket
+        )
 
 
 class TestBenchmarkToolScoping:

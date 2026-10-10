@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agents.analyze.agent import AnalyzeAgent
 from agents.benchmark.agent import BenchmarkAgent
 from agents.provisioning.agent import ProvisioningAgent
 
@@ -17,6 +18,7 @@ def test_benchmark_crucible_prompt_and_tool_scope_with_default_or_explicit_harne
     agent = BenchmarkAgent.__new__(BenchmarkAgent)
     agent._skill_provider = SimpleNamespace(default_harness="crucible")
     agent.tools = [
+        SimpleNamespace(name="get_skill_context"),
         SimpleNamespace(name="read_skills"),
         SimpleNamespace(name="list_harness_docs"),
         SimpleNamespace(name="read_harness_doc"),
@@ -28,12 +30,16 @@ def test_benchmark_crucible_prompt_and_tool_scope_with_default_or_explicit_harne
     prompt = agent._system_prompt(ticket)
     agent._apply_tool_scoping(ticket)
 
-    assert "## Crucible Benchmark Execution" in prompt
-    assert "Read harness-specific documentation" in prompt
+    assert "## Benchmark Tool Contracts" in prompt
+    assert "get_skill_context" in prompt
     assert "list_harness_docs" not in prompt
     assert "read_harness_doc" not in prompt
     # Crucible's configured tool policy is applied in both cases.
-    assert [tool.name for tool in agent.tools] == ["validate_benchmark"]
+    assert [tool.name for tool in agent.tools] == [
+        "get_skill_context",
+        "get_execution_config",
+        "validate_benchmark",
+    ]
 
 
 @pytest.mark.parametrize("directives", [{}, {"harness": "crucible"}])
@@ -46,7 +52,19 @@ def test_provisioning_crucible_prompt_with_default_or_explicit_harness(
 
     prompt = agent._system_prompt(ticket)
 
-    assert "## Crucible Provisioning Notes" in prompt
+    assert "## Provisioning Configuration and Host Scope" in prompt
+    assert "get_skill_context" in prompt
+
+
+def test_analyze_crucible_prompt_uses_gateway_not_direct_skill_readers():
+    agent = AnalyzeAgent.__new__(AnalyzeAgent)
+    ticket = {"custom_fields": {"directives": {"harness": "crucible"}}}
+
+    prompt = agent._system_prompt(ticket)
+
+    assert 'get_skill_context(subject="harness/crucible"' in prompt
+    assert "bundled project-local docs" in prompt
+    assert "list_skill_docs` with the non-Crucible harness category" in prompt
 
 
 def test_non_crucible_ticket_keeps_available_harness_documentation_guidance():

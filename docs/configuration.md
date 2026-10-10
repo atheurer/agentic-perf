@@ -30,9 +30,10 @@ without a restart:
 - `agent_iterations.*` and `global_max_iterations`
 - `agent_task_timeout`
 
-All other fields (poll_interval, skills/repo-cache, secrets/vault,
-telemetry, budget, max_concurrent_agents, introspection) require a
-restart.
+Other service fields (poll_interval, legacy skills/repo-cache, secrets providers,
+telemetry, budget, max_concurrent_agents, introspection) require a restart.
+Organization gateway workers read their binding when constructing a provider;
+source content updates affect new tickets, while existing ticket pins persist.
 
 If `config.json` is malformed or unreadable at dispatch time, the
 orchestrator logs a warning and continues with the last successfully
@@ -43,10 +44,150 @@ loaded configuration.
 Use `python3 cli.py config show` to print a redacted, machine-readable JSON
 snapshot. When the orchestrator is running, this reports its persisted startup
 configuration rather than the caller's shell environment, including the
-effective private-skills and secrets paths and loaded harness policy values
-such as Crucible's `provisioning.on_existing_install`. Private skill files are
-cached for the service lifetime, so restart the orchestrator after changing
-one. Credentials, tokens, and private file contents are never included.
+effective private-skills and secrets paths, allowlisted legacy harness policy
+values, and configured organization sources. Gateway diagnostics show a local
+repository path or the Git host/ref/auth method, discovery status, discovered
+subject names/count when available, and explicit binding metadata without
+loading documents or service configuration. Git discovery is offline in this
+command and reports `not_checked` until a worker initializes the source.
+Discovery does not describe a ticket's pinned revision. Unreadable sources
+produce discovery errors, not a successfully empty subject list.
+Organization documents and settings
+are pinned for the ticket lifetime; new tickets load updated source content on
+first use. Legacy private skill files remain cached until restart. Credentials,
+tokens, organization settings, and private document contents are never included.
+
+## Organization skill gateway
+
+An administrator can configure one organization source or a named list of
+sources maintained by different teams. Subjects are discovered by layout across
+all repositories, so adding a package or service configuration does not require
+a per-subject location entry. The first integrated harness subject is
+`harness/crucible`. Use Git URLs for shared organization repositories; local
+paths remain supported for development.
+
+```json
+{
+  "skill_gateway": {
+    "organization": {
+      "sources": [
+        {
+          "id": "crucible",
+          "kind": "git",
+          "url": "ssh://git@git.example.com/performance/crucible-skills.git",
+          "ref": "main"
+        },
+        {
+          "id": "zathras",
+          "kind": "git",
+          "url": "ssh://git@git.example.com/performance/zathras-skills.git",
+          "ref": "main"
+        }
+      ]
+    }
+  }
+}
+```
+
+For HTTPS token authentication, add an `auth` object with `kind: "https-token"`,
+an optional Git username, and a `secret_ref` managed by the existing secrets
+provider. For example, use `auth: {"kind":"https-token","username":"oauth2",
+"secret_ref":"organization/agentic-perf-skills-read-token"}`. The token itself
+must not appear in the URL or config. SSH uses the service account's existing
+OpenSSH identity/agent and known-hosts configuration with strict host-key
+checking; an organization-managed SSH key can instead use
+`auth: {"kind":"ssh-key-secret","secret_ref":"..."}`. HTTP, HTTPS,
+`ssh://`, and standard `user@host:path` SSH clone URLs are accepted. HTTP and
+HTTPS sources can be read anonymously when the repository permits it. Plain
+HTTP is unencrypted and should only be used when the network is the intended
+access boundary. HTTP(S) URL credentials, query strings, and fragments are
+rejected. A private-key secret must be usable non-interactively;
+passphrase-protected keys can use the existing SSH agent.
+
+Each named source refreshes its configured branch during provider initialization
+and reads from an immutable commit checkout. Existing ticket snapshots keep
+their source revisions. `config show` reports each configured host, ref, and auth method, but
+does not connect or expose the full URL or secret reference; discovery is marked
+`not_checked` until a worker initializes the source. Git content is cached under
+service storage, outside ticket workspaces, with restricted directory
+permissions and independent of the mutable mirror. For path sources, the root
+must be absolute and accessible to workers. The repository layout is:
+
+```text
+skills/<namespace>/<name>/SKILL.md
+skills/<namespace>/<name>/skill.json
+service-config/<namespace>/<name>.json
+```
+
+Discovery combines document-package descriptors and service-configuration file
+names. Subjects can have documents only, configuration only, or both. A document
+package needs a standard `SKILL.md` and an explicit `skill.json` Markdown export
+manifest; its declared subject must match the directory layout. Metadata
+discovery does not read those files; content validation happens before use.
+
+Only manifest-listed package documents are served. The service-config tree is
+physically outside those packages and is never exposed as skill files.
+Configured organization settings
+are canonical and are not overlaid with legacy private JSON or harness defaults.
+Document-only subjects do not bind organization runtime settings, so existing
+provider defaults remain available; local legacy private JSON is selected only
+when `legacy_config: true` is explicit. An explicitly configured empty `{}`
+remains a canonical runtime configuration and does not fall back, but does not
+mean all operation requirements are satisfied. Required absent values remain
+absent for the consuming operation to validate. Configuration-only subjects
+provide service settings without organization document entrypoints.
+Approved model-facing configuration views require a registered projection
+schema; this release supplies one for `harness/crucible`. Unconfigured subjects
+retain the existing legacy behavior.
+
+The optional `organization.subjects` map supports explicit exceptions through
+`source`, `service_config`, `source_id`, `required`, and `legacy_config`. Omitted
+fields inherit the discovered binding. For example, `{"required": false}`
+changes only that subject's policy; the repository's `organization.required`
+defaults to `true`. Explicit paths override the corresponding discovered paths.
+When multiple sources contain a subject, a path or runtime-config override must
+name the affected `source_id`. An explicit `source: null` or
+`service_config: null` removes that counterpart; at least one must remain.
+
+For a temporary documents-only migration, `legacy_config: true` removes the
+discovered service configuration and selects legacy settings. Supplying both
+a non-null explicit service configuration and `legacy_config: true` is invalid. Legacy
+runtime settings are not pinned together with documents. There is no implicit
+merge of settings values from different configuration sources.
+
+A missing, unreadable, invalid, empty, or unauthenticated configured repository
+is an explicit discovery error. A required unavailable subject prevents affected actions.
+Organization documents
+and configuration are pinned together under the service-only `skill-snapshots/`
+directory on first use for the ticket lifetime. New tickets see source content
+updates; existing tickets keep their revision. Adding a document/configuration
+counterpart under the same source does not change an existing pin. Changing an
+explicit binding path, Git URL, or ref causes an error for an existing pin.
+Every configured repository must be fetchable before the service can discover
+its subjects. `required: false` applies after discovery; it does not make an
+unavailable repository optional, so a failed Git fetch or authentication attempt
+fails provider initialization even when a subject override is optional.
+
+### Multiple-source overlap and HITL
+
+The gateway preserves all applicable documents from named sources and identifies
+exact duplicates by content digest. If two sources publish the same document
+path with different content, bootstrap returns both source ids, paths, and
+digests as a potential conflict. It does not pick a winner by list order or
+claim to detect every semantic conflict. Ticket guidance can help the agent
+decide which material applies; verified software facts and mandatory org policy
+remain authoritative for their scope. When a material conflict remains
+unresolved, the agent asks for human guidance through HITL and names the sources
+and documents in question. Different service configurations for the same
+subject are a hard configuration conflict: they are not merged or exposed to the
+model, and runtime consumers stop until an administrator selects one.
+Removing a previously pinned subject's binding reports unavailable instead of
+falling back to legacy settings. No refresh command is implemented.
+
+Gateway workers read the administrator binding when they construct their
+provider. This binding is instance configuration; it is not a ticket directive
+or a user identity. User-scoped packages remain a future extension. See the
+[package and retrieval design](design-skill-gateway.md).
 
 ## Minimal Example
 
@@ -1099,11 +1240,12 @@ telemetry-export extra for the OTLP gRPC exporter.
 
 ---
 
-### `secrets` — Vault-Backed Secrets
+### `secrets` — Secret Sources
 
-Connect the secrets cascade to a Bitwarden Secrets Manager project.
-Vault layers are added behind local file layers — a file on disk
-always overrides the vault within the same tier.
+Configure an optional Bitwarden Secrets Manager project. Local files remain
+the default source. Service-only mappings can point directly to Git-backed
+files; those references carry their own repository location and need no
+additional instance-level source configuration.
 
 ```json
 {
@@ -1121,20 +1263,28 @@ always overrides the vault within the same tier.
 }
 ```
 
+In service-only configuration, refer to a repository file with a direct URI,
+such as `git-secret+ssh://git@git.example.com/team/credentials.git?ref=main&path=registry/auth.json`.
+Each URI identifies its Git repository, branch, and file path. Optional
+`auth_kind` and `auth_ref` query parameters select an HTTPS token or SSH private
+key through the local or Bitwarden secret provider. No separate Git repository
+location needs to be added to this configuration.
+
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `organization_id` | string | yes | Bitwarden organization UUID |
-| `shared_project_id` | string | yes | SM project for deployment-shared secrets |
-| `group_project_ids` | dict | no | Maps group names to SM project UUIDs for multi-user mode |
-| `server_url` | string | no | Self-hosted server URL (omit for bitwarden.com cloud) |
-| `cache_ttl_seconds` | int | no | In-memory cache TTL in seconds (default: `60`) |
+| `bitwarden.organization_id` | string | yes | Bitwarden organization UUID |
+| `bitwarden.shared_project_id` | string | yes | SM project for deployment-shared secrets |
+| `bitwarden.group_project_ids` | dict | no | Maps group names to SM project UUIDs for multi-user mode |
+| `bitwarden.server_url` | string | no | Self-hosted server URL (omit for bitwarden.com cloud) |
+| `bitwarden.cache_ttl_seconds` | int | no | In-memory cache TTL in seconds (default: `60`) |
 
-Requires `pip install agentic-perf[bitwarden]` and a machine account
+Bitwarden requires `pip install agentic-perf[bitwarden]` and a machine account
 access token (env `AGENTIC_PERF_BWS_TOKEN` or file
 `~/.agentic-perf/secrets/bitwarden/access-token`).
 
-When this section is absent, vault layers are never constructed.
-See [Secrets Management](secrets.md) for full details.
+When `bitwarden` is absent, vault layers are never constructed. Git-backed
+service references use the local or Bitwarden provider for optional bootstrap
+credentials. See [Secrets Management](secrets.md) for full details.
 
 ---
 

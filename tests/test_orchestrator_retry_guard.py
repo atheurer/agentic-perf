@@ -506,9 +506,17 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
     dispatcher.try_claim.return_value = False
     dispatcher.shutdown = AsyncMock()
     dispatcher._trace_contexts = {}
-    monkeypatch.setattr(main, "Dispatcher", lambda *_args, **_kwargs: dispatcher)
+    dispatcher_options = {}
+
+    def make_dispatcher(*_args, **kwargs):
+        dispatcher_options.update(kwargs)
+        return dispatcher
+
+    monkeypatch.setattr(main, "Dispatcher", make_dispatcher)
     monkeypatch.setattr(main, "RepoCache", lambda: object())
-    monkeypatch.setattr(main, "build_skill_provider", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        main, "build_skill_provider_async", AsyncMock(return_value=object())
+    )
     monkeypatch.setattr(main, "LocalSecretsProvider", lambda: object())
     monkeypatch.setattr(
         main,
@@ -621,6 +629,18 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
     try:
         await asyncio.wait_for(second_poll.wait(), timeout=5)
         assert not task.done()
+        provider_factory = dispatcher_options["skill_provider_factory"]
+        assert callable(provider_factory)
+        assert (
+            main.build_skill_provider_async.await_args_list[0].kwargs[
+                "defer_organization_sources"
+            ]
+            is True
+        )
+        await provider_factory("PERF-no-git-ticket", "benchmark")
+        assert main.build_skill_provider_async.await_args.kwargs["ticket_id"] == (
+            "PERF-no-git-ticket"
+        )
         dispatcher.try_claim.assert_any_call("PERF-healthy", "executing_benchmark")
         assert client.patch.await_count >= 1
         if failure_path != "recovery_patch":
@@ -754,7 +774,9 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     client = Client()
     monkeypatch.setattr(main, "Dispatcher", lambda *_args, **_kwargs: dispatcher)
     monkeypatch.setattr(main, "RepoCache", lambda: object())
-    monkeypatch.setattr(main, "build_skill_provider", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        main, "build_skill_provider_async", AsyncMock(return_value=object())
+    )
     monkeypatch.setattr(main, "LocalSecretsProvider", lambda: object())
     monkeypatch.setattr(
         main,

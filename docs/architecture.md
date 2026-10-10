@@ -1220,16 +1220,16 @@ verdicts, and operational directives.
 
 ## Skill Documentation
 
-The `skills/` directory contains per-harness documentation that agents read
-at runtime through `list_harness_docs` and `read_harness_doc` tools:
+Crucible guidance is retrieved through the subject-scoped skill gateway.
+Administrator-configured organization documents and service configuration
+are private; software references remain upstream or controller sourced. See
+[skill gateway design](design-skill-gateway.md). Other harnesses retain local
+`skills/` documents through `read_skills`; repository tools serve repository docs:
 
 ```
 skills/
   crucible/
-    cdm-query-guide.md     # How to query the CommonDataModel for results
-    kube-endpoints.md       # Kubernetes endpoint configuration
-    run-file-pitfalls.md    # Common run-file mistakes and solutions
-    userenv-guide.md        # User environment selection
+    README.md              # Generic subject gateway pointer
   zathras/
     local-config-guide.md   # Local execution configuration
     scenario-construction.md # Building test scenarios

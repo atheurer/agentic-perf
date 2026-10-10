@@ -140,8 +140,21 @@ class TestProvisioningSkillTools:
             assert res[0]["filename"] == "host-tuning.md"
             assert res[1]["found"] is True
             assert res[1]["filename"] == "network-manager.md"
-            assert res[2]["found"] is True
+            assert res[2]["found"] is False
             assert res[2]["filename"] == "run-file-pitfalls.md"
+            assert "get_skill_context" in res[2]["message"]
+
+    @pytest.mark.asyncio
+    async def test_crucible_skill_listing_routes_to_gateway(
+        self, mock_skills_dir: Path
+    ):
+        with patch("agents.provisioning.server._SKILLS_DIR", mock_skills_dir):
+            result = json.loads(
+                await _provisioning_server().list_skill_docs("crucible")
+            )
+        assert result["found"] is False
+        assert "get_skill_context" in result["message"]
+        assert "files" not in result
 
 
 class TestBenchmarkSkillAndDocTools:
@@ -161,8 +174,9 @@ class TestBenchmarkSkillAndDocTools:
             )
             res = json.loads(res_str)
             assert len(res) == 1
-            assert res[0]["found"] is True
+            assert res[0]["found"] is False
             assert res[0]["filename"] == "run-file-pitfalls.md"
+            assert "get_skill_context" in res[0]["message"]
 
     @pytest.mark.asyncio
     async def test_read_skills_batch(self, mock_skills_dir: Path):
@@ -177,7 +191,8 @@ class TestBenchmarkSkillAndDocTools:
             res_str = await _benchmark_server().read_skills(docs)
             res = json.loads(res_str)
             assert len(res) == 2
-            assert res[0]["found"] is True
+            assert res[0]["found"] is False
+            assert "get_skill_context" in res[0]["message"]
             assert res[1]["found"] is True
 
     @pytest.mark.asyncio
@@ -186,14 +201,18 @@ class TestBenchmarkSkillAndDocTools:
             patch("agents.benchmark.server._repo_cache", mock_repo_cache),
             patch("agents.benchmark.server._ensure_init", new_callable=AsyncMock),
         ):
-            # Exact path with docs/
+            listed = json.loads(await _benchmark_server().list_harness_docs("crucible"))
+            assert listed["found"] is False
+            assert "get_skill_context" in listed["message"]
+
+            # Crucible documentation is no longer read through RepoCache.
             res1 = json.loads(
                 await _benchmark_server().read_harness_doc(
                     "crucible", "docs/how-run-files-work.md"
                 )
             )
-            assert res1["found"] is True
-            assert "How Run Files Work" in res1["content"]
+            assert res1["found"] is False
+            assert "get_skill_context" in res1["message"]
 
             # Missing docs/
             res2 = json.loads(
@@ -201,8 +220,8 @@ class TestBenchmarkSkillAndDocTools:
                     "crucible", "how-run-files-work.md"
                 )
             )
-            assert res2["found"] is True
-            assert "How Run Files Work" in res2["content"]
+            assert res2["found"] is False
+            assert "get_skill_context" in res2["message"]
 
             # Redundant harness prefix
             res3 = json.loads(
@@ -210,7 +229,8 @@ class TestBenchmarkSkillAndDocTools:
                     "crucible", "crucible/docs/how-run-files-work.md"
                 )
             )
-            assert res3["found"] is True
+            assert res3["found"] is False
+            assert "get_skill_context" in res3["message"]
 
             # Empty harness with full path
             res4 = json.loads(
@@ -218,7 +238,8 @@ class TestBenchmarkSkillAndDocTools:
                     "", "crucible/docs/how-run-files-work.md"
                 )
             )
-            assert res4["found"] is True
+            assert res4["found"] is False
+            assert "get_skill_context" in res4["message"]
 
 
 class TestRepoCacheReadFile:
@@ -304,8 +325,21 @@ class TestReviewDocTools:
                 "crucible", "how-run-files-work.md"
             )
             res = json.loads(res_str)
-            assert res["status"] == "ok"
-            assert "How Run Files Work" in res["content"]
+            assert res["found"] is False
+            assert "get_skill_context" in res["message"]
+
+    @pytest.mark.asyncio
+    async def test_list_harness_docs_routes_crucible_to_gateway(
+        self, mock_repo_cache: RepoCache
+    ):
+        with (
+            patch("agents.review.server._repo_cache", mock_repo_cache),
+            patch("agents.review.server._ensure_init", new_callable=AsyncMock),
+        ):
+            result = json.loads(await _review_server().list_harness_docs("crucible"))
+        assert result["found"] is False
+        assert "get_skill_context" in result["message"]
+        assert "docs" not in result
 
 
 class TestAnalyzeAndTriageSkillTools:
@@ -337,6 +371,46 @@ class TestAnalyzeAndTriageSkillTools:
             assert res[0]["filename"] == "host-tuning.md"
             assert "Host Tuning Guide" in res[0]["content"]
 
+    @pytest.mark.asyncio
+    async def test_analyze_crucible_skill_listing_routes_to_gateway(
+        self, mock_skills_dir: Path
+    ):
+        from agents.analyze.server import list_skill_docs
+
+        with patch("agents.analyze.server.SKILLS_DIR", mock_skills_dir):
+            result = json.loads(await list_skill_docs("crucible"))
+        assert result["found"] is False
+        assert "get_skill_context" in result["message"]
+        assert "files" not in result
+
+    @pytest.mark.asyncio
+    async def test_analyze_gateway_uses_analyze_phase(self, monkeypatch):
+        import agents.analyze.server as analyze_server
+
+        provider = object()
+        calls = {}
+
+        async def get_provider():
+            return provider
+
+        async def gateway(actual_provider, **kwargs):
+            calls["provider"] = actual_provider
+            calls.update(kwargs)
+            return '{"found": true}'
+
+        monkeypatch.setattr(analyze_server, "_get_skill_provider", get_provider)
+        monkeypatch.setattr(analyze_server, "skill_context_gateway", gateway)
+
+        result = await analyze_server.get_skill_context(
+            subject="harness/crucible", benchmark="uperf"
+        )
+
+        assert result == '{"found": true}'
+        assert calls["provider"] is provider
+        assert calls["phase"] == "analyze"
+        assert calls["agent_name"] == "analyze-agent"
+        assert calls["subject"] == "harness/crucible"
+
 
 class TestReadSkillDocumentsBatch:
     def test_batch_returns_all_results(self, mock_skills_dir: Path):
@@ -348,8 +422,9 @@ class TestReadSkillDocumentsBatch:
         assert len(results) == 2
         assert results[0]["found"] is True
         assert results[0]["filename"] == "host-tuning.md"
-        assert results[1]["found"] is True
+        assert results[1]["found"] is False
         assert results[1]["filename"] == "run-file-pitfalls.md"
+        assert "get_skill_context" in results[1]["message"]
 
     def test_batch_category_alias(self, mock_skills_dir: Path):
         docs = [{"category": "general", "filename": "host-tuning.md"}]
@@ -417,3 +492,5 @@ class TestReadSkillDocumentsBatch:
             "network-manager.md",
             "host-tuning.md",
         ]
+        assert results[0]["found"] is False
+        assert "get_skill_context" in results[0]["message"]

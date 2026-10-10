@@ -36,11 +36,17 @@ from agents.server_utils import (
     _public_context_result,
     build_crucible_context_gateway,
     build_repo_cache,
-    build_skill_provider,
+    build_skill_provider_async,
     build_ssh_from_ticket,
     controller_context_gateway,
     read_skill_documents,
     tool_progress,
+)
+from agents.skill_gateway import (
+    SKILL_GATEWAY_TOOL_DESCRIPTION,
+    organization_manages_harness,
+    skill_config_view,
+    skill_context_gateway,
 )
 from providers.execution import (
     AuditedFilesystem,
@@ -838,7 +844,7 @@ async def _ensure_init():
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = build_skill_provider()
+    _skill_provider = await build_skill_provider_async(skill_phase="benchmark")
     _crucible_context = build_crucible_context_gateway(catalog_only=False)
     try:
         _repo_cache = await build_repo_cache()
@@ -1360,6 +1366,42 @@ def _controller_snapshot_documents(
 # ---------------------------------------------------------------------------
 
 
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    benchmark: str = "",
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+) -> str:
+    """Retrieve guidance through server-owned subject and source bindings."""
+    await _ensure_init()
+    response = await skill_context_gateway(
+        _skill_provider,
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="benchmark-agent",
+        phase="benchmark",
+        ssh=_ssh,
+        controller_host=_controller_host(),
+        subject=subject,
+        benchmark=benchmark,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+    )
+    if subject == "harness/crucible":
+        return _with_crucible_runfile_contract(response)
+    return response
+
+
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
     """Read local skill documents for harnesses that still use the legacy fallback."""
@@ -1371,6 +1413,13 @@ async def read_skills(docs: list[dict]) -> str:
 async def list_harness_docs(harness: str) -> str:
     """List documentation files available for a benchmark harness. Returns file paths and sizes. Use this to discover what reference material is available before constructing a run file."""
     await _ensure_init()
+    if harness == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
     if not _repo_cache:
         return json.dumps({"docs": [], "message": "No repo cache configured"})
     docs = _repo_cache.list_docs(harness, subdirs=["docs", "config"])
@@ -1385,10 +1434,17 @@ async def list_harness_docs(harness: str) -> str:
 async def read_harness_doc(harness: str, doc_path: str) -> str:
     """Read a documentation file from a benchmark harness repository (e.g. harness='crucible', doc_path='docs/how-run-files-work.md'). Use this to learn about run-file format, endpoint structure, benchmark parameters, or any other harness-specific details. Call list_harness_docs first to see available files."""
     await _ensure_init()
-    if not _repo_cache:
-        return json.dumps({"found": False, "message": "No repo cache configured"})
     if not harness and "/" in doc_path:
         harness, doc_path = doc_path.strip().lstrip("/").split("/", 1)
+    if harness == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
+    if not _repo_cache:
+        return json.dumps({"found": False, "message": "No repo cache configured"})
     content = _repo_cache.read_file(harness, doc_path)
     if content is None:
         return json.dumps(
@@ -1404,19 +1460,25 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
 
 @mcp.tool()
 async def get_execution_config(harness_name: str) -> str:
-    """Get the benchmark harness's execution configuration from private skills. Returns controller requirements, pre-run steps, run command, endpoint type, run file format, and defaults. The harness_name should be the harness that owns the benchmark (e.g., 'crucible' or 'zathras')."""
+    """Get legacy execution settings for a harness. For Crucible, read the approved execution configuration view from get_skill_context instead. Deterministic action tools consume service-only commands."""
     await _ensure_init()
-    if harness_name == "crucible":
+    if harness_name == "crucible" or organization_manages_harness(
+        _skill_provider, harness_name
+    ):
+        try:
+            execution = await skill_config_view(
+                _skill_provider, harness_name, "execution", "benchmark"
+            )
+        except ValueError:
+            return json.dumps(
+                {
+                    "harness": harness_name,
+                    "found": False,
+                    "reason": "configuration_view_unavailable",
+                }
+            )
         return json.dumps(
-            {
-                "harness": "crucible",
-                "found": False,
-                "message": (
-                    "Crucible execution guidance is controller-sourced context. "
-                    "Use get_crucible_benchmark_context; use action tools for "
-                    "runtime discovery, validation, and execution."
-                ),
-            }
+            {"harness": harness_name, "found": bool(execution), **execution}
         )
     config = await _skill_provider.get_all_private_config(harness_name)
     execution = config.get("execution", {})
@@ -1440,18 +1502,7 @@ async def get_execution_config(harness_name: str) -> str:
         "run_file_format": execution.get("run_file_format", "json"),
         "results_dir_pattern": execution.get("results_dir_pattern", ""),
     }
-    if harness_name == "crucible":
-        # Userenv availability belongs to the running Crucible controller.
-        # Never propagate a stale/static value from private metadata.
-        result["userenv_discovery"] = execution.get(
-            "userenv_discovery",
-            {
-                "required": True,
-                "command": "crucible userenvs list",
-                "source": "running_controller",
-            },
-        )
-    elif "default_userenv" in execution:
+    if "default_userenv" in execution:
         result["default_userenv"] = execution["default_userenv"]
     return json.dumps(result)
 
@@ -1468,7 +1519,7 @@ async def get_runfile_schema(harness: str = "crucible") -> str:
                 "harness": "crucible",
                 "message": (
                     "The Crucible run-file schema is controller-sourced context. "
-                    'Use get_crucible_benchmark_context(operation="list" or '
+                    'Use get_skill_context(subject="harness/crucible", operation="bootstrap" or '
                     '"read") to retrieve it.'
                 ),
             }
@@ -1501,7 +1552,7 @@ async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str
                 "harness": "crucible",
                 "message": (
                     "Crucible benchmark metadata is controller-sourced context. "
-                    "Use get_crucible_benchmark_context to read multiplex.json "
+                    "Use get_skill_context(subject='harness/crucible') to read multiplex.json "
                     "and related files."
                 ),
             }
@@ -1528,7 +1579,6 @@ async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str
     )
 
 
-@mcp.tool(name="get_crucible_benchmark_context")
 async def _get_crucible_benchmark_context_tool(
     operation: str = "bootstrap",
     path: str = "",
@@ -2125,7 +2175,7 @@ async def get_crucible_benchmark_context(*args, **kwargs) -> str:
     """Compatibility wrapper for direct in-process callers only.
 
     This wrapper is intentionally not registered with MCP. Agents receive the
-    smaller generic schema from ``_get_crucible_benchmark_context_tool``.
+    subject-scoped schema from ``get_skill_context``.
     """
     return await _legacy_get_crucible_benchmark_context(*args, **kwargs)
 
@@ -2143,7 +2193,7 @@ async def get_tool_params(tool: str, harness: str = "crucible") -> str:
                 "harness": "crucible",
                 "message": (
                     "Crucible tool metadata is controller-sourced context. "
-                    "Use get_crucible_benchmark_context to read the tool "
+                    "Use get_skill_context(subject='harness/crucible') to read the tool "
                     "metadata and parameter files."
                 ),
             }
@@ -2201,7 +2251,7 @@ async def get_example_runfile(
                 "endpoint_type": ep_type,
                 "message": (
                     "Crucible examples are controller-sourced context. Use "
-                    "get_crucible_benchmark_context to discover and read them."
+                    "get_skill_context(subject='harness/crucible') to discover and read them."
                 ),
             }
         )

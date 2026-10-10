@@ -351,7 +351,10 @@ class TestDispatcherSecrets:
 
         dispatcher, _ = self._make_dispatcher(secrets_root, user_store)
         secrets = dispatcher._get_secrets_for_ticket({"created_by": "alice"})
-        assert isinstance(secrets, CascadingSecretsProvider)
+        from providers.secrets.git import GitSecretsProvider
+
+        assert isinstance(secrets, GitSecretsProvider)
+        assert isinstance(secrets._fallback, CascadingSecretsProvider)
 
     def test_returns_shared_for_unclaimed(self, secrets_root):
         from state_store.identity import UserStore
@@ -415,7 +418,22 @@ class TestDispatcherSecrets:
 
         dispatcher, _ = self._make_dispatcher(secrets_root, user_store)
         secrets = dispatcher._get_secrets_for_ticket({"created_by": "alice"})
-        assert isinstance(secrets, CascadingSecretsProvider)
+        from providers.secrets.git import GitSecretsProvider
+
+        assert isinstance(secrets, GitSecretsProvider)
+        assert isinstance(secrets._fallback, CascadingSecretsProvider)
+
+    def test_user_cascade_supports_direct_git_secret_references(self, secrets_root):
+        from providers.secrets.git import GitSecretsProvider
+        from state_store.identity import UserStore
+
+        user_store = UserStore(persist_path=secrets_root / "users.json")
+        user_store.create_user("alice")
+        dispatcher, _ = self._make_dispatcher(secrets_root, user_store)
+        secrets = dispatcher._get_secrets_for_ticket({"created_by": "alice"})
+
+        assert isinstance(secrets, GitSecretsProvider)
+        assert isinstance(secrets._fallback, CascadingSecretsProvider)
 
     async def test_shared_layer_excludes_users_and_groups(self, secrets_root):
         from state_store.identity import UserStore
@@ -1026,6 +1044,10 @@ class TestDispatcherVaultConfig:
         cascade = dispatcher._get_secrets_for_ticket(
             {"created_by": "alice"},
         )
+        from providers.secrets.git import GitSecretsProvider
+
+        assert isinstance(cascade, GitSecretsProvider)
+        cascade = cascade._fallback
         assert isinstance(cascade, CascadingSecretsProvider)
         labels = [label for label, _ in cascade._layers]
         assert "vault:shared" in labels
@@ -1048,6 +1070,10 @@ class TestDispatcherVaultConfig:
         cascade = dispatcher._get_secrets_for_ticket(
             {"created_by": "alice"},
         )
+        from providers.secrets.git import GitSecretsProvider
+
+        assert isinstance(cascade, GitSecretsProvider)
+        cascade = cascade._fallback
         assert isinstance(cascade, CascadingSecretsProvider)
         labels = [label for label, _ in cascade._layers]
         assert "vault:shared" not in labels

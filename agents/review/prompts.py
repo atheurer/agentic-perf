@@ -63,23 +63,17 @@ Check the ticket's harness_name field to identify which benchmark harness was us
 
 ## Step 2: Learn How to Retrieve Results
 
-Call get_review_config with the harness name. This returns harness-specific guidance
-on where results are stored and how to access them. Different harnesses store results
-differently — some use APIs, others store files on disk. The review config tells you
-which approach to use.
+For Crucible, bootstrap `get_skill_context(subject="harness/crucible")` and
+read the returned configuration view named `review`, along with the applicable
+review entrypoints. Do not call `get_review_config` for Crucible. For other
+harnesses, call `get_review_config` with the harness name; it returns guidance
+on where results are stored and how to access them.
 
-For Crucible, first use `get_crucible_benchmark_context(operation="bootstrap")`
-and read the returned `AGENTS.md`, following its documentation pointers
-iteratively. When it identifies the `subprojects/benchmarks/` layout, use the
-known benchmark name to read `subprojects/benchmarks/<benchmark>/AGENTS.md`,
-README/CLAUDE, and result-related metadata at controller-relative paths. If a
-needed document is not identified, use `operation="search"` to discover
-controller-relative candidate paths, then read selected paths separately.
-Search results include `size_bytes`. Reads return `document.content` in pages of
-up to 16384 bytes; continue with `next_offset_bytes`, keeping the same path and
-`max_bytes`. Do not ask the gateway to interpret repository metadata,
-assume a fixed hierarchy, or bypass it through a repository-cache path. For other harnesses,
-`list_harness_docs`/`read_harness_doc` remain compatible.
+For Crucible, read the review entrypoints and source documentation through the
+skill gateway. Follow the returned pointers for the selected benchmark and
+its results. Do not use the public Crucible skill directory or repository
+cache as an alternative source. For other harnesses,
+`list_harness_docs`/`read_harness_doc` remain available.
 
 ## Step 3: Retrieve Results
 
@@ -100,10 +94,10 @@ raw files. Use `read_run_results` (reading mode, with file_path) to read
 specific files — it auto-decompresses .xz files and defaults to 4000 bytes.
 Request more if needed.
 
-**Always read the harness skill file** (via `read_skills`) before deciding
-how to retrieve results. For Crucible, use the gateway for source documentation
-and use the controller/artifact tools for run evidence. The skill file remains
-available as a compatibility overlay and does not override phase-effective source.
+Read retrieval guidance before choosing a method. For Crucible, use the
+gateway for guidance and source documentation, and controller/artifact tools
+for run evidence. For other harnesses, read the available harness skill files
+with `read_skills`.
 
 **DIRECTORY DISCOVERY & CACHING MANDATE:** You must discover the run results
 directory **exactly once** at the beginning of the review phase. Once located,
@@ -112,13 +106,13 @@ Running expensive `find` or directory search commands repeatedly is highly
 inefficient and strictly prohibited.
 
 For harnesses that provide a structured API (indicated in the review config),
-you may also have access to tools like get_run_summary or cdm_api_request.
+you may also have access to tools like get_run_summary or cdm_api_requests.
 The review config will tell you when these are applicable.
 
 ### Scratchpad Workspace & Large Tool Outputs
 When tools return large outputs (> 4 KB by default, configurable via `custom_fields.tool_spill_threshold`), they are automatically saved into your ticket workspace as files (e.g. `workspace://cdm_api_requests_1.json`).
 
-- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON tool calls (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`) to receive the exact filtered slice immediately in the same turn without multi-step querying. A tool that declares `jq_filter`, such as `generate_chart_from_workspace`, consumes it as an input transformation instead.
+- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON tool calls (e.g., `cdm_api_requests` or `get_hardware_topology`) to receive the exact filtered slice immediately in the same turn without multi-step querying. A tool that declares `jq_filter`, such as `generate_chart_from_workspace`, consumes it as an input transformation instead.
 - **JSON files**: Use `jq_file_from_workspace` to extract nested keys or slice array items from already-spilled files. To paginate through large arrays, use array slice ranges: `filter=".values[0:50]"` for the first chunk, then `filter=".values[50:100]"` for the next chunk, skipping the previous data.
 - **Text & Log files**: Use `read_file_from_workspace` to paginate. For a byte-truncated line range, keep the same `start_line` and `max_lines` and continue with `offset_bytes=next_offset_bytes` until it is null. Then use `start_line=next_start_line` and `offset_bytes=0` (or omit it) to request the following line range.
 - **Searching**: Use `grep_file_from_workspace` to jump directly to errors, drops, or specific pattern matches in large log files.
@@ -149,10 +143,20 @@ Once you have the benchmark data:
 2. Evaluate the result level — is performance where you'd expect it, or is
    something clearly limiting it?
 3. Read and follow the harness-specific methodology and query guidelines from the
-   harness skill files (via `read_skills`) to investigate potential bottlenecks and root causes.
+   skill gateway for Crucible, or the available harness skill files via
+   `read_skills` for other harnesses, to investigate potential bottlenecks and
+   root causes.
 4. Proceed directly to Step 5 (submit your review).
 
-Do NOT call request_clarification.
+Do not call request_clarification for ordinary review judgments; use an
+inconclusive verdict when evidence is insufficient. Exception: if scoped
+context sources provide materially conflicting instructions that cannot be
+resolved using the ticket's task-specific guidance, verified software behavior,
+and mandatory organization policy, call request_clarification before submitting.
+This includes unresolved conflicts between sources at the same level; locality
+does not break ties between peer sources, including organization sources.
+Identify the conflicting source ids and document paths, and ask only for the
+decision needed to continue.
 
 **Verdict rules:**
 - **Use inconclusive when the available evidence is insufficient
