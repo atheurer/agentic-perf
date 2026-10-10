@@ -1561,13 +1561,13 @@ async def _stop_ticket(
 _benchmark_catalog_provider: Any | None = None
 
 
-def _get_benchmark_catalog_provider() -> Any:
+async def _get_benchmark_catalog_provider() -> Any:
     """Build the read-only capability provider lazily for chat discovery."""
     global _benchmark_catalog_provider
     if _benchmark_catalog_provider is None:
-        from agents.server_utils import build_skill_provider
+        from agents.server_utils import build_skill_provider_async
 
-        _benchmark_catalog_provider = build_skill_provider(
+        _benchmark_catalog_provider = await build_skill_provider_async(
             resolve_source=False,
             catalog_only=True,
         )
@@ -1579,7 +1579,7 @@ async def _list_available_benchmarks(params: dict[str, Any]) -> str:
     from providers.skills.catalog import list_benchmark_catalog
 
     entries, unavailable = await list_benchmark_catalog(
-        _get_benchmark_catalog_provider()
+        await _get_benchmark_catalog_provider()
     )
     harness = str(params.get("harness", "")).casefold()
     query = str(params.get("query", "")).casefold()

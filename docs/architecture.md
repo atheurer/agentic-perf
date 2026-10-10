@@ -171,6 +171,12 @@ agents. `awaiting_customer_guidance` resumes to the previous status when the
 user replies. The `planning_investigation` agent is a stub that auto-advances;
 all other investigation loop agents are fully implemented.
 
+If an agent finishes without advancing the ticket from its dispatched status,
+the orchestrator backs off and retries that stage up to five times. This
+includes `triage_pending`; exhausted retries pause automatic dispatch and add a
+ticket comment for human review. Moving the ticket to another status clears
+the retry limit.
+
 ### Analysis Agent (Data-First Investigation)
 
 The analysis agent investigates performance questions by querying
@@ -802,8 +808,11 @@ but not lease management tools (`jmp_create_lease`,
   `awaiting_hardware`, any existing Jumpstarter lease is
   released. This handles the case where a user sends a ticket
   back to resource acquisition after a provisioning failure.
-- **Lease sweep:** Each poll cycle, the orchestrator checks for
-  orphaned leases whose tickets have reached a terminal status.
+- **Lease sweep:** When Jumpstarter is configured, the orchestrator checks
+  for orphaned leases at the configured
+  `jumpstarter_lease_sweep_interval_seconds` interval (60 seconds by
+  default), independently of ticket polling. A value of `0` disables the
+  sweep. It releases leases whose tickets have reached a terminal status.
   This is a failsafe for leases not cleaned up by teardown
   (crashed orchestrators, skipped teardown, manual closure).
   The normal lease release path is the resource agent's
@@ -1220,16 +1229,16 @@ verdicts, and operational directives.
 
 ## Skill Documentation
 
-The `skills/` directory contains per-harness documentation that agents read
-at runtime through `list_harness_docs` and `read_harness_doc` tools:
+Crucible guidance is retrieved through the subject-scoped skill gateway.
+Administrator-configured organization documents and service configuration
+are private; software references remain upstream or controller sourced. See
+[skill gateway design](design-skill-gateway.md). Other harnesses retain local
+`skills/` documents through `read_skills`; repository tools serve repository docs:
 
 ```
 skills/
   crucible/
-    cdm-query-guide.md     # How to query the CommonDataModel for results
-    kube-endpoints.md       # Kubernetes endpoint configuration
-    run-file-pitfalls.md    # Common run-file mistakes and solutions
-    userenv-guide.md        # User environment selection
+    README.md              # Generic subject gateway pointer
   zathras/
     local-config-guide.md   # Local execution configuration
     scenario-construction.md # Building test scenarios

@@ -78,11 +78,36 @@ def test_no_host_mounts_directive_removes_the_key_from_nested_runfile(monkeypatc
     assert original["remotes"][0]["config"]["settings"]["host-mounts"] == []
 
 
+def test_controller_host_prefers_ssh_address_to_assigned_address(monkeypatch):
+    import agents.benchmark.server as srv
+
+    monkeypatch.setattr(
+        srv,
+        "_ticket",
+        {
+            "custom_fields": {
+                "ssh_hardware_ips": {"controller": "public-controller"},
+                "assigned_hardware_ips": {"controller": "private-controller"},
+            }
+        },
+    )
+
+    assert srv._controller_host() == "public-controller"
+
+
 @pytest.mark.asyncio
 async def test_get_execution_config_crucible(handlers):
     result = await handlers["get_execution_config"](harness_name="crucible")
-    assert result["found"] is False
-    assert "controller-sourced context" in result["message"]
+    assert result["found"] is True
+    assert result["controller_required"] is True
+    assert result["endpoint_type"] == "remotehosts"
+    assert result["endpoint_user"] == "root"
+    assert result["default_userenv"] == "fedora42"
+    assert result["default_osruntime"] == "podman"
+    assert result["run_file_format"] == "json"
+    assert result["results_dir_pattern"] == "/var/lib/crucible/run/*"
+    assert "run_command" not in result
+    assert "pre_run" not in result
 
 
 @pytest.mark.asyncio

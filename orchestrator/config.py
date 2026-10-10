@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from paths import CONFIG_PATH, get_instance_name, resolve_state_store
 
@@ -102,6 +103,9 @@ class OrchestratorConfig:
             or _env_float("POLL_INTERVAL")
             or cfg.get("poll_interval")
             or 3.0
+        )
+        self.jumpstarter_lease_sweep_interval_seconds: float = float(
+            cfg.get("jumpstarter_lease_sweep_interval_seconds", 60.0)
         )
         lease_cfg = cfg.get("orchestrator_lease", {})
         self.leader_lease_ttl_seconds = float(
@@ -449,6 +453,224 @@ def _redacted_private_skills(skills_dir: Path) -> dict:
     return {"path": str(skills_dir), "directory_exists": True, "files": files}
 
 
+def _redacted_skill_gateway(raw_config: dict) -> dict:
+    """Describe bindings and discovery without opening private content files."""
+    gateway = raw_config.get("skill_gateway", {})
+    if not isinstance(gateway, dict):
+        return {"configured": True, "valid_structure": False}
+    organization = gateway.get("organization", {})
+    if not isinstance(organization, dict):
+        return {"configured": True, "valid_structure": False}
+    subjects = organization.get("subjects", {})
+    if not isinstance(subjects, dict):
+        return {"configured": True, "valid_structure": False}
+
+    bindings: dict[str, dict] = {}
+    for subject, binding in subjects.items():
+        if not isinstance(subject, str) or not isinstance(binding, dict):
+            continue
+        safe_binding: dict = {}
+        # Missing override fields inherit discovery; do not report invented
+        # defaults that would imply a different effective binding.
+        if binding.get("source") is not None:
+            safe_binding["source"] = _redacted_skill_source(binding["source"])
+        if binding.get("service_config") is not None:
+            service_config = binding["service_config"]
+            safe_service_config: dict = {"configured": service_config is not None}
+            if isinstance(service_config, dict):
+                service_path = service_config.get("path")
+                if isinstance(service_path, str) and Path(service_path).is_absolute():
+                    safe_service_config["path"] = service_path
+            safe_binding["service_config"] = safe_service_config
+        for key in ("required", "legacy_config"):
+            if key in binding:
+                value = binding[key]
+                safe_binding[key] = value if isinstance(value, bool) else None
+        if isinstance(binding.get("source_id"), str):
+            safe_binding["source_id"] = binding["source_id"]
+        bindings[subject] = safe_binding
+
+    required = organization.get("required", True)
+    try:
+        from providers.skills.gateway import organization_source_descriptors
+
+        descriptors = organization_source_descriptors(organization)
+    except (TypeError, ValueError):
+        descriptors = []
+        source_config_invalid = "source" in organization or "sources" in organization
+    else:
+        source_config_invalid = False
+    safe_organization: dict = {
+        "required": required if isinstance(required, bool) else None,
+        "subjects": bindings,
+    }
+    if descriptors:
+        source_reports = []
+        discovered_subjects: dict[str, dict[str, Any]] = {}
+        for descriptor in descriptors:
+            source_id = descriptor["id"]
+            raw_source = descriptor["source"]
+            discovery = _redacted_skill_discovery(
+                raw_source, required, source_id=source_id
+            )
+            source_reports.append(
+                {
+                    "id": source_id,
+                    "source": _redacted_skill_source(raw_source),
+                    "discovery": discovery,
+                }
+            )
+            for subject, detail in discovery.get("subjects", {}).items():
+                item = discovered_subjects.setdefault(
+                    subject,
+                    {
+                        "sources": [],
+                        "document_package_discovered": False,
+                        "service_config_discovered": False,
+                    },
+                )
+                item["sources"].append(source_id)
+                for key in ("document_package_discovered", "service_config_discovered"):
+                    item[key] = item[key] or detail.get(key, False)
+        safe_organization["sources"] = source_reports
+        safe_organization["discovery"] = {
+            "status": "discovered"
+            if all(
+                item["discovery"].get("status") == "discovered"
+                for item in source_reports
+            )
+            else "partially_checked"
+            if any(
+                item["discovery"].get("status") == "discovered"
+                for item in source_reports
+            )
+            else "not_checked"
+            if all(
+                item["discovery"].get("status") == "not_checked"
+                for item in source_reports
+            )
+            else "error",
+            "source_count": len(source_reports),
+            "subject_count": len(discovered_subjects),
+            "subjects": discovered_subjects,
+        }
+        # Preserve the old short form in diagnostics for existing one-source
+        # configurations while exposing every source for multi-repo setups.
+        if len(source_reports) == 1 and "source" in organization:
+            safe_organization["source"] = source_reports[0]["source"]
+    elif source_config_invalid:
+        safe_organization["discovery"] = {
+            "status": "error",
+            "error": {
+                "code": "invalid_config",
+                "message": "Invalid organization source list",
+            },
+        }
+    else:
+        safe_organization["discovery"] = {"status": "not_configured"}
+    return {
+        "configured": bool(descriptors) or bool(bindings) or source_config_invalid,
+        "organization": safe_organization,
+    }
+
+
+def _redacted_skill_source(source: object) -> dict:
+    """Allowlist supported repository descriptor fields for diagnostics."""
+    if not isinstance(source, dict):
+        return {"kind": "(invalid)"}
+    if source.get("kind") == "path":
+        safe_source: dict = {"kind": "path"}
+        source_path = source.get("path")
+        if isinstance(source_path, str) and Path(source_path).is_absolute():
+            safe_source["path"] = source_path
+        return safe_source
+    if source.get("kind") == "git":
+        from providers.skills.git_source import GitSourceError, parse_git_source
+
+        try:
+            git_source = parse_git_source(source)
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(git_source.url)
+            auth = source.get("auth", {})
+            auth_kind = auth.get("kind", "default")
+            return {
+                "kind": "git",
+                "host": parsed.hostname,
+                "ref": source.get("ref", "main"),
+                "auth_method": auth_kind,
+                "authentication_configured": auth_kind != "default",
+            }
+        except (GitSourceError, KeyError, TypeError):
+            return {"kind": "(invalid)"}
+    return {"kind": "(unsupported)"}
+
+
+def _redacted_skill_discovery(
+    source: dict, required: object, *, source_id: str = "default"
+) -> dict:
+    """Inspect subject descriptors only; report failed catalogs explicitly."""
+    from providers.skills.gateway import (
+        SkillGatewayError,
+        discover_organization_bindings,
+    )
+
+    failure: dict = {
+        "status": "error",
+        "subject_count": None,
+        "subjects": {},
+        "error": {
+            "code": "invalid_config",
+            "message": "Invalid organization repository binding",
+        },
+    }
+    if isinstance(source, dict) and source.get("kind") == "git":
+        from providers.skills.git_source import GitSourceError, parse_git_source
+
+        if not isinstance(required, bool):
+            return failure
+        try:
+            parse_git_source(source)
+        except (GitSourceError, KeyError, TypeError):
+            return failure
+        return {
+            "status": "not_checked",
+            "subject_count": None,
+            "subjects": {},
+        }
+    if (
+        not isinstance(source, dict)
+        or source.get("kind") != "path"
+        or "path" not in source
+    ):
+        return failure
+    if not isinstance(required, bool):
+        return failure
+    try:
+        discovered = discover_organization_bindings(
+            source["path"], required=required, source_id=source_id
+        )
+    except SkillGatewayError as exc:
+        failure["error"] = {
+            "code": exc.code,
+            "message": "Organization repository discovery failed",
+        }
+        return failure
+
+    return {
+        "status": "discovered",
+        "subject_count": len(discovered),
+        "subjects": {
+            subject: {
+                "document_package_discovered": binding.root is not None,
+                "service_config_discovered": binding.service_config is not None,
+                "required": binding.required,
+            }
+            for subject, binding in sorted(discovered.items())
+        },
+    }
+
+
 def build_redacted_config(
     config: OrchestratorConfig, *, source: str = "in-process"
 ) -> dict:
@@ -497,6 +719,8 @@ def build_redacted_config(
             "config_reload": "per-dispatch",
             "private_skills_cache": "until-restart",
             "restart_required_after_private_skill_change": True,
+            "organization_skill_cache": "ticket-lifetime",
+            "organization_skill_source_refresh": "new-ticket-first-use",
         },
         "paths": {
             "private_skills_dir": str(private_skills_dir),
@@ -504,6 +728,7 @@ def build_redacted_config(
             "artifact_dir": str(artifact_dir),
         },
         "private_skills": _redacted_private_skills(private_skills_dir),
+        "skill_gateway": _redacted_skill_gateway(config.raw),
         "state_store": {
             "url": _sanitize_url(config.state_store_url),
             "port": config.state_store_port,
@@ -521,6 +746,9 @@ def build_redacted_config(
         },
         "orchestrator": {
             "poll_interval": config.poll_interval,
+            "jumpstarter_lease_sweep_interval_seconds": (
+                config.jumpstarter_lease_sweep_interval_seconds
+            ),
             "global_max_iterations": config.global_max_iterations,
             "agent_task_timeout": config.agent_task_timeout,
             "stale_task_timeout": config.stale_task_timeout,

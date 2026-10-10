@@ -28,12 +28,15 @@ if _project_root not in sys.path:
 
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
+    build_organization_skill_resolver_async,
     build_secrets_provider,
     build_ssh_from_ticket,
     get_board_selector,
 )
+from agents.skill_gateway import SKILL_GATEWAY_TOOL_DESCRIPTION, skill_context_gateway
 from paths import get_default_ssh_key
 from providers.resource.base import has_reservation_metadata, reservation_failed
+from providers.skills.private import PrivateSkillProvider
 from providers.tracing import (
     bind_trace_context,
     child_context,
@@ -44,12 +47,14 @@ from providers.tracing import (
 logger = logging.getLogger(__name__)
 
 mcp = create_ticket_mcp("resource-agent")
+SKILLS_DIR = Path(_project_root) / "skills"
 
 # Module-level globals -- lazily initialized by _ensure_init()
 _initialized = False
 _ssh = None
 _ticket: dict[str, Any] = {}
 _registry = None
+_skill_provider = None
 
 # Fleet: first available untested device from check_available.
 # Set by check_available_resources, read by reserve_resources.
@@ -89,6 +94,51 @@ async def _ensure_init():
     fields = _ticket.get("custom_fields", {})
     if fields.get("resource_reservation_outcome_unknown") is True:
         _latch_unknown_reservation()
+
+
+async def _get_skill_provider():
+    """Build the docs-only gateway resolver without loading AWS credentials.
+
+    The only secrets lookup this path can perform is authentication explicitly
+    configured for an organization Git source. Resource-provider secrets remain
+    exclusive to ``_ensure_init`` and are never read to retrieve guidance.
+    """
+    global _skill_provider
+    if _skill_provider is None:
+        resolver = await build_organization_skill_resolver_async()
+        skill_provider = PrivateSkillProvider(resolver=resolver)
+        skill_provider.bind_current_attempt("resource")
+        _skill_provider = skill_provider
+    return _skill_provider
+
+
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+) -> str:
+    """Retrieve resource guidance through the subject-scoped context gateway."""
+    return await skill_context_gateway(
+        await _get_skill_provider(),
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="resource-agent",
+        phase="resource",
+        subject=subject,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+        local_skills_dir=SKILLS_DIR,
+    )
 
 
 def _latch_unknown_reservation() -> None:

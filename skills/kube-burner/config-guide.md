@@ -50,8 +50,10 @@ jobs:
 **IMPORTANT**: `jobType` values must be lowercase in
 kube-burner v2.7.0+: `create`, `delete`, `read`, `patch`.
 Capitalized values (e.g., `Create`) cause fatal errors.
-Use `waitWhenFinished: true` (not `podWait`) to wait for
-pods to reach Running state.
+`waitWhenFinished` waits for all job iterations to finish before waiting on
+their pods/jobs. `podWait` waits for each iteration's pods/jobs before moving
+to the next iteration; consult the upstream configuration reference when the
+workload depends on a particular wait policy.
 
 ### templates section
 
@@ -78,13 +80,15 @@ Templates support Go template variables:
     },
     "jobs": [{
       "name": "node-density",
-      "jobType": "Create",
+      "namespace": "node-density",
+      "jobType": "create",
       "jobIterations": 50,
       "namespacedIterations": true,
       "cleanup": true,
       "qps": 20,
       "burst": 20,
-      "objects": [{"objectTemplate": "pod.yml", "replicas": 1, "wait": true}]
+      "waitWhenFinished": true,
+      "objects": [{"objectTemplate": "pod.yml", "replicas": 1}]
     }]
   },
   "templates": {

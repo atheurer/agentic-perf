@@ -93,6 +93,8 @@ def build_skill_provider(
     resolve_source: bool = True,
     catalog_only: bool = False,
     arcaflow_mcp_client: Any | None = None,
+    skill_phase: str = "",
+    organization_resolver: Any | None = None,
 ):
     """Construct a MultiHarnessSkillProvider from environment variables.
 
@@ -137,17 +139,72 @@ def build_skill_provider(
             build_crucible_context_gateway(catalog_only=True)
         )
 
+    private = PrivateSkillProvider(resolver=organization_resolver)
+    phase = skill_phase or os.environ.get("AGENT_NAME", "").removesuffix("-agent")
+    private.bind_current_attempt(phase)
+
     if zathras_home:
         harnesses["zathras"] = ZathrasSkillProvider(zathras_home)
     else:
-        private = PrivateSkillProvider()
         zathras_tests = private._load_config("zathras").get("tests")
         if zathras_tests:
             harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
 
-    return MultiHarnessSkillProvider(
-        harnesses, PrivateSkillProvider(), default_harness="crucible"
+    return MultiHarnessSkillProvider(harnesses, private, default_harness="crucible")
+
+
+async def build_organization_skill_resolver_async(
+    *, secrets_provider: Any | None = None
+):
+    """Resolve only organization skill sources, loading Git auth if required.
+
+    This narrow path is suitable for context-only callers such as the resource
+    gateway. Its secrets provider is used solely by configured organization
+    Git sources; it does not construct resource providers or load their service
+    credentials (for example ``aws/config.json``).
+    """
+    from paths import CONFIG_PATH
+    from providers.skills.gateway import (
+        OrganizationSkillResolver,
+        organization_source_descriptors,
     )
+
+    raw_config = None
+    try:
+        if CONFIG_PATH.exists():
+            raw_config = json.loads(CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    gateway = raw_config.get("skill_gateway") if isinstance(raw_config, dict) else None
+    organization = gateway.get("organization") if isinstance(gateway, dict) else None
+    try:
+        sources = organization_source_descriptors(organization or {})
+    except (TypeError, ValueError):
+        sources = []
+    needs_secret_provider = any(
+        item["source"].get("kind") == "git"
+        and isinstance(item["source"].get("auth", {}), dict)
+        and item["source"].get("auth", {}).get("kind", "default")
+        in {"https-token", "ssh-key-secret"}
+        for item in sources
+    )
+    if secrets_provider is None and needs_secret_provider:
+        secrets_provider = build_secrets_provider()
+    resolver = await OrganizationSkillResolver.from_instance_config_async(
+        raw_config=raw_config,
+        secrets_provider=secrets_provider,
+    )
+    return resolver
+
+
+async def build_skill_provider_async(
+    *, secrets_provider: Any | None = None, **kwargs: Any
+):
+    """Build skills after resolving authenticated organization Git sources."""
+    resolver = await build_organization_skill_resolver_async(
+        secrets_provider=secrets_provider
+    )
+    return build_skill_provider(organization_resolver=resolver, **kwargs)
 
 
 def build_crucible_context_gateway(
@@ -362,7 +419,7 @@ def _emit_context_audit_event(
     emit_private_tool_audit_event(
         ticket_id,
         agent_name=agent_name,
-        tool_name="get_crucible_benchmark_context",
+        tool_name="get_skill_context",
         event_type="context_resolution",
         data={key: value for key, value in data.items() if value is not None},
     )
@@ -377,6 +434,11 @@ def ticket_controller_host(ticket: dict[str, Any]) -> str | None:
             value = context.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+    ssh_addresses = fields.get("ssh_hardware_ips")
+    if isinstance(ssh_addresses, dict):
+        value = ssh_addresses.get("controller")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     assigned = fields.get("assigned_hardware_ips")
     if isinstance(assigned, dict):
         value = assigned.get("controller")
@@ -880,6 +942,7 @@ async def controller_context_gateway(
             ssh=ssh,
             controller_host=controller_host,
             query=query,
+            max_bytes=max_bytes,
         )
     else:
         result = {
@@ -1183,6 +1246,7 @@ def build_secrets_provider():
     """
     from providers.redaction import get_shared_redactor
     from providers.secrets.factory import create_secrets_provider
+    from providers.secrets.git_reference import wrap_git_secret_references
     from providers.secrets.recording import RecordingSecretsProvider
 
     backend = os.environ.get("SECRETS_BACKEND", "local")
@@ -1212,22 +1276,20 @@ def build_secrets_provider():
                     ("vault:shared", vault),
                 ]
             )
-            ticket_id = os.environ.get("TICKET_ID")
-            return (
-                RecordingSecretsProvider(provider, get_shared_redactor(), ticket_id)
-                if ticket_id
-                else provider
-            )
         except ImportError:
             logger.info(
                 "bitwarden-sdk not installed; using local secrets only",
             )
+            provider = local
+    else:
+        provider = local
 
+    provider = wrap_git_secret_references(provider)
     ticket_id = os.environ.get("TICKET_ID")
     return (
-        RecordingSecretsProvider(local, get_shared_redactor(), ticket_id)
+        RecordingSecretsProvider(provider, get_shared_redactor(), ticket_id)
         if ticket_id
-        else local
+        else provider
     )
 
 
@@ -1799,6 +1861,15 @@ def read_skill_document(skills_dir: Path, harness: str, filename: str) -> dict:
                 "harness": harness,
                 "filename": filename,
                 "message": "Invalid path",
+            }
+        if resolved.is_relative_to((skills_dir / "crucible").resolve()):
+            return {
+                "found": False,
+                "harness": "crucible",
+                "message": (
+                    "Use get_skill_context(subject='harness/crucible') for "
+                    "organization guidance and authoritative software references."
+                ),
             }
     except (OSError, ValueError):
         return {

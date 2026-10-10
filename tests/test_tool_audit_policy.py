@@ -1404,7 +1404,7 @@ async def test_each_registered_chat_name_gets_a_correlated_audit_pair(
     monkeypatch.setattr(
         chat_tools,
         "_get_benchmark_catalog_provider",
-        lambda: CatalogProvider(),
+        AsyncMock(return_value=CatalogProvider()),
     )
 
     registrations = _chat_registrations()

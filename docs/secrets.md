@@ -61,6 +61,38 @@ that needs them. When a consumer requires a file path (e.g., for
 SCP), the `secret_file()` context manager materializes an ephemeral
 file (mode 0600 in a 0700 tmpdir) and deletes it on exit.
 
+### HTTPS Git file references
+
+A secret path can point to one file in a Git repository with this marker URI:
+
+```text
+git-secret+https://gitlab.cee.redhat.com/group/repo.git?ref=master&path=secret.json
+```
+
+`ref` names a branch and `path` is one repository-relative file path. This
+currently supports repositories on the exact host `gitlab.cee.redhat.com`,
+with GitLab API v4 available at the host root (`/api/v4`). Other GitLab hosts,
+Git hosting services, custom ports, and GitLab instances mounted below a URL
+prefix are not supported.
+
+The provider resolves exactly that project/ref/file through GitLab's
+repository-files raw API. It does not fetch a Git pack or other repository
+blobs. The project must allow anonymous HTTPS reads through that API endpoint.
+The request does not use Git credentials, Git configuration, SSH, `.netrc`,
+ambient proxy settings, or credentials embedded in proxy URLs. TLS certificate
+and hostname verification stay enabled. Redirects are rejected before their
+response body is read; the raw API endpoint must serve the file directly.
+Response bytes are requested with identity encoding, streamed under a 64 KiB
+limit, and subject to an overall request deadline.
+
+Git secret values are not cached. `get_secret()` keeps the bounded value in
+memory; `secret_file()` creates a mode-0600 file inside a mode-0700 temporary
+directory and removes it when the context exits. `get_secret_file()` returns
+`None` for Git references because they have no stable file path. Other schemes,
+including `git-secret+ssh://`, are rejected. Resolution errors identify the
+sanitized repository and branch and distinguish anonymous access failures,
+invalid project/ref/file paths, rejected redirects, and oversized files.
+
 **Requirements:**
 
 - The official Bitwarden Secrets Manager Python SDK:

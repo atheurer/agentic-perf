@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 
 from agents.base import AgentAbortedError, HITLDriftError
-from agents.server_utils import build_skill_provider
+from agents.server_utils import build_skill_provider_async
 from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
 from providers.execution import (
@@ -430,8 +430,12 @@ async def _resolve_api_key_secret(
             f"LLM API-key secret '{secret_path}' is configured for "
             f"agent {agent_type or 'default'}, but no secrets provider is available"
         )
+    from providers.secrets.git_reference import GitSecretReferenceError
+
     try:
         value = await secrets_provider.get_secret(secret_path)
+    except GitSecretReferenceError as exc:
+        raise SecretReferenceError(str(exc)) from None
     except Exception:
         # Provider exception messages may contain backend details. Keep logs
         # and ticket failure comments free of any returned credential data.
@@ -606,6 +610,9 @@ PLAN_AGENT_STATUS = {
     "synthesis": "synthesizing_results",
     "build_image": "building_image",
 }
+# Triage advances the ticket itself instead of using the execution-plan loop,
+# but it needs the same no-progress retry protection as plan-managed stages.
+DISPATCH_RETRY_STATUSES = frozenset({*PLAN_AGENT_STATUS.values(), "triage_pending"})
 
 
 def _capture_step_results(agent_type: str, cf: dict) -> dict:
@@ -1142,6 +1149,9 @@ async def run_agent_task(
 
         ticket_secrets = dispatcher._get_secrets_for_ticket(ticket_data)
         agent_type = STATUS_AGENT_MAP.get(status, "")
+        ticket_skill_provider = await dispatcher.get_skill_provider_for_ticket(
+            ticket_id, agent_type
+        )
         api_key = (
             await _resolve_api_key_secret(config, agent_type, ticket_secrets)
             if config
@@ -1162,6 +1172,7 @@ async def run_agent_task(
             llm_factory=snapshot_factory,
             iterations_factory=snapshot_iterations,
             secrets_provider=ticket_secrets,
+            skill_provider=ticket_skill_provider,
         )
         if agent is None:
             return
@@ -2337,11 +2348,11 @@ async def _record_dispatch_retry_outcome(
     *,
     claim_id: str | None,
 ) -> None:
-    """Back off repeated agent failures and stop after the configured cap."""
+    """Back off repeated no-progress dispatches and stop after the cap."""
     if (
         dispatcher.is_deposed()
         or not claim_id
-        or dispatched_status not in PLAN_AGENT_STATUS.values()
+        or dispatched_status not in DISPATCH_RETRY_STATUSES
     ):
         return
 
@@ -2387,11 +2398,11 @@ async def _record_dispatch_retry_outcome(
         if exhausted:
             comment = (
                 f"**Automatic dispatch paused:** {DISPATCH_RETRY_LIMIT} "
-                f"consecutive failures at {dispatched_status}. The "
-                "orchestrator stopped retrying this stage to protect system "
-                "resources. Review the agent failure, then clear "
-                "orchestrator_retry_state or move the ticket to another "
-                "status before resuming."
+                f"consecutive attempts did not advance the ticket from "
+                f"{dispatched_status}. The orchestrator stopped retrying this "
+                "stage to protect system resources. Review the agent result, "
+                "then clear orchestrator_retry_state or move the ticket to "
+                "another status before resuming."
             )
         await _persist_retry_state(
             dispatcher.store_url,
@@ -2403,7 +2414,7 @@ async def _record_dispatch_retry_outcome(
         )
         if exhausted:
             logger.error(
-                "Stopped dispatching %s at %s after %d consecutive failures",
+                "Stopped dispatching %s at %s after %d no-progress attempts",
                 ticket_id,
                 dispatched_status,
                 attempts,
@@ -2666,6 +2677,7 @@ async def _poll_loop_after_lease(
     """
     dispatcher: Dispatcher | None = None
     trace_sweep_task: asyncio.Task | None = None
+    jumpstarter_sweep_task: asyncio.Task | None = None
     lease_renew_task: asyncio.Task | None = None
     repo_cache = RepoCache()
 
@@ -2699,26 +2711,6 @@ async def _poll_loop_after_lease(
                 )
                 arcaflow_mcp = None
             break
-
-    skills = build_skill_provider(
-        crucible_home=config.crucible_home,
-        repo_cache=repo_cache,
-        source_repo=config.raw.get("crucible_source_repo"),
-        source_url=config.harness_repos.get("crucible"),
-        zathras_home=config.zathras_home,
-        resolve_source=False,
-        catalog_only=True,
-        arcaflow_mcp_client=arcaflow_mcp,
-    )
-
-    # Collect harness-contributed directive schemas so the
-    # normalization framework knows about harness-specific keys.
-    # Provider-backed harnesses register via get_directive_schema().
-    # Standalone harnesses register at module import.
-    import providers.skills.boot_time  # noqa: F401
-    from providers.directives import collect_from_providers
-
-    collect_from_providers(skills)
 
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")
@@ -2763,6 +2755,84 @@ async def _poll_loop_after_lease(
             secrets = local_secrets
     else:
         secrets = local_secrets
+
+    from providers.secrets.git_reference import wrap_git_secret_references
+
+    secrets = wrap_git_secret_references(secrets)
+
+    async def make_skill_provider(ticket_id: str = "", phase: str = ""):
+        provider = await build_skill_provider_async(
+            crucible_home=config.crucible_home,
+            repo_cache=repo_cache,
+            source_repo=config.raw.get("crucible_source_repo"),
+            source_url=config.harness_repos.get("crucible"),
+            zathras_home=config.zathras_home,
+            resolve_source=False,
+            catalog_only=True,
+            arcaflow_mcp_client=arcaflow_mcp,
+            secrets_provider=secrets,
+        )
+        if ticket_id and hasattr(provider, "bind_attempt"):
+            provider.bind_attempt(ticket_id, "initial", phase or "orchestrator")
+        return provider
+
+    skills = await make_skill_provider()
+
+    # Collect harness-contributed directive schemas so the
+    # normalization framework knows about harness-specific keys.
+    # Provider-backed harnesses register via get_directive_schema().
+    # Standalone harnesses register at module import.
+    import providers.skills.boot_time  # noqa: F401
+    from providers.directives import collect_from_providers
+
+    collect_from_providers(skills)
+
+    gateway_config = config.raw.get("skill_gateway")
+    organization_config = (
+        gateway_config.get("organization") if isinstance(gateway_config, dict) else None
+    )
+    from providers.skills.gateway import organization_source_descriptors
+
+    try:
+        organization_sources = organization_source_descriptors(
+            organization_config if isinstance(organization_config, dict) else {}
+        )
+    except (TypeError, ValueError):
+        organization_sources = []
+    skill_provider_factory = None
+    if any(item["source"].get("kind") == "git" for item in organization_sources):
+
+        async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
+            if phase not in {
+                "triage",
+                "platform",
+                "provisioning",
+                "benchmark",
+                "review",
+            }:
+                return skills
+            return await make_skill_provider(ticket_id, phase)
+
+        skill_provider_factory = refresh_ticket_skill_provider
+
+    try:
+        jumpstarter_configured = bool(
+            await secrets.get_secret("jumpstarter/config.json")
+        )
+    except Exception:
+        logger.warning(
+            "Could not check Jumpstarter configuration; lease sweep is disabled",
+            exc_info=True,
+        )
+        jumpstarter_configured = False
+    if jumpstarter_configured:
+        if config.jumpstarter_lease_sweep_interval_seconds > 0:
+            logger.info(
+                "Jumpstarter orphan lease sweep enabled (interval=%ss)",
+                config.jumpstarter_lease_sweep_interval_seconds,
+            )
+        else:
+            logger.info("Jumpstarter orphan lease sweep disabled by configuration")
 
     has_api_key_secret_refs = config.llm_api_key_secret is not None or any(
         isinstance(agent_cfg, dict) and "api_key_secret" in agent_cfg
@@ -2848,6 +2918,7 @@ async def _poll_loop_after_lease(
             introspection_llm=config.introspection_llm,
             session_id=str(leader_lease.session_id),
             fencing_epoch=leader_lease.epoch,
+            skill_provider_factory=skill_provider_factory,
         )
         lease_loss_gate.bind(dispatcher)
 
@@ -2900,6 +2971,7 @@ async def _poll_loop_after_lease(
         status_offset = 0
         was_at_capacity = False
         last_trace_sweep = 0.0
+        last_jumpstarter_sweep = 0.0
         repos_refreshed = False
         normalization_delivery_states: dict[str, dict[str, Any]] = {}
 
@@ -2920,6 +2992,30 @@ async def _poll_loop_after_lease(
                     asyncio.to_thread(_sweep_trace_spools)
                 )
                 last_trace_sweep = time.monotonic()
+            if jumpstarter_sweep_task is not None and jumpstarter_sweep_task.done():
+                try:
+                    jumpstarter_sweep_task.result()
+                except Exception:
+                    logger.exception("Jumpstarter orphan lease sweep failed")
+                jumpstarter_sweep_task = None
+            now = time.monotonic()
+            if (
+                jumpstarter_configured
+                and config.jumpstarter_lease_sweep_interval_seconds > 0
+                and now - last_jumpstarter_sweep
+                >= config.jumpstarter_lease_sweep_interval_seconds
+                and jumpstarter_sweep_task is None
+            ):
+                # Sweep independently of ticket dispatch, but don't let a slow
+                # Jumpstarter control plane hold up polling or agent starts.
+                jumpstarter_sweep_task = asyncio.create_task(
+                    _sweep_orphaned_leases(
+                        config.state_store_url,
+                        auth_headers=_mutation_headers(None),
+                    ),
+                    name="jumpstarter-lease-sweep",
+                )
+                last_jumpstarter_sweep = now
             # Check system-wide budget before dispatching
             if system_budget is not None and events is not None:
                 from providers.budget import (
@@ -3312,13 +3408,6 @@ async def _poll_loop_after_lease(
                 dispatched_tickets=all_fetched,
             )
 
-            # Jumpstarter: release orphaned leases whose
-            # tickets are closed or no longer active.
-            await _sweep_orphaned_leases(
-                config.state_store_url,
-                auth_headers=_mutation_headers(None),
-            )
-
             # Stale-task watchdog: cancel tasks with no events
             # for longer than the configured threshold.
             if config.stale_task_timeout > 0 and events is not None:
@@ -3336,6 +3425,7 @@ async def _poll_loop_after_lease(
             await asyncio.sleep(config.poll_interval)
     finally:
         await _cancel_and_await(trace_sweep_task)
+        await _cancel_and_await(jumpstarter_sweep_task)
         if dispatcher is not None:
             await dispatcher.shutdown()
         await _cancel_and_await(lease_renew_task)

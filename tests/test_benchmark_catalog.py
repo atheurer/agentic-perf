@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -74,7 +75,9 @@ async def test_triage_list_matches_shared_catalog(monkeypatch):
 
     provider = _Provider({"crucible": _Harness([_suite("uperf")])})
     expected, _ = await list_benchmark_catalog(provider)
-    monkeypatch.setattr(triage_server, "_get_provider", lambda: provider)
+    monkeypatch.setattr(
+        triage_server, "_get_provider", AsyncMock(return_value=provider)
+    )
 
     result = json.loads(await triage_server.list_benchmarks())
 

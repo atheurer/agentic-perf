@@ -1056,7 +1056,7 @@ async def test_crucible_context_gateway_persists_phase_owned_effective_manifest(
     resolution = next(
         event for event in events if event["event_type"] == "context_resolution"
     )
-    assert resolution["data"]["tool"] == "get_crucible_benchmark_context"
+    assert resolution["data"]["tool"] == "get_skill_context"
     assert resolution["data"]["details"]["effective_source"] == "github"
     assert resolution["data"]["details"]["phase"] == "benchmark"
 
@@ -1797,18 +1797,19 @@ class TestEndpointUserEnforcement:
 
 
 @pytest.mark.asyncio
-async def test_context_gateway_mcp_schema_exposes_generic_request_fields():
+async def test_skill_context_mcp_schema_exposes_generic_request_fields():
     import agents.benchmark.server as benchmark_server
     import agents.review.server as review_server
 
     for server in (benchmark_server, review_server):
         tools = await server.mcp.list_tools()
-        tool = next(
-            item for item in tools if item.name == "get_crucible_benchmark_context"
-        )
+        tool = next(item for item in tools if item.name == "get_skill_context")
         assert set(tool.parameters["properties"]) == {
+            "subject",
             "operation",
+            "ref",
             "path",
+            "from_ref",
             "query",
             "max_bytes",
             "offset_bytes",
@@ -1817,7 +1818,7 @@ async def test_context_gateway_mcp_schema_exposes_generic_request_fields():
 
 
 @pytest.mark.asyncio
-async def test_registered_controller_context_tool_includes_provider_runfile_contract(
+async def test_registered_skill_context_tool_includes_provider_runfile_contract(
     tmp_path, monkeypatch
 ):
     import agents.benchmark.server as benchmark_server
@@ -1833,7 +1834,7 @@ async def test_registered_controller_context_tool_includes_provider_runfile_cont
     )
     calls = []
 
-    async def fake_controller_context_gateway(**kwargs):
+    async def fake_skill_context_gateway(*_args, **kwargs):
         calls.append(kwargs)
         return json.dumps(
             {
@@ -1845,16 +1846,16 @@ async def test_registered_controller_context_tool_includes_provider_runfile_cont
 
     monkeypatch.setattr(
         benchmark_server,
-        "controller_context_gateway",
-        fake_controller_context_gateway,
+        "skill_context_gateway",
+        fake_skill_context_gateway,
     )
 
     tools = await benchmark_server.mcp.list_tools()
-    assert any(tool.name == "get_crucible_benchmark_context" for tool in tools)
+    assert any(tool.name == "get_skill_context" for tool in tools)
 
     response = json.loads(
-        await benchmark_server._get_crucible_benchmark_context_tool(
-            operation="bootstrap"
+        await benchmark_server.get_skill_context(
+            subject="harness/crucible", operation="bootstrap"
         )
     )
 
@@ -1867,6 +1868,7 @@ async def test_registered_controller_context_tool_includes_provider_runfile_cont
     }
     assert "Use {} when no tags apply" in response["runfile_contract"]["guidance"]
     assert calls[0]["operation"] == "bootstrap"
+    assert calls[0]["subject"] == "harness/crucible"
 
 
 @pytest.mark.asyncio

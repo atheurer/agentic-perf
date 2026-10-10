@@ -425,6 +425,7 @@ async def test_agent_crash_guidance_transition_carries_ticket_claim() -> None:
 
     dispatcher = MagicMock()
     dispatcher._claim_ids = {"PERF-2": "claim-2"}
+    dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
     dispatcher.create_agent.return_value = agent
     dispatcher.store_url = "http://store"
     dispatcher.events = None
@@ -508,7 +509,11 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
     dispatcher._trace_contexts = {}
     monkeypatch.setattr(main, "Dispatcher", lambda *_args, **_kwargs: dispatcher)
     monkeypatch.setattr(main, "RepoCache", lambda: object())
-    monkeypatch.setattr(main, "build_skill_provider", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        main,
+        "build_skill_provider_async",
+        AsyncMock(return_value=object()),
+    )
     monkeypatch.setattr(main, "LocalSecretsProvider", lambda: object())
     monkeypatch.setattr(
         main,
@@ -754,7 +759,11 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     client = Client()
     monkeypatch.setattr(main, "Dispatcher", lambda *_args, **_kwargs: dispatcher)
     monkeypatch.setattr(main, "RepoCache", lambda: object())
-    monkeypatch.setattr(main, "build_skill_provider", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        main,
+        "build_skill_provider_async",
+        AsyncMock(return_value=object()),
+    )
     monkeypatch.setattr(main, "LocalSecretsProvider", lambda: object())
     monkeypatch.setattr(
         main,
