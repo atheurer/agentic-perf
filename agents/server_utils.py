@@ -434,6 +434,11 @@ def ticket_controller_host(ticket: dict[str, Any]) -> str | None:
             value = context.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+    ssh_addresses = fields.get("ssh_hardware_ips")
+    if isinstance(ssh_addresses, dict):
+        value = ssh_addresses.get("controller")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     assigned = fields.get("assigned_hardware_ips")
     if isinstance(assigned, dict):
         value = assigned.get("controller")
