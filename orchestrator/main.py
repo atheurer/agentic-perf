@@ -430,8 +430,12 @@ async def _resolve_api_key_secret(
             f"LLM API-key secret '{secret_path}' is configured for "
             f"agent {agent_type or 'default'}, but no secrets provider is available"
         )
+    from providers.secrets.git_reference import GitSecretReferenceError
+
     try:
         value = await secrets_provider.get_secret(secret_path)
+    except GitSecretReferenceError as exc:
+        raise SecretReferenceError(str(exc)) from None
     except Exception:
         # Provider exception messages may contain backend details. Keep logs
         # and ticket failure comments free of any returned credential data.
@@ -2751,6 +2755,10 @@ async def _poll_loop_after_lease(
             secrets = local_secrets
     else:
         secrets = local_secrets
+
+    from providers.secrets.git_reference import wrap_git_secret_references
+
+    secrets = wrap_git_secret_references(secrets)
 
     async def make_skill_provider(ticket_id: str = "", phase: str = ""):
         provider = await build_skill_provider_async(

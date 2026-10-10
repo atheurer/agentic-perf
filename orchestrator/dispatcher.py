@@ -647,6 +647,11 @@ class Dispatcher:
                         vault_config=self._vault_config,
                     )
 
+        if provider is not None:
+            from providers.secrets.git_reference import wrap_git_secret_references
+
+            provider = wrap_git_secret_references(provider)
+
         if provider is not None and self._redactor is not None:
             ticket_id = (ticket_data or {}).get("id", "")
             if ticket_id:

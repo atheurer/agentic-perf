@@ -1246,6 +1246,7 @@ def build_secrets_provider():
     """
     from providers.redaction import get_shared_redactor
     from providers.secrets.factory import create_secrets_provider
+    from providers.secrets.git_reference import wrap_git_secret_references
     from providers.secrets.recording import RecordingSecretsProvider
 
     backend = os.environ.get("SECRETS_BACKEND", "local")
@@ -1275,22 +1276,20 @@ def build_secrets_provider():
                     ("vault:shared", vault),
                 ]
             )
-            ticket_id = os.environ.get("TICKET_ID")
-            return (
-                RecordingSecretsProvider(provider, get_shared_redactor(), ticket_id)
-                if ticket_id
-                else provider
-            )
         except ImportError:
             logger.info(
                 "bitwarden-sdk not installed; using local secrets only",
             )
+            provider = local
+    else:
+        provider = local
 
+    provider = wrap_git_secret_references(provider)
     ticket_id = os.environ.get("TICKET_ID")
     return (
-        RecordingSecretsProvider(local, get_shared_redactor(), ticket_id)
+        RecordingSecretsProvider(provider, get_shared_redactor(), ticket_id)
         if ticket_id
-        else local
+        else provider
     )
 
 
