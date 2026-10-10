@@ -20,6 +20,10 @@ from urllib.parse import urlsplit
 from paths import AGENTIC_PERF_HOME
 from providers.execution import AuditedFilesystem, AuditedSubprocessRunner
 from providers.secrets.base import SecretsProvider
+from providers.secrets.git_reference import (
+    GitSecretReferenceError,
+    parse_git_secret_reference,
+)
 
 _REF_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SECRET_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
@@ -189,6 +193,11 @@ def parse_git_source(source: object) -> _GitSourceConfig:
 
 
 def _valid_secret_ref(value: object) -> bool:
+    if isinstance(value, str) and value.startswith("git-secret+"):
+        try:
+            return parse_git_secret_reference(value) is not None
+        except GitSecretReferenceError as exc:
+            raise GitSourceError("invalid_config", str(exc)) from None
     return (
         isinstance(value, str)
         and _SECRET_REF.fullmatch(value) is not None
@@ -294,6 +303,8 @@ async def _git_environment(
             yield env
     except GitSourceError:
         raise
+    except GitSecretReferenceError as exc:
+        raise GitSourceError("organization_auth_unavailable", str(exc)) from None
     except Exception:
         raise GitSourceError(
             "organization_auth_unavailable",

@@ -61,6 +61,32 @@ that needs them. When a consumer requires a file path (e.g., for
 SCP), the `secret_file()` context manager materializes an ephemeral
 file (mode 0600 in a 0700 tmpdir) and deletes it on exit.
 
+### HTTPS Git file references
+
+A secret path can point to one file in a Git repository with this marker URI:
+
+```text
+git-secret+https://gitlab.example/group/repo.git?ref=master&path=secret.json
+```
+
+The provider removes the `git-secret+` marker and uses the resulting HTTPS Git
+URL. `ref` names a branch and `path` is one repository-relative file path.
+The repository must allow anonymous HTTPS reads; this source does not use SSH,
+Git credential helpers, or configured credentials. TLS certificate checks stay
+enabled. Only the requested branch and file are resolved. Git servers must
+support Git's `blob:none` filter; the provider fails instead of retrying with a
+full blob download if filtering is unavailable.
+
+Git secret values are not cached. Each lookup uses a shallow temporary Git
+repository that is removed after the requested value is read. `get_secret()`
+keeps the value in memory; `secret_file()` creates a mode-0600 file inside a
+mode-0700 temporary directory and removes it when the context exits.
+`get_secret_file()` returns `None` for Git references because they have no
+stable file path. Other schemes, including `git-secret+ssh://`, are rejected.
+Resolution failures raise `SecretsBackendError` with the sanitized repository
+and branch plus checks for anonymous HTTPS access, TLS trust, network access,
+and the branch or file path.
+
 **Requirements:**
 
 - The official Bitwarden Secrets Manager Python SDK:
