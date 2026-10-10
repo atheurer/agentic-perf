@@ -67,12 +67,7 @@ class PrivateSkillProvider(SkillProvider):
 
     def uses_organization_config(self, suite_name: str) -> bool:
         _validate_suite_name(suite_name)
-        binding = self._resolver.bindings.get(f"harness/{suite_name}")
-        return (
-            not binding.legacy_config
-            if binding is not None
-            else self._resolver.has_subject(f"harness/{suite_name}")
-        )
+        return self._resolver.uses_organization_config(f"harness/{suite_name}")
 
     def _load_config(self, suite_name: str) -> dict[str, Any]:
         _validate_suite_name(suite_name)
@@ -82,8 +77,7 @@ class PrivateSkillProvider(SkillProvider):
             config = self._resolver.get_runtime_config(f"harness/{suite_name}")
             assert config is not None
             return config
-        binding = self._resolver.bindings.get(f"harness/{suite_name}")
-        if binding is not None and binding.legacy_config:
+        if self._resolver.uses_legacy_config(f"harness/{suite_name}"):
             self._resolver.get_runtime_config(f"harness/{suite_name}")
         if suite_name in self._cache:
             return self._cache[suite_name]
@@ -103,7 +97,8 @@ class PrivateSkillProvider(SkillProvider):
                 return {}
             protected = [
                 binding.service_config
-                for binding in self._resolver.bindings.values()
+                for group in self._resolver.bindings.values()
+                for binding in group
                 if binding.service_config is not None
             ]
             # The Crucible projection also applies to aliases of its old file.

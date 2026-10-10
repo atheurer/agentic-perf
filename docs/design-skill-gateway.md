@@ -11,8 +11,9 @@ documentation from the installed Crucible controller. Organization guidance is
 available to all users of an agentic-perf instance. A future user source applies
 only to the authenticated user associated with a ticket.
 
-Use one administrator-configured organization source outside the public
-repository. The first release supports a local path and a Git URL. Git
+Use administrator-configured organization sources outside the public
+repository. The first release supports one or more local paths or Git URLs; a
+single-source shorthand keeps the common setup simple. Git
 authentication uses either the instance's existing OpenSSH identity/agent or
 a secret reference resolved by the existing secret provider. Implement
 organization scope first; reserve user and project extension points without
@@ -33,13 +34,15 @@ repository is separate from the public agentic-perf checkout and is maintained
 by the organization.
 
 The acceptance check must verify that one `skill_gateway.organization.source`
-setting discovers the repository's subjects and their paired documents and
-service configuration. A clean Crucible ticket must obtain its organization
-context through the gateway. The developer must not need to copy private
-documents into `private-skills`, add per-subject source entries, edit prompts,
-or obtain undocumented instructions from the administrator. The Git URL and
-ref are configured once; credentials, when needed, are referenced from the
-existing secrets provider and never stored in agentic-perf configuration.
+setting discovers a repository's subjects and their paired documents and
+service configuration. An instance can also configure a named `sources` list
+when independent teams maintain separate repositories. A clean Crucible ticket
+must obtain its organization context through the gateway. The developer must
+not need to copy private documents into `private-skills`, add per-subject source
+entries, edit prompts, or obtain undocumented instructions from the
+administrator. Each Git URL and ref is configured once; credentials, when
+needed, are referenced from the existing secrets provider and never stored in
+agentic-perf configuration.
 
 For SSH URLs, the source uses the existing OpenSSH identity and known-hosts
 configuration with strict host-key checking. An administrator may instead
@@ -155,24 +158,35 @@ relevance within that scope; authorization is enforced separately.
 
 ## Administrator configuration
 
-Configure one organization source for the instance. A local path remains
-available for development; a Git URL lets a new developer configure the shared
-private repository directly:
+Configure one organization source for the simple case. When sources are
+maintained independently, configure a named `sources` list. Each repository
+uses the same subject directory layout, and the gateway discovers the union of
+subjects without per-subject location settings. Local paths remain available
+for development; Git URLs let developers use shared private repositories:
 
 ```json
 {
   "skill_gateway": {
     "organization": {
-      "source": {
-        "kind": "git",
-        "url": "https://git.example.com/performance/organization-skills.git",
-        "ref": "main",
-        "auth": {
-          "kind": "https-token",
-          "username": "oauth2",
-          "secret_ref": "organization/agentic-perf-skills-read-token"
+      "sources": [
+        {
+          "id": "crucible",
+          "kind": "git",
+          "url": "https://git.example.com/performance/crucible-skills.git",
+          "ref": "main",
+          "auth": {
+            "kind": "https-token",
+            "username": "oauth2",
+            "secret_ref": "organization/agentic-perf-skills-read-token"
+          }
+        },
+        {
+          "id": "zathras",
+          "kind": "git",
+          "url": "ssh://git@git.example.com/performance/zathras-skills.git",
+          "ref": "main"
         }
-      }
+      ]
     }
   }
 }
@@ -187,9 +201,10 @@ content is used. No per-subject instance entry is needed for the common case.
 The optional `organization.subjects` map retains explicit per-subject exceptions
 and migration choices. Supplied fields refine a discovered binding; omitted
 fields are inherited. For example, `{"required": false}` changes only that
-subject's required policy. An explicit `source` or `service_config` changes the
-corresponding path; an explicit null removes that counterpart, provided the
-subject retains another source. The repository-level source cannot be null.
+subject's required policy. When more than one source contains a subject,
+source-specific overrides must identify `source_id`. An explicit `source` or
+`service_config` changes the corresponding path; an explicit null removes that
+counterpart, provided the subject retains another source.
 Selecting `legacy_config: true` removes the discovered
 service configuration unless a non-null one is explicitly supplied, which is an
 invalid conflict. These are binding overrides, not merges of settings values.
@@ -377,26 +392,47 @@ required to validate or execute a run.
 
 ## Priority and conflicts
 
-Do not use a single ordering to overwrite all information about a topic.
+Use locality as an informative default for contextual claims and preferences,
+not as a universal authority ordering. Upstream context supplies baseline
+knowledge. Organization context is more local to the shared deployment and
+normally carries more weight for environment-specific procedures and defaults.
+Authenticated user context, when configured, is more local to that user and
+normally carries more weight for that user's preferences. Ticket text gives
+task-specific intent and can guide choices among soft defaults. Each source
+must still be evaluated for the scope of the claim it makes.
 
 | Content | Resolution rule |
 | --- | --- |
-| Installed-runtime facts | Verified runtime and documentation matching that installation establish what the software supports. Guidance cannot change a schema or installed capability. |
-| Organization guidance | Applies to every user of the instance and supplies operational procedures and defaults. |
-| User preferences, later | Apply only to that ticket's authenticated user and can override soft organization defaults. |
-| Ticket directives | Explicit task-specific requests override saved soft defaults, within enforced constraints. |
+| Verified software/runtime facts | Runtime evidence and version-matched software documentation establish supported behavior. General upstream or local prose cannot change a schema or installed capability. |
+| Upstream context | Baseline knowledge, including general product and benchmark information. Use version-matched authoritative documentation for software behavior. |
+| Organization context | Applies to users of the configured instance. Normally takes precedence over upstream defaults for local procedures, environment details, and preferences. |
+| Authenticated user context | Applies only to that user's tickets. When available, normally takes precedence over organization defaults for personal preferences, unless those conflict with mandatory organization policy or verified behavior. |
+| Ticket guidance | Describes the current task and may select among compatible soft defaults or clarify which scoped source applies. It cannot waive mandatory policy or alter software capability. |
 | Hard requirements | Enforce through validated configuration or code. A Markdown instruction by itself is not a security or correctness boundary. |
+
+This feature implements multiple organization sources and the installed
+software/documentation source. Authenticated user-level skill sources are a
+future layer; the locality rule above defines the intended resolution behavior
+when they are added, and does not imply they are loaded today.
 
 Project scope is a future extension. Resolve project-specific defaults and
 requirements explicitly when implementing it; do not bake the previous
 conversation's tentative project/user ordering into the first release.
 
-Documents remain distinct with scope and role metadata. Arbitrary prose is not
-deep-merged, and the gateway does not promise automatic semantic conflict
-detection. When guidance contradicts installed facts, agents report the conflict
-and use the verified facts for execution compatibility. Deterministic settings
-have explicit merge/override rules and field-level provenance when future
-preference layers are added.
+Documents remain distinct with scope, source id, revision, and role metadata.
+Arbitrary prose is not deep-merged. The gateway identifies exact duplicate
+documents and same-path documents with different content; it does not claim to
+detect every semantic contradiction. Ticket agents compare all applicable
+entrypoints across sources using ticket-specific trust guidance, verified
+software behavior, and mandatory organization policy. Locality may help resolve
+conflicts across levels for soft defaults, but sources at the same level have
+no implicit winner. If a material same-level conflict (such as conflicting
+organization repositories) or other material conflict remains unresolved, the
+agent raises HITL and identifies the competing source ids and document paths.
+Repository order and source id never decide authority. Multiple distinct
+runtime configurations for one subject are exposed as a configuration conflict
+and cannot be silently merged or selected; the administrator must configure
+an explicit source choice before runtime consumers proceed.
 
 ## Revisions and workspace persistence
 
@@ -561,9 +597,16 @@ Required checks before team rollout include:
 
 - Configure once, and obtain the same organization subject/revision for tickets
   from different users; model-supplied identity or paths cannot alter the source.
-- Discover document-only, configuration-only, and combined subjects from one
-  repository root; adding a subject does not require another instance entry.
-  Keep explicit subject binding overrides and report discovery failures.
+- Discover document-only, configuration-only, and combined subjects across
+  multiple source roots; adding a subject does not require a per-subject source
+  entry.
+- Preserve source ids and revisions in document references. Return all
+  same-subject entrypoints, identify exact duplicates and same-path variants,
+  and ensure source ordering never selects a winner.
+- Verify that ticket-specific trust guidance can inform runtime resolution,
+  while unresolved material conflicts can raise HITL with both source ids and
+  document paths. Conflicting service configuration must fail explicitly.
+- Keep explicit subject binding overrides and report discovery failures.
 - Bootstrap organization guidance without a controller; retrieve software docs
   when the phase has a controller; report required-source failures explicitly.
 - Preserve existing controller entrypoint traversal, paging, search, path

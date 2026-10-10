@@ -2779,16 +2779,16 @@ async def _poll_loop_after_lease(
     organization_config = (
         gateway_config.get("organization") if isinstance(gateway_config, dict) else None
     )
-    organization_source = (
-        organization_config.get("source", {})
-        if isinstance(organization_config, dict)
-        else {}
-    )
+    from providers.skills.gateway import organization_source_descriptors
+
+    try:
+        organization_sources = organization_source_descriptors(
+            organization_config if isinstance(organization_config, dict) else {}
+        )
+    except (TypeError, ValueError):
+        organization_sources = []
     skill_provider_factory = None
-    if (
-        isinstance(organization_source, dict)
-        and organization_source.get("kind") == "git"
-    ):
+    if any(item["source"].get("kind") == "git" for item in organization_sources):
 
         async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
             if phase not in {
