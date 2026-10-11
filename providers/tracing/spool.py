@@ -26,6 +26,8 @@ from .models import TraceEventV1
 _HEADER = struct.Struct("!I")
 _DIGEST_SIZE = 32
 _MAX_FRAME = 1_048_576
+_WARN_AT_PERCENTAGES = (80, 90, 95)
+DEFAULT_TRACE_SPOOL_MAX_BYTES = 512 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -49,7 +51,7 @@ class TraceSpool:
         directory: Path = TRACE_SPOOL_DIR,
         *,
         name: str | None = None,
-        max_bytes: int = 64 * 1024 * 1024,
+        max_bytes: int = DEFAULT_TRACE_SPOOL_MAX_BYTES,
         create: bool = True,
     ) -> None:
         if max_bytes < _HEADER.size + _DIGEST_SIZE:
@@ -69,6 +71,8 @@ class TraceSpool:
         self.ack_path = self.directory / f"{identity}.ack"
         self.lock_path = self.directory / f"{identity}.lock"
         self.max_bytes = max_bytes
+        self._warned_percentages: set[int] = set()
+        self._full_logged = False
         created = not self.path.exists()
         if created and not create:
             raise FileNotFoundError(self.path)
@@ -121,9 +125,35 @@ class TraceSpool:
             frame = (
                 _HEADER.pack(len(payload)) + payload + hashlib.sha256(payload).digest()
             )
-            if self.path.stat().st_size + len(frame) > self.max_bytes:
+            current_size = self.path.stat().st_size
+            projected_size = current_size + len(frame)
+            if projected_size > self.max_bytes:
+                if not self._full_logged:
+                    logger.error(
+                        "Trace spool %s cannot fit a trace event under its cap "
+                        "(%d bytes used + %d requested > %d-byte cap)",
+                        self.path.name,
+                        current_size,
+                        len(frame),
+                        self.max_bytes,
+                    )
+                    self._full_logged = True
                 raise SpoolBackpressure("trace spool size cap reached")
             self._filesystem.append(self.path.name, frame, sync=True)
+            current_size = self.path.stat().st_size
+            for percentage in _WARN_AT_PERCENTAGES:
+                if (
+                    current_size * 100 >= self.max_bytes * percentage
+                    and percentage not in self._warned_percentages
+                ):
+                    logger.warning(
+                        "Trace spool %s reached %d%% capacity (%d/%d bytes)",
+                        self.path.name,
+                        percentage,
+                        current_size,
+                        self.max_bytes,
+                    )
+                    self._warned_percentages.add(percentage)
 
     def _ack_offset(self) -> int:
         if self.ack_path.is_symlink():
@@ -193,6 +223,8 @@ class TraceSpool:
                     self._write_ack(0)
                     self._filesystem.rename(temporary, self.path.name)
                     self._fsync_dir()
+                    self._warned_percentages.clear()
+                    self._full_logged = False
                 finally:
                     self._filesystem.unlink(temporary, missing_ok=True)
 
@@ -219,6 +251,8 @@ class TraceSpool:
             self._filesystem.touch(self.path.name, mode=0o600)
             self._filesystem.unlink(self.ack_path.name, missing_ok=True)
             self._fsync_dir()
+            self._warned_percentages.clear()
+            self._full_logged = False
         except OSError:
             pass
 
