@@ -166,14 +166,20 @@ def create_ticket(body: CreateTicketRequest, request: Request):
 
     # Normalize directives at creation time so tickets always
     # start with canonical keys regardless of user terminology.
+    normalization_report: str | None = None
     if body.custom_fields and "directives" in body.custom_fields:
         try:
             import providers.skills.boot_time  # noqa: F401 — register aliases
-            from providers.directives import normalize_directives
+            from providers.directives import (
+                format_normalization_report,
+                normalize_directives,
+            )
 
-            body.custom_fields["directives"] = normalize_directives(
+            normalized, applied, unrecognized = normalize_directives(
                 body.custom_fields["directives"]
-            )[0]
+            )
+            body.custom_fields["directives"] = normalized
+            normalization_report = format_normalization_report(applied, unrecognized)
         except Exception:
             pass
 
@@ -182,6 +188,15 @@ def create_ticket(body: CreateTicketRequest, request: Request):
         created_by=created_by,
         owners=owners,
     )
+
+    if normalization_report:
+        from state_store.models import AddCommentRequest
+
+        store.add_comment(
+            ticket.id,
+            AddCommentRequest(author="system", body=normalization_report),
+        )
+
     result = ticket.model_dump(mode="json")
     result["action_required"] = after_create(ticket)
     if quota_warning:
@@ -250,19 +265,27 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
     require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
     fields = body.fields
+    normalization_report: str | None = None
     if "directives" in fields:
         try:
             import providers.skills.boot_time  # noqa: F401 — register aliases
-            from providers.directives import normalize_directives
+            from providers.directives import (
+                format_normalization_report,
+                normalize_directives,
+            )
 
+            normalized, applied, unrecognized = normalize_directives(
+                fields["directives"]
+            )
             fields = dict(fields)
-            fields["directives"] = normalize_directives(fields["directives"])[0]
+            fields["directives"] = normalized
+            normalization_report = format_normalization_report(applied, unrecognized)
         except Exception:
-            pass  # normalization is best-effort; raw keys still work
+            pass
 
     try:
         session_id, epoch, claim_id, leader_only = mutation_fence(request)
-        return store.update_fields(
+        result = store.update_fields(
             ticket_id,
             fields,
             session_id=session_id,
@@ -270,6 +293,14 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
             claim_id=claim_id,
             leader_only=leader_only,
         )
+        if normalization_report:
+            from state_store.models import AddCommentRequest
+
+            store.add_comment(
+                ticket_id,
+                AddCommentRequest(author="system", body=normalization_report),
+            )
+        return result
     except ClaimFenceError as e:
         raise HTTPException(
             status_code=409,

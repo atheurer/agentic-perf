@@ -93,3 +93,66 @@ class TestDirectiveNormalizationOnCreate:
         assert directives["power_off_delay"] == 30
         assert "sample_count" in directives
         assert directives["sample_count"] == 10
+
+
+class TestNormalizationComment:
+    def test_patch_normalization_adds_comment(self, client, ticket_id):
+        """Normalization adds a visible comment to the ticket."""
+        import providers.skills.boot_time  # noqa: F401
+
+        client.patch(
+            f"/api/v1/tickets/{ticket_id}/fields",
+            json={
+                "fields": {"directives": {"harness": "boot-time", "delay_seconds": 20}}
+            },
+        )
+
+        ticket = client.get(f"/api/v1/tickets/{ticket_id}").json()
+        comments = ticket.get("comments", [])
+        norm_comments = [
+            c for c in comments if "normalization" in c.get("body", "").lower()
+        ]
+        assert len(norm_comments) == 1
+        assert "delay_seconds" in norm_comments[0]["body"]
+        assert "power_off_delay" in norm_comments[0]["body"]
+        assert norm_comments[0]["author"] == "system"
+
+    def test_create_normalization_adds_comment(self, client):
+        """Normalization at creation adds a comment."""
+        import providers.skills.boot_time  # noqa: F401
+
+        r = client.post(
+            "/api/v1/tickets",
+            json={
+                "summary": "test",
+                "description": "desc",
+                "custom_fields": {"directives": {"harness": "boot-time", "cycles": 10}},
+            },
+        )
+        tid = r.json()["id"]
+        ticket = client.get(f"/api/v1/tickets/{tid}").json()
+        comments = ticket.get("comments", [])
+        norm_comments = [
+            c for c in comments if "normalization" in c.get("body", "").lower()
+        ]
+        assert len(norm_comments) == 1
+        assert "cycles" in norm_comments[0]["body"]
+        assert "sample_count" in norm_comments[0]["body"]
+
+    def test_no_comment_when_no_aliases(self, client, ticket_id):
+        """No comment when directives use canonical keys."""
+        client.patch(
+            f"/api/v1/tickets/{ticket_id}/fields",
+            json={
+                "fields": {
+                    "directives": {"harness": "boot-time", "power_off_delay": 20}
+                }
+            },
+        )
+
+        ticket = client.get(f"/api/v1/tickets/{ticket_id}").json()
+        comments = ticket.get("comments", [])
+        norm_comments = [
+            c for c in comments if "normalization" in c.get("body", "").lower()
+        ]
+        assert len(norm_comments) == 0
