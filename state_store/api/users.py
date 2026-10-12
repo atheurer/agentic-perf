@@ -73,6 +73,46 @@ def list_users(request: Request):
     return [UserStore.to_safe_dict(u) for u in store.list_users()]
 
 
+class UpdateUserRequest(BaseModel):
+    allowed_sources: list[str] | None = None
+    max_requests_per_hour: int | None = None
+
+    # Distinguish "field omitted" from "field set to null".
+    # When the caller sends {"max_requests_per_hour": null},
+    # Pydantic sets it to None.  When the field is absent,
+    # we need to skip it.  model_fields_set tracks which
+    # keys the caller actually provided.
+
+
+@router.patch("/{username}")
+def update_user(username: str, body: UpdateUserRequest, request: Request):
+    """Update mutable fields on an existing user (admin-only)."""
+    principal = _get_principal(request)
+    require_admin(principal)
+    store = _get_store(request)
+
+    from state_store.identity import _UNSET
+
+    kwargs: dict = {}
+    if "allowed_sources" in body.model_fields_set:
+        kwargs["allowed_sources"] = body.allowed_sources
+    if "max_requests_per_hour" in body.model_fields_set:
+        kwargs["max_requests_per_hour"] = body.max_requests_per_hour
+    else:
+        kwargs["max_requests_per_hour"] = _UNSET
+
+    if not kwargs or (len(kwargs) == 1 and kwargs.get("max_requests_per_hour") is _UNSET):
+        raise HTTPException(status_code=422, detail="No mutable fields provided")
+
+    try:
+        user = store.update_user(username, **kwargs)
+    except UserNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return UserStore.to_safe_dict(user)
+
+
 @router.post("/{username}/disable")
 def disable_user(username: str, request: Request):
     principal = _get_principal(request)

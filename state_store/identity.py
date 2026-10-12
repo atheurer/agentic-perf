@@ -24,6 +24,7 @@ from paths import AGENTIC_PERF_HOME
 logger = logging.getLogger(__name__)
 
 _USERNAME_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+_UNSET = object()  # sentinel for "field not provided"
 DEFAULT_USERS_PATH = AGENTIC_PERF_HOME / "users.json"
 
 
@@ -164,6 +165,42 @@ class UserStore:
     def list_users(self) -> list[User]:
         with self._lock:
             return [u.model_copy() for u in self._users.values()]
+
+    def update_user(
+        self,
+        username: str,
+        *,
+        allowed_sources: list[str] | None = None,
+        max_requests_per_hour: int | None | object = _UNSET,
+    ) -> User:
+        """Update mutable fields on an existing user.
+
+        Only ``allowed_sources`` and ``max_requests_per_hour`` are
+        mutable.  Omitted fields (``None`` / sentinel) are left
+        unchanged.  Passing ``max_requests_per_hour=None`` explicitly
+        clears the limit.
+
+        Raises:
+            UserNotFound: if the user does not exist.
+            ValueError: if ``allowed_sources`` is set to an empty
+                list on a service account (they must retain at
+                least one source restriction).
+        """
+        normalized = validate_username(username)
+        with self._lock:
+            user = self._users.get(normalized)
+            if user is None:
+                raise UserNotFound(f"User '{username}' not found")
+            if allowed_sources is not None:
+                if user.service_account and not allowed_sources:
+                    raise ValueError(
+                        "Service accounts must have at least one allowed_sources entry"
+                    )
+                user.allowed_sources = list(allowed_sources)
+            if max_requests_per_hour is not _UNSET:
+                user.max_requests_per_hour = max_requests_per_hour  # type: ignore[assignment]
+            self._save()
+            return user.model_copy()
 
     def disable_user(self, username: str) -> User:
         normalized = username.lower()
