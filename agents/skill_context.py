@@ -3,8 +3,21 @@
 from __future__ import annotations
 
 
-def skill_context_prompt(subject: str) -> str:
+def skill_context_prompt(subject: str | None = None) -> str:
     """Describe the gateway contract without embedding source-specific guidance."""
+    if subject is None:
+        return """\
+## Subject Context
+
+After identifying the benchmark and selected harness from the request and
+catalog, use `get_skill_context` for only the matching subject. Use
+`harness/<selected-harness>` for benchmark guidance and
+`resource/<selected-provider>` for resource-provider guidance. Do not load
+context for unrelated harnesses or providers. If a subject is unconfigured,
+continue with the catalog and available tools, and report the missing context
+when it affects the task.
+"""
+
     return f"""\
 ## Subject Context
 

@@ -33,6 +33,7 @@ class TestProvisioningToolScoping:
                 "install_packages",
                 "set_ssh_context",
                 "check_host",
+                "check_host_prerequisites",
                 "submit_provisioning_result",
                 "request_clarification",
             ]
@@ -62,8 +63,20 @@ class TestProvisioningToolScoping:
         agent._apply_tool_scoping(ticket)
         names = {t.name for t in agent.tools}
         assert "jmp_run" in names
+        assert "check_host_prerequisites" in names
         assert "deploy_secret" not in names
         assert "install_harness" not in names
+
+    def test_self_installing_prompt_uses_read_only_prerequisite_check(self):
+        agent = self._make_agent()
+        agent._harness_self_installing = True
+        prompt = agent._system_prompt(
+            {"custom_fields": {"directives": {"harness": "arcaflow-plugins"}}}
+        )
+        assert "read-only check_host_prerequisites" in prompt
+        assert "do not call get_private_config" in prompt
+        assert "Podman" in prompt
+        assert "benchmark agent owns workload execution" in prompt
 
     def test_crucible_no_scoping(self):
         """Non-self-installing harnesses keep all tools."""
@@ -80,7 +93,7 @@ class TestProvisioningToolScoping:
         agent = self._make_agent()
         ticket = {"custom_fields": {"directives": {}}}
         agent._apply_tool_scoping(ticket)
-        assert len(agent.tools) == 10
+        assert len(agent.tools) == 11
 
     def test_crucible_harness_keeps_install_tools(self):
         """Non-self-installing harnesses keep install tools after scoping."""
@@ -161,6 +174,9 @@ class TestBenchmarkToolScoping:
         assert "get_plugin_schema" in plugins
         assert "plugin_list" in plugins
         assert "plugin_describe" in plugins
+        assert "jq_file_from_workspace" in plugins
+        assert "read_file_from_workspace" in plugins
+        assert "list_files_from_workspace" in plugins
         # Workflow tools should NOT be in the plugins harness
         assert "workflow_load" not in plugins
         assert "workflow_execute" not in plugins

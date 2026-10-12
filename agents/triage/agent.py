@@ -73,6 +73,32 @@ def _description_harness_intent(
                 }
             )
 
+    # In ordinary prose, "Arcaflow workflow" names the workflow harness;
+    # the bare alias "arcaflow" names the direct plugin harness. Treat the
+    # two-word form as the longer, canonical workflow name so a negation of
+    # workflows does not accidentally exclude arcaflow-plugins as well.
+    if "arcaflow-workflows" in harness_names:
+        for match in re.finditer(
+            r"(?<![\w-])arcaflow\s+workflows?(?![\w-])",
+            description,
+            re.IGNORECASE,
+        ):
+            clause_start = (
+                max(
+                    description.rfind(separator, 0, match.start())
+                    for separator in ".!?;\n"
+                )
+                + 1
+            )
+            occurrences.append(
+                {
+                    "start": match.start(),
+                    "end": match.end(),
+                    "clause_start": clause_start,
+                    "canonical": "arcaflow-workflows",
+                }
+            )
+
     occurrences.sort(key=lambda item: (item["start"], -item["end"]))
     # A canonical name and alias may overlap in a name set. Keep only the
     # longest match at a given location so it cannot create duplicate intent.
@@ -939,14 +965,7 @@ class TriageAgent(AgentBase):
             self._mcp = None
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
-        return (
-            TRIAGE_SYSTEM_PROMPT
-            + "\n\nApply the following subject context instructions when the "
-            "request selects Crucible or catalog discovery selects that harness. "
-            "Keep using the typed catalog tools for benchmark discovery; "
-            "triage does not require a prepared controller.\n\n"
-            + skill_context_prompt("harness/crucible")
-        )
+        return TRIAGE_SYSTEM_PROMPT + "\n\n" + skill_context_prompt()
 
     def _has_external_data_tools(self) -> bool:
         """Check if external MCP data tools are configured."""

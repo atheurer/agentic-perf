@@ -84,11 +84,15 @@ or `--uperf`).
 
 The execution handler performs these steps before running:
 
-1. Labels all nodes with `node-role.kubernetes.io/worker`
-   (K3s nodes lack this label by default; k8s-netperf
-   requires it to schedule pods)
-2. Cleans up any existing `netperf` namespace
-3. Creates fresh `netperf` namespace and service account
+1. Checks that the `netperf` namespace does not already exist. If it exists,
+   execution stops without deleting or changing it.
+2. Adds `node-role.kubernetes.io/worker` only to nodes missing that label.
+3. Creates the `netperf` namespace and service account.
+4. On completion, removes only worker labels added by this run and deletes only
+   the namespace created by this run.
+
+Single-node OpenShift clusters already label their node as a worker; the
+handler accepts this and does not need to change the node label.
 
 ## Example: Multi-Profile Test
 

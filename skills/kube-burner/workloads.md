@@ -61,9 +61,22 @@ Pod latencies:
            Ready: 2345ms
 ```
 
-Local indexing is the default — JSON metrics files are written
-to `collected-metrics/` in the working directory automatically
-when no Elasticsearch endpoint is configured.
+For agentic-perf to retain kube-burner's measurement output, configure a
+local indexer under `metricsEndpoints`, even when the run does not scrape a
+Prometheus endpoint:
+
+```yaml
+metricsEndpoints:
+  - indexer:
+      type: local
+      metricsDirectory: collected-metrics
+```
+
+Without an indexer, kube-burner can complete the workload without writing
+measurement JSON files. Agentic-perf's generated run-files include this local
+indexer and return the result directory and discovered files. Keep
+`metricsDirectory` relative to the run directory; the run is isolated under
+its own temporary directory on the controller.
 
 ## Exit Codes
 

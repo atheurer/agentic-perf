@@ -323,7 +323,6 @@ class ProvisioningAgent(AgentBase):
             "uninstall_harness",
             "ensure_harness_installed",
             "ensure_prerequisites",
-            "check_host_prerequisites",
             "check_platform_contract",
         }
     )
@@ -718,6 +717,26 @@ class ProvisioningAgent(AgentBase):
         )
 
         prompt = PROVISIONING_BASE_PROMPT
+        if getattr(self, "_harness_self_installing", False):
+            prompt += (
+                "\n\n## Read-Only Checks for Self-Installing Harnesses\n\n"
+                "This harness does not need host-side harness installation. "
+                "This instruction overrides the base prompt's private "
+                "provisioning-config lookup and installation steps: do not "
+                "call get_private_config for this check. "
+                "Do not call install_harness, ensure_harness_installed, "
+                "install_packages, or ensure_prerequisites. Call the "
+                "read-only check_host_prerequisites tool for the allocated "
+                "target host(s). Use its per-command results to verify only "
+                "the runtime required by this harness (for Arcaflow plugins, "
+                "Podman). Missing unrelated utilities do not block the run. "
+                "If a required runtime is missing, do not install it; report "
+                "the specific missing dependency with request_clarification. "
+                "Do not try to execute the benchmark in this phase; the "
+                "benchmark agent owns workload execution. If the required "
+                "runtime is present and SSH connectivity is verified, submit "
+                "provisioning as complete with that evidence."
+            )
         if harness == "crucible":
             prompt += "\n\n" + skill_context_prompt("harness/crucible")
         if gateway_cloud_access:

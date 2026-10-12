@@ -138,7 +138,7 @@ class TestHarnessToolScoping:
         assert "config-guide.md" not in prompt
         assert "workloads.md" not in prompt
 
-    def test_kube_endpoint_for_other_harness_keeps_its_own_context_paths(self):
+    def test_k8s_netperf_routes_context_through_gateway(self):
         agent = self._make_agent()
         repo_cache = MagicMock()
         repo_cache.list_docs.return_value = [{"path": "docs/netperf-guide.md"}]
@@ -155,12 +155,28 @@ class TestHarnessToolScoping:
         prompt = agent._system_prompt(ticket)
         messages = agent._build_messages(ticket)[0]["content"]
 
-        assert "harness's endpoint documentation" in prompt
+        assert 'get_skill_context(subject="harness/k8s-netperf"' in prompt
         assert 'get_skill_context(subject="harness/kube-burner"' not in prompt
-        assert "k8s-netperf Skills" in messages
-        assert "config-guide.md" in messages
-        assert "Available k8s-netperf Documentation" in messages
-        assert "docs/netperf-guide.md" in messages
+        assert "k8s-netperf Skills" not in messages
+        assert "config-guide.md" not in messages
+        assert "Available k8s-netperf Documentation" not in messages
+        assert "docs/netperf-guide.md" not in messages
+        assert "read_harness_doc" not in prompt
+
+        agent.tools = self._make_tools(
+            [
+                "get_skill_context",
+                "list_harness_docs",
+                "read_harness_doc",
+                "validate_benchmark",
+                "execute_benchmark",
+            ]
+        )
+        agent._apply_tool_scoping(ticket)
+        assert {tool.name for tool in agent.tools} == {
+            "get_skill_context",
+            "execute_benchmark",
+        }
 
     def test_no_harness_directive_keeps_all_tools(self):
         agent = self._make_agent()

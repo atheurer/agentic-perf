@@ -10,6 +10,7 @@ EXCLUDED = {
     "orchestrator/leader_lease.py",
     "orchestrator/poller.py",
     "providers/execution/http.py",
+    "providers/secrets/git_reference.py",
     "providers/skills/arcaflow_plugins.py",
     "providers/skills/crucible.py",
     "providers/tracing/client.py",

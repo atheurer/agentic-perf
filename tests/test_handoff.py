@@ -392,6 +392,36 @@ class TestEnrichedRequiredHosts:
         ok, reason = check_handoff("awaiting_provision", ticket)
         assert ok, reason
 
+    def test_direct_execution_uses_single_target_without_controller(self):
+        ticket = {
+            "custom_fields": {
+                "execution_model": "direct",
+                "required_hosts": [{"roles": ["client"], "host": "sut.example.com"}],
+                "assigned_hardware_ips": {
+                    "controller": "",
+                    "targets": ["sut.example.com"],
+                },
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert ok, reason
+
+    def test_kubernetes_workload_pods_do_not_need_separate_host_allocations(self):
+        ticket = {
+            "custom_fields": {
+                "directives": {"endpoint_type": "kube"},
+                "required_hosts": [
+                    {"roles": ["client"], "host": "bastion.example.com"}
+                ],
+                "assigned_hardware_ips": {
+                    "controller": "bastion.example.com",
+                    "targets": [],
+                },
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert ok, reason
+
 
 class TestHostIdentityEnforcement:
     """When required_hosts carry 'host', identities must appear verbatim."""
