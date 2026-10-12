@@ -395,6 +395,76 @@ class TestProcessStopRequests:
     """Verify _process_stop_requests handles non-active tickets."""
 
     @pytest.mark.asyncio
+    async def test_active_hard_stop_preserves_user_reason_until_task_handles_it(
+        self, app, store
+    ):
+        """Cancellation sees the user-stop reason before task cleanup clears it."""
+        import httpx
+
+        from orchestrator.dispatcher import Dispatcher
+        from orchestrator.main import _cancellation_reason, _process_stop_requests
+
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="active hard stop", description="test"),
+        )
+        store.transition_ticket(
+            ticket.id,
+            TransitionRequest(status="triage_pending"),
+        )
+        store.update_fields(
+            ticket.id,
+            {
+                "stop_requested": {
+                    "mode": "hard",
+                    "requested_at": "2026-01-01T00:00:00Z",
+                },
+            },
+        )
+
+        dispatcher = Dispatcher(
+            state_store_url="http://testserver",
+            llm_provider=MagicMock(),
+            skill_provider=MagicMock(),
+        )
+        dispatcher.release_claim = AsyncMock()
+        reasons = []
+
+        async def running_task():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                reasons.append(_cancellation_reason(dispatcher, ticket.id))
+                raise
+            finally:
+                await dispatcher.mark_done(ticket.id)
+
+        task = asyncio.create_task(running_task())
+        dispatcher.set_task(ticket.id, task, status="triage_pending")
+        await asyncio.sleep(0)
+
+        def make_client(**_kwargs):
+            return httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://testserver",
+                headers={"Authorization": f"Bearer {app.state.api_token}"},
+            )
+
+        with (
+            patch(
+                "orchestrator.main._auth_headers",
+                return_value={"Authorization": f"Bearer {app.state.api_token}"},
+            ),
+            patch("orchestrator.main.AuditedAsyncHTTPClient", make_client),
+        ):
+            await _process_stop_requests(dispatcher, "http://testserver")
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert reasons == ["Agent stopped by user request"]
+        assert store.get_ticket(ticket.id).status.value == "closed"
+
+    @pytest.mark.asyncio
     async def test_hard_stop_closes_non_active(self, app, store, client):
         """Non-active ticket with hard stop_requested gets force-closed."""
         ticket = store.create_ticket(

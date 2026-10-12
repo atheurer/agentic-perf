@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -187,12 +188,16 @@ class AgentBase(ABC):
             file_ref: str,
             filter: str,
             limit: int = 50,
+            max_bytes: int = 16384,
+            offset_bytes: int = 0,
             include_alternates: bool = False,
         ) -> str:
             res = _get_manager().jq_query(
                 file_ref,
                 filter,
                 limit=limit,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
                 include_alternates=include_alternates,
             )
             return json.dumps(res, indent=2)
@@ -240,12 +245,14 @@ class AgentBase(ABC):
         async def _read_document(
             ref: str,
             include_alternates: bool = False,
-            max_bytes: int = 262144,
+            max_bytes: int = 16384,
+            offset_bytes: int = 0,
         ) -> str:
             res = _get_manager().read_document(
                 ref,
                 include_alternates=include_alternates,
                 max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
             )
             return json.dumps(res, indent=2)
 
@@ -397,6 +404,17 @@ class AgentBase(ABC):
             f"- **Automatic Spilling**: Tool outputs exceeding {spill_threshold} bytes are automatically saved "
             "to your ticket workspace (e.g. `workspace://tool_name_1.json`). Use `jq_file_from_workspace` to query JSON fields, "
             "`read_file_from_workspace` to paginate text/logs, and `grep_file_from_workspace` to search.\n"
+            "- **Bounded reads**: `jq_file_from_workspace`, `read_file_from_workspace`, and "
+            "`read_document_from_workspace` accept `max_bytes` up to 16384. When a result includes "
+            "`next_offset_bytes`, repeat the same request with the same file/ref, filter, limit, and "
+            "`max_bytes`, setting `offset_bytes` to that value. For a paged jq result, read the `result_slice` "
+            "field; join its pages in order (it is text for strings and compact JSON text for objects/arrays). "
+            "If `items_truncated` is true, use an array slice in the jq filter because `limit` omitted items.\n"
+            "- For `read_file_from_workspace` with `max_lines`, keep the same line range and use "
+            "`next_offset_bytes` until it is null; then use `next_start_line` with `offset_bytes=0` "
+            "(or omit `offset_bytes`) to request the following range.\n"
+            "- Workspace file listings and document searches include `size_bytes`; use that to choose "
+            "a focused jq filter or an appropriately sized read.\n"
             "- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON-returning "
             "tool call (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`, `get_ethtool_info`) "
             "to slice and return the exact data in a single turn without multi-step querying. When a tool "
@@ -1142,12 +1160,17 @@ class AgentBase(ABC):
                             ticket_id, submit_call
                         )
                     if block_msg:
+                        input_keys = (
+                            list(submit_call.input.keys())
+                            if isinstance(submit_call.input, dict)
+                            else []
+                        )
                         self._emit(
                             ticket_id,
                             "tool_called",
                             {
                                 "tool": submit_call.name,
-                                "input_keys": list(submit_call.input.keys()),
+                                "input_keys": input_keys,
                                 "blocked": True,
                             },
                         )
@@ -1176,6 +1199,7 @@ class AgentBase(ABC):
                                 ],
                             }
                         )
+                        await self._save_messages(ticket_id, messages, required=True)
                         continue
                     self._emit(
                         ticket_id,
@@ -1452,6 +1476,10 @@ class AgentBase(ABC):
                                 ticket_id,
                             )
 
+                # Persist messages immediately so tool results survive
+                # crashes or LLM failures between iterations (#920).
+                await self._save_messages(ticket_id, messages, required=True)
+
             else:
                 # while loop exhausted (max_iterations reached)
                 await self._save_messages(ticket_id, messages)
@@ -1636,6 +1664,43 @@ class AgentBase(ABC):
         return [c for c in (ticket.get("comments") or []) if c.get("author") == "user"]
 
     @staticmethod
+    def _effective_harness(
+        directives: dict[str, Any], skill_provider: Any = None
+    ) -> str:
+        """Return the selected harness or the provider's configured default."""
+        if directives.get("workflow_source"):
+            from providers.skills.base import WORKFLOW_HARNESS
+
+            return WORKFLOW_HARNESS
+        explicit = directives.get("harness")
+        if isinstance(explicit, str) and explicit:
+            from providers.skills.base import HARNESS_ALIASES
+
+            return HARNESS_ALIASES.get(explicit, explicit)
+        default = getattr(skill_provider, "default_harness", "")
+        return default if isinstance(default, str) else ""
+
+    @staticmethod
+    def _load_prompt_fragment(prompts_dir: Path, name: str | None) -> str:
+        """Read one prompt fragment only when it stays inside prompts_dir.
+
+        Fragment names originate in ticket fields, so accept only a single
+        filename component and resolve symlinks before checking containment.
+        """
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            return ""
+        try:
+            root = prompts_dir.resolve(strict=True)
+            if not root.is_dir():
+                return ""
+            fragment = (root / f"{name}.md").resolve(strict=True)
+            if not fragment.is_relative_to(root) or not fragment.is_file():
+                return ""
+            return fragment.read_text().strip()
+        except (OSError, RuntimeError):
+            return ""
+
+    @staticmethod
     def _load_prompt_fragments(
         agent_dir: Path,
         resource_provider: str | None = None,
@@ -1648,18 +1713,22 @@ class AgentBase(ABC):
 
         parts = []
         if resource_provider:
-            provider_file = prompts_dir / f"{resource_provider}.md"
-            if provider_file.exists():
-                parts.append(provider_file.read_text().strip())
+            provider_fragment = AgentBase._load_prompt_fragment(
+                prompts_dir, resource_provider
+            )
+            if provider_fragment:
+                parts.append(provider_fragment)
         else:
-            auto_file = prompts_dir / "auto_select.md"
-            if auto_file.exists():
-                parts.append(auto_file.read_text().strip())
+            auto_fragment = AgentBase._load_prompt_fragment(prompts_dir, "auto_select")
+            if auto_fragment:
+                parts.append(auto_fragment)
 
         if endpoint_type:
-            endpoint_file = prompts_dir / f"{endpoint_type}.md"
-            if endpoint_file.exists():
-                parts.append(endpoint_file.read_text().strip())
+            endpoint_fragment = AgentBase._load_prompt_fragment(
+                prompts_dir, endpoint_type
+            )
+            if endpoint_fragment:
+                parts.append(endpoint_fragment)
 
         return "\n\n".join(parts)
 
@@ -1771,13 +1840,23 @@ class AgentBase(ABC):
                 )
                 if q_res.get("status") == "ok":
                     filtered_data = q_res.get("result")
+                    filtered_slice = q_res.get("result_slice")
                     filtered_json = json.dumps(
                         {
                             "status": "filtered",
                             "file_ref": file_ref,
                             "jq_filter": jq_filter,
-                            "data": filtered_data,
+                            "data": (
+                                filtered_slice
+                                if filtered_slice is not None
+                                else filtered_data
+                            ),
+                            "result_format": q_res.get("result_format"),
+                            "offset_bytes": q_res.get("offset_bytes", 0),
+                            "next_offset_bytes": q_res.get("next_offset_bytes"),
+                            "result_total_bytes": q_res.get("total_bytes"),
                             "truncated": q_res.get("truncated", False),
+                            "items_truncated": q_res.get("items_truncated", False),
                             "total_items": q_res.get("total_items"),
                             "full_size_bytes": len(raw_bytes),
                         },
@@ -1799,9 +1878,11 @@ class AgentBase(ABC):
                             "size_bytes": len(raw_bytes),
                             "preview": preview,
                             "message": (
-                                f"Full output saved to '{file_ref}'. Filtered result ({len(filtered_json)} bytes) "
-                                f"exceeds threshold. Refine jq_file_from_workspace or read slices."
+                                f"Full output saved to '{file_ref}'. Filtered page ({len(filtered_json)} bytes) "
+                                "exceeds threshold. Call jq_file_from_workspace with the same filter and "
+                                "set offset_bytes to next_offset_bytes to continue."
                             ),
+                            "next_offset_bytes": q_res.get("next_offset_bytes"),
                         }
                         return json.dumps(descriptor, indent=2)
                 else:
@@ -2424,6 +2505,8 @@ class AgentBase(ABC):
         self,
         ticket_id: str,
         messages: list[dict[str, Any]],
+        *,
+        required: bool = False,
     ) -> None:
         try:
             await self._update_fields(
@@ -2432,6 +2515,8 @@ class AgentBase(ABC):
             )
         except Exception:
             logger.debug(f"Failed to save messages for {ticket_id}")
+            if required:
+                raise
 
     async def _update_fields(
         self, ticket_id: str, fields: dict[str, Any]
@@ -2545,11 +2630,6 @@ class AgentBase(ABC):
         await self._update_fields(
             ticket_id,
             {"pending_interject": None},
-        )
-        self._emit(
-            ticket_id,
-            "user_interjection",
-            {"message": message},
         )
         return message
 

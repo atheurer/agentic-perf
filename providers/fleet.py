@@ -81,6 +81,113 @@ def get_fleet_progress(
     }
 
 
+def snapshot_iteration_data(custom_fields: dict[str, Any]) -> dict[str, Any]:
+    """Capture per-iteration state that would otherwise be overwritten.
+
+    Called by the fleet coordinator before recording a host result
+    so that each tested_host entry carries the full context from
+    its iteration — run_id, serial data, flash diagnostics, etc.
+    Without this, subsequent iterations overwrite ticket-level
+    fields and synthesis has no per-board data to analyze.
+    """
+    flash = custom_fields.get("jumpstarter_flash", {})
+    if not isinstance(flash, dict):
+        flash = {}
+    bm = custom_fields.get("benchmark_status")
+    snapshot: dict[str, Any] = {}
+
+    # Benchmark results
+    run_id = custom_fields.get("run_id", "")
+    if run_id:
+        snapshot["run_id"] = run_id
+    if isinstance(bm, dict):
+        snapshot["benchmark_status"] = bm
+    elif isinstance(bm, str):
+        snapshot["benchmark_status"] = bm
+    for field in ("benchmark_duration", "benchmark_notes", "run_file_used"):
+        value = custom_fields.get(field)
+        if value is not None:
+            snapshot[field] = value
+    samples = custom_fields.get("samples_collected")
+    if samples is not None:
+        snapshot["samples_collected"] = samples
+    if "platform_ready" in custom_fields:
+        snapshot["platform_ready"] = custom_fields["platform_ready"]
+
+    # Board identity
+    platform_board = custom_fields.get("platform_board", "")
+    if platform_board:
+        snapshot["platform_board"] = platform_board
+    assigned_ips = custom_fields.get("assigned_hardware_ips")
+    if assigned_ips:
+        snapshot["assigned_hardware_ips"] = assigned_ips
+
+    # Platform / provisioning
+    platform_ip = custom_fields.get("platform_ip", "")
+    if platform_ip:
+        snapshot["platform_ip"] = platform_ip
+    flash_duration = custom_fields.get("platform_flash_duration_s")
+    if flash_duration is not None:
+        snapshot["flash_duration_s"] = flash_duration
+    boot_duration = custom_fields.get("platform_boot_duration_s")
+    if boot_duration is not None:
+        snapshot["boot_duration_s"] = boot_duration
+    if flash.get("diagnostics"):
+        snapshot["flash_diagnostics"] = flash["diagnostics"]
+    serial_path = custom_fields.get("platform_serial_log", "")
+    if serial_path:
+        snapshot["serial_log_path"] = serial_path
+
+    output_dir = custom_fields.get("output_dir", "")
+    if output_dir:
+        snapshot["output_dir"] = output_dir
+
+    # KPIs if any were extracted
+    kpis = custom_fields.get("benchmark_kpis")
+    if kpis:
+        snapshot["benchmark_kpis"] = kpis
+
+    return snapshot
+
+
+def next_iteration_fields(custom_fields: dict[str, Any]) -> dict[str, Any]:
+    """Clear ticket-global state owned by the completed fleet iteration.
+
+    The fleet result has already been captured in ``tested_hosts``.  Resetting
+    these fields prevents the next board from inheriting this board's benchmark
+    outcome while leaving the accumulated ``output_dirs`` history intact.
+    """
+    fields: dict[str, Any] = {
+        "platform_ready": False,
+        "platform_board": "",
+        "platform_ip": "",
+        "assigned_hardware_ips": {},
+        "ssh_hardware_ips": {},
+        "resource_reservation_id": None,
+        "resource_provider_metadata": {},
+        "quads_assignment_id": None,
+        "quads_cloud_name": "",
+        "fresh_host": False,
+        "platform_flash_duration_s": None,
+        "platform_boot_duration_s": None,
+        "platform_serial_log": "",
+        "run_id": "",
+        "benchmark_status": None,
+        "benchmark_notes": "",
+        "benchmark_duration": None,
+        "run_file_used": {},
+        "benchmark_kpis": {},
+        "samples_collected": None,
+        "output_dir": "",
+    }
+    flash = custom_fields.get("jumpstarter_flash", {})
+    if isinstance(flash, dict):
+        flash = dict(flash)
+        flash.pop("diagnostics", None)
+        fields["jumpstarter_flash"] = flash
+    return fields
+
+
 def build_tested_host_entry(
     host_id: str,
     lease_id: str = "",
@@ -88,6 +195,7 @@ def build_tested_host_entry(
     status: str = "completed",
     failure_reason: str | None = None,
     metrics: dict[str, Any] | None = None,
+    iteration_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a tested_hosts entry for the fleet tracker."""
     entry: dict[str, Any] = {
@@ -100,6 +208,8 @@ def build_tested_host_entry(
         entry["failure_reason"] = failure_reason
     if metrics:
         entry["metrics"] = metrics
+    if iteration_data:
+        entry["iteration_data"] = iteration_data
     return entry
 
 
@@ -113,12 +223,17 @@ async def record_host_result(
     status: str = "completed",
     failure_reason: str | None = None,
     metrics: dict[str, Any] | None = None,
+    iteration_data: dict[str, Any] | None = None,
 ) -> None:
     """Record a host result in the fleet tracker.
 
     Appends a tested_host entry and persists it via the
     provided update_fields callback (typically agent's
     ``_update_fields`` method).
+
+    When ``iteration_data`` is provided (from
+    ``snapshot_iteration_data``), it is stored in the entry
+    so per-board context survives across fleet iterations.
     """
     fleet = dict(custom_fields.get("fleet_investigation", {}))
     tested = list(fleet.get("tested_hosts", []))
@@ -130,6 +245,7 @@ async def record_host_result(
             status=status,
             failure_reason=failure_reason,
             metrics=metrics,
+            iteration_data=iteration_data,
         )
     )
     fleet["tested_hosts"] = tested

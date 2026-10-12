@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sys
 
 import pytest
 
 from providers.execution.subprocess import AuditedSubprocessRunner
-from providers.tracing import bind_trace_context, new_trace_context, reset_trace_context
+from providers.tracing import (
+    LifecycleState,
+    bind_trace_context,
+    new_trace_context,
+    reset_trace_context,
+)
 from providers.tracing.client import TraceDeliveryError
 
 
@@ -90,10 +96,11 @@ async def test_tracked_communicate_timeout_escalates_and_is_timed_out() -> None:
             [
                 sys.executable,
                 "-c",
-                "import signal,time;signal.signal(signal.SIGTERM, lambda *_: None);time.sleep(5)",
+                "import signal,time;signal.signal(signal.SIGTERM, lambda *_: None);print('ready', flush=True);time.sleep(5)",
             ]
         )
-        await asyncio.sleep(0.05)  # let the child install its SIGTERM handler
+        ready = await asyncio.wait_for(process.stdout.readline(), timeout=10.0)
+        assert ready == b"ready\n"
         with pytest.raises(asyncio.TimeoutError):
             await process.communicate(timeout=0.01)
     finally:
@@ -152,6 +159,97 @@ async def test_repeated_wait_emits_one_terminal_and_binary_output_is_bounded() -
     ]
 
 
+async def test_streamed_output_preserves_terminal_metadata_and_incomplete_failure() -> (
+    None
+):
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
+    try:
+        runner = AuditedSubprocessRunner(emit, output_limit=3)
+        for complete in (True, False):
+            process = await runner.start(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys;sys.stdout.buffer.write(b'abcdef');sys.stderr.buffer.write(b'err!')",
+                ]
+            )
+            stdout, stderr = await process._process.communicate()
+            await process.finish_streamed_output(
+                stdout, stderr, drain_complete=complete
+            )
+            await process.finish_streamed_output(
+                stdout, stderr, drain_complete=complete
+            )
+            terminal = events[-1]
+            assert terminal.lifecycle.state.value == (
+                "completed" if complete else "failed"
+            )
+            assert terminal.attributes["stdout_size"] == 6
+            assert terminal.attributes["stderr_size"] == 4
+            assert (
+                terminal.attributes["stdout_digest"]
+                == hashlib.sha256(stdout).hexdigest()[:16]
+            )
+            assert (
+                terminal.attributes["stderr_digest"]
+                == hashlib.sha256(stderr).hexdigest()[:16]
+            )
+            assert terminal.attributes["stdout_truncated"] is True
+            assert terminal.attributes["stderr_truncated"] is True
+            assert terminal.attributes["output_incomplete"] is not complete
+        assert [event.lifecycle.state.value for event in events] == [
+            "requested",
+            "started",
+            "completed",
+            "requested",
+            "started",
+            "failed",
+        ]
+    finally:
+        reset_trace_context(token)
+
+
+async def test_streamed_output_timeout_and_cancellation_emit_one_terminal() -> None:
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
+    try:
+        runner = AuditedSubprocessRunner(emit)
+        for state, options in (
+            ("timed_out", {"timed_out": True}),
+            ("cancelled", {"cancelled": True}),
+        ):
+            process = await runner.start([sys.executable, "-c", "pass"])
+            await process._process.communicate()
+            for _ in range(2):
+                await process.finish_streamed_output(
+                    b"partial", b"", drain_complete=False, **options
+                )
+            terminal = events[-1]
+            assert terminal.lifecycle.state.value == state
+            assert terminal.attributes["stdout_size"] == len(b"partial")
+            assert terminal.attributes["output_incomplete"] is True
+            assert terminal.attributes.get("timed_out", False) is (state == "timed_out")
+        assert [event.lifecycle.state.value for event in events] == [
+            "requested",
+            "started",
+            "timed_out",
+            "requested",
+            "started",
+            "cancelled",
+        ]
+    finally:
+        reset_trace_context(token)
+
+
 async def test_mutating_spawn_requires_critical_recorder() -> None:
     token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
     try:
@@ -161,6 +259,63 @@ async def test_mutating_spawn_requires_critical_recorder() -> None:
             )
     finally:
         reset_trace_context(token)
+
+
+async def test_default_recorder_is_shared_and_reset_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from providers.execution import subprocess as subprocess_module
+
+    AuditedSubprocessRunner.reset_default_recorder()
+
+    instances = []
+
+    class FakeTraceClient:
+        def __init__(self, url: str, token: str) -> None:
+            self.url = url
+            self.token = token
+            self.closed = False
+            instances.append(self)
+
+        def record(self, _event) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setenv("STATE_STORE_URL", "http://state-store.invalid")
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "test-token")
+    monkeypatch.setattr(subprocess_module, "TraceClient", FakeTraceClient)
+
+    first = AuditedSubprocessRunner()
+    second = AuditedSubprocessRunner()
+    event = first._event(
+        LifecycleState.REQUESTED,
+        ["demo"],
+        context=new_trace_context(ticket_id="PERF-1"),
+    )
+    assert event is not None
+
+    try:
+        await first._record(event)
+        await second._record(event)
+
+        assert len(instances) == 1
+        assert first._recorder is instances[0]
+        assert second._recorder is instances[0]
+        assert AuditedSubprocessRunner._default_recorder is instances[0]
+
+        AuditedSubprocessRunner.reset_default_recorder()
+        assert instances[0].closed
+        assert AuditedSubprocessRunner._default_recorder is None
+
+        third = AuditedSubprocessRunner()
+        await third._record(event)
+        assert len(instances) == 2
+        assert third._recorder is instances[1]
+        assert instances[1] is not instances[0]
+    finally:
+        AuditedSubprocessRunner.reset_default_recorder()
 
 
 async def test_mutating_spawn_without_context_fails_before_launch(

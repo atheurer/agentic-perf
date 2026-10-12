@@ -96,6 +96,8 @@ class Dispatcher:
         self._session_id = session_id
         self._fencing_epoch = fencing_epoch
         self._deposed = False
+        self._claim_lost = False
+        self._stopped_tickets: set[str] = set()
         self.lease_seconds = lease_seconds
         self._user_store = user_store
         self._secrets_root = secrets_root
@@ -110,6 +112,7 @@ class Dispatcher:
         self._quota_warned: set[str] = set()
         self._introspection_tasks: dict[str, asyncio.Task] = {}
         self._introspection_agents: dict[str, Any] = {}
+        self._introspection_starting: set[str] = set()
         self._trace_contexts: dict[str, Any] = {}
         self._previous_invocations: dict[str, Any] = {}
         trace_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
@@ -234,6 +237,13 @@ class Dispatcher:
                         "claim_id": self._claim_ids.get(ticket_id),
                     },
                 )
+                if r.status_code != 200:
+                    logger.warning(
+                        "Claim renewal rejected for %s: HTTP %d: %s",
+                        ticket_id,
+                        r.status_code,
+                        r.text[:200],
+                    )
                 return r.status_code == 200
         except Exception as exc:
             logger.exception(f"Failed to renew claim on {ticket_id}")
@@ -282,12 +292,20 @@ class Dispatcher:
         if task is not None and not task.done():
             task.cancel()
 
-    def set_task(self, ticket_id: str, task: asyncio.Task) -> None:
+    def set_task(self, ticket_id: str, task: asyncio.Task, status: str = "") -> None:
         self._tasks[ticket_id] = task
+        statuses = getattr(self, "_task_statuses", None)
+        if statuses is None:
+            statuses = self._task_statuses = {}
+        if status:
+            statuses[ticket_id] = status
+        else:
+            statuses.pop(ticket_id, None)
 
     def mark_deposed(self) -> None:
         """Stop all agent work after losing the control-plane fence."""
         self._deposed = True
+        self._claim_lost = True
         for task in (
             list(self._tasks.values())
             + list(self._renewal_tasks.values())
@@ -335,6 +353,7 @@ class Dispatcher:
         self._introspection_agents.clear()
         self._claim_ids.clear()
         self._trace_contexts.clear()
+        self._stopped_tickets.clear()
         self._previous_invocations.clear()
         self._quota_blocked.clear()
         self._quota_warned.clear()
@@ -349,6 +368,14 @@ class Dispatcher:
 
     def is_deposed(self) -> bool:
         return self._deposed
+
+    def has_lost_claim(self) -> bool:
+        """Return whether work stopped because its orchestration claim was lost."""
+        return self._claim_lost
+
+    def was_stopped_by_user(self, ticket_id: str) -> bool:
+        """Return True if the ticket was hard-stopped by a user request."""
+        return ticket_id in self._stopped_tickets
 
     def set_agent(self, ticket_id: str, agent: Any) -> None:
         self._agents[ticket_id] = agent
@@ -365,6 +392,14 @@ class Dispatcher:
     def clear_handoff_blocked(self, ticket_id: str) -> None:
         self._handoff_blocked = {
             (t, s) for t, s in self._handoff_blocked if t != ticket_id
+        }
+
+    def reconcile_handoff_blocked(self, ticket_statuses: dict[str, str]) -> None:
+        """Keep suppression only while each ticket remains at its blocked status."""
+        self._handoff_blocked = {
+            (ticket_id, status)
+            for ticket_id, status in self._handoff_blocked
+            if ticket_statuses.get(ticket_id) == status
         }
 
     def is_quota_blocked(self, ticket_id: str) -> bool:
@@ -403,6 +438,7 @@ class Dispatcher:
         elif mode == "hard":
             task = self._tasks.get(ticket_id)
             if task is not None and not task.done():
+                self._stopped_tickets.add(ticket_id)
                 task.cancel()
                 if context is not None:
                     self._trace.record(
@@ -421,13 +457,24 @@ class Dispatcher:
         """Return a snapshot of ticket_id → Task for non-done tasks."""
         # Clean up finished tasks while iterating.
         done = [tid for tid, task in self._tasks.items() if task.done()]
+        statuses = getattr(self, "_task_statuses", None)
         for tid in done:
             self._tasks.pop(tid, None)
+            if statuses is not None:
+                statuses.pop(tid, None)
         return dict(self._tasks)
+
+    def active_tasks_for_status(self, status: str) -> int:
+        """Return the count of non-done tasks currently running for a specific status."""
+        self.active_tasks()
+        statuses = getattr(self, "_task_statuses", {})
+        return sum(1 for tid in self._tasks if statuses.get(tid) == status)
 
     async def mark_done(self, ticket_id: str) -> None:
         self._tasks.pop(ticket_id, None)
+        getattr(self, "_task_statuses", {}).pop(ticket_id, None)
         self._agents.pop(ticket_id, None)
+        getattr(self, "_stopped_tickets", set()).discard(ticket_id)
         self.stop_renewal(ticket_id)
         await self.release_claim(ticket_id)
         getattr(self, "_claim_ids", {}).pop(ticket_id, None)
@@ -459,6 +506,7 @@ class Dispatcher:
     def start_introspection(
         self,
         ticket_id: str,
+        llm_factory: Any | None = None,
     ) -> bool:
         """Start the introspection agent for a ticket.
 
@@ -473,7 +521,13 @@ class Dispatcher:
 
         from agents.introspection.agent import IntrospectionAgent
 
-        llm = self._get_llm("introspection") if self._introspection_llm else None
+        llm = None
+        if self._introspection_llm:
+            llm = (
+                llm_factory("introspection")
+                if llm_factory
+                else self._get_llm("introspection")
+            )
         agent = IntrospectionAgent(
             state_store_url=self.store_url,
             event_bus=self.events,
@@ -602,14 +656,19 @@ class Dispatcher:
         ticket_data: dict | None = None,
         llm_factory: Any | None = None,
         iterations_factory: Any | None = None,
+        secrets_provider: SecretsProvider | None = None,
     ) -> Any:
         agent_type = STATUS_AGENT_MAP.get(status)
         if agent_type is None:
             return None
 
         factory = self._llm_factory if llm_factory is None else llm_factory
+        ticket_secrets = (
+            secrets_provider
+            if secrets_provider is not None
+            else self._get_secrets_for_ticket(ticket_data)
+        )
         llm = factory(agent_type) if factory is not None else self.llm
-        ticket_secrets = self._get_secrets_for_ticket(ticket_data)
         agent: Any = None
 
         if agent_type == "triage":
@@ -635,6 +694,7 @@ class Dispatcher:
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
+                skill_provider=self.skills,
             )
         elif agent_type == "provisioning":
             agent = ProvisioningAgent(

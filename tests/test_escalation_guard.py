@@ -276,6 +276,7 @@ class TestMaxIterationsGuard:
             event_bus=event_bus,
             max_iterations=1,
         )
+        agent._save_messages = AsyncMock()
 
         get_response = MagicMock()
         get_response.raise_for_status = MagicMock()

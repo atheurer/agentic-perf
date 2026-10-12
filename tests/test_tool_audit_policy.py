@@ -43,6 +43,7 @@ SERVER_ROOT = ROOT / "agents"
 # vague names such as ``run``: a fixed remote read command is still read-only.
 _PROTECTED_MUTATORS = {
     "open",
+    "fcntl.flock",
     "os.open",
     "os.mkdir",
     "os.makedirs",
@@ -53,6 +54,17 @@ _PROTECTED_MUTATORS = {
     "os.rmdir",
     "os.chmod",
     "os.chown",
+    "os.fchmod",
+    "os.fchown",
+    "os.fsync",
+    "os.ftruncate",
+    "os.link",
+    "os.symlink",
+    "os.truncate",
+    "os.utime",
+    "os.write",
+    "tempfile.mkdtemp",
+    "tempfile.mkstemp",
     "subprocess.run",
     "subprocess.Popen",
     "asyncio.create_subprocess_exec",
@@ -177,6 +189,11 @@ def _side_effect_category(path: str, call: str) -> str | None:
         "delete",
     }:
         return "mutating_http_state"
+    if (
+        path == "providers/resource/jumpstarter_provision.py"
+        and call == "filesystem.write"
+    ):
+        return "filesystem"
     if "image_build" in path or "image_builder" in path:
         return "image"
     if "resource/" in path or "boto3" in lowered or "ec2" in lowered:
@@ -968,6 +985,26 @@ def test_checked_in_side_effect_inventory_has_zero_unexplained_boundaries() -> N
         assert date.fromisoformat(expires_on) >= date.today()
 
 
+def test_directive_normalization_boundary_is_system_only() -> None:
+    entry = (
+        "orchestrator/main.py",
+        "_normalize_ticket_directives",
+        "mutating_http_state",
+    )
+    assert entry in INVENTORIED_SIDE_EFFECTS
+    assert INVENTORY_DISPOSITIONS[entry][0] == "system_only"
+
+
+def test_user_reply_inventory_allows_owner_user_principals() -> None:
+    entry = (
+        "state_store/api/interject.py",
+        "user_reply",
+        "mutating_http_state",
+    )
+    assert entry in INVENTORIED_SIDE_EFFECTS
+    assert INVENTORY_DISPOSITIONS[entry][0] == "audited"
+
+
 def test_tool_audit_exemptions_and_side_effect_owners_are_reviewable() -> None:
     """Exemptions may be necessary, but cannot become silent permanent bypasses."""
     used_owners = set()
@@ -1552,6 +1589,7 @@ async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
         state_store_url="http://state-store.invalid",
         max_iterations=2,
     )
+    agent._save_messages = AsyncMock()
     agent._tool_min_interval = 0
     events = []
     agent._trace = TraceRecorder(client=SimpleNamespace(record=events.append))
@@ -1710,6 +1748,18 @@ async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair()
             assert isinstance(argument, dict), name
             if name == "present_runfile_for_approval":
                 argument["validation_id"] = "policy-validation"
+            if (
+                isinstance(agent, ProvisioningAgent)
+                and name == "submit_provisioning_result"
+            ):
+                # The generic schema fixture is structurally valid but an
+                # incomplete provisioning result also needs actionable
+                # notes and host identities allocated on the ticket.
+                argument["notes"] = "Provisioning is incomplete pending follow-up."
+                ticket["custom_fields"]["assigned_hardware_ips"] = {
+                    "controller": "PERF-policy",
+                    "targets": [],
+                }
             calls.append(ToolCall(id=f"native-real-{index}", name=name, input=argument))
         responses = [
             LLMResponse(

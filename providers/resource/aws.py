@@ -696,10 +696,19 @@ class AWSResourceProvider(ResourceProvider):
         provider_metadata: dict[str, Any],
     ) -> dict[str, Any]:
         ec2 = self._get_ec2_client()
-        instance_ids = provider_metadata.get("instance_ids", reservation_id.split(","))
+        requested_ids = provider_metadata.get("instance_ids", reservation_id.split(","))
+        if isinstance(requested_ids, str):
+            requested_ids = [
+                item.strip() for item in requested_ids.split(",") if item.strip()
+            ]
+        else:
+            requested_ids = [str(item) for item in requested_ids if item]
+        instance_ids = list(requested_ids)
 
+        ownership_skipped = []
         if self._instance_name:
             instance_ids = await self._filter_by_instance_name(ec2, instance_ids)
+            ownership_skipped = sorted(set(requested_ids) - set(instance_ids))
             if not instance_ids:
                 logger.warning(
                     "[aws-provider] No instances with matching agentic-perf-instance "
@@ -709,17 +718,23 @@ class AWSResourceProvider(ResourceProvider):
                     "provider": self.provider_name,
                     "reservation_id": reservation_id,
                     "status": "skipped",
-                    "details": {"instances": []},
+                    "details": {
+                        "instances": [],
+                        "outstanding_instance_ids": ownership_skipped,
+                    },
                 }
 
         logger.info(f"[aws-provider] Terminating instances: {instance_ids}")
         result = await asyncio.to_thread(
             ec2.terminate_instances, InstanceIds=instance_ids
         )
+        terminated_instances = result.get("TerminatingInstances", [])
+        terminated_ids = {item["InstanceId"] for item in terminated_instances}
+        outstanding_ids = sorted(set(requested_ids) - terminated_ids)
         return {
             "provider": self.provider_name,
             "reservation_id": reservation_id,
-            "status": "terminated",
+            "status": "partial" if outstanding_ids else "terminated",
             "details": {
                 "instances": [
                     {
@@ -727,8 +742,9 @@ class AWSResourceProvider(ResourceProvider):
                         "previous_state": i["PreviousState"]["Name"],
                         "current_state": i["CurrentState"]["Name"],
                     }
-                    for i in result.get("TerminatingInstances", [])
-                ]
+                    for i in terminated_instances
+                ],
+                "outstanding_instance_ids": outstanding_ids,
             },
         }
 

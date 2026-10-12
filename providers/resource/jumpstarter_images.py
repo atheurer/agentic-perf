@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin, urlsplit
 
@@ -35,6 +36,9 @@ logger = logging.getLogger(__name__)
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _TRUSTED_CROSS_ORIGIN_REDIRECTS = frozenset(
     {("autosd.sig.centos.org", "download.autosd.sig.centos.org")}
+)
+_DATED_MONTHLY_RELEASE_RE = re.compile(
+    r"^monthly/(?P<prefix>[^/]+)-(?P<year_month>20\d{4})(?P<time>\d{4,6})?$"
 )
 
 
@@ -189,6 +193,40 @@ async def _resolve_latest_monthly(
         return ""
 
 
+async def _resolve_monthly_prefix(
+    client: AuditedAsyncHTTPClient,
+    monthly_url: str,
+    prefix: str,
+    year_month: str,
+) -> str:
+    """Resolve a ``monthly/<prefix>-YYYYMM`` request to its dated build."""
+    try:
+        response = await _audited_get_follow_redirects(client, monthly_url + "/")
+        if response.status_code != 200:
+            return ""
+        links = re.findall(r"""href=["']?([^"'\s<>]+/?)['"]?""", response.text)
+        dated_dir = re.compile(
+            rf"{re.escape(prefix)}-{re.escape(year_month)}\d{{4,6}}",
+            re.IGNORECASE,
+        )
+        matches = sorted(
+            name
+            for name in (link.rstrip("/").rsplit("/", 1)[-1] for link in links)
+            if dated_dir.fullmatch(name)
+        )
+        if not matches:
+            return ""
+        resolved = f"monthly/{matches[-1]}"
+        logger.info("[images] Resolved monthly prefix to %s", resolved)
+        return resolved
+    except Exception:
+        logger.warning(
+            "[images] Failed to resolve dated monthly release",
+            exc_info=True,
+        )
+        return ""
+
+
 async def resolve_image_urls(
     base_url: str = "https://autosd.sig.centos.org/",
     image_version: str = "AutoSD-10",
@@ -219,6 +257,8 @@ async def resolve_image_urls(
           combos for this board (for fallback selection)
     """
     base_url = base_url.rstrip("/")
+    monthly_match = _DATED_MONTHLY_RELEASE_RE.fullmatch(release)
+    date_qualified_monthly = monthly_match is not None
 
     # Monthly releases use dated subdirectories (e.g.,
     # monthly/autosd10-202608010205/). Resolve 'monthly'
@@ -238,6 +278,24 @@ async def resolve_image_urls(
         timeout=30.0,
         verify=not trust_server,
     ) as client:
+        if monthly_match and not monthly_match.group("time"):
+            monthly_url = f"{base_url}/{image_version}/monthly"
+            resolved_monthly = await _resolve_monthly_prefix(
+                client,
+                monthly_url,
+                monthly_match.group("prefix"),
+                monthly_match.group("year_month"),
+            )
+            if not resolved_monthly:
+                return {
+                    "error": f"No dated monthly build matched '{release}'",
+                    "manifest_url": monthly_url + "/",
+                }
+            release = resolved_monthly
+            manifest_url = (
+                f"{base_url}/{image_version}/{release}/info/test_images_info.json"
+            )
+
         r = await _audited_get_follow_redirects(client, manifest_url)
 
         # Fallback chain when the specific release 404s:
@@ -245,7 +303,7 @@ async def resolve_image_urls(
         #    → latest-RHIVOS-2.1-202607240103). The on-host release
         #    string may omit the minor version.
         # 2. Use the latest symlink (e.g., latest-RHIVOS-2).
-        if r.status_code == 404 and release != "nightly":
+        if r.status_code == 404 and release != "nightly" and not date_qualified_monthly:
             # Extract datestamp and search for a matching release
             import re as _re
 
@@ -284,7 +342,7 @@ async def resolve_image_urls(
                 except Exception:
                     pass
 
-        if r.status_code == 404 and release != "nightly":
+        if r.status_code == 404 and release != "nightly" and not date_qualified_monthly:
             fallback_release = f"latest-{image_version}"
             fallback_url = (
                 f"{base_url}/{image_version}/{fallback_release}"

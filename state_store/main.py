@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -16,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from orchestrator.config import _load_config_file
+from orchestrator.config import ConfigFileError, _load_config_file
 from paths import (
     AGENTIC_PERF_HOME,
     TRACE_DB_PATH,
@@ -45,6 +46,13 @@ from .trace_store import TraceStore
 STATIC_DIR = Path(__file__).parent / "static"
 
 logger = logging.getLogger(__name__)
+# Ensure startup logs are visible even when uvicorn uses
+# --log-level warning (which only affects uvicorn's loggers).
+if not logger.handlers and not logging.root.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 _runtime_locks: dict[Path, tuple[PersistenceRootLock, int]] = {}
 _runtime_locks_guard = threading.Lock()
@@ -57,7 +65,7 @@ def _validate_positive_int(
     allow_zero: bool = True,
 ) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        raise ValueError(f"{name} must be a non-negative integer")
     if not allow_zero and value == 0:
         raise ValueError(f"{name} must be > 0, got 0")
     return value
@@ -90,8 +98,12 @@ def mount_routers(
     app.include_router(chat_router)
 
 
-def _initialize_runtime(app: FastAPI, port: int) -> None:
+def _initialize_runtime(app: FastAPI, port: int, cfg: dict) -> None:
     """Construct writable runtime components only after the root lock is held."""
+    logger.info("Initializing trace store...")
+    from .status import record_store_status
+
+    record_store_status("initializing_trace_store")
     app.state.trace_store = TraceStore(TRACE_DB_PATH)
     app.state.trace_instance_id = get_instance_name()
     app.state.trace_health = {
@@ -106,7 +118,6 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
     app.state.benchmark_validator_token = load_or_generate_validator_token()
     app.state.benchmark_validation_capabilities = {}
 
-    cfg = _load_config_file()
     auth_cfg = cfg.get("auth", {})
     multi_user = auth_cfg.get("multi_user", False)
     anonymous_read = auth_cfg.get("anonymous_read", False)
@@ -211,9 +222,8 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
     from providers.redaction import Redactor
 
     audit_redactor = Redactor()
-    # Compatibility adapters use independent SQLite connections to the same
-    # database, so API worker threads never interleave transactions on one
-    # connection while the TraceStore remains the sole persistence authority.
+    # EventBus and AuditLog reuse the authoritative app.state.trace_store
+    # instance to avoid opening redundant SQLite connections and repeated checks.
     # Security wiring: AuditLog(redactor=...) must remain connected to the
     # same redactor as EventBus so sensitive audit fields are scrubbed.
     audit_log = AuditLog(
@@ -222,12 +232,17 @@ def _initialize_runtime(app: FastAPI, port: int) -> None:
         process_identity=getattr(app.state, "store_diagnostics", {}),
     )
     app.state.audit_log = audit_log
-    app.state.event_bus = EventBus(redactor=audit_redactor)
+    app.state.event_bus = EventBus(
+        redactor=audit_redactor, trace_store=app.state.trace_store
+    )
+    record_store_status("loading_tickets")
+    logger.info("Loading tickets from disk...")
     app.state.store = TicketStore(
         audit_log=audit_log,
         event_bus=app.state.event_bus,
         trace_store=app.state.trace_store,
     )
+    record_store_status("mounting_routers")
     mount_routers(app, auth, rate_limit_dep)
 
     chat_cfg = cfg.get("chat", {})
@@ -311,11 +326,30 @@ if hasattr(os, "register_at_fork"):
 
 def _start_runtime(app: FastAPI, port: int) -> None:
     """Acquire the root lock before constructing any writable backend."""
+    from .status import record_store_status
+
     if getattr(app.state, "runtime_initialized", False):
         if getattr(app.state, "runtime_pid", None) == os.getpid():
             return
         _discard_inherited_runtime(app)
+    # Auth defaults are safe only when the config is absent. A present but
+    # unreadable config must never silently replace the configured policy.
+    try:
+        cfg = _load_config_file(strict=True)
+        auth_cfg = cfg.get("auth", {})
+        if not isinstance(auth_cfg, dict):
+            raise ConfigFileError("auth must be a JSON object")
+        for name in ("multi_user", "anonymous_read"):
+            if not isinstance(auth_cfg.get(name, False), bool):
+                raise ConfigFileError(f"auth.{name} must be a boolean")
+        _validate_positive_int(auth_cfg.get("token_ttl_days", 0), "auth.token_ttl_days")
+    except (ConfigFileError, ValueError) as exc:
+        logger.error("State store refused startup: %s", exc)
+        raise
+    logger.info("Acquiring persistence root lock...")
     lock = _acquire_runtime_lock(port)
+    record_store_status("lock_acquired")
+    logger.info("Lock acquired (store_id=%s)", lock.store_id)
     app.state.process_lock = lock
     app.state.store_diagnostics = {
         "store_id": lock.store_id,
@@ -325,9 +359,10 @@ def _start_runtime(app: FastAPI, port: int) -> None:
         "process": lock.metadata,
     }
     try:
-        _initialize_runtime(app, port)
+        _initialize_runtime(app, port, cfg)
         app.state.runtime_initialized = True
         app.state.runtime_pid = os.getpid()
+        record_store_status("runtime_ready")
         logger.info(
             "State store started: store_id=%s session_id=%s root=%s",
             lock.store_id,
@@ -355,6 +390,8 @@ def _discard_inherited_runtime(app: FastAPI) -> None:
 
 
 def _close_runtime(app: FastAPI) -> None:
+    from .status import clear_store_status
+
     if not getattr(app.state, "runtime_initialized", False):
         return
     if getattr(app.state, "runtime_pid", None) != os.getpid():
@@ -371,6 +408,7 @@ def _close_runtime(app: FastAPI) -> None:
     if lock is not None:
         _release_runtime_lock(lock)
         app.state.process_lock = None
+    clear_store_status()
 
 
 def create_app(*, initialize_immediately: bool = False) -> FastAPI:
@@ -380,9 +418,22 @@ def create_app(*, initialize_immediately: bool = False) -> FastAPI:
     async def lifespan(app: FastAPI):
         if not getattr(app.state, "runtime_initialized", False):
             _start_runtime(app, port)
+
+        # Periodic WAL checkpoint task to prevent trace.db WAL
+        # growth.  The WAL is memory-mapped by readers; an
+        # unbounded WAL causes linear memory growth (#1074).
+        async def _periodic_wal_checkpoint() -> None:
+            while True:
+                await asyncio.sleep(300)  # every 5 minutes
+                ts = getattr(app.state, "trace_store", None)
+                if ts is not None and hasattr(ts, "checkpoint"):
+                    await asyncio.to_thread(ts.checkpoint)
+
+        checkpoint_task = asyncio.create_task(_periodic_wal_checkpoint())
         try:
             yield
         finally:
+            checkpoint_task.cancel()
             _close_runtime(app)
 
     app = FastAPI(title="Agentic Perf State Store", version="0.1.0", lifespan=lifespan)

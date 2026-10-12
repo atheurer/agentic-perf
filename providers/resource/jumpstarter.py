@@ -32,7 +32,17 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+# ── Jumpstarter directive schema ──────────────────────────
+# Register Jumpstarter-specific directives so the
+# normalization framework recognizes them.
+from providers.directives import register_directives
+
 from .base import ResourceProvider
+
+register_directives(
+    recognized={"jumpstarter_serial"},
+    aliases={},
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,12 +154,17 @@ class JumpstarterResourceProvider(ResourceProvider):
                 except Exception:
                     pass
             if needs_set:
-                user_config.parent.mkdir(parents=True, exist_ok=True)
-                user_config.write_text(
+                from providers.execution import AuditedFilesystem
+
+                filesystem = AuditedFilesystem.system(user_config.parent)
+                filesystem.mkdir(".", mode=0o777)
+                filesystem.write(
+                    user_config.name,
                     "apiVersion: jumpstarter.dev/v1alpha1\n"
                     "kind: UserConfig\n"
                     "config:\n"
-                    f"  current-client: {client_name}\n"
+                    f"  current-client: {client_name}\n",
+                    mode=0o644,
                 )
                 logger.info(f"[jumpstarter] Set current client to {client_name}")
 
@@ -332,9 +347,8 @@ class JumpstarterResourceProvider(ResourceProvider):
                 requirements,
             )
 
-        matching = [
-            d for d in all_devices if d["labels"].get(key) == value and d["available"]
-        ]
+        selector_matches = [d for d in all_devices if d["labels"].get(key) == value]
+        matching = [d for d in selector_matches if d["available"]]
 
         # Fleet exclusion: filter out already-tested hosts
         exclude = requirements.get("exclude_hosts", [])
@@ -353,16 +367,17 @@ class JumpstarterResourceProvider(ResourceProvider):
         # No matches — distinguish between "wrong
         # selector" and "all devices already tested."
         if not matching:
-            if exclude:
+            excluded_matches = [d for d in selector_matches if d["name"] in exclude]
+            if selector_matches and len(excluded_matches) == len(selector_matches):
                 # All matching devices have been tested
                 return {
                     "provider": "jumpstarter",
                     "available": False,
-                    "matching_devices": 0,
+                    "matching_devices": len(selector_matches),
                     "requested": count,
                     "selector": selector,
                     "all_excluded": True,
-                    "excluded_hosts": exclude,
+                    "excluded_hosts": [d["name"] for d in excluded_matches],
                     "message": ("All matching devices have been excluded."),
                 }
             targets = await self.list_targets()

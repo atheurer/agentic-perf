@@ -50,6 +50,7 @@ from providers.execution import (
     RootedPath,
     durable_filesystem_emitter,
 )
+from providers.skills.crucible import crucible_runfile_contract_errors
 
 logger = logging.getLogger(__name__)
 
@@ -58,18 +59,22 @@ mcp = create_ticket_mcp("benchmark-agent")
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
 _CRUCIBLE_ROOT = "/opt/crucible"
+_BOOT_TIME_DRAIN_TIMEOUT = 10.0
 
 
 def _write_ticket_staging_file(
     ticket_id: str, content: str
 ) -> tuple[AuditedFilesystem, str, str]:
-    """Create a ticket-owned local SCP staging file with an auditable lifecycle."""
-    filesystem = AuditedFilesystem(
-        RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
-        ticket_id=ticket_id,
-        emit=durable_filesystem_emitter(),
-        critical=True,
-    )
+    """Create an audited ticket or explicit system-context SCP staging file."""
+    if ticket_id:
+        filesystem = AuditedFilesystem(
+            RootedPath(tempfile.gettempdir(), "workspace", logical_prefix="transport"),
+            ticket_id=ticket_id,
+            emit=durable_filesystem_emitter(),
+            critical=True,
+        )
+    else:
+        filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
     name = f"agentic-perf-{ticket_id}-{uuid.uuid4().hex}.json"
     return filesystem, name, str(filesystem.write(name, content))
 
@@ -352,15 +357,6 @@ _SHELL_INJECTION_RE = re.compile(
     r";|&&|\|\||`|\$\(|\|",
 )
 
-# Arcaflow plugin discovery is deliberately limited to the published
-# Arcaflow plugin namespace. Besides preventing accidental execution of an
-# unrelated image, this means the image can never contribute shell syntax to
-# the remote command used by the schema probe.
-_ARCAFLOW_PLUGIN_IMAGE_RE = re.compile(
-    r"^quay\.io/arcalot/arcaflow-plugin-[a-z0-9][a-z0-9._-]*"
-    r"(?::[a-zA-Z0-9][a-zA-Z0-9._-]*|@sha256:[0-9a-fA-F]{64})?$"
-)
-
 
 def _validate_run_command(
     run_command: str,
@@ -398,19 +394,6 @@ def _validate_run_command(
     return True, "OK"
 
 
-def _validate_plugin_image(plugin_image: str) -> tuple[bool, str]:
-    """Validate an Arcaflow plugin image before using it in a remote command."""
-    if not isinstance(plugin_image, str) or not plugin_image.strip():
-        return False, "plugin_image must be a non-empty string"
-    if not _ARCAFLOW_PLUGIN_IMAGE_RE.fullmatch(plugin_image):
-        return (
-            False,
-            "plugin_image must be a quay.io/arcalot/arcaflow-plugin image "
-            "with an optional tag or sha256 digest",
-        )
-    return True, "OK"
-
-
 _FORBIDDEN_REBOOT_HOSTS = FORBIDDEN_REBOOT_HOSTS
 _is_self_host = is_self_host
 
@@ -426,6 +409,10 @@ _crucible_context = None
 _repo_cache = None
 _ticket: dict[str, Any] = {}
 _validation_records: dict[str, dict[str, Any]] = {}
+_BENCHMARK_OPERATION_LEASE_TTL_SECONDS = 900.0
+_BENCHMARK_OPERATION_LEASE_RENEW_INTERVAL_SECONDS = 300.0
+_BENCHMARK_OPERATION_RENEW_RETRY_INITIAL_SECONDS = 1.0
+_BENCHMARK_OPERATION_RENEW_RETRY_MAX_SECONDS = 30.0
 
 
 def _benchmark_intent_identity(
@@ -471,6 +458,15 @@ class _BenchmarkOperation:
         self.owner = owner
         self._client = None
         self._local = None
+        self._renewal_stop: asyncio.Event | None = None
+        self._renewal_task: asyncio.Task[BaseException | None] | None = None
+        self._renewal_failure: BaseException | None = None
+        self._renewal_pending_failure: BaseException | None = None
+        self._initial_lease_deadline: float | None = None
+        self._renewal_inflight = False
+        self._renewal_state_changed: asyncio.Event | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._closed = False
 
     async def acquire(self) -> tuple[dict[str, Any], str]:
         from providers.tracing.client import TraceClient
@@ -479,9 +475,16 @@ class _BenchmarkOperation:
         url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
         if token:
             self._client = TraceClient(url, token)
+            self._initial_lease_deadline = (
+                asyncio.get_running_loop().time()
+                + _BENCHMARK_OPERATION_LEASE_TTL_SECONDS
+            )
             try:
                 result = await asyncio.to_thread(
-                    self._client.operation_acquire, self.key, self.request_hash, 900
+                    self._client.operation_acquire,
+                    self.key,
+                    self.request_hash,
+                    _BENCHMARK_OPERATION_LEASE_TTL_SECONDS,
                 )
             except Exception as exc:
                 # Only a conflict proves that another worker owns the intent.
@@ -505,18 +508,201 @@ class _BenchmarkOperation:
         )
 
         self._local = TraceStore(TRACE_DB_PATH)
+        self._initial_lease_deadline = (
+            asyncio.get_running_loop().time() + _BENCHMARK_OPERATION_LEASE_TTL_SECONDS
+        )
         try:
             operation, status = await asyncio.to_thread(
                 self._local.acquire_operation_result,
                 self.key,
                 self.request_hash,
                 self.owner,
-                900,
+                _BENCHMARK_OPERATION_LEASE_TTL_SECONDS,
             )
         except (OperationLeaseError, OperationTransitionError):
             operation = self._local.get_operation(self.key)
             return (operation.__dict__ if operation else {}), "in_progress"
         return operation.__dict__, status
+
+    async def start_renewal(self, operation: dict[str, Any]) -> None:
+        """Keep this fenced execution lease alive until terminalization.
+
+        The registry client is synchronous, so each renewal runs in a worker
+        thread while the Crucible process and progress callbacks use the event
+        loop. The completion callback also stops the heartbeat if the tool
+        exits through an unexpected exception or cancellation path.
+        """
+        if self._renewal_task is not None:
+            return
+        self._renewal_stop = asyncio.Event()
+        self._renewal_state_changed = asyncio.Event()
+        self._renewal_task = asyncio.create_task(
+            self._renew_operation_lease(operation, self._renewal_stop),
+            name=f"benchmark-operation-renew:{self.key}",
+        )
+        parent_task = asyncio.current_task()
+        if parent_task is not None:
+            stop = self._renewal_stop
+
+            def cleanup_after_parent(_task: asyncio.Task[Any]) -> None:
+                stop.set()
+                if self._closed:
+                    return
+
+                async def cleanup() -> None:
+                    try:
+                        await self.close()
+                    except Exception:
+                        logger.exception(
+                            "benchmark operation cleanup failed for %s", self.key
+                        )
+
+                self._cleanup_task = asyncio.create_task(
+                    cleanup(), name=f"benchmark-operation-cleanup:{self.key}"
+                )
+
+            parent_task.add_done_callback(cleanup_after_parent)
+
+    async def _renew_operation_lease(
+        self, operation: dict[str, Any], stop: asyncio.Event
+    ) -> BaseException | None:
+        loop = asyncio.get_running_loop()
+        lease_deadline = self._initial_lease_deadline or (
+            loop.time() + _BENCHMARK_OPERATION_LEASE_TTL_SECONDS
+        )
+        interval = min(
+            _BENCHMARK_OPERATION_LEASE_RENEW_INTERVAL_SECONDS,
+            _BENCHMARK_OPERATION_LEASE_TTL_SECONDS / 3,
+        )
+        retry_delay: float | None = None
+        while True:
+            remaining = lease_deadline - loop.time()
+            if remaining <= 0:
+                failure = self._renewal_pending_failure or TimeoutError(
+                    "benchmark operation lease expired before renewal was confirmed"
+                )
+                self._renewal_failure = failure
+                self._renewal_state_changed.set()
+                return failure
+            wait_for = min(retry_delay or interval, remaining)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=wait_for)
+                return self._renewal_pending_failure
+            except asyncio.TimeoutError:
+                try:
+                    token = int(operation["fencing_generation"])
+                    renew_started = loop.time()
+                    self._renewal_inflight = True
+                    self._renewal_state_changed.set()
+                    if self._client is not None:
+                        renewal_result = await asyncio.to_thread(
+                            self._client.operation_transition,
+                            self.key,
+                            "renew",
+                            token,
+                            ttl_seconds=_BENCHMARK_OPERATION_LEASE_TTL_SECONDS,
+                        )
+                    elif self._local is not None:
+                        renewal_result = await asyncio.to_thread(
+                            self._local.renew_operation,
+                            self.key,
+                            self.owner,
+                            token,
+                            _BENCHMARK_OPERATION_LEASE_TTL_SECONDS,
+                        )
+                    else:
+                        raise RuntimeError("benchmark operation registry unavailable")
+                    self._renewal_failure = None
+                    self._renewal_pending_failure = None
+                    lease_deadline = (
+                        renew_started + _BENCHMARK_OPERATION_LEASE_TTL_SECONDS
+                    )
+                    renewed_operation = (
+                        renewal_result.get("operation", {})
+                        if isinstance(renewal_result, dict)
+                        else renewal_result.__dict__
+                    )
+                    renewed_expiry = renewed_operation.get("lease_expires_at")
+                    if renewed_expiry:
+                        try:
+                            expiry = datetime.fromisoformat(renewed_expiry)
+                            remaining = (
+                                expiry - datetime.now(timezone.utc)
+                            ).total_seconds()
+                            lease_deadline = min(
+                                lease_deadline,
+                                loop.time() + max(0.0, remaining),
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    self._renewal_inflight = False
+                    self._renewal_state_changed.set()
+                    retry_delay = None
+                except Exception as exc:
+                    self._renewal_pending_failure = exc
+                    self._renewal_inflight = False
+                    self._renewal_state_changed.set()
+                    if self._authoritative_lease_rejection(exc):
+                        self._renewal_failure = exc
+                        return exc
+                    retry_delay = min(
+                        _BENCHMARK_OPERATION_RENEW_RETRY_INITIAL_SECONDS
+                        if retry_delay is None
+                        else retry_delay * 2,
+                        _BENCHMARK_OPERATION_RENEW_RETRY_MAX_SECONDS,
+                    )
+
+    @staticmethod
+    def _authoritative_lease_rejection(exc: BaseException) -> bool:
+        """Recognize registry responses proving this fencing lease is stale."""
+        cause: BaseException | None = exc
+        while cause is not None:
+            if type(cause).__name__ in {
+                "OperationLeaseError",
+                "OperationTransitionError",
+            }:
+                return True
+            status_code = getattr(getattr(cause, "response", None), "status_code", None)
+            if status_code == 409:
+                return True
+            cause = cause.__cause__
+        return False
+
+    async def _await_renewal_resolution(self) -> None:
+        """Let transient renewal failures retry before finalizing the operation."""
+        task = self._renewal_task
+        changed = self._renewal_state_changed
+        if task is None or changed is None:
+            return
+        while not task.done():
+            changed.clear()
+            if not self._renewal_inflight and self._renewal_pending_failure is None:
+                return
+            if task.done():
+                break
+            await changed.wait()
+
+    async def stop_renewal(self) -> BaseException | None:
+        """Stop and join renewal before mutating or closing the operation."""
+        task = self._renewal_task
+        stop = self._renewal_stop
+        if task is None or stop is None:
+            return self._renewal_failure or self._renewal_pending_failure
+        stop.set()
+        try:
+            failure = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Let an in-flight synchronous renewal finish before its client is
+            # closed. The caller's cancellation is still propagated.
+            try:
+                await task
+            finally:
+                self._renewal_task = None
+                self._renewal_stop = None
+            raise
+        self._renewal_task = None
+        self._renewal_stop = None
+        return failure or self._renewal_failure or self._renewal_pending_failure
 
     async def transition(
         self, action: str, operation: dict[str, Any], **kwargs: Any
@@ -550,10 +736,16 @@ class _BenchmarkOperation:
         return result.__dict__
 
     async def close(self) -> None:
-        if self._client is not None:
-            await asyncio.to_thread(self._client.close)
-        if self._local is not None:
-            self._local.close()
+        if self._closed:
+            return
+        await self.stop_renewal()
+        try:
+            if self._client is not None:
+                await asyncio.to_thread(self._client.close)
+            if self._local is not None:
+                self._local.close()
+        finally:
+            self._closed = True
 
     async def terminalize(
         self,
@@ -562,9 +754,48 @@ class _BenchmarkOperation:
         descriptor: dict[str, Any],
     ) -> bool:
         """Persist a terminal outcome; retry ambiguous writes as indeterminate."""
+        await self._await_renewal_resolution()
+        renewal_failure = await self.stop_renewal()
+        renewal_failed = renewal_failure is not None
+        if renewal_failed:
+            requested_outcome = outcome
+            benchmark_result = descriptor.get("benchmark_result")
+            outcome = "indeterminate"
+            failure_descriptor: dict[str, Any] = {
+                key: value
+                for key, value in descriptor.items()
+                if key not in {"outcome", "benchmark_result"}
+            }
+            failure_descriptor.update(
+                {
+                    "outcome": "lease_renewal_failed",
+                    "requested_outcome": requested_outcome,
+                    "renewal_error_type": type(renewal_failure).__name__,
+                }
+            )
+            if isinstance(benchmark_result, dict):
+                compact_result = {
+                    key: benchmark_result[key]
+                    for key in (
+                        "exit_code",
+                        "harness",
+                        "run_id",
+                        "run_dir",
+                        "validation_id",
+                    )
+                    if key in benchmark_result
+                }
+                compact_result.update(
+                    {
+                        "status": "indeterminate",
+                        "message": "Lease renewal was not confirmed; reconcile this run",
+                    }
+                )
+                failure_descriptor["benchmark_result"] = compact_result
+            descriptor = failure_descriptor
         try:
             await self.transition(outcome, operation, descriptor=descriptor)
-            return True
+            return not renewal_failed
         except Exception:
             logger.exception("benchmark operation terminal write failed")
             if outcome != "indeterminate":
@@ -577,10 +808,10 @@ class _BenchmarkOperation:
                             "terminal_write_failed": True,
                         },
                     )
-                    return True
+                    return False
                 except Exception:
                     logger.exception("benchmark operation indeterminate write failed")
-            return False
+        return False
 
 
 async def _ensure_init():
@@ -673,43 +904,6 @@ def _controller_host() -> str | None:
     if isinstance(assigned, dict) and isinstance(assigned.get("controller"), str):
         return assigned["controller"].strip() or None
     return None
-
-
-def _authorized_plugin_hosts() -> set[str]:
-    """Return host identities assigned to this ticket for schema discovery."""
-    fields = _ticket.get("custom_fields", {}) if _ticket else {}
-    authorized: set[str] = set()
-
-    def add(value: Any) -> None:
-        if isinstance(value, str) and value.strip():
-            authorized.add(value.strip().rstrip(".").lower())
-
-    add(_controller_host())
-    assigned = fields.get("assigned_hardware_ips", {})
-    if isinstance(assigned, dict):
-        add(assigned.get("controller"))
-        targets = assigned.get("targets", [])
-        if isinstance(targets, (list, tuple, set)):
-            for target in targets:
-                add(target)
-        else:
-            add(targets)
-
-    inventory = fields.get("host_inventory", {})
-    if isinstance(inventory, dict):
-        for host in inventory:
-            add(host)
-    return authorized
-
-
-def _validate_plugin_host(host: str) -> tuple[bool, str]:
-    """Check that a schema target is an assigned controller/inventory host."""
-    if not isinstance(host, str) or not host.strip():
-        return False, "No target host available"
-    normalized = host.strip().rstrip(".").lower()
-    if normalized not in _authorized_plugin_hosts():
-        return False, "Target host is not assigned to this ticket"
-    return True, "OK"
 
 
 async def _read_controller_file(host: str, path: str) -> str | None:
@@ -1206,57 +1400,6 @@ async def get_execution_config(harness_name: str) -> str:
                 ),
             }
         )
-    # Arcaflow plugins are self-contained containers — no private
-    # execution config or harness installation is needed.
-    if harness_name == "arcaflow-plugins":
-        return json.dumps(
-            {
-                "harness": harness_name,
-                "found": True,
-                "controller_required": False,
-                "run_command": "podman run",
-                "endpoint_type": "remotehosts",
-                "endpoint_user": "root",
-                "run_file_format": "yaml",
-                "results_dir_pattern": "",
-                "default_image_registry": "quay.io/arcalot",
-                "image_naming": (
-                    "quay.io/arcalot/arcaflow-plugin-<workload> "
-                    "(community plugins; third-party plugins "
-                    "may use different registries)"
-                ),
-                "workflow": [
-                    "1. Call get_plugin_schema with the plugin image to discover available steps and input parameters",
-                    "2. Build the input YAML based on the schema and ticket parameters",
-                    "3. Call execute_benchmark with "
-                    "run_file containing: plugin_image, "
-                    "plugin_step (the step name, e.g. "
-                    "'uperf' or 'workload'), and input "
-                    "(the YAML parameters as a dict). "
-                    "The tool handles podman run, -s flag, "
-                    "stdin piping, and result collection.",
-                ],
-                "run_file_keys": {
-                    "plugin_image": "required — full container image ref",
-                    "plugin_step": "required — step name (e.g. 'workload', 'uperf')",
-                    "input": "required — plugin input parameters as a dict",
-                },
-                "note": (
-                    "Arcaflow plugins are containers. "
-                    "Community plugins from quay.io/arcalot "
-                    "are typically multi-arch (amd64 + arm64). "
-                    "Do NOT manually "
-                    "pull or run containers — use "
-                    "get_runfile_schema and "
-                    "execute_benchmark which handle "
-                    "image resolution and execution. "
-                    "Do NOT try to install workload "
-                    "binaries (uperf, fio, etc.) on the "
-                    "host — they run inside containers."
-                ),
-            }
-        )
-
     config = await _skill_provider.get_all_private_config(harness_name)
     execution = config.get("execution", {})
     if not execution:
@@ -1328,75 +1471,6 @@ async def get_runfile_schema(harness: str = "crucible") -> str:
 
 
 @mcp.tool()
-async def get_plugin_schema(
-    plugin_image: str,
-    host: str = "",
-) -> str:
-    """Query an Arcaflow plugin container for its input schema.
-
-    Runs the plugin with --json-schema input on the target host
-    via podman. Returns the JSON schema describing the plugin's
-    available steps and their input parameters.
-
-    Args:
-        plugin_image: Full container image ref
-            (e.g., quay.io/arcalot/arcaflow-plugin-fio:0.5.0)
-        host: Target host IP. Uses the ticket's controller
-            if not specified.
-    """
-    await _ensure_init()
-    if _ssh is None:
-        return json.dumps({"error": "SSH not initialized"})
-
-    image_valid, image_error = _validate_plugin_image(plugin_image)
-    if not image_valid:
-        return json.dumps({"error": image_error})
-
-    target = host or _controller_host() or ""
-    host_valid, host_error = _validate_plugin_host(target)
-    if not host_valid:
-        return json.dumps({"error": host_error})
-
-    cmd = shlex.join(["podman", "run", "--rm", plugin_image, "--json-schema", "input"])
-    result = await _ssh.run(target, cmd, timeout=60)
-
-    if result.exit_code != 0:
-        # Try --schema as fallback (returns full schema)
-        cmd_full = shlex.join(["podman", "run", "--rm", plugin_image, "--schema"])
-        result = await _ssh.run(target, cmd_full, timeout=60)
-
-    if result.exit_code != 0:
-        return json.dumps(
-            {
-                "error": f"Failed to query plugin schema (exit {result.exit_code})",
-                "stderr": result.stderr[:500] if result.stderr else "",
-                "hint": (
-                    "The plugin image may not exist or may not "
-                    "support --json-schema. Check the image ref."
-                ),
-            }
-        )
-
-    # Parse and return the schema
-    try:
-        schema = json.loads(result.stdout)
-        return json.dumps(
-            {
-                "plugin_image": plugin_image,
-                "schema": schema,
-            }
-        )
-    except json.JSONDecodeError:
-        return json.dumps(
-            {
-                "plugin_image": plugin_image,
-                "raw_output": result.stdout[:2000],
-                "note": "Output was not valid JSON",
-            }
-        )
-
-
-@mcp.tool()
 async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str:
     """Get the parameter definitions (multiplex.json) for a specific benchmark. Returns presets (named parameter sets like 'basic', 'default') and validations (regex patterns for allowed values per argument). Use this to understand what mv-params arguments are valid and what values they accept."""
     await _ensure_init()
@@ -1441,46 +1515,68 @@ async def _get_crucible_benchmark_context_tool(
     operation: str = "bootstrap",
     path: str = "",
     query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
 ) -> str:
     """Use generic context primitives for the designated Crucible controller.
 
     ``bootstrap`` returns the controller's entrypoint document. ``read`` reads
-    the caller-selected controller-relative path. ``search`` searches controller
-    path names and file contents, returning grouped candidates; the caller then
-    selects files to read. Source selection, phase policy, and provenance are
-    server-managed.
+    a caller-selected path with bounded byte paging. ``search`` searches
+    controller paths and file contents, returning grouped candidates and sizes.
+    Source selection, phase policy, and provenance are server-managed.
     """
     await _ensure_init()
+    if _crucible_context is None:
+        raise RuntimeError("Crucible context provider was not initialized")
     if operation not in {"bootstrap", "read", "search"}:
-        return json.dumps(
-            {
-                "found": False,
-                "operation": operation,
-                "reason": "unsupported_operation",
-                "guidance": "Use bootstrap, read, or search.",
-            }
+        return _with_crucible_runfile_contract(
+            json.dumps(
+                {
+                    "found": False,
+                    "operation": operation,
+                    "reason": "unsupported_operation",
+                    "guidance": "Use bootstrap, read, or search.",
+                }
+            )
         )
     controller_host = _controller_host()
     if _ssh is None or not controller_host:
-        return json.dumps(
-            {
-                "found": False,
-                "operation": operation,
-                "reason": "controller_not_identified",
-            }
+        return _with_crucible_runfile_contract(
+            json.dumps(
+                {
+                    "found": False,
+                    "operation": operation,
+                    "reason": "controller_not_identified",
+                }
+            )
         )
-    return await controller_context_gateway(
-        ssh=_ssh,
-        controller_host=controller_host,
-        ticket_id=os.environ.get("TICKET_ID", ""),
-        agent_name="benchmark-agent",
-        phase="benchmark",
-        operation=operation,
-        path=path,
-        query=query,
-        benchmark="",
-        include_alternates=False,
+    return _with_crucible_runfile_contract(
+        await controller_context_gateway(
+            ssh=_ssh,
+            controller_host=controller_host,
+            ticket_id=os.environ.get("TICKET_ID", ""),
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation=operation,
+            path=path,
+            query=query,
+            benchmark="",
+            include_alternates=False,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
+        )
     )
+
+
+def _with_crucible_runfile_contract(response: str) -> str:
+    """Attach provider-owned run-file requirements to model-facing context."""
+    if _crucible_context is None:
+        raise RuntimeError("Crucible context provider was not initialized")
+    result = json.loads(response)
+    if not isinstance(result, dict):
+        raise ValueError("Crucible context response must be a JSON object")
+    result["runfile_contract"] = _crucible_context.get_runfile_contract()
+    return json.dumps(result)
 
 
 async def _legacy_get_crucible_benchmark_context(
@@ -1492,6 +1588,8 @@ async def _legacy_get_crucible_benchmark_context(
     subject_area: str | list[str] = "all",
     include_alternates: bool = False,
     query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
 ) -> str:
     """Compatibility implementation for pre-gateway internal callers."""
     await _ensure_init()
@@ -1511,6 +1609,8 @@ async def _legacy_get_crucible_benchmark_context(
             path=path,
             query=query,
             include_alternates=include_alternates,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
         )
     if operation == "context" and _ssh is not None and _controller_host():
         return json.dumps(
@@ -2295,9 +2395,18 @@ async def execute_benchmark(
             finally:
                 await replay_guard.close()
         return json.dumps(active_check)
+    run_uuid = uuid.uuid4().hex[:8]
+    harness_name = harness or "crucible"
+
+    # The approval gate applies only to Crucible, which has the
+    # validate_benchmark → request_approval → execute pipeline.
+    # Other harnesses (arcaflow-plugins, boot-time) do not use
+    # that flow and would be blocked unconditionally.
     if (
-        active_check.get("id") or os.environ.get("TICKET_ID")
-    ) and not approval_request_id:
+        harness_name == "crucible"
+        and (active_check.get("id") or os.environ.get("TICKET_ID"))
+        and not approval_request_id
+    ):
         return json.dumps(
             {
                 "status": "rejected",
@@ -2305,9 +2414,6 @@ async def execute_benchmark(
                 "message": "ticket-scoped benchmark execution requires approval_request_id",
             }
         )
-
-    run_uuid = uuid.uuid4().hex[:8]
-    harness_name = harness or "crucible"
 
     async def pause_for_reconciliation(reason: str) -> None:
         """Put ambiguous executions in the canonical human-guidance state."""
@@ -2473,6 +2579,19 @@ async def execute_benchmark(
                 "message": "A runfile is required for this harness",
             }
         )
+    if harness_name == "crucible":
+        contract_errors = crucible_runfile_contract_errors(run_file)
+        if contract_errors:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "harness": harness_name,
+                    "reason_code": "invalid_runfile_contract",
+                    "message": (
+                        f"Run-file failed schema validation: {contract_errors}"
+                    ),
+                }
+            )
 
     if run_command is not None:
         valid, reason = _validate_run_command(run_command, harness_name)
@@ -2571,6 +2690,8 @@ async def execute_benchmark(
                 }
             )
         operation_owned = True
+        if harness_name == "crucible":
+            await operation_guard.start_renewal(operation_record)
         try:
             await operation_guard.transition(
                 "prepared", operation_record, descriptor={"intent": immutable_intent}
@@ -3471,169 +3592,6 @@ async def execute_benchmark(
             response["error"] = result.stderr[-1000:] if result.stderr else ""
         return json.dumps(response)
 
-    if harness_name == "arcaflow-plugins":
-        import asyncio as _asyncio
-        import shutil
-
-        plugin_image = run_file.get("plugin_image", "")
-        plugin_input = run_file.get("input", {})
-        # Accept key aliases — the LLM uses various
-        # names for the step parameter.
-        plugin_step = (
-            run_file.get("plugin_step")
-            or run_file.get("step")
-            or run_file.get("step_name")
-            or "workload"
-        )
-
-        if not plugin_image:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "exit_code": -1,
-                    "run_id": f"arcaflow-{run_uuid}",
-                    "harness": "arcaflow-plugins",
-                    "output": "",
-                    "error": "No plugin_image specified in run file",
-                    "message": "Missing plugin_image",
-                }
-            )
-
-        image_valid, image_error = _validate_plugin_image(plugin_image)
-        if not image_valid:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "exit_code": -1,
-                    "run_id": f"arcaflow-{run_uuid}",
-                    "output": "",
-                    "error": image_error,
-                    "message": "Invalid Arcaflow plugin image",
-                }
-            )
-
-        # Determine if we can run locally (no SSH needed)
-        is_local = controller in ("localhost", "127.0.0.1", "::1")
-
-        # Serialize input as YAML if pyyaml available, else JSON
-        try:
-            import yaml
-
-            input_content = yaml.dump(plugin_input, default_flow_style=False)
-        except ImportError:
-            input_content = json.dumps(plugin_input, indent=2)
-
-        # Build container args: optional -s step, then -f - for stdin
-        container_args = []
-        container_args += ["-s", plugin_step]
-        container_args += ["-f", "-"]
-
-        if is_local:
-            logger.info(f"[benchmark] Local execution: podman run {plugin_image}")
-            podman_path = shutil.which("podman")
-            if not podman_path:
-                return json.dumps(
-                    {
-                        "status": "failed",
-                        "exit_code": -1,
-                        "run_id": f"arcaflow-{run_uuid}",
-                        "harness": "arcaflow-plugins",
-                        "output": "",
-                        "error": "podman not found locally",
-                        "message": "Arcaflow plugins require podman",
-                    }
-                )
-
-            proc = await AuditedSubprocessRunner().start(
-                [
-                    podman_path,
-                    "run",
-                    "-i",
-                    "--rm",
-                    "--network=host",
-                    plugin_image,
-                    *container_args,
-                ],
-                stdin=input_content.encode(),
-                mutating=True,
-            )
-            stdout_bytes, stderr_bytes = await proc.communicate()
-            exit_code = proc.returncode or 0
-            stdout_str = stdout_bytes.decode(errors="replace")
-            stderr_str = stderr_bytes.decode(errors="replace")
-        else:
-            podman_check = await _ssh.run(controller, "which podman", timeout=10)
-            if podman_check.exit_code != 0:
-                return json.dumps(
-                    {
-                        "status": "failed",
-                        "exit_code": -1,
-                        "run_id": f"arcaflow-{run_uuid}",
-                        "harness": "arcaflow-plugins",
-                        "output": "",
-                        "error": "podman not found on target host",
-                        "message": "Arcaflow plugins require podman on the target host",
-                    }
-                )
-
-            input_path = f"/tmp/arcaflow-input-{run_uuid}.yaml"
-            await _ssh.run(
-                controller,
-                f"cat > {input_path} << 'ARCAEOF'\n{input_content}\nARCAEOF",
-            )
-
-            podman_args = [
-                "podman",
-                "run",
-                "-i",
-                "--rm",
-                plugin_image,
-                "-s",
-                plugin_step,
-                "-f",
-                "-",
-            ]
-            cmd = f"cat {shlex.quote(input_path)} | {shlex.join(podman_args)} 2>&1"
-            logger.info(f"[benchmark] Executing Arcaflow plugin via SSH: {cmd}")
-            result = await _ssh.run_with_progress(
-                controller,
-                cmd,
-                progress_callback=_benchmark_progress,
-            )
-            exit_code = result.exit_code
-            stdout_str = result.stdout or ""
-            stderr_str = result.stderr or ""
-
-            await _ssh.run(controller, f"rm -f {input_path}", timeout=10)
-
-        response = {
-            "status": "completed" if exit_code == 0 else "failed",
-            "exit_code": exit_code,
-            "run_id": f"arcaflow-{run_uuid}",
-            "harness": "arcaflow-plugins",
-            "plugin_image": plugin_image,
-            "execution_mode": "local" if is_local else "ssh",
-            "message": (
-                "Arcaflow plugin completed"
-                if exit_code == 0
-                else f"Arcaflow plugin failed (exit {exit_code})"
-            ),
-        }
-        if exit_code == 0 and stdout_str:
-            try:
-                response["result_summary"] = json.loads(stdout_str)
-            except json.JSONDecodeError:
-                try:
-                    import yaml
-
-                    response["result_summary"] = yaml.safe_load(stdout_str)
-                except Exception:
-                    response["result_summary"] = stdout_str[:3000]
-        if exit_code != 0:
-            response["output"] = stdout_str[-3000:] if stdout_str else ""
-            response["error"] = stderr_str[-1000:] if stderr_str else ""
-        return json.dumps(response)
-
     # Default: crucible (and any unknown harness that uses JSON run-files)
     ticket_id = os.environ.get("TICKET_ID", "")
     if validation_id and operation_guard is None:
@@ -3697,6 +3655,7 @@ async def execute_benchmark(
                 }
             )
         operation_owned = True
+        await operation_guard.start_renewal(operation_record)
         try:
             await operation_guard.transition(
                 "prepared", operation_record, descriptor={"intent": immutable_intent}
@@ -3742,16 +3701,9 @@ async def execute_benchmark(
             }
         )
 
-    if ticket_id:
-        staging, staging_name, local_path = _write_ticket_staging_file(
-            ticket_id, json.dumps(run_file, indent=2)
-        )
-    else:
-        staging = None
-        staging_name = ""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(run_file, f, indent=2)
-            local_path = f.name
+    staging, staging_name, local_path = _write_ticket_staging_file(
+        ticket_id, json.dumps(run_file, indent=2)
+    )
 
     logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
     try:
@@ -3793,10 +3745,7 @@ async def execute_benchmark(
                 }
             )
     finally:
-        if staging:
-            staging.unlink(staging_name, missing_ok=True)
-        else:
-            Path(local_path).unlink(missing_ok=True)
+        staging.unlink(staging_name, missing_ok=True)
 
     if scp_result.exit_code != 0:
         response = {
@@ -3940,6 +3889,7 @@ async def execute_benchmark(
                     "outcome": "indeterminate",
                     "external_id_persist_failed": True,
                     "error_type": type(exc).__name__,
+                    "known_external_ids": {"run_id": run_id, "run_dir": run_dir},
                 },
             )
             await operation_guard.close()
@@ -4043,6 +3993,17 @@ async def validate_benchmark(
             }
         )
 
+    contract_errors = crucible_runfile_contract_errors(run_file)
+    if contract_errors:
+        return json.dumps(
+            {
+                "status": "invalid",
+                "valid": False,
+                "harness": harness_name,
+                "errors": contract_errors,
+            }
+        )
+
     execution = {}
     if _skill_provider:
         execution = (await _skill_provider.get_all_private_config(harness_name)).get(
@@ -4069,16 +4030,9 @@ async def validate_benchmark(
         ticket_id = os.environ.get("TICKET_ID", "")
         staging = None
         staging_name = ""
-        if ticket_id:
-            staging, staging_name, local_path = _write_ticket_staging_file(
-                ticket_id, json.dumps(run_file, indent=2)
-            )
-        else:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False
-            ) as file:
-                json.dump(run_file, file, indent=2)
-                local_path = file.name
+        staging, staging_name, local_path = _write_ticket_staging_file(
+            ticket_id, json.dumps(run_file, indent=2)
+        )
 
         copied = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
         if copied.exit_code != 0:
@@ -4180,8 +4134,6 @@ async def validate_benchmark(
         if local_path:
             if staging:
                 staging.unlink(staging_name, missing_ok=True)
-            else:
-                Path(local_path).unlink(missing_ok=True)
         try:
             await _ssh.run(controller, f"rm -f {remote_path}", timeout=10)
         except Exception:
@@ -4243,6 +4195,55 @@ async def get_run_logs(
             "status": "ok" if log_result.exit_code == 0 else "error",
         }
     )
+
+
+_MAX_BOOT_SERIAL_READ = 1024 * 1024
+
+
+def _boot_serial_diagnostics(serial_log_path: Path) -> dict[str, Any]:
+    """Read a bounded serial snapshot and report boot/failure indicators."""
+    try:
+        with serial_log_path.open("rb") as stream:
+            file_size = stream.seek(0, os.SEEK_END)
+            if not file_size:
+                return {}
+            stream.seek(max(0, file_size - _MAX_BOOT_SERIAL_READ))
+            # A serial writer may append after the seek. Bound the read itself.
+            serial_bytes = stream.read(_MAX_BOOT_SERIAL_READ)
+    except OSError:
+        return {}
+
+    serial_text = serial_bytes.decode("utf-8", errors="replace")
+    lower_text = serial_text.lower()
+    indicators = [
+        label
+        for pattern, label in (
+            ("kernel panic", "kernel_panic"),
+            ("unable to mount root", "root_mount_failure"),
+            ("not syncing", "kernel_not_syncing"),
+            ("reboot: system halted", "system_halted"),
+            ("out of memory", "oom"),
+            ("oom-killer", "oom_killer"),
+            ("call trace", "call_trace"),
+            ("initramfs unpacking failed", "initramfs_failed"),
+            ("reboot: power down", "power_down"),
+            ("reboot: restarting system", "reboot_restart"),
+            ("invalid gpt", "invalid_gpt"),
+            ("autoboot", "uboot_autoboot"),
+            ("login:", "reached_login"),
+        )
+        if pattern in lower_text
+    ]
+    if re.search(r"(?m)^u-boot(?:[ \t]+\d|[ \t]*$)", lower_text):
+        indicators.append("uboot_banner")
+
+    diagnostics: dict[str, Any] = {
+        "serial_log_bytes": file_size,
+        "serial_tail": serial_text[-2000:],
+    }
+    if indicators:
+        diagnostics["serial_indicators"] = indicators
+    return diagnostics
 
 
 @mcp.tool()
@@ -4331,22 +4332,109 @@ async def execute_boot_time_test(
 
     # ── Wait for SSH readiness ─────────────────────────
     # Freshly provisioned boards may not have SSH ready
-    # immediately. Wait up to 60s for port 22.
+    # immediately. Wait up to 60s for port 22.  If a
+    # Jumpstarter lease is available and SSH fails, power-
+    # cycle the board and retry — the board may not have
+    # booted cleanly after flashing.
     import asyncio as _asyncio
     import socket as _socket
 
-    for _attempt in range(12):
-        try:
-            s = _socket.create_connection((sut_host, 22), timeout=5)
-            s.close()
+    _js_lease_id = ""
+    if _ticket:
+        _js_fields = _ticket.get("custom_fields", {})
+        _js_meta = _js_fields.get("resource_provider_metadata", {})
+        _js_lease_id = _js_meta.get("lease_id", "")
+        if _js_fields.get("resource_provider") != "jumpstarter":
+            _js_lease_id = ""
+
+    _MAX_POWER_CYCLES = 3
+    _SSH_ATTEMPTS_PER_CYCLE = 12
+    _ssh_ready = False
+    _power_cycles_attempted = 0
+    _ssh_polling_windows = 0
+
+    while True:
+        _ssh_polling_windows += 1
+        for _attempt in range(_SSH_ATTEMPTS_PER_CYCLE):
+            try:
+                s = _socket.create_connection((sut_host, 22), timeout=5)
+                s.close()
+                _ssh_ready = True
+                break
+            except (OSError, ConnectionRefusedError):
+                logger.info(
+                    "[boot-time] Waiting for SSH on %s (cycle %d/%d, attempt %d/%d)",
+                    sut_host,
+                    _power_cycles_attempted + 1,
+                    _MAX_POWER_CYCLES + 1,
+                    _attempt + 1,
+                    _SSH_ATTEMPTS_PER_CYCLE,
+                )
+                await _asyncio.sleep(5)
+
+        if _ssh_ready:
             break
-        except (OSError, ConnectionRefusedError):
-            logger.info(
-                f"[boot-time] Waiting for SSH on {sut_host} (attempt {_attempt + 1}/12)"
+
+        if not _js_lease_id:
+            # No Jumpstarter lease — cannot power-cycle
+            break
+
+        if _power_cycles_attempted >= _MAX_POWER_CYCLES:
+            break
+
+        _power_cycles_attempted += 1
+        logger.warning(
+            "[boot-time] SSH unreachable after %ds,"
+            " power-cycling board via Jumpstarter"
+            " (lease=%s, power cycle %d/%d)",
+            _SSH_ATTEMPTS_PER_CYCLE * 5,
+            _js_lease_id,
+            _power_cycles_attempted,
+            _MAX_POWER_CYCLES,
+        )
+        try:
+            _pc_proc = await AuditedSubprocessRunner().start(
+                [
+                    "jmp",
+                    "shell",
+                    "--lease",
+                    _js_lease_id,
+                    "--",
+                    "j",
+                    "power",
+                    "cycle",
+                ],
+                mutating=True,
             )
-            await _asyncio.sleep(5)
+            _pc_out, _pc_err = await asyncio.wait_for(
+                _pc_proc.communicate(),
+                timeout=60,
+            )
+            logger.info(
+                "[boot-time] Power cycle complete (rc=%d), waiting for SSH",
+                _pc_proc.returncode,
+            )
+        except Exception as _pc_exc:
+            logger.warning(
+                "[boot-time] Power cycle failed: %s",
+                _pc_exc,
+            )
+            break
 
     # ── Prep: install boot-time-analysis-tools on SUT ─────────
+    if not _ssh_ready:
+        return json.dumps(
+            {
+                "status": "failed",
+                "error": (
+                    f"SUT {sut_host} not SSH-reachable after"
+                    f" {_power_cycles_attempted} Jumpstarter power-cycle attempt(s)"
+                    f" across {_ssh_polling_windows} SSH polling window(s)."
+                    f" Board may need manual intervention."
+                ),
+            }
+        )
+
     ssh_user = "root"
     ssh_password = "password"
     if _ticket:
@@ -4407,8 +4495,9 @@ async def execute_boot_time_test(
             critical=True,
         )
         if _ticket_id
-        else None
+        else AuditedFilesystem.system(output_dir)
     )
+    artifact_file_mode = 0o600 if _ticket_id else 0o644
 
     # Security: password on argv — see comment at install_proc above.
     cmd = [
@@ -4483,238 +4572,388 @@ async def execute_boot_time_test(
 
     serial_proc = None
     serial_log_fh = None
+    harness_log_fh = None
     serial_log_path = output_dir / "serial-capture.log"
-    if _ticket:
-        _fields = _ticket.get("custom_fields", {})
-        _metadata = _fields.get(
-            "resource_provider_metadata",
-            {},
-        )
-        _lease_id = _metadata.get("lease_id", "")
-        _directives = _fields.get("directives", {})
-        _passive_serial = _directives.get(
-            "serial_capture",
-            False,
-        )
-        # Don't run passive serial alongside active serial
-        _serial_active = _directives.get(
-            "jumpstarter_serial",
-            False,
-        )
-        if (
-            _lease_id
-            and _fields.get("resource_provider") == "jumpstarter"
-            and _passive_serial
-            and not _serial_active
-        ):
-            try:
-                serial_log_fh = (
-                    artifact_filesystem.open_stream("serial-capture.log")
-                    if artifact_filesystem
-                    else open(serial_log_path, "wb")
-                )
-                serial_proc = await AuditedSubprocessRunner().start(
-                    [
-                        "jmp",
-                        "shell",
-                        f"--lease={_lease_id}",
-                        "--",
-                        "j",
-                        "serial",
-                        "pipe",
-                    ],
-                    stdout=serial_log_fh,
-                    stderr=_asyncio.subprocess.DEVNULL,
-                    mutating=True,
-                )
-                logger.info(
-                    f"[boot-time] Passive serial capture "
-                    f"started (lease={_lease_id}, "
-                    f"pid={serial_proc.pid})"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[boot-time] Failed to start passive serial capture: {e}"
-                )
-                serial_proc = None
-                if serial_log_fh:
-                    serial_log_fh.close()
-                    serial_log_fh = None
-
-    # ── Execute ───────────────────────────────────────────
-    # Run from output_dir so boot-timings-test.sh creates
-    # its results folder (and SCPs files) here, not relative
-    # to the scripts repo.
-    # Merge Jumpstarter env vars with current environment
-    run_env = {**_os.environ, **jumpstarter_env} if jumpstarter_env else None
-    # Timeout: samples × ~90s per sample + 15min overhead.
-    # Prevents orphaned jmp shell subprocesses from keeping
-    # the pipe open indefinitely (observed: 4hr hang when
-    # capture-boot timed out but jmp shell child lingered).
-    benchmark_timeout = (samples * 90) + 900
-
-    proc = await AuditedSubprocessRunner().start(
-        cmd,
-        cwd=str(output_dir),
-        env=run_env,
-        mutating=True,
-    )
-    _STALL_CHECK_INTERVAL = 60
-    _STALL_TIMEOUT = 300
-
-    # Keep communicate() running for the whole lifetime of the process so
-    # stdout/stderr pipes are drained while we poll for artifact progress.
-    # Waiting on proc.wait() with PIPEs can deadlock when the child produces
-    # more output than the pipe buffer can hold.
-    communicate_task = _asyncio.create_task(proc.communicate())
-    loop = _asyncio.get_running_loop()
-    start_time = loop.time()
-    deadline = start_time + benchmark_timeout
     try:
-        last_file_count = sum(1 for path in output_dir.rglob("*") if path.is_file())
-    except OSError:
-        last_file_count = 0
-    last_progress_time = start_time
-    stall_killed = False
-
-    while not communicate_task.done():
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            logger.warning(
-                "[boot-time] Subprocess timed out after %ds, killing",
-                benchmark_timeout,
+        if _ticket:
+            _fields = _ticket.get("custom_fields", {})
+            _metadata = _fields.get(
+                "resource_provider_metadata",
+                {},
             )
-            proc.kill()
-            break
+            _lease_id = _metadata.get("lease_id", "")
+            _directives = _fields.get("directives", {})
+            # Default to serial capture for Jumpstarter boards.
+            # Serial output is the only diagnostic evidence when
+            # boards fail to come back from reboots.
+            _is_jumpstarter = _fields.get("resource_provider") == "jumpstarter"
+            _passive_serial = _directives.get(
+                "serial_capture",
+                _is_jumpstarter,
+            )
+            # Don't run passive serial alongside active serial
+            _serial_active = _directives.get(
+                "jumpstarter_serial",
+                False,
+            )
+            if (
+                _lease_id
+                and _fields.get("resource_provider") == "jumpstarter"
+                and _passive_serial
+                and not _serial_active
+            ):
+                try:
+                    serial_log_fh = artifact_filesystem.open_stream(
+                        "serial-capture.log", mode=artifact_file_mode
+                    )
+                    serial_proc = await AuditedSubprocessRunner().start(
+                        [
+                            "jmp",
+                            "shell",
+                            f"--lease={_lease_id}",
+                            "--",
+                            "j",
+                            "serial",
+                            "pipe",
+                        ],
+                        stdout=serial_log_fh,
+                        stderr=_asyncio.subprocess.DEVNULL,
+                        mutating=True,
+                    )
+                    logger.info(
+                        f"[boot-time] Passive serial capture "
+                        f"started (lease={_lease_id}, "
+                        f"pid={serial_proc.pid})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[boot-time] Failed to start passive serial capture: {e}"
+                    )
+                    serial_proc = None
+                    if serial_log_fh:
+                        serial_log_fh.close()
+                        serial_log_fh = None
+
+        # ── Execute ───────────────────────────────────────────
+        # Run from output_dir so boot-timings-test.sh creates
+        # its results folder (and SCPs files) here, not relative
+        # to the scripts repo.
+        # Merge Jumpstarter env vars with current environment
+        run_env = {**_os.environ, **jumpstarter_env} if jumpstarter_env else None
+        # Timeout: samples × ~90s per sample + 15min overhead.
+        # Prevents orphaned jmp shell subprocesses from keeping
+        # the pipe open indefinitely (observed: 4hr hang when
+        # capture-boot timed out but jmp shell child lingered).
+        benchmark_timeout = (samples * 90) + 900
+
+        # Capture full subprocess output to an artifact log file.
+        # The tool result truncates stdout to the last 3000 bytes,
+        # which loses critical diagnostics (BOOT_CONFIG, power cycle
+        # results, error messages) when wait_for_sut_up spam fills
+        # the buffer. The log file preserves everything.
+        try:
+            harness_log_fh = artifact_filesystem.open_stream(
+                "harness-output.log", mode=artifact_file_mode
+            )
+        except Exception as exc:
+            logger.warning("[boot-time] Cannot open harness output log: %s", exc)
+
+        proc = await AuditedSubprocessRunner().start(
+            cmd,
+            cwd=str(output_dir),
+            env=run_env,
+            mutating=True,
+        )
+        _STALL_CHECK_INTERVAL = 60
+        _STALL_TIMEOUT = 300
+
+        # Drain bounded chunks so an unterminated line cannot exceed the
+        # StreamReader line limit and strand the benchmark subprocess.
+        _stdout_chunks: list[bytes] = []
+        _stderr_chunks: list[bytes] = []
+        harness_log_failed = False
+
+        async def _drain_stream(
+            stream: _asyncio.StreamReader | None,
+            chunks: list[bytes],
+            prefix: bytes = b"",
+        ) -> None:
+            nonlocal harness_log_failed
+            if stream is None:
+                return
+            at_line_start = True
+            while True:
+                chunk = await stream.read(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if harness_log_fh is not None and not harness_log_failed:
+                    try:
+                        # A line may span reads. Prefix each stderr line once,
+                        # including empty lines and lines beyond 64 KiB.
+                        if prefix:
+                            tagged = (prefix if at_line_start else b"") + chunk.replace(
+                                b"\n", b"\n" + prefix
+                            )
+                            if chunk.endswith(b"\n"):
+                                tagged = tagged[: -len(prefix)]
+                            at_line_start = chunk.endswith(b"\n")
+                        else:
+                            tagged = chunk
+                        harness_log_fh.write(tagged)
+                        harness_log_fh.flush()
+                    except Exception as exc:
+                        harness_log_failed = True
+                        logger.warning(
+                            "[boot-time] Cannot write harness output log: %s", exc
+                        )
+
+        _drain_stdout = _asyncio.create_task(_drain_stream(proc.stdout, _stdout_chunks))
+        _drain_stderr = _asyncio.create_task(
+            _drain_stream(proc.stderr, _stderr_chunks, b"STDERR: ")
+        )
+        drain_task = _asyncio.gather(_drain_stdout, _drain_stderr)
+
+        async def _wait_drains() -> None:
+            # asyncio Process.wait() can itself wait for pipe EOF. The parent
+            # returncode is set independently, even when a descendant holds
+            # an inherited write end open.
+            while proc.returncode is None:
+                if drain_task.done() and drain_task.exception() is not None:
+                    await drain_task
+                await _asyncio.sleep(0.05)
+            await _asyncio.wait_for(
+                _asyncio.shield(drain_task), timeout=_BOOT_TIME_DRAIN_TIMEOUT
+            )
+
+        communicate_task = _asyncio.create_task(_wait_drains())
+        loop = _asyncio.get_running_loop()
+        start_time = loop.time()
+        deadline = start_time + benchmark_timeout
+        try:
+            last_file_count = sum(1 for path in output_dir.rglob("*") if path.is_file())
+        except OSError:
+            last_file_count = 0
+        last_progress_time = start_time
+        stall_killed = False
+        timed_out = False
+        drain_complete = False
+        cancelled = False
+        drain_error = ""
 
         try:
-            await _asyncio.wait_for(
-                _asyncio.shield(communicate_task),
-                timeout=min(_STALL_CHECK_INTERVAL, remaining),
-            )
-            break
-        except _asyncio.TimeoutError:
-            now = loop.time()
-            try:
-                file_count = sum(1 for path in output_dir.rglob("*") if path.is_file())
-            except OSError:
-                file_count = last_file_count
+            while not communicate_task.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.warning(
+                        "[boot-time] Subprocess timed out after %ds, killing",
+                        benchmark_timeout,
+                    )
+                    timed_out = True
+                    if proc.returncode is None:
+                        proc.kill()
+                    break
 
-            if file_count > last_file_count:
-                last_file_count = file_count
-                last_progress_time = now
-            elif now - last_progress_time >= _STALL_TIMEOUT:
-                logger.warning(
-                    "[boot-time] No new artifacts for %ds (stall detected at "
-                    "%d files), killing subprocess",
-                    int(now - last_progress_time),
-                    file_count,
-                )
-                proc.kill()
-                stall_killed = True
+                try:
+                    await _asyncio.wait_for(
+                        _asyncio.shield(communicate_task),
+                        timeout=min(_STALL_CHECK_INTERVAL, remaining),
+                    )
+                    break
+                except _asyncio.TimeoutError:
+                    now = loop.time()
+                    try:
+                        file_count = sum(
+                            1 for path in output_dir.rglob("*") if path.is_file()
+                        )
+                    except OSError:
+                        file_count = last_file_count
+
+                    if file_count > last_file_count:
+                        last_file_count = file_count
+                        last_progress_time = now
+                    elif now - last_progress_time >= _STALL_TIMEOUT:
+                        logger.warning(
+                            "[boot-time] No new artifacts for %ds (stall detected at "
+                            "%d files), killing subprocess",
+                            int(now - last_progress_time),
+                            file_count,
+                        )
+                        if proc.returncode is None:
+                            proc.kill()
+                        stall_killed = True
+                        break
+                except Exception as exc:
+                    drain_error = f"subprocess output read failed: {exc}"
+                    break
+
+            if not drain_error:
+                try:
+                    await _asyncio.wait_for(
+                        _asyncio.shield(communicate_task),
+                        timeout=_BOOT_TIME_DRAIN_TIMEOUT,
+                    )
+                    drain_complete = True
+                except _asyncio.TimeoutError:
+                    drain_error = "subprocess output pipes remained open after exit"
+                except Exception as exc:
+                    drain_error = f"subprocess output read failed: {exc}"
+        except _asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            # gather() can finish on one reader's error while its sibling is
+            # still blocked. Join each reader before closing the shared log.
+            for task in (communicate_task, _drain_stdout, _drain_stderr):
+                if not task.done():
+                    task.cancel()
+            await _asyncio.gather(
+                communicate_task,
+                _drain_stdout,
+                _drain_stderr,
+                drain_task,
+                return_exceptions=True,
+            )
+            for _ in range(200):
+                if proc.returncode is not None:
+                    break
+                await _asyncio.sleep(0.05)
+            if proc.returncode is None:
+                logger.warning("[boot-time] Benchmark did not exit after kill")
+            stdout_bytes = b"".join(_stdout_chunks)
+            stderr_bytes = b"".join(_stderr_chunks)
+            if drain_error:
+                logger.warning("[boot-time] %s", drain_error)
+            await proc.finish_streamed_output(
+                stdout_bytes,
+                stderr_bytes,
+                drain_complete=drain_complete,
+                timed_out=timed_out,
+                cancelled=cancelled,
+                failed=stall_killed,
+            )
+
+        exit_code = proc.returncode if proc.returncode is not None else 1
+        if not drain_complete or timed_out or stall_killed:
+            exit_code = exit_code or 1
+        stdout_str = stdout_bytes.decode(errors="replace")
+        stderr_str = stderr_bytes.decode(errors="replace")
+        if drain_error:
+            stderr_str += f"\n[agentic-perf] {drain_error}"
+        if stall_killed:
+            stderr_str += (
+                "\n[agentic-perf] Benchmark killed: no new artifact files for 5 "
+                "minutes (stall detected). This may indicate the board is "
+                "unresponsive after a cold reboot or the serial connection is dead."
+            )
+
+        # ── Parse reboot method from script output ───────
+        reboot_method = ""
+        for line in stdout_str.split("\n"):
+            if line.startswith("Reboot mode:"):
+                reboot_method = line.split(":", 1)[1].strip()
                 break
 
-    # The communicate task continues draining output after kill. Bound the
-    # cleanup in case a descendant inherited one of the pipe file descriptors.
-    try:
-        stdout_bytes, stderr_bytes = await _asyncio.wait_for(
-            _asyncio.shield(communicate_task),
-            timeout=10,
-        )
-    except _asyncio.TimeoutError:
-        communicate_task.cancel()
-        try:
-            await communicate_task
-        except _asyncio.CancelledError:
-            pass
-        stdout_bytes, stderr_bytes = b"", b""
-
-    exit_code = proc.returncode or 0
-    stdout_str = stdout_bytes.decode(errors="replace")
-    stderr_str = stderr_bytes.decode(errors="replace")
-    if stall_killed:
-        stderr_str += (
-            "\n[agentic-perf] Benchmark killed: no new artifact files for 5 "
-            "minutes (stall detected). This may indicate the board is "
-            "unresponsive after a cold reboot or the serial connection is dead."
-        )
-
-    # ── Parse reboot method from script output ───────
-    reboot_method = ""
-    for line in stdout_str.split("\n"):
-        if line.startswith("Reboot mode:"):
-            reboot_method = line.split(":", 1)[1].strip()
-            break
-
-    # ── Stall diagnostics ─────────────────────────────────
-    # When the stall detector kills the process, capture
-    # board state before reporting failure.
-    stall_diag: dict[str, Any] = {}
-    # Capture diagnostics on any failure, not just stall kills.
-    # The script may exit with code 1 (serial timeout, boot
-    # failure) before the stall detector triggers.
-    # Check for boot sample files (boot_time_logs.json), not
-    # raw file count — serial/metadata files are always present.
-    sample_count = _count_boot_time_samples(output_dir)
-    run_diag = stall_killed or (exit_code != 0 and sample_count == 0)
-    if run_diag and _ssh is not None and sut_host:
-        logger.info("[boot-time] Capturing stall diagnostics for %s", sut_host)
-        try:
-            ping = await _ssh.run(
-                sut_host,
-                "echo ALIVE",
-                timeout=5,
-            )
-            stall_diag["ssh_reachable"] = ping.exit_code == 0 and "ALIVE" in ping.stdout
-        except Exception:
-            stall_diag["ssh_reachable"] = False
-
-        if not stall_diag.get("ssh_reachable"):
-            # Board not reachable via SSH — try ping
+        # ── Stall diagnostics ─────────────────────────────────
+        # When the stall detector kills the process, capture
+        # board state before reporting failure.
+        stall_diag: dict[str, Any] = {}
+        # Capture diagnostics on any failure, not just stall kills.
+        # The script may exit with code 1 (serial timeout, boot
+        # failure) before the stall detector triggers.
+        # Check for boot sample files (boot_time_logs.json), not
+        # raw file count — serial/metadata files are always present.
+        sample_count = _count_boot_time_samples(output_dir)
+        run_diag = stall_killed or (exit_code != 0 and sample_count == 0)
+        if run_diag and _ssh is not None and sut_host:
+            logger.info("[boot-time] Capturing stall diagnostics for %s", sut_host)
             try:
-                ping_proc = await _asyncio.create_subprocess_exec(
-                    "ping",
-                    "-c1",
-                    "-W3",
+                ping = await _ssh.run(
                     sut_host,
-                    stdout=_asyncio.subprocess.DEVNULL,
-                    stderr=_asyncio.subprocess.DEVNULL,
+                    "echo ALIVE",
+                    timeout=5,
                 )
-                await ping_proc.wait()
-                stall_diag["pingable"] = ping_proc.returncode == 0
+                stall_diag["ssh_reachable"] = (
+                    ping.exit_code == 0 and "ALIVE" in ping.stdout
+                )
             except Exception:
-                stall_diag["pingable"] = False
+                stall_diag["ssh_reachable"] = False
 
-        stall_diag["samples_before_stall"] = sample_count
-        stall_diag["stall_duration_s"] = _STALL_TIMEOUT
+            if not stall_diag.get("ssh_reachable"):
+                # Board not reachable via SSH — try ping
+                try:
+                    ping_proc = await _asyncio.create_subprocess_exec(
+                        "ping",
+                        "-c1",
+                        "-W3",
+                        sut_host,
+                        stdout=_asyncio.subprocess.DEVNULL,
+                        stderr=_asyncio.subprocess.DEVNULL,
+                    )
+                    await ping_proc.wait()
+                    stall_diag["pingable"] = ping_proc.returncode == 0
+                except Exception:
+                    stall_diag["pingable"] = False
 
-        # Write diagnostics to artifact file
-        diag_file = output_dir / "stall-diagnostics.json"
-        try:
-            import json as _json
+            stall_diag["samples_before_stall"] = sample_count
+            stall_diag["stall_duration_s"] = _STALL_TIMEOUT
 
-            diag_file.write_text(_json.dumps(stall_diag, indent=2))
-            logger.info(
-                "[boot-time] Stall diagnostics: %s",
-                stall_diag,
-            )
-        except Exception:
-            pass
+            # Preserve the raw tail in the artifact/tool response, not service logs.
+            stall_diag.update(_boot_serial_diagnostics(serial_log_path))
 
-    # ── Stop passive serial capture ─────────────────────────
-    if serial_proc is not None:
-        try:
-            serial_proc.terminate()
+            # Write diagnostics to artifact file
             try:
-                await serial_proc.wait(timeout=10)
-            except _asyncio.TimeoutError:
-                # The tracked wait has already escalated to kill.
+                import json as _json
+
+                artifact_filesystem.write(
+                    "stall-diagnostics.json",
+                    _json.dumps(stall_diag, indent=2),
+                    mode=artifact_file_mode,
+                )
+                logger.info(
+                    "[boot-time] Stall diagnostics: %s",
+                    {
+                        key: value
+                        for key, value in stall_diag.items()
+                        if key != "serial_tail"
+                    },
+                )
+            except Exception:
                 pass
-            logger.info("[boot-time] Passive serial capture stopped")
-        except Exception as e:
-            logger.warning(f"[boot-time] Error stopping serial capture: {e}")
-    if serial_log_fh is not None:
-        serial_log_fh.close()
+
+    finally:
+        # Stop capture on command-start failures, monitoring errors, and cancellation.
+        try:
+            if serial_proc is not None:
+                try:
+                    if serial_proc.returncode is None:
+                        try:
+                            serial_proc.terminate()
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        await serial_proc.wait(timeout=10)
+                    except _asyncio.TimeoutError:
+                        # The tracked wait has already escalated to kill.
+                        pass
+                    logger.info("[boot-time] Passive serial capture stopped")
+                except Exception as exc:
+                    logger.warning("[boot-time] Error stopping serial capture: %s", exc)
+        finally:
+            if serial_log_fh is not None:
+                serial_log_fh.close()
+            if harness_log_fh is not None:
+                try:
+                    harness_log_fh.close()
+                except Exception as exc:
+                    logger.warning(
+                        "[boot-time] Cannot close harness output log: %s", exc
+                    )
     if serial_log_path.exists():
         size = serial_log_path.stat().st_size
         if size > 0:
@@ -4723,10 +4962,7 @@ async def execute_boot_time_test(
             )
         else:
             # Remove empty log file
-            if artifact_filesystem:
-                artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
-            else:
-                serial_log_path.unlink(missing_ok=True)
+            artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
 
     # ── Parse results ─────────────────────────────────────────
     # Find the results folder created by boot-timings-test.sh
@@ -4754,23 +4990,16 @@ async def execute_boot_time_test(
         )
         meta_out, _ = await meta_proc.communicate()
         if meta_proc.returncode == 0 and meta_out:
-            if artifact_filesystem:
-                artifact_filesystem.write("metadata.json", meta_out)
-            else:
-                metadata_file.write_bytes(meta_out)
+            artifact_filesystem.write(
+                "metadata.json", meta_out, mode=artifact_file_mode
+            )
             logger.info("[boot-time] Metadata collected")
         else:
             # Create minimal stub so merge can proceed
-            if artifact_filesystem:
-                artifact_filesystem.write("metadata.json", "{}")
-            else:
-                metadata_file.write_text("{}")
+            artifact_filesystem.write("metadata.json", "{}", mode=artifact_file_mode)
             logger.info("[boot-time] Metadata collection failed — using empty stub")
     else:
-        if artifact_filesystem:
-            artifact_filesystem.write("metadata.json", "{}")
-        else:
-            metadata_file.write_text("{}")
+        artifact_filesystem.write("metadata.json", "{}", mode=artifact_file_mode)
 
     # ── Merge into Horreum-compatible JSON ─────────────
     merged_file = output_dir / "merged-results.json"
@@ -4822,10 +5051,9 @@ async def execute_boot_time_test(
         )
         merge_out, merge_err = await merge_proc.communicate()
         if merge_proc.returncode == 0 and merge_out:
-            if artifact_filesystem:
-                artifact_filesystem.write("merged-results.json", merge_out)
-            else:
-                merged_file.write_bytes(merge_out)
+            artifact_filesystem.write(
+                "merged-results.json", merge_out, mode=artifact_file_mode
+            )
             logger.info(f"[boot-time] Merged results saved to {merged_file}")
         else:
             logger.warning(
@@ -4982,14 +5210,17 @@ async def execute_boot_time_test(
                     new_dir = response["output_dir"]
                     if new_dir not in existing:
                         existing.append(new_dir)
+                    result_fields = {
+                        "output_dir": new_dir,
+                        "output_dirs": existing,
+                        # These per-run values are snapshotted by the fleet
+                        # coordinator before the next board overwrites them.
+                        "samples_collected": response.get("samples_collected", 0),
+                        "benchmark_kpis": response.get("kpis") or {},
+                    }
                     update_response = await _client.patch(
                         f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-                        json={
-                            "fields": {
-                                "output_dir": new_dir,
-                                "output_dirs": existing,
-                            }
-                        },
+                        json={"fields": result_fields},
                     )
                     update_response.raise_for_status()
                 logger.info(
@@ -5004,13 +5235,16 @@ async def execute_boot_time_test(
 
     if reboot_method:
         response["reboot_method"] = reboot_method
-        # Flag mismatch: cold boot requested but SSH reboot used
-        boot_type = (
-            _ticket.get("custom_fields", {}).get("directives", {}).get("boot_type", "")
-            if _ticket
-            else ""
+        # Flag mismatch: cold boot requested but SSH reboot used.
+        # Check both canonical (reboot_method) and legacy (boot_type)
+        # directive keys for the user's requested reboot method.
+        _directives = (
+            _ticket.get("custom_fields", {}).get("directives", {}) if _ticket else {}
         )
-        if boot_type == "cold" and reboot_method == "ssh":
+        requested_method = _directives.get("reboot_method", "") or _directives.get(
+            "boot_type", ""
+        )
+        if requested_method == "cold" and reboot_method == "ssh":
             response["reboot_method_mismatch"] = (
                 "Cold boot requested but script used SSH "
                 "reboots. Jumpstarter power control flags "

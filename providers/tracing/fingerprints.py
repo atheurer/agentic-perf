@@ -6,20 +6,22 @@ import hashlib
 import hmac
 import os
 import secrets
-import tempfile
 from pathlib import Path
+
+from providers.execution import AuditedFilesystem
 
 
 def load_audit_key(key_path: Path) -> bytes:
     """Load or atomically create the deployment-local HMAC audit key."""
-    key_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(key_path.parent, 0o700)
+    filesystem = AuditedFilesystem.system(key_path.parent)
+    filesystem.mkdir(".")
+    filesystem.chmod(".", 0o700)
 
     def _read_existing() -> bytes:
         key = key_path.read_bytes()
         if len(key) < 32:
             raise ValueError("trace audit key is too short")
-        os.chmod(key_path, 0o600)
+        filesystem.chmod(key_path.name, 0o600)
         return key
 
     try:
@@ -28,18 +30,12 @@ def load_audit_key(key_path: Path) -> bytes:
         return key
     except FileNotFoundError:
         key = secrets.token_bytes(32)
-        fd, temp_name = tempfile.mkstemp(
-            prefix=".trace-audit-key-", dir=key_path.parent
-        )
+        temp_name = filesystem.temporary_file(prefix=".trace-audit-key-")
         try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(key)
-                stream.flush()
-                os.fsync(stream.fileno())
+            filesystem.write(temp_name, key, mode=0o600, atomic=False)
             try:
                 # link(2) publishes only if no concurrent creator won first.
-                os.link(temp_name, key_path)
+                filesystem.hardlink(temp_name, key_path.name)
             except FileExistsError:
                 _fsync_directory(key_path.parent)
                 return _read_existing()
@@ -47,7 +43,7 @@ def load_audit_key(key_path: Path) -> bytes:
             return key
         finally:
             try:
-                os.unlink(temp_name)
+                filesystem.unlink(temp_name, missing_ok=True)
             except FileNotFoundError:
                 pass
 

@@ -5,7 +5,7 @@ from providers.llm.base import ToolDefinition
 WORKSPACE_TOOLS = [
     ToolDefinition(
         name="jq_file_from_workspace",
-        description="Execute a jq filter expression on a structured JSON workspace file to extract keys, arrays, or compute aggregated values. For large arrays, use slice ranges (e.g. '.values[0:50]', next chunk: '.values[50:100]') to paginate.",
+        description="Execute a jq filter on a structured JSON workspace file. Set max_bytes (up to 16384) to choose the result page size. If next_offset_bytes is returned, repeat the same file_ref, filter, limit, and max_bytes with offset_bytes set to that value. Oversized string results return result_slice as text; oversized object/array results return slices of compact JSON text that can be joined in order. If items_truncated is true, use a jq array slice because limit omitted items.",
         input_schema={
             "type": "object",
             "properties": {
@@ -21,6 +21,16 @@ WORKSPACE_TOOLS = [
                     "type": "integer",
                     "description": "Maximum list items to return in result (default 50)",
                     "default": 50,
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "description": "Maximum result bytes to return (default 16384, hard maximum 16384)",
+                    "default": 16384,
+                },
+                "offset_bytes": {
+                    "type": "integer",
+                    "description": "Byte offset in the same result; use next_offset_bytes to continue",
+                    "default": 0,
                 },
                 "include_alternates": {
                     "type": "boolean",
@@ -71,13 +81,13 @@ WORKSPACE_TOOLS = [
     ),
     ToolDefinition(
         name="read_file_from_workspace",
-        description="Read a slice or chunk of a workspace file by lines or bytes. Returns 'next_start_line' and 'next_offset_bytes' to easily fetch the next chunk without re-reading previous data.",
+        description="Read a bounded slice of a workspace text file or indexed context document by bytes, or by line range when max_lines is set. max_bytes is capped at 16384. Continue byte reads with next_offset_bytes. With max_lines, keep the same line range while next_offset_bytes is non-null; after that range is complete, use next_start_line with offset_bytes=0 (or omit offset_bytes) for the following range.",
         input_schema={
             "type": "object",
             "properties": {
                 "file_ref": {
                     "type": "string",
-                    "description": "workspace:// URI or relative filename",
+                    "description": "workspace:// URI, relative filename, or indexed context ref (e.g. 'benchmark/fio/README.md')",
                 },
                 "offset_bytes": {
                     "type": "integer",
@@ -86,7 +96,7 @@ WORKSPACE_TOOLS = [
                 },
                 "max_bytes": {
                     "type": "integer",
-                    "description": "Maximum bytes to read (default 4096)",
+                    "description": "Maximum bytes to read (default 4096, hard maximum 16384)",
                     "default": 4096,
                 },
                 "start_line": {
@@ -119,7 +129,8 @@ WORKSPACE_TOOLS = [
         description=(
             "Read an exact context document previously inventoried by a context "
             "gateway into the ticket workspace. Pass a logical ref or URI returned "
-            "by the gateway; the current phase-effective source is used by default."
+            "by the gateway; the current phase-effective source is used by default. "
+            "Reads are capped at 16384 bytes and return next_offset_bytes for continuation."
         ),
         input_schema={
             "type": "object",
@@ -135,8 +146,13 @@ WORKSPACE_TOOLS = [
                 },
                 "max_bytes": {
                     "type": "integer",
-                    "description": "Maximum document bytes to return (default 262144)",
-                    "default": 262144,
+                    "description": "Maximum document bytes to return (default 16384, hard maximum 16384)",
+                    "default": 16384,
+                },
+                "offset_bytes": {
+                    "type": "integer",
+                    "description": "Byte offset in the document; use next_offset_bytes to continue",
+                    "default": 0,
                 },
             },
             "required": ["ref"],

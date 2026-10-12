@@ -71,6 +71,69 @@ async def test_generate_runfile_with_tags(provider: CrucibleSkillProvider):
 async def test_generate_runfile_no_endpoints(provider: CrucibleSkillProvider):
     result = await provider.generate_runfile("fio", {})
     assert "endpoints" not in result.template
+    assert result.template["tags"] == {}
+
+
+@pytest.mark.asyncio
+async def test_generate_runfile_defaults_tags_to_object():
+    provider = CrucibleSkillProvider("/nonexistent")
+
+    result = await provider.generate_runfile("uperf", {})
+
+    assert result.template["tags"] == {}
+
+
+@pytest.mark.asyncio
+async def test_validate_runfile_requires_object_tags_without_controller_schema():
+    provider = CrucibleSkillProvider("/nonexistent")
+
+    missing = await provider.validate_runfile({"benchmarks": []})
+    malformed = await provider.validate_runfile({"benchmarks": [], "tags": ["network"]})
+
+    assert missing == {
+        "valid": False,
+        "errors": ["missing required top-level key: tags"],
+    }
+    assert malformed == {
+        "valid": False,
+        "errors": ["top-level tags must be an object"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_runfile_schema_requires_tags_without_mutating_source(monkeypatch):
+    provider = CrucibleSkillProvider("/nonexistent")
+    source_schema = {
+        "type": "object",
+        "properties": {"benchmarks": {"type": "array"}},
+        "required": ["benchmarks"],
+    }
+    monkeypatch.setattr(provider, "_load_schema", lambda: source_schema)
+
+    schema = await provider.get_runfile_schema()
+
+    assert schema["properties"]["tags"] == {"type": "object", "default": {}}
+    assert schema["required"] == ["benchmarks", "tags"]
+    assert "tags" not in source_schema["properties"]
+    assert source_schema["required"] == ["benchmarks"]
+
+
+@pytest.mark.asyncio
+async def test_validate_runfile_uses_required_tags_schema_copy(monkeypatch):
+    provider = CrucibleSkillProvider("/nonexistent")
+    source_schema = {
+        "type": "object",
+        "properties": {"benchmarks": {"type": "array"}},
+        "required": ["benchmarks"],
+        "additionalProperties": False,
+    }
+    monkeypatch.setattr(provider, "_load_schema", lambda: source_schema)
+
+    validation = await provider.validate_runfile({"benchmarks": [], "tags": {}})
+
+    assert validation["valid"] is True
+    assert source_schema["required"] == ["benchmarks"]
+    assert "tags" not in source_schema["properties"]
 
 
 @pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")
@@ -897,9 +960,32 @@ async def test_gateway_materializes_inventory_for_workspace_read_and_search(
             operation="read",
             namespace="benchmark/perftest",
             path=readme["ref"],
+            max_bytes=8,
         )
     )
-    assert "server-1" in read["document"]["content"]
+    assert read["document"]["content"] == "client-1"
+    assert read["document"]["size_bytes"] == len(
+        b"client-1 and server-1 form one perftest pair"
+    )
+    assert read["document"]["next_offset_bytes"] == 8
+    continued_read = json.loads(
+        await crucible_context_gateway(
+            provider,
+            ticket_id="PERF-WORKSPACE-CONTEXT",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            benchmark="perftest",
+            operation="read",
+            namespace="benchmark/perftest",
+            path=readme["ref"],
+            max_bytes=64,
+            offset_bytes=read["document"]["next_offset_bytes"],
+        )
+    )
+    assert read["document"]["content"] + continued_read["document"]["content"] == (
+        "client-1 and server-1 form one perftest pair"
+    )
+    assert continued_read["document"]["next_offset_bytes"] is None
 
     search = json.loads(
         await crucible_context_gateway(
@@ -1720,8 +1806,67 @@ async def test_context_gateway_mcp_schema_exposes_generic_request_fields():
         tool = next(
             item for item in tools if item.name == "get_crucible_benchmark_context"
         )
-        assert set(tool.parameters["properties"]) == {"operation", "path", "query"}
+        assert set(tool.parameters["properties"]) == {
+            "operation",
+            "path",
+            "query",
+            "max_bytes",
+            "offset_bytes",
+        }
         assert tool.parameters["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_registered_controller_context_tool_includes_provider_runfile_contract(
+    tmp_path, monkeypatch
+):
+    import agents.benchmark.server as benchmark_server
+
+    provider = CrucibleSkillProvider(tmp_path / "missing-controller")
+    monkeypatch.setattr(benchmark_server, "_initialized", True)
+    monkeypatch.setattr(benchmark_server, "_crucible_context", provider)
+    monkeypatch.setattr(benchmark_server, "_ssh", object())
+    monkeypatch.setattr(
+        benchmark_server,
+        "_controller_host",
+        lambda: "controller.example.test",
+    )
+    calls = []
+
+    async def fake_controller_context_gateway(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "found": True,
+                "operation": "bootstrap",
+                "document": {"ref": "AGENTS.md", "content": "controller guidance"},
+            }
+        )
+
+    monkeypatch.setattr(
+        benchmark_server,
+        "controller_context_gateway",
+        fake_controller_context_gateway,
+    )
+
+    tools = await benchmark_server.mcp.list_tools()
+    assert any(tool.name == "get_crucible_benchmark_context" for tool in tools)
+
+    response = json.loads(
+        await benchmark_server._get_crucible_benchmark_context_tool(
+            operation="bootstrap"
+        )
+    )
+
+    assert response["document"]["content"] == "controller guidance"
+    assert response["runfile_contract"] == provider.get_runfile_contract()
+    assert response["runfile_contract"]["required_top_level_fields"] == ["tags"]
+    assert response["runfile_contract"]["properties"]["tags"] == {
+        "type": "object",
+        "default": {},
+    }
+    assert "Use {} when no tags apply" in response["runfile_contract"]["guidance"]
+    assert calls[0]["operation"] == "bootstrap"
 
 
 @pytest.mark.asyncio
@@ -1749,8 +1894,8 @@ async def test_controller_context_gateway_follows_agent_supplied_paths(
                 return SSHResult(
                     "CONTENT\t/opt/crucible/subprojects/benchmarks/perftest/README.md\t12\t"
                     "device guidance\n"
-                    "NAME\tf\t/opt/crucible/subprojects/benchmarks/perftest/README.md\n"
-                    "NAME\td\t/opt/crucible/subprojects/benchmarks/perftest\n",
+                    "NAME\tf\t17\t/opt/crucible/subprojects/benchmarks/perftest/README.md\n"
+                    "NAME\td\t\t/opt/crucible/subprojects/benchmarks/perftest\n",
                     "",
                     0,
                 )
@@ -1786,10 +1931,28 @@ async def test_controller_context_gateway_follows_agent_supplied_paths(
             phase="benchmark",
             operation="read",
             path="subprojects/benchmarks/perftest/README.md",
+            max_bytes=8,
         )
     )
     assert read["document"]["ref"] == "subprojects/benchmarks/perftest/README.md"
-    assert read["document"]["content"] == "perftest guidance"
+    assert read["document"]["content"] == "perftest"
+    assert read["document"]["size_bytes"] == len(b"perftest guidance")
+    assert read["document"]["next_offset_bytes"] == 8
+    assert "content" not in read["documents"][0]
+    continued = json.loads(
+        await controller_context_gateway(
+            ssh=FakeSSH(),
+            controller_host="controller.example.test",
+            ticket_id=ticket_id,
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="read",
+            path="subprojects/benchmarks/perftest/README.md",
+            max_bytes=8,
+            offset_bytes=read["document"]["next_offset_bytes"],
+        )
+    )
+    assert continued["document"]["content"] == " guidanc"
     manager = WorkspaceManager(
         ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark"
     )
@@ -1811,6 +1974,7 @@ async def test_controller_context_gateway_follows_agent_supplied_paths(
     )
     assert search["found"] is True
     assert search["results"][0]["ref"] == "subprojects/benchmarks/perftest/README.md"
+    assert search["results"][0]["size_bytes"] == 17
     assert search["results"][0]["match_kinds"] == ["content", "name"]
     assert search["results"][0]["matches"][0]["kind"] == "content"
     assert search["total_files"] == 2

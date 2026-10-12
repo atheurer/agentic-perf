@@ -3,7 +3,8 @@
 Routes writes to a single authoritative backend and fans out
 reads across multiple backends. This supports scenarios like:
 
-- Migration: old records in files, new records in OpenSearch
+- Migration: read existing records from one file store while new
+  records are written to another
 - Federated dedup: check multiple teams' record stores
 - Local cache: write to primary backend, read from local mirror too
 

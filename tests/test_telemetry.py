@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from providers.cost import estimate_cost, estimate_cumulative_cost
 from providers.events import CumulativeUsage, EventBus
 
 # Skip tests that need OpenTelemetry when it's not installed
@@ -42,6 +43,7 @@ def test_cumulative_usage_initial():
     assert d["llm_calls"] == 0
     assert d["total_duration_ms"] == 0
     assert d["models_used"] == []
+    assert d["estimated_cost_usd"] == 0
 
 
 def test_cumulative_usage_single_record():
@@ -64,6 +66,23 @@ def test_cumulative_usage_single_record():
     assert d["llm_calls"] == 1
     assert d["total_duration_ms"] == 500
     assert d["models_used"] == ["claude-sonnet-4-6"]
+    assert d["estimated_cost_usd"] == estimate_cost(
+        "claude-sonnet-4-6",
+        100,
+        50,
+        cache_read_input_tokens=80,
+        cache_creation_input_tokens=10,
+    )
+
+
+def test_cumulative_usage_without_model_uses_fallback_pricing():
+    """Unlabeled usage preserves estimate_cost's fallback model behavior."""
+    u = CumulativeUsage()
+    u.record(100, 50, 500)
+
+    d = u.to_dict()
+    assert d["models_used"] == []
+    assert d["estimated_cost_usd"] == estimate_cost("", 100, 50)
 
 
 def test_cumulative_usage_accumulates():
@@ -84,6 +103,20 @@ def test_cumulative_usage_accumulates():
         "claude-sonnet-4-6",
         "gpt-4o",
     }
+
+
+def test_cumulative_cost_preserves_per_call_context_tiers():
+    """Thresholds apply to each call, not the ticket's combined token total."""
+    u = CumulativeUsage()
+    u.record(150_000, 0, 0, "gemini-2.5-pro")
+    u.record(150_000, 0, 0, "gemini-2.5-pro")
+
+    d = u.to_dict()
+    expected = 2 * estimate_cost("gemini-2.5-pro", 150_000, 0)
+    aggregate_estimate = estimate_cost("gemini-2.5-pro", 300_000, 0)
+    assert expected != aggregate_estimate
+    assert d["estimated_cost_usd"] == expected
+    assert estimate_cumulative_cost(d) == expected
 
 
 # --- EventBus usage tracking ---
@@ -331,3 +364,9 @@ def test_eventbus_global_usage(event_bus: EventBus):
         "claude-sonnet-4-6",
         "gpt-4o",
     }
+    assert g["estimated_cost_usd"] == sum(
+        (
+            estimate_cost("claude-sonnet-4-6", 100, 50),
+            estimate_cost("gpt-4o", 200, 80),
+        )
+    )

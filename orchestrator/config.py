@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,13 +11,53 @@ from paths import CONFIG_PATH, get_instance_name, resolve_state_store
 logger = logging.getLogger(__name__)
 
 
-def _load_config_file() -> dict:
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+def _provider_family(provider: str) -> str:
+    """Normalize provider aliases when deciding credential inheritance."""
+    if not isinstance(provider, str):
+        return str(provider)
+    provider = provider.lower()
+    return {
+        "claude": "anthropic",
+        "anthropic": "anthropic",
+        "gemini": "google",
+        "google": "google",
+    }.get(provider, provider)
+
+
+class ConfigFileError(ValueError):
+    """A config cannot be safely loaded; its message never includes contents."""
+
+
+def _load_config_file(*, strict: bool = False) -> dict:
+    """Read config, refusing invalid present files when auth depends on them."""
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise ConfigFileError(
+                f"Invalid JSON in {CONFIG_PATH}: {exc.msg} "
+                f"(line {exc.lineno}, column {exc.colno})"
+            ) from None
+        return {}
+    except UnicodeDecodeError:
+        if strict:
+            raise ConfigFileError(
+                f"Cannot read {CONFIG_PATH}: expected UTF-8"
+            ) from None
+        return {}
+    except OSError as exc:
+        if strict:
+            raise ConfigFileError(
+                f"Cannot read {CONFIG_PATH}: {exc.strerror or 'I/O error'}"
+            ) from None
+        return {}
+    if strict and not isinstance(cfg, dict):
+        raise ConfigFileError(
+            f"Invalid config in {CONFIG_PATH}: expected a JSON object"
+        )
+    return cfg
 
 
 class OrchestratorConfig:
@@ -83,6 +122,7 @@ class OrchestratorConfig:
             or os.environ.get("LLM_PROVIDER")
             or llm_cfg.get("provider", "mock")
         )
+        self.llm_api_key_secret = llm_cfg.get("api_key_secret")
         self.llm_model = (
             llm_model or os.environ.get("LLM_MODEL") or llm_cfg.get("model", "")
         )
@@ -252,6 +292,18 @@ class OrchestratorConfig:
         )
         self.max_concurrent_agents: int = max(1, int(_max_agents_raw))
 
+        # Maximum number of concurrent teardown tasks. Teardowns
+        # (especially aborted runs) are resource intensive and
+        # can exhaust memory if executed in parallel. Defaults to 1
+        # for safe sequential execution.
+        _max_teardowns_raw = _env_or_cfg(
+            "MAX_CONCURRENT_TEARDOWNS",
+            cfg,
+            "max_concurrent_teardowns",
+            1,
+        )
+        self.max_concurrent_teardowns: int = max(1, int(_max_teardowns_raw))
+
         # Introspection agent: continuous passive observer.
         # Enable globally via config or env var. Can also be
         # enabled per-ticket via custom_fields.introspection_enabled.
@@ -281,6 +333,8 @@ class OrchestratorConfig:
         introspection).
         """
         base = {"provider": self.llm_provider, "model": self.llm_model}
+        if self.llm_api_key_secret is not None:
+            base["api_key_secret"] = self.llm_api_key_secret
         if self.llm_provider == "openai":
             base["api"] = self.llm_api
 
@@ -291,7 +345,17 @@ class OrchestratorConfig:
 
         # Explicit per-agent overrides from config.
         if agent_type in self._agent_models:
-            base.update(self._agent_models[agent_type])
+            agent_cfg = self._agent_models[agent_type]
+            configured_provider = agent_cfg.get("provider", self.llm_provider)
+            if (
+                _provider_family(configured_provider)
+                != _provider_family(self.llm_provider)
+                and "api_key_secret" not in agent_cfg
+            ):
+                # A credential reference belongs to the provider it was
+                # configured alongside; do not pass it to another vendor.
+                base.pop("api_key_secret", None)
+            base.update(agent_cfg)
         if base.get("provider") == "openai" and "api" not in base:
             base["api"] = self.llm_api
         return base
@@ -419,6 +483,7 @@ def build_redacted_config(
         safe_agent_models[str(k)] = {
             "provider": str(v.get("provider", "")),
             "model": str(v.get("model", "")),
+            "api_key_secret_configured": v.get("api_key_secret") is not None,
         }
 
     snapshot: dict = {
@@ -449,6 +514,7 @@ def build_redacted_config(
             "backend": config.llm_backend,
             "region": config.llm_region,
             "api": config.llm_api,
+            "api_key_secret_configured": config.llm_api_key_secret is not None,
             "timeout": config.llm_timeout,
             "max_tokens": config.llm_max_tokens,
             "reasoning_effort": config.llm_reasoning_effort,
@@ -459,6 +525,7 @@ def build_redacted_config(
             "agent_task_timeout": config.agent_task_timeout,
             "stale_task_timeout": config.stale_task_timeout,
             "max_concurrent_agents": config.max_concurrent_agents,
+            "max_concurrent_teardowns": config.max_concurrent_teardowns,
             "skip_teardown": config.skip_teardown,
             "leader_lease_ttl_seconds": config.leader_lease_ttl_seconds,
             "leader_lease_renew_interval": config.leader_lease_renew_interval,
@@ -498,24 +565,16 @@ def write_effective_config(config: OrchestratorConfig) -> dict:
     """
     snapshot = build_redacted_config(config, source="orchestrator")
     destination = _effective_config_path()
-    destination.parent.mkdir(parents=True, exist_ok=True)
     snapshot["runtime"]["written_at"] = datetime.now(timezone.utc).isoformat()
-    fd, temporary = tempfile.mkstemp(
-        prefix=f".{destination.name}.", dir=destination.parent
+    from providers.execution import AuditedFilesystem
+
+    filesystem = AuditedFilesystem.system(destination.parent)
+    filesystem.mkdir(".", mode=0o777)
+    filesystem.write(
+        destination.name,
+        json.dumps(snapshot, indent=2) + "\n",
+        mode=0o600,
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(snapshot, stream, indent=2)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
     return snapshot
 
 

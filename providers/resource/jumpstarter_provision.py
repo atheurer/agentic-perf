@@ -13,6 +13,7 @@ No LLM reasoning. Structured error capture at each step.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -22,6 +23,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from providers.execution import AuditedSubprocessRunner, FilesystemAuditError
+
 logger = logging.getLogger(__name__)
 
 # Timeout defaults (seconds)
@@ -29,6 +32,45 @@ _FLASH_TIMEOUT = 600
 _BOOT_WAIT = 60
 _TCP_TIMEOUT = 30
 _SSH_TIMEOUT = 30
+
+
+# Error details that indicate infrastructure failures (not image problems).
+# Retrying a failed provision with a different image variant will not help —
+# the error is in the environment, not the artifact.
+_INFRASTRUCTURE_ERROR_PATTERNS = (
+    "failed to get u-boot prompt",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "broken pipe",
+    "transport endpoint is not connected",
+    "network is unreachable",
+    "no route to host",
+    "grpc",
+    "lease expired",
+    "exporter disconnected",
+)
+_INFRASTRUCTURE_ERROR_DIAGNOSTIC = (
+    "INFRASTRUCTURE_ERROR: This failure is caused by the "
+    "test environment (not the OS image). Retrying with "
+    "a different image variant will not help."
+)
+
+
+def is_infrastructure_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like an infrastructure error.
+
+    Infrastructure errors are failures in the test environment (network,
+    board firmware, gRPC tunnel, lease management) rather than problems
+    with the OS image. Retrying with a different image variant will not fix
+    them.
+    """
+    # ExceptionGroup / TaskGroup wrappers are always infrastructure.
+    if isinstance(exc, (ExceptionGroup, BaseExceptionGroup)):
+        return True
+
+    msg = repr(exc).lower()
+    return any(p in msg for p in _INFRASTRUCTURE_ERROR_PATTERNS)
 
 
 @dataclass
@@ -44,9 +86,97 @@ class ProvisionResult:
     flash_duration_s: float = 0.0
     boot_duration_s: float = 0.0
     serial_log_path: str = ""
+    infrastructure_error: bool = False
 
 
 _DEFAULT_PROVISION_LEASE_DURATION_SECONDS = 14_400
+
+
+def _write_flash_diagnostics(
+    artifact_dir: str,
+    ticket_id: str,
+    diag: list[str],
+) -> None:
+    """Write flash diagnostics to artifact file and log.
+
+    Called on flash failure so diagnostics are durable even
+    if the LLM is unavailable to process the tool result.
+    """
+    from providers.execution import (
+        AuditedFilesystem,
+        RootedPath,
+        durable_filesystem_emitter,
+    )
+    from providers.redaction import get_shared_redactor
+
+    redactor = get_shared_redactor()
+    safe_diagnostics = [
+        _redact_flash_detail(ticket_id, item, redactor=redactor) for item in diag
+    ]
+    summary = "\n".join(safe_diagnostics)
+    logger.warning(
+        "[platform] Flash diagnostics for %s:\n%s",
+        ticket_id,
+        summary,
+    )
+    if artifact_dir:
+        payload = json.dumps(
+            {
+                "ticket_id": ticket_id,
+                "diagnostics": safe_diagnostics,
+            },
+            indent=2,
+        )
+        if ticket_id:
+            filesystem = AuditedFilesystem(
+                RootedPath(
+                    artifact_dir,
+                    "artifact",
+                    logical_prefix="platform-provision",
+                ),
+                ticket_id=ticket_id,
+                emit=durable_filesystem_emitter(),
+                critical=True,
+            )
+        else:
+            filesystem = AuditedFilesystem.system(artifact_dir)
+        filesystem.write("flash-diagnostics.json", payload, mode=0o600)
+        logger.info(
+            "[platform] Flash diagnostics written to %s",
+            f"{artifact_dir}/flash-diagnostics.json",
+        )
+
+
+def _redact_flash_detail(
+    ticket_id: str,
+    detail: str,
+    *,
+    redactor: Any | None = None,
+) -> str:
+    """Redact exception text and remove potentially signed URL parameters."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    from providers.redaction import get_shared_redactor
+
+    safe_detail = (redactor or get_shared_redactor()).redact_string(ticket_id, detail)
+    url_pattern = re.compile(r"\b(?:https?|s3|gs)://[^\s\"'<>]+", re.IGNORECASE)
+    trailing_punctuation = ".,;:!?)]}"
+
+    def strip_query(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        suffix = ""
+        while candidate and candidate[-1] in trailing_punctuation:
+            suffix = candidate[-1] + suffix
+            candidate = candidate[:-1]
+        try:
+            parts = urlsplit(candidate)
+        except ValueError:
+            return "[REDACTED:url]" + suffix
+        if parts.query or parts.fragment:
+            candidate = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        return candidate + suffix
+
+    return url_pattern.sub(strip_query, safe_detail)
 
 
 async def provision_jumpstarter(
@@ -120,16 +250,27 @@ async def provision_jumpstarter(
                     emit=durable_filesystem_emitter(),
                     critical=True,
                 )
+            else:
+                from providers.execution import AuditedFilesystem
+
+                serial_filesystem = AuditedFilesystem.system(artifact_dir)
             serial_log_path = str(Path(artifact_dir) / "serial-capture.log")
+            serial_log_relative = "serial-capture.log"
         else:
             import tempfile
 
-            serial_log_path = tempfile.mktemp(prefix="serial-capture-", suffix=".log")
+            from providers.execution import AuditedFilesystem
+
+            serial_filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
+            serial_log_path = str(
+                serial_filesystem.temporary_file(
+                    prefix="serial-capture-", suffix=".log", mode=0o644
+                )
+            )
+            serial_log_relative = serial_log_path
         try:
-            serial_log_fh = (
-                serial_filesystem.open_stream("serial-capture.log")
-                if serial_filesystem
-                else open(serial_log_path, "wb")
+            serial_log_fh = serial_filesystem.open_stream(
+                serial_log_relative, mode=0o644 if not ticket_id else 0o600
             )
             serial_proc = await AuditedSubprocessRunner().start(
                 [
@@ -174,11 +315,17 @@ async def provision_jumpstarter(
             client_config_path,
             selector,
             lease_duration_seconds,
+            ticket_id,
+            artifact_dir,
         )
         result = prov_result
     except asyncio.CancelledError:
         # Cancellation is a control-flow signal.  The finally block still
         # stops serial capture, but the caller must observe cancellation.
+        raise
+    except FilesystemAuditError:
+        # A critical ticket artifact must not be reported as safely handled
+        # when its audit record could not be durably delivered.
         raise
     except Exception as exc:
         # Unwrap ExceptionGroup/TaskGroup to expose the
@@ -195,6 +342,13 @@ async def provision_jumpstarter(
             diag.append(f"Provisioning failed: {'; '.join(real_errors)}")
         else:
             diag.append(f"Provisioning exception: {exc}")
+        if is_infrastructure_error(exc):
+            result.infrastructure_error = True
+            diag.append(
+                "INFRASTRUCTURE_ERROR: This failure is caused by the test "
+                "environment (not the OS image). Retrying with a different "
+                "image variant will not help."
+            )
         logger.error(
             "[platform] Provisioning failed: %s",
             exc,
@@ -249,6 +403,8 @@ def _provision_sync(
     client_config_path: str,
     selector: str = "",
     lease_duration_seconds: int = _DEFAULT_PROVISION_LEASE_DURATION_SECONDS,
+    ticket_id: str = "",
+    artifact_dir: str = "",
 ) -> ProvisionResult:
     """Synchronous provisioning — runs in executor thread.
 
@@ -266,6 +422,8 @@ def _provision_sync(
         client_config_path,
         selector,
         lease_duration_seconds,
+        ticket_id,
+        artifact_dir,
     )
 
 
@@ -293,6 +451,8 @@ async def _provision_async(
     client_config_path: str,
     selector: str = "",
     lease_duration_seconds: int = _DEFAULT_PROVISION_LEASE_DURATION_SECONDS,
+    ticket_id: str = "",
+    artifact_dir: str = "",
 ) -> ProvisionResult:
     """Async provisioning using the Jumpstarter SDK."""
     from anyio.from_thread import BlockingPortal
@@ -343,6 +503,9 @@ async def _provision_async(
                             ssh_public_key,
                             result,
                             diag,
+                            board_name=board_name,
+                            ticket_id=ticket_id,
+                            artifact_dir=artifact_dir,
                         )
 
 
@@ -352,6 +515,10 @@ async def _run_provision_steps(
     ssh_public_key: str,
     result: ProvisionResult,
     diag: list[str],
+    *,
+    board_name: str = "",
+    ticket_id: str = "",
+    artifact_dir: str = "",
 ) -> ProvisionResult:
     """Execute the deterministic provision steps."""
     # ── Step 1: Flash ────────────────────────────────
@@ -391,7 +558,17 @@ async def _run_provision_steps(
         diag.append(f"Flash succeeded in {result.flash_duration_s:.0f}s")
     except Exception as exc:
         result.flash_duration_s = time.monotonic() - t0
-        diag.append(f"Flash failed: {exc}")
+        # Use repr() for ExceptionGroup/TaskGroup so sub-exception
+        # messages are visible in diagnostics, not just the group label.
+        safe_exc = _redact_flash_detail(ticket_id, repr(exc))
+        diag.append(f"Flash failed ({result.flash_duration_s:.0f}s): {safe_exc}")
+        logger.error(
+            "[platform] Flash failed for %s (%s) after %.0fs: %s",
+            board_name,
+            ticket_id,
+            result.flash_duration_s,
+            safe_exc,
+        )
         # Retry once
         logger.warning("[platform] Flash failed, retrying")
         diag.append("Retrying flash...")
@@ -401,7 +578,23 @@ async def _run_provision_steps(
             result.flash_duration_s = time.monotonic() - t0
             diag.append(f"Flash retry succeeded in {result.flash_duration_s:.0f}s")
         except Exception as exc2:
-            diag.append(f"Flash retry failed: {exc2}")
+            retry_duration = time.monotonic() - t0
+            safe_exc2 = _redact_flash_detail(ticket_id, repr(exc2))
+            diag.append(f"Flash retry failed ({retry_duration:.0f}s): {safe_exc2}")
+            logger.error(
+                "[platform] Flash retry failed for %s (%s) after %.0fs: %s",
+                board_name,
+                ticket_id,
+                retry_duration,
+                safe_exc2,
+            )
+            if is_infrastructure_error(exc) or is_infrastructure_error(exc2):
+                result.infrastructure_error = True
+                diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
+            # Write diagnostics directly to artifact so they
+            # survive even if the LLM is unavailable to process
+            # the tool result.
+            _write_flash_diagnostics(artifact_dir, ticket_id, diag)
             result.diagnostics = diag
             return result
 
@@ -422,11 +615,13 @@ async def _run_provision_steps(
 
     # ── Step 4: Discover IP ──────────────────────────
     ip = ""
+    address_errors: list[BaseException] = []
     try:
         addr = await to_thread.run_sync(client.tcp.address)
         ip = _parse_exporter_address(addr)
         diag.append(f"IP discovered: {ip}")
     except Exception as exc:
+        address_errors.append(exc)
         diag.append(f"TCP address failed: {exc}")
         # The exporter may have temporarily disconnected
         # during reboot. Retry with backoff — the gRPC
@@ -450,10 +645,14 @@ async def _run_provision_steps(
                 diag.append(f"IP discovered on retry {attempt + 1}: {ip}")
                 break
             except Exception as exc2:
+                address_errors.append(exc2)
                 diag.append(f"Retry {attempt + 1} failed: {exc2}")
 
     if not ip:
         diag.append("IP discovery failed")
+        if any(is_infrastructure_error(exc) for exc in address_errors):
+            result.infrastructure_error = True
+            diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
         result.diagnostics = diag
         return result
 
@@ -539,9 +738,8 @@ async def _run_provision_steps(
             )
             stdout = getattr(verify, "stdout", "")
             if "SSH_OK" not in str(stdout):
-                diag.append(
-                    f"SSH verification failed: {getattr(verify, 'stderr', '')[:200]}"
-                )
+                stderr = getattr(verify, "stderr", "")
+                diag.append(f"SSH verification failed: {stderr[:200]}")
                 result.diagnostics = diag
                 return result
             diag.append("SSH verified")
@@ -560,6 +758,3 @@ async def _run_provision_steps(
         ip,
     )
     return result
-
-
-from providers.execution import AuditedSubprocessRunner

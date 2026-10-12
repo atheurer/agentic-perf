@@ -1,8 +1,8 @@
 """Abstract interface for Investigation Record storage.
 
-Any storage backend (file, OpenSearch, Elasticsearch, Horreum,
-S3, PostgreSQL, etc.) implements this interface. Agents interact with
-records through these methods, never with the backend directly.
+Storage providers implement this interface. The registry currently
+provides file storage, and agents interact with records through these
+methods rather than with a storage implementation directly.
 
 Records are write-once: all investigation data (root cause,
 confidence, operational metrics, change attribution) is set at

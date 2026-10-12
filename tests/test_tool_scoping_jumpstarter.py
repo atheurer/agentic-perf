@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
 from providers.llm.base import ToolDefinition
 
 
 class TestProvisioningToolScoping:
     """Test _apply_tool_scoping on the provisioning agent."""
 
-    def _make_agent(self):
-        from unittest.mock import AsyncMock
-
+    def _make_agent(self, skill_provider=None):
         from agents.provisioning.agent import ProvisioningAgent
 
         agent = ProvisioningAgent(
             llm_provider=AsyncMock(),
             state_store_url="http://localhost:8090",
+            skill_provider=skill_provider,
         )
         # Simulate tools that would be loaded from MCP
         agent.tools = [
@@ -37,6 +41,7 @@ class TestProvisioningToolScoping:
 
     def test_boot_time_scoping(self):
         agent = self._make_agent()
+        agent._harness_self_installing = True
         ticket = {"custom_fields": {"directives": {"harness": "boot-time"}}}
         agent._apply_tool_scoping(ticket)
         names = {t.name for t in agent.tools}
@@ -52,6 +57,7 @@ class TestProvisioningToolScoping:
 
     def test_arcaflow_scoping(self):
         agent = self._make_agent()
+        agent._harness_self_installing = True
         ticket = {"custom_fields": {"directives": {"harness": "arcaflow-plugins"}}}
         agent._apply_tool_scoping(ticket)
         names = {t.name for t in agent.tools}
@@ -85,6 +91,58 @@ class TestProvisioningToolScoping:
         assert "install_harness" in names
         assert "deploy_secret" in names
 
+    def test_default_crucible_keeps_install_tools_when_directive_is_omitted(self):
+        agent = self._make_agent(
+            skill_provider=SimpleNamespace(default_harness="crucible")
+        )
+        ticket = {"custom_fields": {"directives": {}}}
+
+        agent._apply_tool_scoping(ticket)
+
+        names = {tool.name for tool in agent.tools}
+        assert "install_harness" in names
+        assert "deploy_secret" in names
+
+    @pytest.mark.asyncio
+    async def test_default_crucible_jumpstarter_does_not_auto_complete(self):
+        agent = self._make_agent(
+            skill_provider=SimpleNamespace(default_harness="crucible")
+        )
+        ticket = {
+            "id": "PERF-DEFAULT-CRUCIBLE",
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "directives": {},
+                "platform_ready": True,
+                "hosts_provisioned": ["10.0.0.8"],
+            },
+        }
+        mcp = AsyncMock()
+        mcp.list_tools = AsyncMock(
+            return_value=[
+                ToolDefinition(name="install_harness", description="", input_schema={})
+            ]
+        )
+
+        with (
+            patch("agents.provisioning.agent.AgentMCPClient", return_value=mcp),
+            patch.object(
+                agent, "_get_ticket", new_callable=AsyncMock, return_value=ticket
+            ),
+            patch.object(
+                agent, "_auto_complete_jumpstarter", new_callable=AsyncMock
+            ) as auto_complete,
+            patch(
+                "agents.provisioning.agent.AgentBase.run", new_callable=AsyncMock
+            ) as base_run,
+        ):
+            await agent.run(ticket["id"])
+
+        auto_complete.assert_not_awaited()
+        base_run.assert_awaited_once_with(ticket["id"])
+        assert any(tool.name == "install_harness" for tool in agent.tools)
+        assert "## Crucible Provisioning Notes" in agent._system_prompt(ticket)
+
 
 class TestBenchmarkToolScoping:
     """Test _HARNESS_TOOLS on the benchmark agent."""
@@ -92,24 +150,36 @@ class TestBenchmarkToolScoping:
     def test_arcaflow_scoping(self):
         from agents.benchmark.agent import BenchmarkAgent
 
-        allowed = BenchmarkAgent._HARNESS_TOOLS.get("arcaflow-plugins")
-        assert allowed is not None
-        assert "execute_benchmark" in allowed
-        assert "get_runfile_schema" in allowed
-        assert {
-            "plugin_list",
-            "plugin_describe",
-            "workflow_load",
-            "workflow_input_build",
-            "workflow_input_validate",
-            "workflow_input_export",
-            "workflow_execute",
-            "workflow_execution_status",
-            "workflow_execution_cancel",
-            "workflow_execution_output",
-        } <= allowed
+        # arcaflow-plugins: direct plugin execution via podman
+        plugins = BenchmarkAgent._HARNESS_TOOLS.get("arcaflow-plugins")
+        assert plugins is not None
+        assert "execute_arcaflow_plugin" in plugins
+        assert "execute_benchmark" not in plugins
+        assert "get_plugin_schema" in plugins
+        assert "plugin_list" in plugins
+        assert "plugin_describe" in plugins
+        # Workflow tools should NOT be in the plugins harness
+        assert "workflow_load" not in plugins
+        assert "workflow_execute" not in plugins
+
+        # arcaflow-workflows: MCP workflow execution
+        workflows = BenchmarkAgent._HARNESS_TOOLS.get("arcaflow-workflows")
+        assert workflows is not None
+        assert "workflow_load" in workflows
+        assert "workflow_input_build" in workflows
+        assert "workflow_input_validate" in workflows
+        assert "execute_arcaflow_workflow" in workflows
+        # Raw execution tools are internal to execute_arcaflow_workflow
+        assert "workflow_execute" not in workflows
+        assert "workflow_execution_status" not in workflows
+        # Plugin tools should NOT be in the workflows harness
+        assert "execute_benchmark" not in workflows
+        assert "get_plugin_schema" not in workflows
+        assert "plugin_list" not in workflows
+
         # Unrestricted shell access is not part of any harness allowlist.
-        assert "write_remote_file" not in allowed
+        assert "write_remote_file" not in plugins
+        assert "write_remote_file" not in workflows
 
     def test_external_tool_filter_keeps_local_and_enabled_workflow_tools(self):
         from agents.benchmark.agent import _filter_external_tools
@@ -150,3 +220,33 @@ class TestBenchmarkToolScoping:
         assert allowed is not None
         assert "validate_benchmark" in allowed
         assert "execute_benchmark" in allowed
+
+
+@pytest.mark.asyncio
+async def test_arcaflow_plugin_server_failure_is_required_only_for_plugin_harness():
+    from agents.benchmark.agent import _connect_arcaflow_plugin_server
+
+    optional_mcp = AsyncMock()
+    optional_mcp.connect_ticket_server.side_effect = RuntimeError("startup failed")
+    await _connect_arcaflow_plugin_server(
+        optional_mcp,
+        "arcaflow_plugin_server.py",
+        ticket_id="PERF-OPTIONAL",
+        state_store_url="http://state-store.test",
+        agent_name="benchmark-agent",
+        required=False,
+    )
+    optional_mcp.disconnect.assert_not_awaited()
+
+    required_mcp = AsyncMock()
+    required_mcp.connect_ticket_server.side_effect = RuntimeError("startup failed")
+    with pytest.raises(RuntimeError, match="startup failed"):
+        await _connect_arcaflow_plugin_server(
+            required_mcp,
+            "arcaflow_plugin_server.py",
+            ticket_id="PERF-PLUGINS",
+            state_store_url="http://state-store.test",
+            agent_name="benchmark-agent",
+            required=True,
+        )
+    required_mcp.disconnect.assert_awaited_once()

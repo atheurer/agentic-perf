@@ -89,20 +89,58 @@ def _match_model_entry(model: str, pricing: dict[str, Any]) -> dict[str, Any]:
     return pricing.get("fallback", {})
 
 
-def _match_model(model: str, pricing: dict[str, Any]) -> dict[str, float]:
+def _match_model(
+    model: str,
+    pricing: dict[str, Any],
+    input_tokens: int = 0,
+) -> dict[str, float]:
     """Find pricing rates for a model.
 
     Returns input, output, cache_read, and cache_write rates.
-    Cache rates fall back to the input rate when not specified.
+    Context tiers apply to the full request when their input-token
+    threshold is met. Cache rates fall back to the applicable input rate.
     """
     entry = _match_model_entry(model, pricing)
     input_rate = entry.get("input_per_token", 0)
-    return {
+    rates = {
         "input": input_rate,
         "output": entry.get("output_per_token", 0),
         "cache_read": entry.get("cache_read_per_token", input_rate),
         "cache_write": entry.get("cache_write_per_token", input_rate),
     }
+
+    applicable_tiers: list[tuple[int, bool, dict[str, Any]]] = []
+    for tier in entry.get("context_tiers", []):
+        if not isinstance(tier, dict):
+            continue
+
+        gt_threshold = tier.get("input_tokens_gt")
+        gte_threshold = tier.get("input_tokens_gte")
+        if (gt_threshold is None) == (gte_threshold is None):
+            continue
+
+        threshold = gt_threshold if gt_threshold is not None else gte_threshold
+        if isinstance(threshold, bool) or not isinstance(threshold, int):
+            continue
+
+        inclusive = gte_threshold is not None
+        threshold_met = (
+            input_tokens >= threshold if inclusive else input_tokens > threshold
+        )
+        if threshold_met:
+            applicable_tiers.append((threshold, inclusive, tier))
+
+    if applicable_tiers:
+        selected_tier = max(applicable_tiers, key=lambda match: match[:2])[2]
+        tier_input_rate = selected_tier.get("input_per_token", rates["input"])
+        rates = {
+            "input": tier_input_rate,
+            "output": selected_tier.get("output_per_token", rates["output"]),
+            "cache_read": selected_tier.get("cache_read_per_token", tier_input_rate),
+            "cache_write": selected_tier.get("cache_write_per_token", tier_input_rate),
+        }
+
+    return rates
 
 
 def estimate_cost(
@@ -129,7 +167,7 @@ def estimate_cost(
         Estimated cost in USD.
     """
     pricing = _load_pricing()
-    rates = _match_model(model, pricing)
+    rates = _match_model(model, pricing, input_tokens)
     uncached = input_tokens - cache_read_input_tokens - cache_creation_input_tokens
     return (
         max(0, uncached) * rates["input"]
@@ -144,9 +182,14 @@ def estimate_cumulative_cost(
 ) -> float:
     """Estimate USD cost from a CumulativeUsage dict.
 
-    Uses the first model in models_used for pricing. If
-    multiple models were used, this is approximate.
+    Prefer the accumulated per-call estimate, which preserves context-tier
+    pricing and supports tickets with multiple models. If this field is absent
+    (for example, in a legacy usage snapshot), estimate the aggregate using the
+    first model in models_used; tiered pricing may be approximate in that case.
     """
+    if "estimated_cost_usd" in usage:
+        return float(usage["estimated_cost_usd"])
+
     models = usage.get("models_used", [])
     model = models[0] if models else ""
     return estimate_cost(

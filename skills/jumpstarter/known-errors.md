@@ -57,6 +57,54 @@ Serial logs are saved as artifacts at
 `platform-provision/serial-capture.log` and can be
 downloaded from the ticket's artifact list.
 
+## Board Powers Off Shortly After Successful Provisioning
+
+**Symptom:** Board is flashed, boots, SSH is verified, but
+~2-3 minutes later the board powers off. Serial capture
+shows `systemd-shutdown` followed by `reboot: Power down`.
+No benchmark samples are collected.
+
+**Serial indicators:**
+- `Initramfs unpacking failed: Decoding failed`
+- `reboot: Restarting system` (first boot auto-reboot)
+- `reboot: Power down` (second boot gives up)
+- `Invalid GPT` / `Can't read GPT header`
+
+**Cause:** AutoSD uses **sysboot** for boot health checks
+and **ukiboot** for A/B partition management. When the
+initramfs is corrupted:
+
+1. First boot: initramfs fails → sysboot health check
+   fails → `FailureAction=reboot-force` → automatic reboot
+2. Second boot: initramfs fails again →
+   `tries_remaining` exhausted → no valid boot slot →
+   system powers off
+
+The board appears to boot successfully (reaches login,
+SSH works) because the rootfs on disk is intact — but
+sysboot detects the unhealthy initramfs and triggers the
+A/B rollback mechanism. With a fresh flash there is no
+slot B to fall back to, so it powers off.
+
+**Diagnosis:** Check the provisioning serial capture
+(`platform-provision/serial-capture.log`) for
+`Initramfs unpacking failed`. If present, the OS image
+is corrupted or incompatible with this board.
+
+**This is NOT an agentic-perf or Jumpstarter issue.** The
+problem is in the OS image build. Report to the image
+build team with:
+- The exact image URL from `jumpstarter_flash.flash_targets`
+- The board type and firmware version from serial output
+- The full provisioning serial log as evidence
+
+**Timing signature:** The consistent ~170s kernel timestamp
+on the shutdown (across different boards) is the sysboot
+health check timeout + ukiboot retry exhaustion. If you
+see `Power down` at roughly the same kernel time on
+multiple boards with the same image, it confirms an image
+problem rather than a board-specific hardware issue.
+
 ## Lease Cannot Be Satisfied
 
 **Error:** `the lease cannot be satisfied`

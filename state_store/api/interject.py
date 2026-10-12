@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from state_store.auth import require_write_access
+from state_store.auth import Principal, require_write_access
 from state_store.models import (
     PAUSED_STATUSES,
     TERMINAL_STATUSES,
@@ -15,6 +15,10 @@ from state_store.models import (
 from state_store.store import TicketNotFound
 
 router = APIRouter(prefix="/tickets", tags=["interject"])
+
+
+def _event_actor(principal: Principal) -> str:
+    return principal.username if principal.kind == "user" else "chat-agent"
 
 
 class InterjectRequest(BaseModel):
@@ -64,6 +68,15 @@ def interject(
             },
         )
 
+    event_bus = getattr(request.app.state, "event_bus", None)
+    if event_bus is not None:
+        event_bus.emit(
+            ticket_id,
+            _event_actor(principal),
+            "user_interjection",
+            {"message": body.message},
+        )
+
     store.add_comment(
         ticket_id,
         AddCommentRequest(author="user", body=body.message),
@@ -82,4 +95,47 @@ def interject(
     return JSONResponse(
         status_code=200,
         content={"status": "queued", "ticket_id": ticket_id},
+    )
+
+
+class UserReplyRequest(BaseModel):
+    message: str
+
+
+@router.post("/{ticket_id}/user-reply")
+def user_reply(
+    ticket_id: str,
+    body: UserReplyRequest,
+    request: Request,
+) -> JSONResponse:
+    """Record a user reply event for dashboard visibility.
+
+    Called after the chat agent delivers a HITL reply so the
+    event appears immediately in the live feed.
+    """
+    store = request.app.state.store
+
+    try:
+        ticket = store.get_ticket(ticket_id)
+    except TicketNotFound:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"Ticket {ticket_id} not found"},
+        )
+
+    principal = request.state.principal
+    multi_user = getattr(request.app.state, "multi_user", False)
+    require_write_access(principal, ticket, multi_user)
+    event_bus = getattr(request.app.state, "event_bus", None)
+    if event_bus is not None:
+        event_bus.emit(
+            ticket_id,
+            _event_actor(principal),
+            "user_reply",
+            {"message": body.message},
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={"status": "recorded", "ticket_id": ticket_id},
     )

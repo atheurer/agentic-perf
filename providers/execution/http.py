@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -36,6 +37,12 @@ from providers.tracing import (
     trace_headers,
 )
 from providers.tracing.client import TraceClient, TraceDeliveryError
+from providers.tracing.spool import SpoolError
+
+logger = logging.getLogger(__name__)
+
+# Module-level latch: log spool backpressure once, not per event.
+_backpressure_logged = False
 
 _SAFE_HEADERS = frozenset({"accept", "content-type", "user-agent", "x-requested-with"})
 _CAUSAL_HEADERS = frozenset(
@@ -324,9 +331,24 @@ class _AuditedHTTPBase:
                     "mutating HTTP requires central trace readiness"
                 )
             return
-        await asyncio.to_thread(
-            self._recorder.record_critical if critical else self._recorder.record, event
-        )
+        try:
+            await asyncio.to_thread(
+                self._recorder.record_critical if critical else self._recorder.record,
+                event,
+            )
+        except (SpoolError, TraceDeliveryError, OSError) as exc:
+            if critical:
+                raise
+            # Non-critical trace failures (e.g., spool full) must
+            # never block agent operations.  Log once per process
+            # lifetime to avoid flooding under sustained backpressure.
+            global _backpressure_logged
+            if not _backpressure_logged:
+                logger.warning(
+                    "non-critical trace recording degraded: %s",
+                    exc,
+                )
+                _backpressure_logged = True
 
     def _headers(
         self,

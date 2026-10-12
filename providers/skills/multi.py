@@ -36,6 +36,11 @@ class MultiHarnessSkillProvider(SkillProvider):
         self._private = private or PrivateSkillProvider()
         self._default = default_harness
 
+    @property
+    def default_harness(self) -> str:
+        """Name of the harness used when a ticket does not select one."""
+        return self._default
+
     def list_harnesses(self) -> list[str]:
         return list(self._harnesses.keys())
 

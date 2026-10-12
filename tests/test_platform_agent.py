@@ -15,10 +15,11 @@ from agents.platform.agent import PlatformAgent
 class TestPlatformAgent:
     """Test platform agent setup and routing."""
 
-    def _make_agent(self):
+    def _make_agent(self, event_bus=None):
         return PlatformAgent(
             llm_provider=AsyncMock(),
             state_store_url="http://localhost:8090",
+            event_bus=event_bus,
         )
 
     def test_system_prompt(self):
@@ -81,6 +82,84 @@ class TestPlatformAgent:
         assert "platform_ready=false" in msgs[0]["content"]
 
     @pytest.mark.asyncio
+    async def test_run_escalates_missing_image_version_without_llm(self):
+        event_bus = MagicMock()
+        agent = self._make_agent(event_bus=event_bus)
+        flash_error = (
+            "No OS image version specified. Set image_version in ticket directives."
+        )
+
+        with (
+            patch("agents.platform.agent.AgentMCPClient") as mcp_factory,
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {"jumpstarter_flash": {"error": flash_error}}
+                },
+            ),
+            patch.object(agent, "_add_comment", new_callable=AsyncMock) as add_comment,
+            patch.object(
+                agent, "_transition_ticket", new_callable=AsyncMock
+            ) as transition,
+            patch(
+                "agents.platform.agent.AgentBase.run", new_callable=AsyncMock
+            ) as base_run,
+        ):
+            await agent.run("T-1")
+
+        add_comment.assert_awaited_once()
+        assert "missing user input" in add_comment.await_args.args[1]
+        assert flash_error in add_comment.await_args.args[1]
+        transition.assert_awaited_once_with(
+            "T-1",
+            "awaiting_customer_guidance",
+            comment="Platform agent: missing image_version — user input required",
+        )
+        mcp_factory.assert_not_called()
+        base_run.assert_not_awaited()
+        assert agent._mcp is None
+        assert [call.args[2] for call in event_bus.emit.call_args_list] == [
+            "agent_started",
+            "agent_finished",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_run_records_early_escalation_error(self):
+        event_bus = MagicMock()
+        agent = self._make_agent(event_bus=event_bus)
+
+        with (
+            patch("agents.platform.agent.AgentMCPClient") as mcp_factory,
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "jumpstarter_flash": {"error": "No OS image_version specified"}
+                    }
+                },
+            ),
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("transition failed"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="transition failed"):
+                await agent.run("T-1")
+
+        mcp_factory.assert_not_called()
+        assert [call.args[2] for call in event_bus.emit.call_args_list] == [
+            "agent_started",
+            "agent_error",
+        ]
+
+    @pytest.mark.asyncio
     async def test_handle_completion_success(self):
         agent = self._make_agent()
         response = AsyncMock()
@@ -117,6 +196,7 @@ class TestPlatformAgent:
             fields = mock_fields.call_args[0][1]
             assert fields["platform_ready"] is True
             assert fields["hosts_provisioned"] == ["10.0.0.1"]
+            assert fields["platform_board"] == "rcar-05"
             agent._transition_ticket.assert_called_once()
             assert agent._transition_ticket.call_args[0][1] == "awaiting_provision"
 
@@ -147,10 +227,18 @@ class TestPlatformAgent:
                 agent,
                 "_get_ticket",
                 new_callable=AsyncMock,
-                return_value={"custom_fields": {}},
+                return_value={
+                    "custom_fields": {
+                        "resource_provider": "aws",
+                        "resource_provider_metadata": {
+                            "exporter_name": "must-not-be-used",
+                        },
+                    },
+                },
             ),
         ):
             await agent._handle_completion("T-1", response)
+            assert "platform_board" not in agent._update_fields.call_args.args[1]
             assert (
                 agent._transition_ticket.call_args[0][1] == "awaiting_customer_guidance"
             )
@@ -195,6 +283,71 @@ class TestPlatformAgent:
         ):
             await agent._handle_completion("T-1", response)
             assert agent._transition_ticket.call_args[0][1] == "coordinating_fleet"
+
+    @pytest.mark.parametrize(
+        "board_fields",
+        [
+            pytest.param({}, id="omitted"),
+            pytest.param({"board_name": ""}, id="empty"),
+            pytest.param({"board_name": None}, id="none"),
+        ],
+    )
+    async def test_handle_completion_failure_fleet_uses_jumpstarter_exporter(
+        self, board_fields
+    ):
+        """An early Jumpstarter failure still records the ticket's board."""
+        agent = self._make_agent()
+        response = AsyncMock()
+        response.text = ""
+        response.tool_calls = [
+            MagicMock(
+                name="submit_platform_result",
+                input={
+                    "platform_ready": False,
+                    "diagnostics": "Image provisioning failed",
+                    **board_fields,
+                },
+            )
+        ]
+        ticket = {
+            "custom_fields": {
+                "resource_provider": "jumpstarter",
+                "resource_provider_metadata": {
+                    "exporter_name": "board-03",
+                },
+                "fleet_investigation": {
+                    "enabled": True,
+                    "tested_hosts": [],
+                },
+            },
+        }
+
+        with (
+            patch.object(
+                agent, "_update_fields", new_callable=AsyncMock
+            ) as update_fields,
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+            ) as transition,
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value=ticket,
+            ) as get_ticket,
+        ):
+            await agent._handle_completion("T-1", response)
+
+        assert update_fields.call_args.args[1]["platform_board"] == "board-03"
+        transition.assert_awaited_once_with(
+            "T-1",
+            "coordinating_fleet",
+            comment="Fleet: board-03 provisioning failed, coordinating",
+        )
+        get_ticket.assert_awaited_once_with("T-1")
 
 
 class TestProvisionJumpstarter:
@@ -398,6 +551,138 @@ class TestProvisionJumpstarterSDK:
         assert any("U-Boot" in d for d in r.diagnostics)
 
     @pytest.mark.asyncio
+    async def test_flash_retry_diagnostics_are_audited_and_redacted(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Both flash exceptions stay useful without leaking registered or URL secrets."""
+        import json
+
+        from providers.redaction import Redactor
+        from providers.resource.jumpstarter_provision import (
+            ProvisionResult,
+            _run_provision_steps,
+        )
+
+        ticket_id = "PERF-FLASH-REDACTION"
+        registered_secret = "flash-provider-token-secret"
+        initial_signature = "initial-signed-url-secret"
+        retry_signature = "retry-signed-url-secret"
+        redactor = Redactor()
+        redactor.register(ticket_id, "jumpstarter/flash-token", registered_secret)
+        events = []
+        monkeypatch.setattr("providers.redaction.get_shared_redactor", lambda: redactor)
+        monkeypatch.setattr(
+            "providers.execution.durable_filesystem_emitter", lambda: events.append
+        )
+
+        client = MagicMock()
+        client.storage.flash = MagicMock(
+            side_effect=[
+                ExceptionGroup(
+                    "initial flash group",
+                    [
+                        RuntimeError(
+                            "initial failure "
+                            f"{registered_secret} "
+                            "https://images.example/flash"
+                            f"?X-Amz-Signature={initial_signature}"
+                        )
+                    ],
+                ),
+                RuntimeError(
+                    "retry failure "
+                    f"{registered_secret} "
+                    "https://images.example/flash"
+                    f"?X-Amz-Signature={retry_signature}"
+                ),
+            ]
+        )
+
+        with (
+            caplog.at_level("ERROR"),
+            patch(
+                "providers.resource.jumpstarter_provision.asyncio.sleep",
+                return_value=None,
+            ),
+        ):
+            result = await _run_provision_steps(
+                client,
+                "https://images.example/flash",
+                "",
+                ProvisionResult(board_name="test-board"),
+                [],
+                ticket_id=ticket_id,
+                artifact_dir=str(tmp_path),
+            )
+
+        artifact_path = tmp_path / "flash-diagnostics.json"
+        artifact = json.loads(artifact_path.read_text())
+        output = caplog.text + artifact_path.read_text()
+        assert not result.success
+        assert client.storage.flash.call_count == 2
+        assert "initial flash group" in output
+        assert "initial failure" in output
+        assert "retry failure" in output
+        assert "RuntimeError" in output
+        assert "images.example/flash" in output
+        for secret in (registered_secret, initial_signature, retry_signature):
+            assert secret not in output
+        assert "X-Amz-Signature" not in output
+        assert [item.lifecycle.state.value for item in events] == [
+            "requested",
+            "completed",
+        ]
+        assert events[0].ticket_id == ticket_id
+        assert events[0].action.target == (
+            "artifact://platform-provision/flash-diagnostics.json"
+        )
+        assert artifact["ticket_id"] == ticket_id
+        assert any("initial failure" in item for item in artifact["diagnostics"])
+        assert any("retry failure" in item for item in artifact["diagnostics"])
+
+    def test_flash_diagnostics_audit_failure_blocks_ticket_write(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed durable audit request must not permit a ticket file mutation."""
+        from providers.execution import FilesystemAuditError
+        from providers.resource.jumpstarter_provision import _write_flash_diagnostics
+
+        def fail_delivery(_event):
+            raise OSError("spool unavailable")
+
+        monkeypatch.setattr(
+            "providers.execution.durable_filesystem_emitter",
+            lambda: fail_delivery,
+        )
+
+        with pytest.raises(FilesystemAuditError):
+            _write_flash_diagnostics(str(tmp_path), "PERF-AUDIT-FAIL", ["failure"])
+
+        assert not (tmp_path / "flash-diagnostics.json").exists()
+
+    def test_flash_diagnostics_use_system_context_only_without_ticket(
+        self, tmp_path, monkeypatch
+    ):
+        """No-ticket scratch writes remain explicit system-context mutations."""
+        import json
+
+        from providers.resource.jumpstarter_provision import _write_flash_diagnostics
+
+        def fail_delivery(_event):
+            raise OSError("spool unavailable")
+
+        monkeypatch.setattr(
+            "providers.execution.durable_filesystem_emitter",
+            lambda: fail_delivery,
+        )
+
+        _write_flash_diagnostics(str(tmp_path), "", ["scratch diagnostic"])
+
+        artifact = json.loads((tmp_path / "flash-diagnostics.json").read_text())
+        assert artifact["ticket_id"] == ""
+        assert artifact["diagnostics"] == ["scratch diagnostic"]
+
+    @pytest.mark.asyncio
     async def test_ip_discovery_failure_retries(self):
         """TCP address fails, power cycles, retries."""
         from unittest.mock import MagicMock
@@ -429,8 +714,43 @@ class TestProvisionJumpstarterSDK:
             )
 
         assert not r.success
+        assert r.infrastructure_error is False
         assert client.tcp.address.call_count >= 2
         assert client.power.cycle.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_tcp_address_infrastructure_failure_marks_result(self):
+        """Terminal gRPC address failures are reported as infrastructure errors."""
+        from unittest.mock import MagicMock
+
+        from providers.resource.jumpstarter_provision import (
+            ProvisionResult,
+            _run_provision_steps,
+        )
+
+        client = MagicMock()
+        client.storage.flash = MagicMock()
+        client.power.on = MagicMock()
+        client.power.cycle = MagicMock()
+        client.tcp.address = MagicMock(
+            side_effect=RuntimeError("gRPC connection reset")
+        )
+
+        with patch(
+            "providers.resource.jumpstarter_provision.asyncio.sleep",
+            return_value=None,
+        ):
+            result = await _run_provision_steps(
+                client,
+                "https://image.xz",
+                "",
+                ProvisionResult(board_name="test-board"),
+                [],
+            )
+
+        assert not result.success
+        assert result.infrastructure_error is True
+        assert any("INFRASTRUCTURE_ERROR" in item for item in result.diagnostics)
 
     @pytest.mark.asyncio
     async def test_invalid_ip_rejected(self):

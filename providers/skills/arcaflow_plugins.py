@@ -14,7 +14,12 @@ import httpx
 from paths import PLUGIN_SCHEMA_CACHE_DIR as _DEFAULT_SCHEMA_CACHE_DIR
 from providers.execution import AuditedSubprocessRunner
 
-from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
+from .base import (
+    EXECUTION_MODEL_DIRECT,
+    BenchmarkSuite,
+    RunfileTemplate,
+    SkillProvider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +39,10 @@ class PluginSchemaCache:
 
     def __init__(self, cache_dir: Path = _DEFAULT_SCHEMA_CACHE_DIR) -> None:
         self._cache_dir = cache_dir
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        from providers.execution import AuditedFilesystem
+
+        self._filesystem = AuditedFilesystem.system(self._cache_dir)
+        self._filesystem.mkdir(".", mode=0o777)
         self._memory: dict[str, dict[str, Any]] = {}
 
     def _cache_path(self, repo_name: str, version: str) -> Path:
@@ -67,7 +75,9 @@ class PluginSchemaCache:
         self._memory[key] = schema_data
         path = self._cache_path(repo_name, version)
         try:
-            path.write_text(json.dumps(schema_data, indent=2))
+            self._filesystem.write(
+                path.name, json.dumps(schema_data, indent=2), mode=0o644
+            )
         except OSError:
             logger.debug(f"[arcaflow-plugins] Failed to write schema cache for {key}")
 
@@ -819,6 +829,8 @@ class ArcaflowPluginSkillProvider(SkillProvider):
                     min_hosts=1,
                     harness="arcaflow-plugins",
                     architectures=info.get("architectures", []),
+                    execution_model=EXECUTION_MODEL_DIRECT,
+                    self_installing=True,
                 )
             )
         return results
@@ -837,6 +849,8 @@ class ArcaflowPluginSkillProvider(SkillProvider):
             min_hosts=1,
             harness="arcaflow-plugins",
             architectures=info.get("architectures", []),
+            execution_model=EXECUTION_MODEL_DIRECT,
+            self_installing=True,
         )
 
     async def resolve_benchmark(self, requirements: dict[str, Any]) -> str | None:
@@ -1039,3 +1053,12 @@ class ArcaflowPluginSkillProvider(SkillProvider):
             errors.append("'input' must be a dictionary")
 
         return {"valid": len(errors) == 0, "errors": errors}
+
+    def get_directive_schema(self) -> dict[str, Any]:
+        return {
+            "recognized": {
+                "workflow_name",
+                "workflow_source",
+            },
+            "aliases": {},
+        }

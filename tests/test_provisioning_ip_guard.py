@@ -31,6 +31,15 @@ def _make_agent() -> ProvisioningAgent:
 
 
 def _make_response(submit_input: dict) -> MagicMock:
+    submit_input = dict(submit_input)
+    if submit_input.get("provisioning_complete") is True:
+        submit_input.setdefault(
+            "verification",
+            {
+                "status": "verified",
+                "details": "Harness verification passed.",
+            },
+        )
     tc = MagicMock()
     tc.name = "submit_provisioning_result"
     tc.input = submit_input
@@ -210,6 +219,57 @@ class TestHandleCompletionIPGuard:
                 "controller": "10.0.0.5",
                 "targets": ["10.0.0.5", "10.0.0.6"],
             }
+
+    @pytest.mark.asyncio
+    async def test_projection_preserves_public_ssh_addresses(self):
+        """Filter resource SSH addresses using assigned private host IDs."""
+        agent = _make_agent()
+        response = _make_response(
+            {
+                "provisioning_complete": True,
+                "hosts_provisioned": ["10.0.0.5", "10.0.0.6"],
+                "harness_name": "crucible",
+                "harness_version": "1.0",
+            }
+        )
+
+        with (
+            patch.object(
+                agent, "_update_fields", new_callable=AsyncMock
+            ) as mock_fields,
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(agent, "_transition_ticket", new_callable=AsyncMock),
+            patch.object(
+                agent,
+                "_plan_controls_next_transition",
+                return_value=False,
+            ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "assigned_hardware_ips": {
+                            "controller": "10.0.0.5",
+                            "targets": ["10.0.0.6"],
+                        },
+                        "ssh_hardware_ips": {
+                            "controller": "52.1.1.5",
+                            "targets": ["52.1.1.6"],
+                        },
+                    }
+                },
+            ),
+            patch("providers.workspace.manager.WorkspaceManager"),
+        ):
+            await agent._handle_completion("PERF-AWS", response)
+
+        fields = mock_fields.call_args[0][1]
+        assert fields["ssh_hardware_ips"] == {
+            "controller": "52.1.1.5",
+            "targets": ["52.1.1.6"],
+        }
 
     @pytest.mark.asyncio
     async def test_get_ticket_called_for_role_projection(self):
@@ -454,6 +514,77 @@ class TestRoleProjection:
                 "targets": ["10.0.0.99"],
             }
 
+    @pytest.mark.asyncio
+    async def test_ticket_lookup_failure_does_not_overwrite_ssh_mapping(self):
+        agent = _make_agent()
+        response = _make_response(
+            {
+                "provisioning_complete": True,
+                "hosts_provisioned": ["10.0.0.99"],
+                "harness_name": "crucible",
+                "harness_version": "1.0",
+            }
+        )
+
+        with (
+            patch.object(
+                agent, "_update_fields", new_callable=AsyncMock
+            ) as mock_fields,
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(agent, "_transition_ticket", new_callable=AsyncMock),
+            patch.object(agent, "_plan_controls_next_transition", return_value=False),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("state store unavailable"),
+            ),
+            patch("providers.workspace.manager.WorkspaceManager"),
+        ):
+            await agent._handle_completion("PERF-LOOKUP-FAIL", response)
+
+        fields = mock_fields.call_args[0][1]
+        assert "ssh_hardware_ips" not in fields
+
+    @pytest.mark.asyncio
+    async def test_missing_role_map_preserves_existing_ssh_mapping(self):
+        agent = _make_agent()
+        response = _make_response(
+            {
+                "provisioning_complete": True,
+                "hosts_provisioned": ["10.0.0.99"],
+                "harness_name": "crucible",
+                "harness_version": "1.0",
+            }
+        )
+
+        with (
+            patch.object(
+                agent, "_update_fields", new_callable=AsyncMock
+            ) as mock_fields,
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(agent, "_transition_ticket", new_callable=AsyncMock),
+            patch.object(agent, "_plan_controls_next_transition", return_value=False),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "ssh_hardware_ips": {
+                            "controller": "52.1.1.99",
+                            "targets": [],
+                        }
+                    }
+                },
+            ),
+            patch("providers.workspace.manager.WorkspaceManager"),
+        ):
+            await agent._handle_completion("PERF-NO-ROLE-MAP", response)
+
+        fields = mock_fields.call_args[0][1]
+        assert "ssh_hardware_ips" not in fields
+
 
 # ------------------------------------------------------------------
 # Platform agent: assigned_hardware_ips scoping (#577)
@@ -475,6 +606,7 @@ class TestPlatformIPScoping:
         agent._tool_handlers = {}
         agent._events = None
         agent._mcp = None
+        agent._skill_provider = None
         agent._stop_requested = False
         agent._client = AsyncMock()
 
@@ -518,9 +650,73 @@ class TestPlatformIPScoping:
             await agent._handle_completion("PERF-TEST", response)
 
             fields = mock_fields.call_args[0][1]
+            # Controller execution (default): first host is
+            # controller, rest are targets
             assert fields["assigned_hardware_ips"] == {
                 "controller": "10.0.0.1",
                 "targets": ["10.0.0.2"],
+            }
+
+    @pytest.mark.asyncio
+    async def test_jumpstarter_direct_writes_targets_only(self):
+        """Direct execution model puts all IPs in targets."""
+        from agents.platform.agent import PlatformAgent
+
+        agent = PlatformAgent.__new__(PlatformAgent)
+        agent.agent_name = "platform-agent"
+        agent.llm = MagicMock()
+        agent.store_url = "http://localhost:8090"
+        agent.tools = []
+        agent._tool_handlers = {}
+        agent._events = None
+        agent._mcp = None
+        agent._stop_requested = False
+        agent._client = AsyncMock()
+
+        tc = MagicMock()
+        tc.name = "submit_platform_result"
+        tc.input = {
+            "platform_ready": True,
+            "hosts_provisioned": ["10.0.0.1"],
+        }
+        response = MagicMock()
+        response.text = ""
+        response.tool_calls = [tc]
+
+        with (
+            patch.object(
+                agent,
+                "_update_fields",
+                new_callable=AsyncMock,
+            ) as mock_fields,
+            patch.object(
+                agent,
+                "_add_comment",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "resource_provider": "jumpstarter",
+                        "execution_model": "direct",
+                    },
+                },
+            ),
+        ):
+            await agent._handle_completion("PERF-TEST", response)
+
+            fields = mock_fields.call_args[0][1]
+            assert fields["assigned_hardware_ips"] == {
+                "controller": "",
+                "targets": ["10.0.0.1"],
             }
 
     @pytest.mark.asyncio

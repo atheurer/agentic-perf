@@ -332,4 +332,15 @@ class TestConstructionSites:
             for node in audit_calls
             for keyword in node.keywords
         )
-        assert "EventBus(redactor=" in source
+        event_bus_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "EventBus"
+        ]
+        assert any(
+            keyword.arg == "redactor"
+            for node in event_bus_calls
+            for keyword in node.keywords
+        )

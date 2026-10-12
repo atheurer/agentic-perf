@@ -32,7 +32,9 @@ class RepoCache:
                 )
                 raise RuntimeError(f"failed to refresh {name}: {stderr}")
         else:
-            repo_path.parent.mkdir(parents=True, exist_ok=True)
+            from providers.execution import AuditedFilesystem
+
+            AuditedFilesystem.system(repo_path.parent).mkdir(".", mode=0o777)
             logger.info(f"[repo-cache] Cloning {name} from {url}")
             result = await runner.run(
                 ["git", "clone", "--depth", "1", url, str(repo_path)],

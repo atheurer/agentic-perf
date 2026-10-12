@@ -74,8 +74,10 @@ iteratively. When it identifies the `subprojects/benchmarks/` layout, use the
 known benchmark name to read `subprojects/benchmarks/<benchmark>/AGENTS.md`,
 README/CLAUDE, and result-related metadata at controller-relative paths. If a
 needed document is not identified, use `operation="search"` to discover
-controller-relative candidate paths, then read selected paths separately. Do not
-ask the gateway to interpret repository metadata,
+controller-relative candidate paths, then read selected paths separately.
+Search results include `size_bytes`. Reads return `document.content` in pages of
+up to 16384 bytes; continue with `next_offset_bytes`, keeping the same path and
+`max_bytes`. Do not ask the gateway to interpret repository metadata,
 assume a fixed hierarchy, or bypass it through a repository-cache path. For other harnesses,
 `list_harness_docs`/`read_harness_doc` remain compatible.
 
@@ -118,7 +120,7 @@ When tools return large outputs (> 4 KB by default, configurable via `custom_fie
 
 - **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON tool calls (e.g., `cdm_api_request`, `get_hardware_topology`, `get_tool_params`) to receive the exact filtered slice immediately in the same turn without multi-step querying. A tool that declares `jq_filter`, such as `generate_chart_from_workspace`, consumes it as an input transformation instead.
 - **JSON files**: Use `jq_file_from_workspace` to extract nested keys or slice array items from already-spilled files. To paginate through large arrays, use array slice ranges: `filter=".values[0:50]"` for the first chunk, then `filter=".values[50:100]"` for the next chunk, skipping the previous data.
-- **Text & Log files**: Use `read_file_from_workspace` to paginate. The response provides `next_start_line` and `next_offset_bytes`. To read the next chunk without re-reading previous lines, simply pass `start_line=next_start_line` or `offset_bytes=next_offset_bytes`.
+- **Text & Log files**: Use `read_file_from_workspace` to paginate. For a byte-truncated line range, keep the same `start_line` and `max_lines` and continue with `offset_bytes=next_offset_bytes` until it is null. Then use `start_line=next_start_line` and `offset_bytes=0` (or omit it) to request the following line range.
 - **Searching**: Use `grep_file_from_workspace` to jump directly to errors, drops, or specific pattern matches in large log files.
 - **Listing**: Use `list_files_from_workspace` to see all saved files in the ticket workspace.
 
@@ -150,9 +152,25 @@ Once you have the benchmark data:
    harness skill files (via `read_skills`) to investigate potential bottlenecks and root causes.
 4. Proceed directly to Step 5 (submit your review).
 
-Do NOT call request_clarification. If you cannot retrieve results
-or encounter unexpected data, submit with verdict=inconclusive and
-explain what went wrong in the detailed_analysis field.
+Do NOT call request_clarification.
+
+**Verdict rules:**
+- **Use inconclusive when the available evidence is insufficient
+  to determine whether the hypothesis is confirmed or refuted.**
+  This includes missing or corrupted relevant data, results that
+  measure unrelated metrics or conditions, and cases with no
+  defensible comparison baseline when one is needed.
+- Do not use inconclusive merely because results are complex,
+  noisy, or unexpected. High variability, bimodal distributions,
+  and unexpected patterns are findings to report as observations;
+  explain what they do and do not establish about the hypothesis.
+- When relevant measurements do support an outcome, state that
+  outcome and the evidence for it. Do not overstate what the
+  measurements establish.
+- A valid measured value of zero is not missing data. If
+  samples were collected and a metric is validly measured as
+  zero (for example, zero throughput), treat it as evidence and
+  assess it against the hypothesis and relevant comparisons.
 
 
 
@@ -171,7 +189,7 @@ Call submit_review_result with:
 - results_url if a harness-specific viewer is available
 
 If you cannot retrieve results through any available method, explain what you
-tried and why it failed. Do not guess at results — report inconclusive with
+tried and why it failed. Only then use verdict=inconclusive with
 actionable recommendations for how to access the data.
 
 ### Analysis-only investigations

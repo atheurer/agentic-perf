@@ -6,6 +6,7 @@ query filtering, build history append, and registry configuration.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,17 @@ def _make_record(**overrides) -> InvestigationRecord:
 
 
 # --- Model tests ---
+
+
+def test_checked_in_schema_matches_model():
+    """Keep the published record schema in sync with its Pydantic model."""
+    schema_path = (
+        Path(__file__).resolve().parents[1]
+        / "providers/investigation/schemas/investigation-record-v1.json"
+    )
+    assert (
+        json.loads(schema_path.read_text()) == InvestigationRecord.model_json_schema()
+    )
 
 
 def test_record_generates_id():

@@ -222,7 +222,9 @@ def test_jq_query_bounds_oversized_single_list_item_by_bytes(workspace):
 
     assert res["truncated"] is True
     assert res["total_items"] == 1
-    assert res["result"] is None
+    assert len(res["result_slice"].encode("utf-8")) <= 100
+    assert res["result_format"] == "json"
+    assert res["next_offset_bytes"] is not None
 
 
 def test_jq_query_bounds_oversized_object_by_bytes(workspace):
@@ -231,8 +233,9 @@ def test_jq_query_bounds_oversized_object_by_bytes(workspace):
     res = workspace.jq_query("workspace://large.json", ".", max_bytes=256)
 
     assert res["truncated"] is True
-    assert res["result"]["_truncated"] is True
-    assert len(json.dumps(res["result"]).encode("utf-8")) <= 256
+    assert len(res["result_slice"].encode("utf-8")) <= 256
+    assert res["result_format"] == "json"
+    assert res["next_offset_bytes"] is not None
 
 
 def test_jq_query_bounds_multidocument_stream_by_bytes(workspace):
@@ -242,7 +245,66 @@ def test_jq_query_bounds_multidocument_stream_by_bytes(workspace):
 
     assert res["truncated"] is True
     assert res["total_items"] == 2
-    assert res["result"] is None
+    assert len(res["result_slice"].encode("utf-8")) == 100
+    assert res["next_offset_bytes"] is not None
+
+
+def test_jq_query_pages_large_string_result_and_caps_requested_size(workspace):
+    text = "éabc" * 7000
+    workspace.save_file("large.json", json.dumps({"document": text}))
+
+    first = workspace.jq_query("workspace://large.json", ".document", max_bytes=32768)
+    assert first["bytes_returned"] <= 16384
+    assert first["total_bytes"] == len(text.encode("utf-8"))
+    assert first["next_offset_bytes"] is not None
+
+    pages = [first["result_slice"]]
+    offset = first["next_offset_bytes"]
+    while offset is not None:
+        page = workspace.jq_query(
+            "workspace://large.json",
+            ".document",
+            max_bytes=16384,
+            offset_bytes=offset,
+        )
+        assert page["bytes_returned"] <= 16384
+        pages.append(page["result_slice"])
+        offset = page["next_offset_bytes"]
+    assert "".join(pages) == text
+
+
+def test_jq_query_pages_large_json_result(workspace):
+    items = [{"id": index, "payload": "x" * 80} for index in range(300)]
+    workspace.save_file("large.json", json.dumps({"items": items}))
+    pages = []
+    offset = 0
+    while True:
+        result = workspace.jq_query(
+            "workspace://large.json",
+            ".items",
+            limit=500,
+            max_bytes=512,
+            offset_bytes=offset,
+        )
+        assert result["bytes_returned"] <= 512
+        pages.append(result["result_slice"])
+        offset = result["next_offset_bytes"]
+        if offset is None:
+            break
+
+    assert json.loads("".join(pages)) == items
+
+
+def test_jq_query_rejects_invalid_page_request(workspace):
+    workspace.save_file("small.json", '{"ok": true}')
+    assert (
+        workspace.jq_query("workspace://small.json", ".", offset_bytes=-1)["status"]
+        == "error"
+    )
+    assert (
+        workspace.jq_query("workspace://small.json", ".", max_bytes=3)["status"]
+        == "error"
+    )
 
 
 def test_grep_file_ethtool_dump(workspace):
@@ -287,6 +349,87 @@ def test_read_file_slice(workspace):
     )
     assert res_bytes["status"] == "ok"
     assert len(res_bytes["content"]) <= 50
+
+
+def test_line_read_can_continue_when_byte_limit_splits_selected_lines(workspace):
+    content = "".join(f"line {index}: {'x' * 30}\n" for index in range(8))
+    workspace.save_file("long-lines.log", content)
+
+    first = workspace.read_file_slice(
+        "workspace://long-lines.log", start_line=2, max_lines=4, max_bytes=64
+    )
+    assert first["status"] == "ok"
+    assert first["next_offset_bytes"] is not None
+
+    pages = [first]
+    while pages[-1]["next_offset_bytes"] is not None:
+        pages.append(
+            workspace.read_file_slice(
+                "workspace://long-lines.log",
+                start_line=2,
+                max_lines=4,
+                offset_bytes=pages[-1]["next_offset_bytes"],
+                max_bytes=64,
+            )
+        )
+    assert all(page["status"] == "ok" for page in pages)
+    assert "".join(page["content"] for page in pages) == "".join(
+        f"line {index}: {'x' * 30}\n" for index in range(1, 5)
+    )
+    assert pages[-1]["next_start_line"] == 6
+
+
+def test_read_document_and_generic_reader_share_offset_paging(workspace):
+    text = "workspace context: " + "é" * 4000
+    snapshot = workspace.save_source_snapshot(
+        "github", {"commit": "abc"}, {"guide.md": text}, "fio"
+    )
+    workspace.index_context_documents(
+        [
+            {
+                "ref": "benchmark/fio/guide.md",
+                "namespace": "benchmark/fio",
+                "source": "github",
+                "authority": "effective",
+                "workspace_ref": snapshot["files"]["guide.md"],
+            }
+        ]
+    )
+
+    first = workspace.read_document("benchmark/fio/guide.md", max_bytes=256)
+    assert first["size_bytes"] == len(text.encode("utf-8"))
+    assert first["bytes_returned"] <= 256
+    assert first["next_offset_bytes"] is not None
+
+    second = workspace.read_file_slice(
+        "benchmark/fio/guide.md",
+        offset_bytes=first["next_offset_bytes"],
+        max_bytes=32768,
+    )
+    assert first["content"] + second["content"] == text
+    assert second["next_offset_bytes"] is None
+
+
+def test_search_and_context_manifest_return_document_sizes(workspace):
+    text = "a matching passage\n"
+    snapshot = workspace.save_source_snapshot(
+        "github", {"commit": "abc"}, {"guide.md": text}, "fio"
+    )
+    workspace.index_context_documents(
+        [
+            {
+                "ref": "benchmark/fio/guide.md",
+                "namespace": "benchmark/fio",
+                "source": "github",
+                "authority": "effective",
+                "workspace_ref": snapshot["files"]["guide.md"],
+            }
+        ]
+    )
+    search = workspace.search_documents("matching")
+    assert search["results"][0]["size_bytes"] == len(text.encode("utf-8"))
+    manifest = workspace.context_manifest("benchmark/fio")
+    assert manifest["documents"][0]["size_bytes"] == len(text.encode("utf-8"))
 
 
 def test_generate_preview_json_and_text():

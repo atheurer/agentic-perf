@@ -10,10 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 import secrets
-import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -374,7 +372,7 @@ class UserStore:
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
-        """Atomic write: temp file + os.replace()."""
+        """Atomically persist the user and group records."""
         data = {
             "users": {
                 name: user.model_dump(mode="json") for name, user in self._users.items()
@@ -384,22 +382,11 @@ class UserStore:
                 for name, group in self._groups.items()
             },
         }
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(self._path.parent),
-            suffix=".tmp",
-        )
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f, indent=2)
-            os.chmod(tmp_path, 0o600)
-            os.replace(tmp_path, str(self._path))
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        from providers.execution import AuditedFilesystem
+
+        filesystem = AuditedFilesystem.system(self._path.parent)
+        filesystem.mkdir(".", mode=0o777)
+        filesystem.write(self._path.name, json.dumps(data, indent=2), mode=0o600)
 
     def _load(self) -> None:
         if not self._path.exists():

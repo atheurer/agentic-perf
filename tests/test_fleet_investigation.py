@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from providers.fleet import (
     build_tested_host_entry,
     get_fleet_progress,
@@ -199,3 +203,387 @@ class TestStateMachineFleetTransitions:
 
         allowed = VALID_TRANSITIONS[TicketStatus.COORDINATING_FLEET]
         assert TicketStatus.AWAITING_CUSTOMER_GUIDANCE in allowed
+
+
+class TestResourceAgentFleetExhaustion:
+    """Resource agent routes to fleet coordinator on exhaustion (#994)."""
+
+    async def test_request_human_input_catches_fleet_exhaustion(self):
+        """_request_human_input triggers fleet exhaustion check."""
+        from unittest.mock import AsyncMock
+
+        from agents.resource.agent import ResourceAgent
+
+        agent = ResourceAgent.__new__(ResourceAgent)
+        agent.agent_name = "resource-agent"
+        agent._ticket_id = "PERF-FLEET"
+        agent._mode = "acquire"
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "id": "PERF-FLEET",
+                "custom_fields": {
+                    "fleet_investigation": {
+                        "enabled": True,
+                        "tested_hosts": [
+                            {"host_id": "board-01"},
+                        ],
+                    },
+                    "resource_fleet_exhaustion_detected": True,
+                },
+            }
+        )
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+
+        from agents.base import HITLDriftError
+
+        with pytest.raises(HITLDriftError, match="Fleet"):
+            await agent._request_human_input(
+                "PERF-FLEET",
+                "All boards excluded",
+            )
+
+        agent._transition_ticket.assert_called_once()
+        call_args = agent._transition_ticket.call_args
+        assert call_args.args[1] == "coordinating_fleet"
+
+    async def test_fleet_without_confirmed_exhaustion_allows_guidance(self):
+        from unittest.mock import AsyncMock, patch
+
+        from agents.base import AgentBase
+        from agents.resource.agent import ResourceAgent
+
+        agent = ResourceAgent.__new__(ResourceAgent)
+        agent._ticket_id = "PERF-FLEET"
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "custom_fields": {"fleet_investigation": {"enabled": True}},
+            }
+        )
+
+        with patch.object(
+            AgentBase,
+            "_request_human_input",
+            new_callable=AsyncMock,
+            return_value="user reply",
+        ) as mock_hitl:
+            result = await agent._request_human_input(
+                "PERF-FLEET",
+                "Need the image version before provisioning.",
+            )
+
+        assert result == "user reply"
+        mock_hitl.assert_awaited_once()
+
+    async def test_completion_cannot_bypass_confirmed_exhaustion(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from agents.base import HITLDriftError
+        from agents.resource.agent import ResourceAgent
+
+        agent = ResourceAgent.__new__(ResourceAgent)
+        agent._ticket_id = "PERF-FLEET"
+        agent._get_submit_result = lambda _response: {
+            "assigned_hardware_ips": {"targets": ["10.0.0.1"]}
+        }
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "custom_fields": {
+                    "fleet_investigation": {"enabled": True},
+                    "resource_fleet_exhaustion_detected": True,
+                }
+            }
+        )
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        agent._update_fields = AsyncMock()
+
+        with pytest.raises(HITLDriftError, match="Fleet"):
+            await agent._handle_completion("PERF-FLEET", MagicMock())
+
+        agent._transition_ticket.assert_awaited_once()
+        agent._update_fields.assert_not_awaited()
+
+
+class TestResourceServerFleetExhaustion:
+    def test_exhaustion_requires_every_matching_board_to_be_tested(self):
+        from agents.resource.server import _is_confirmed_fleet_exhaustion
+
+        result = {
+            "available": False,
+            "all_excluded": True,
+            "excluded_hosts": ["board-01", "board-02"],
+        }
+
+        assert _is_confirmed_fleet_exhaustion(result, {"board-01", "board-02"})
+        assert not _is_confirmed_fleet_exhaustion(result, {"board-01"})
+        assert not _is_confirmed_fleet_exhaustion(result, set())
+
+    async def test_persists_only_confirmed_exhaustion(self, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        import agents.resource.server as resource_server
+
+        provider = MagicMock()
+        provider.provider_name = "jumpstarter"
+        provider.check_available = AsyncMock(
+            side_effect=[
+                {
+                    "available": False,
+                    "all_excluded": True,
+                    "excluded_hosts": ["board-01"],
+                    "selector": "board_type=s32g",
+                },
+                {"available": True, "devices": [{"name": "board-02"}]},
+            ]
+        )
+        registry = MagicMock()
+        registry.get_provider = AsyncMock(return_value=provider)
+        monkeypatch.setattr(resource_server, "_ensure_init", AsyncMock())
+        monkeypatch.setattr(resource_server, "_registry", registry)
+        monkeypatch.setattr(
+            resource_server,
+            "_ticket",
+            {
+                "id": "PERF-FLEET",
+                "custom_fields": {
+                    "fleet_investigation": {
+                        "enabled": True,
+                        "tested_hosts": [{"host_id": "board-01"}],
+                    }
+                },
+            },
+        )
+        monkeypatch.setenv("TICKET_ID", "PERF-FLEET")
+
+        ticket_response = MagicMock(status_code=200)
+        ticket_response.json.return_value = {
+            "custom_fields": {
+                "fleet_investigation": {
+                    "enabled": True,
+                    "tested_hosts": [{"host_id": "board-01"}],
+                }
+            }
+        }
+        update_response = MagicMock()
+        http_client = MagicMock()
+        http_client.get = AsyncMock(return_value=ticket_response)
+        http_client.patch = AsyncMock(return_value=update_response)
+        http_context = AsyncMock()
+        http_context.__aenter__.return_value = http_client
+        http_context.__aexit__.return_value = False
+
+        with (
+            patch(
+                "providers.execution.AuditedAsyncHTTPClient",
+                return_value=http_context,
+            ),
+            patch("state_store.auth.read_token_from_file", return_value="token"),
+        ):
+            exhausted = json.loads(
+                await resource_server.check_available_resources(
+                    provider="jumpstarter",
+                    requirements={"jumpstarter_selector": "board_type=s32g"},
+                )
+            )
+            available = json.loads(
+                await resource_server.check_available_resources(
+                    provider="jumpstarter",
+                    requirements={"jumpstarter_selector": "board_type=s32g"},
+                )
+            )
+
+        assert exhausted["fleet_exhausted"] is True
+        assert "fleet_exhausted" not in available
+        assert [
+            call.kwargs["json"]["fields"]["resource_fleet_exhaustion_detected"]
+            for call in http_client.patch.await_args_list
+        ] == [True, False]
+
+    async def test_non_fleet_falls_through(self):
+        """Non-fleet tickets use normal HITL path."""
+        from unittest.mock import AsyncMock, patch
+
+        from agents.base import AgentBase
+        from agents.resource.agent import ResourceAgent
+
+        agent = ResourceAgent.__new__(ResourceAgent)
+        agent.agent_name = "resource-agent"
+        agent._ticket_id = "PERF-NORMAL"
+        agent._mode = "acquire"
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "id": "PERF-NORMAL",
+                "custom_fields": {},
+            }
+        )
+
+        # Patch the grandparent _request_human_input
+        with patch.object(
+            AgentBase,
+            "_request_human_input",
+            new_callable=AsyncMock,
+            return_value="user reply",
+        ) as mock_hitl:
+            result = await agent._request_human_input(
+                "PERF-NORMAL",
+                "Need help",
+            )
+            assert result == "user reply"
+            mock_hitl.assert_called_once()
+
+
+class TestSnapshotIterationData:
+    """snapshot_iteration_data captures per-board state (#1035)."""
+
+    def test_captures_benchmark_data(self):
+        from providers.fleet import snapshot_iteration_data
+
+        cf = {
+            "run_id": "boot-time-abc123",
+            "benchmark_status": "failed",
+            "samples_collected": 2,
+            "benchmark_kpis": {"avg_boot_s": 12.5},
+        }
+        snap = snapshot_iteration_data(cf)
+        assert snap["run_id"] == "boot-time-abc123"
+        assert snap["benchmark_status"] == "failed"
+        assert snap["samples_collected"] == 2
+        assert snap["benchmark_kpis"]["avg_boot_s"] == 12.5
+
+    def test_captures_platform_data(self):
+        from providers.fleet import snapshot_iteration_data
+
+        cf = {
+            "platform_ip": "10.26.29.22",
+            "platform_flash_duration_s": 98.5,
+            "platform_boot_duration_s": 31.2,
+            "platform_serial_log": "/tmp/serial-capture.log",
+            "output_dir": "/tmp/artifacts/run-123",
+            "jumpstarter_flash": {"diagnostics": ["Flash succeeded in 98s"]},
+        }
+        snap = snapshot_iteration_data(cf)
+        assert snap["platform_ip"] == "10.26.29.22"
+        assert snap["flash_duration_s"] == 98.5
+        assert snap["boot_duration_s"] == 31.2
+        assert snap["flash_diagnostics"] == ["Flash succeeded in 98s"]
+        assert snap["serial_log_path"] == "/tmp/serial-capture.log"
+        assert snap["output_dir"] == "/tmp/artifacts/run-123"
+
+    def test_captures_board_identity(self):
+        from providers.fleet import snapshot_iteration_data
+
+        cf = {
+            "platform_board": "nxp-s32g-vnp-rdb3-07",
+            "assigned_hardware_ips": {"targets": ["10.26.29.43"]},
+        }
+        snap = snapshot_iteration_data(cf)
+        assert snap["platform_board"] == "nxp-s32g-vnp-rdb3-07"
+        assert snap["assigned_hardware_ips"] == {"targets": ["10.26.29.43"]}
+
+    def test_empty_fields_omitted(self):
+        from providers.fleet import snapshot_iteration_data
+
+        snap = snapshot_iteration_data({})
+        assert snap == {}
+
+    def test_build_entry_includes_iteration_data(self):
+        from providers.fleet import build_tested_host_entry
+
+        entry = build_tested_host_entry(
+            host_id="board-01",
+            status="completed",
+            iteration_data={"run_id": "boot-time-xyz"},
+        )
+        assert entry["iteration_data"]["run_id"] == "boot-time-xyz"
+
+    def test_build_entry_omits_iteration_data_when_none(self):
+        from providers.fleet import build_tested_host_entry
+
+        entry = build_tested_host_entry(host_id="board-01")
+        assert "iteration_data" not in entry
+
+
+class TestNextIterationFields:
+    """next_iteration_fields clears stale state between fleet iterations (#1139)."""
+
+    def test_clears_benchmark_and_platform_fields(self):
+        from providers.fleet import next_iteration_fields
+
+        cf = {
+            "platform_board": "nxp-s32g-vnp-rdb3-07",
+            "platform_ip": "10.26.29.43",
+            "assigned_hardware_ips": {"targets": ["10.26.29.43"]},
+            "run_id": "boot-time-cbf04406",
+            "benchmark_status": "completed",
+            "platform_ready": True,
+        }
+        fields = next_iteration_fields(cf)
+        assert fields["platform_board"] == ""
+        assert fields["platform_ip"] == ""
+        assert fields["assigned_hardware_ips"] == {}
+        assert fields["run_id"] == ""
+        assert fields["benchmark_status"] is None
+        assert fields["platform_ready"] is False
+
+    def test_clears_all_stale_fields(self):
+        """Every field that could bleed into the next iteration is reset."""
+        from providers.fleet import next_iteration_fields
+
+        cf = {
+            "platform_board": "board-01",
+            "platform_ip": "10.0.0.1",
+            "assigned_hardware_ips": {"targets": ["10.0.0.1"]},
+            "ssh_hardware_ips": {"targets": ["192.0.2.1"]},
+            "resource_reservation_id": "old-lease",
+            "resource_provider_metadata": {"lease_id": "old-lease"},
+            "quads_assignment_id": 42,
+            "quads_cloud_name": "cloud-old",
+            "fresh_host": True,
+            "run_id": "run-abc",
+            "benchmark_status": "completed",
+            "benchmark_notes": "all good",
+            "benchmark_duration": 120,
+            "run_file_used": {"block_size": "4k"},
+            "benchmark_kpis": {"avg_boot_s": 12.5},
+            "samples_collected": 8,
+            "output_dir": "/tmp/run-abc",
+            "platform_ready": True,
+            "platform_flash_duration_s": 45.0,
+            "platform_boot_duration_s": 20.0,
+            "platform_serial_log": "/tmp/serial.log",
+        }
+        fields = next_iteration_fields(cf)
+        # All benchmark/platform fields should be reset to empty/null
+        assert fields["platform_board"] == ""
+        assert fields["assigned_hardware_ips"] == {}
+        assert fields["ssh_hardware_ips"] == {}
+        assert fields["resource_reservation_id"] is None
+        assert fields["resource_provider_metadata"] == {}
+        assert fields["quads_assignment_id"] is None
+        assert fields["quads_cloud_name"] == ""
+        assert fields["fresh_host"] is False
+        assert fields["run_id"] == ""
+        assert fields["benchmark_status"] is None
+        assert fields["benchmark_notes"] == ""
+        assert fields["benchmark_duration"] is None
+        assert fields["run_file_used"] == {}
+        assert fields["benchmark_kpis"] == {}
+        assert fields["samples_collected"] is None
+        assert fields["output_dir"] == ""
+        assert fields["platform_ready"] is False
+        assert fields["platform_flash_duration_s"] is None
+        assert fields["platform_boot_duration_s"] is None
+        assert fields["platform_serial_log"] == ""
+
+    def test_preserves_flash_config_but_clears_diagnostics(self):
+        from providers.fleet import next_iteration_fields
+
+        cf = {
+            "jumpstarter_flash": {
+                "command": "flash-board",
+                "diagnostics": "board one diagnostics",
+            },
+        }
+        fields = next_iteration_fields(cf)
+        assert fields["jumpstarter_flash"] == {"command": "flash-board"}

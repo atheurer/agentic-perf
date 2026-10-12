@@ -6,6 +6,7 @@ output after the V2/V3/V4 fixes.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import tempfile
@@ -60,7 +61,7 @@ class TestSSHStdinData:
         )
 
     async def test_no_stdin_when_stdin_data_is_none(self) -> None:
-        """When stdin_data is not provided, stdin is not piped."""
+        """When no payload is supplied, SSH cannot inherit an interactive stdin."""
         mock_proc = AsyncMock()
         mock_proc.communicate.return_value = (b"ok\n", b"")
         mock_proc.returncode = 0
@@ -73,7 +74,7 @@ class TestSSHStdinData:
             await ssh.run("host1", "echo hello")
 
         create_call = mock_exec.call_args
-        assert create_call.kwargs.get("stdin") is None
+        assert create_call.kwargs.get("stdin") is asyncio.subprocess.DEVNULL
 
 
 # ── V2: KUBEADMIN_PASSWORD not on command line ─────────────────
@@ -102,7 +103,6 @@ class TestV2EnvFile:
             command: str,
             timeout: int = 300,
             key_path: str | None = None,
-            allocate_pty: bool = False,
             stdin_data: bytes | None = None,
         ) -> SSHResult:
             ssh_commands.append(command)

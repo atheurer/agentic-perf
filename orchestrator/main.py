@@ -13,32 +13,265 @@ import sys
 import time
 from typing import Any
 
+import httpx
+
 from agents.base import AgentAbortedError, HITLDriftError
 from agents.server_utils import build_skill_provider
 from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
-from providers.execution import AuditedAsyncHTTPClient
+from providers.execution import (
+    AmbiguousHTTPReplayError,
+    AuditedAsyncHTTPClient,
+    AuditedSubprocessRunner,
+)
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import (
+    TraceContext,
     bind_trace_context,
     current_trace_context,
     new_trace_context,
     reset_trace_context,
     trace_headers,
 )
+from state_store.status import (
+    clear_orchestrator_status,
+    record_orchestrator_status,
+)
 
-from .config import OrchestratorConfig
+from .config import OrchestratorConfig, _provider_family
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher
 from .handoff import check_handoff
 from .poller import fetch_all_tickets
+from .retry_guard import (
+    DISPATCH_RETRY_BASE_SECONDS,
+    DISPATCH_RETRY_LIMIT,
+    DISPATCH_RETRY_MAX_SECONDS,
+    HANDOFF_RETRY_BASE_SECONDS,
+    HANDOFF_RETRY_LIMIT,
+    HANDOFF_RETRY_MAX_SECONDS,
+    RETRY_STATE_FIELD,
+    clear_retry_entry,
+    prune_stale_retry_entries,
+    record_retry_failure,
+    retry_is_suppressed,
+)
 
 logger = logging.getLogger(__name__)
 
 # Reasoning models may spend part of this budget on hidden reasoning tokens,
 # and the Responses API requires max_output_tokens to be at least 16.
 MODEL_CHECK_MAX_TOKENS = 1024
+_NORMALIZATION_FEEDBACK_MAX_ATTEMPTS = 3
+
+
+def _directive_mappings_equal(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Compare JSON directive mappings without Python's bool/number coercion."""
+    return json.dumps(left, sort_keys=True, default=str) == json.dumps(
+        right, sort_keys=True, default=str
+    )
+
+
+def _directives_for_triage(
+    directives: dict[str, Any], unrecognized: list[str]
+) -> dict[str, Any]:
+    """Keep invalid sample counts out of triage and benchmark inputs."""
+    result = dict(directives)
+    if any(
+        note.startswith("Invalid value for '")
+        and "expected an integer greater than zero for 'sample_count'" in note
+        for note in unrecognized
+    ):
+        result.pop("sample_count", None)
+    return result
+
+
+async def _normalize_ticket_directives(
+    store_url: str,
+    ticket_id: str,
+    raw_directives: dict[str, Any],
+    events: Any,
+    delivery_states: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
+    """Persist normalized directives before feedback or triage can use them."""
+    from providers.directives import format_normalization_report, normalize_directives
+
+    normalized, applied, unrecognized = normalize_directives(raw_directives)
+    fingerprint_payload = json.dumps(
+        {
+            "source_directives": raw_directives,
+            "directives": normalized,
+            "unrecognized": unrecognized,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    fingerprint = hashlib.sha256(fingerprint_payload.encode()).hexdigest()
+    delivery = delivery_states.get(ticket_id)
+    has_feedback = bool(applied or unrecognized)
+
+    if delivery is not None and _directive_mappings_equal(
+        raw_directives, delivery["normalized"]
+    ):
+        # An earlier PATCH may have committed even if its response was lost.
+        # Keep the original report while a later poll confirms persisted state.
+        delivery["patch_confirmed"] = True
+        normalized = delivery["normalized"]
+        applied = delivery["event_payload"]["applied"]
+        unrecognized = delivery["event_payload"]["unrecognized"]
+        has_feedback = bool(applied or unrecognized)
+    elif delivery is not None and delivery["fingerprint"] != fingerprint:
+        if has_feedback or not _directive_mappings_equal(normalized, raw_directives):
+            delivery = None
+        else:
+            delivery_states.pop(ticket_id, None)
+            delivery = None
+
+    if delivery is None and (
+        has_feedback or not _directive_mappings_equal(normalized, raw_directives)
+    ):
+        comment_body = format_normalization_report(applied, unrecognized)
+        delivery = {
+            "fingerprint": fingerprint,
+            "normalized": normalized,
+            "patch_confirmed": _directive_mappings_equal(normalized, raw_directives),
+            "event_attempts": 0,
+            "event_delivered": not has_feedback,
+            "event_payload": {"applied": applied, "unrecognized": unrecognized},
+            "comment_attempts": 0,
+            "comment_delivered": comment_body is None,
+            "comment_terminal": comment_body is None,
+            "comment_body": comment_body,
+        }
+        delivery_states[ticket_id] = delivery
+        for hint in unrecognized:
+            logger.warning("[directives] %s", hint)
+
+    if delivery is None:
+        return _directives_for_triage(normalized, unrecognized), True
+
+    if (
+        not _directive_mappings_equal(normalized, raw_directives)
+        and not delivery["patch_confirmed"]
+    ):
+        context_token = bind_trace_context(
+            new_trace_context(ticket_id=ticket_id, agent_id="orchestrator")
+        )
+        try:
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0,
+                headers=_mutation_headers(None),
+            ) as client:
+                response = await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {"directives": normalized}},
+                )
+        except Exception:
+            # Keep the delivery state so an ambiguous response can be
+            # reconciled against the next fetched ticket snapshot.
+            logger.warning(
+                "Directive normalization PATCH failed for %s",
+                ticket_id,
+                exc_info=True,
+            )
+            return {}, False
+        finally:
+            reset_trace_context(context_token)
+
+        if not 200 <= response.status_code < 300:
+            logger.warning(
+                "Directive normalization PATCH failed for %s: HTTP %d",
+                ticket_id,
+                response.status_code,
+            )
+            return {}, False
+        delivery["patch_confirmed"] = True
+
+    if not delivery["patch_confirmed"]:
+        return {}, False
+
+    event_needed = (
+        events is not None
+        and not delivery["event_delivered"]
+        and delivery["event_attempts"] < _NORMALIZATION_FEEDBACK_MAX_ATTEMPTS
+    )
+    if event_needed:
+        delivery["event_attempts"] += 1
+        try:
+            events.emit(
+                ticket_id,
+                "orchestrator",
+                "directive_normalization",
+                delivery["event_payload"],
+            )
+        except Exception:
+            logger.warning(
+                "Failed to emit directive normalization event for %s",
+                ticket_id,
+                exc_info=True,
+            )
+        else:
+            delivery["event_delivered"] = True
+
+    comment_needed = (
+        delivery["comment_body"] is not None
+        and not delivery["comment_delivered"]
+        and not delivery["comment_terminal"]
+        and delivery["comment_attempts"] < _NORMALIZATION_FEEDBACK_MAX_ATTEMPTS
+    )
+    if comment_needed:
+        delivery["comment_attempts"] += 1
+        context_token = bind_trace_context(
+            new_trace_context(ticket_id=ticket_id, agent_id="orchestrator")
+        )
+        try:
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0,
+                headers=_mutation_headers(None),
+            ) as client:
+                response = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                    json={
+                        "author": "orchestrator",
+                        "body": delivery["comment_body"],
+                    },
+                )
+        except AmbiguousHTTPReplayError:
+            delivery["comment_terminal"] = True
+            logger.warning(
+                "Directive normalization comment outcome is ambiguous for %s",
+                ticket_id,
+                exc_info=True,
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            logger.warning(
+                "Directive normalization comment failed before send for %s",
+                ticket_id,
+                exc_info=True,
+            )
+        except Exception:
+            delivery["comment_terminal"] = True
+            logger.warning(
+                "Directive normalization comment failed after an unknown outcome "
+                "for %s",
+                ticket_id,
+                exc_info=True,
+            )
+        else:
+            delivery["comment_terminal"] = True
+            if 200 <= response.status_code < 300:
+                delivery["comment_delivered"] = True
+            else:
+                logger.warning(
+                    "Directive normalization comment failed for %s: HTTP %d",
+                    ticket_id,
+                    response.status_code,
+                )
+        finally:
+            reset_trace_context(context_token)
+
+    return _directives_for_triage(normalized, unrecognized), True
 
 
 def _ensure_state_store_environment(config: OrchestratorConfig) -> None:
@@ -55,12 +288,24 @@ def _ensure_state_store_environment(config: OrchestratorConfig) -> None:
 
 
 def _make_llm_provider(
-    config: OrchestratorConfig, provider: str = "", model: str = "", api: str = ""
+    config: OrchestratorConfig,
+    provider: str = "",
+    model: str = "",
+    api: str = "",
+    api_key: str | None = None,
 ):
+    provider_name = provider or config.llm_provider
+    if api_key is None:
+        if provider_name in ("claude", "anthropic"):
+            api_key = config.anthropic_api_key
+        elif provider_name == "openai":
+            api_key = config._openai_api_key
+        elif provider_name in ("gemini", "google"):
+            api_key = config._gemini_api_key
     return create_llm_provider(
-        provider=provider or config.llm_provider,
+        provider=provider_name,
         model=model or config.llm_model,
-        api_key=config.anthropic_api_key,
+        api_key=api_key,
         backend=config.llm_backend,
         project_id=config.llm_project_id,
         region=config.llm_region,
@@ -70,7 +315,10 @@ def _make_llm_provider(
     )
 
 
-def _make_llm_factory(config: OrchestratorConfig):
+def _make_llm_factory(
+    config: OrchestratorConfig,
+    api_keys: dict[str, str] | None = None,
+):
     def factory(agent_type: str):
         agent_cfg = config.get_agent_llm_config(agent_type)
         provider = _make_llm_provider(
@@ -78,6 +326,7 @@ def _make_llm_factory(config: OrchestratorConfig):
             provider=agent_cfg.get("provider", ""),
             model=agent_cfg.get("model", ""),
             api=agent_cfg.get("api", ""),
+            api_key=(api_keys or {}).get(agent_type),
         )
         provider.default_timeout = config.llm_timeout
         effort = agent_cfg.get("reasoning_effort") or config.llm_reasoning_effort
@@ -157,7 +406,51 @@ def _fresh_config(fallback: OrchestratorConfig) -> OrchestratorConfig:
     return config
 
 
-async def _validate_models(config: OrchestratorConfig) -> None:
+class SecretReferenceError(RuntimeError):
+    """A configured LLM secret path could not be resolved safely."""
+
+
+async def _resolve_api_key_secret(
+    config: OrchestratorConfig,
+    agent_type: str,
+    secrets_provider: Any,
+) -> str | None:
+    """Resolve an explicitly configured API key secret for one agent."""
+    agent_cfg = config.get_agent_llm_config(agent_type)
+    secret_path = agent_cfg.get("api_key_secret")
+    if secret_path is None:
+        return None
+    if not isinstance(secret_path, str) or not secret_path.strip():
+        raise SecretReferenceError(
+            f"llm API-key secret for agent {agent_type or 'default'} "
+            "must be a non-empty secret path"
+        )
+    if secrets_provider is None:
+        raise SecretReferenceError(
+            f"LLM API-key secret '{secret_path}' is configured for "
+            f"agent {agent_type or 'default'}, but no secrets provider is available"
+        )
+    try:
+        value = await secrets_provider.get_secret(secret_path)
+    except Exception:
+        # Provider exception messages may contain backend details. Keep logs
+        # and ticket failure comments free of any returned credential data.
+        raise SecretReferenceError(
+            f"Unable to resolve configured LLM API-key secret '{secret_path}' "
+            f"for agent {agent_type or 'default'}"
+        ) from None
+    if value is None or not value.strip():
+        raise SecretReferenceError(
+            f"Configured LLM API-key secret '{secret_path}' was not found "
+            f"for agent {agent_type or 'default'}"
+        )
+    return value.strip()
+
+
+async def _validate_models(
+    config: OrchestratorConfig,
+    secrets_provider: Any = None,
+) -> None:
     """Make a minimal test call for each distinct LLM configuration at startup.
 
     Catches model/region mismatches before any tickets are processed.
@@ -170,18 +463,14 @@ async def _validate_models(config: OrchestratorConfig) -> None:
 
     # Two-pass: first collect all configs and group agent types per
     # dedup key, then probe each unique configuration once.
-    key_to_agents: dict[tuple[str, str, str, str, str], list[str]] = {}
-    key_to_cfg: dict[tuple[str, str, str, str, str], dict] = {}
+    key_to_agents: dict[tuple[str, str, str, str, str, str], list[str]] = {}
+    key_to_cfg: dict[tuple[str, str, str, str, str, str], dict] = {}
 
     for agent_type in agent_types:
         if agent_type:
             cfg = config.get_agent_llm_config(agent_type)
         else:
-            cfg = {
-                "provider": config.llm_provider,
-                "model": config.llm_model,
-                "api": getattr(config, "llm_api", "chat_completions"),
-            }
+            cfg = config.get_agent_llm_config("")
 
         provider_name = cfg.get("provider", config.llm_provider) or ""
         model_name = cfg.get("model", config.llm_model) or ""
@@ -198,7 +487,20 @@ async def _validate_models(config: OrchestratorConfig) -> None:
             fallback = config.llm_reasoning_effort
             effort = fallback if isinstance(fallback, str) else None
         effort_str = effort or ""
-        key = (provider_name, model_name, region, api_name, effort_str)
+        secret_ref = cfg.get("api_key_secret")
+        secret_ref_key = (
+            secret_ref
+            if isinstance(secret_ref, str)
+            else f"<invalid:{type(secret_ref).__name__}>"
+        )
+        key = (
+            provider_name,
+            model_name,
+            region,
+            api_name,
+            effort_str,
+            secret_ref_key,
+        )
 
         agent_label = agent_type or "default"
         key_to_agents.setdefault(key, []).append(agent_label)
@@ -206,9 +508,10 @@ async def _validate_models(config: OrchestratorConfig) -> None:
             key_to_cfg[key] = cfg
 
     for key, agents in key_to_agents.items():
-        provider_name, model_name, region, api_name, effort_str = key
+        provider_name, model_name, region, api_name, effort_str, _ = key
         effort = effort_str or None
         cfg = key_to_cfg[key]
+        secret_ref = cfg.get("api_key_secret")
 
         label = f"{provider_name}/{model_name}" + (f" [{region}]" if region else "")
         if effort:
@@ -216,11 +519,19 @@ async def _validate_models(config: OrchestratorConfig) -> None:
         agents_str = ", ".join(agents)
 
         try:
+            api_key = None
+            if secret_ref is not None:
+                api_key = await _resolve_api_key_secret(
+                    config,
+                    agents[0] if agents[0] != "default" else "",
+                    secrets_provider,
+                )
             provider = _make_llm_provider(
                 config,
                 provider=cfg.get("provider", ""),
                 model=cfg.get("model", ""),
                 api=api_name,
+                api_key=api_key,
             )
             if effort:
                 provider.reasoning_effort = effort
@@ -258,8 +569,23 @@ async def _validate_models(config: OrchestratorConfig) -> None:
                     f" — reasoning calls can be slower"
                 )
             logger.error(msg)
+        except SecretReferenceError as exc:
+            logger.warning(
+                "Skipping startup model check for %s (agents: %s): %s. "
+                "Startup validation uses shared secrets; ticket dispatch "
+                "resolves each user's cascade.",
+                label,
+                agents_str,
+                exc,
+            )
         except Exception as exc:
-            msg = f"Model check FAILED: {label} (agents: {agents_str}) — {exc}"
+            probe_error = (
+                f"configured API-key secret '{secret_ref}' was resolved, "
+                "but the model probe failed"
+                if secret_ref
+                else str(exc)
+            )
+            msg = f"Model check FAILED: {label} (agents: {agents_str}) — {probe_error}"
             if effort:
                 msg += (
                     f"\n  → reasoning_effort={effort} is configured for"
@@ -519,6 +845,23 @@ async def _advance_plan(
             return
 
         if step.get("agent_type") == "provision":
+            if not cf.get("provisioning_complete", False):
+                hosts = cf.get("hosts_provisioned", [])
+                response = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": "awaiting_customer_guidance",
+                        "comment": (
+                            "Provisioning did not report completion, so the "
+                            "execution plan cannot advance to benchmarking. "
+                            f"Hosts reported: {hosts}. Review the provisioning "
+                            "result and resume the ticket after resolving it."
+                        ),
+                    },
+                )
+                response.raise_for_status()
+                return
+
             missing = _missing_host_tuning(cf)
             if missing:
                 logger.warning(
@@ -733,6 +1076,71 @@ async def _advance_plan(
         response.raise_for_status()
 
 
+def _cancellation_reason(dispatcher: Dispatcher, ticket_id: str) -> str:
+    """Describe why a running agent received task cancellation."""
+    if dispatcher.was_stopped_by_user(ticket_id) is True:
+        return "Agent stopped by user request"
+    if dispatcher.has_lost_claim() is True:
+        return "Agent stopped: orchestrator claim lost"
+    return "Agent stopped: task cancelled"
+
+
+def _resource_reconciliation_required_before_resume(status: str, ticket: dict) -> bool:
+    """Whether a downstream resume must pass through resource allocation first."""
+    if status not in {
+        "preparing_platform",
+        "awaiting_provision",
+        "executing_benchmark",
+    }:
+        return False
+
+    from agents.resource.agent import _provider_selection_changed
+    from providers.resource.registry import PROVIDER_REGISTRY
+
+    fields = ticket.get("custom_fields", {})
+    if not isinstance(fields, dict):
+        return True
+    directives = fields.get("directives", {})
+    directives = directives if isinstance(directives, dict) else {}
+    provider = fields.get("resource_provider")
+    if not provider and fields.get("quads_assignment_id"):
+        provider = "quads"
+    requested_provider = directives.get("resource_provider")
+    metadata = fields.get("resource_provider_metadata") or {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    has_allocation_identity = bool(
+        fields.get("resource_reservation_id")
+        or fields.get("quads_assignment_id")
+        or any(
+            metadata.get(key)
+            for key in (
+                "reservation_id",
+                "lease_id",
+                "assignment_id",
+                "instance_ids",
+            )
+        )
+    )
+
+    if not provider:
+        return bool(requested_provider or has_allocation_identity)
+    if not isinstance(provider, str) or provider not in {
+        *PROVIDER_REGISTRY,
+        "user_provided",
+    }:
+        return True
+    if requested_provider and requested_provider != provider:
+        return True
+    if provider == "user_provided":
+        return False
+    try:
+        return _provider_selection_changed(provider, fields, directives)
+    except Exception:
+        # Unparseable requirements are not safe evidence that the old lease
+        # still satisfies the request. Route to the resource agent to fail closed.
+        return True
+
+
 async def run_agent_task(
     dispatcher: Dispatcher,
     status: str,
@@ -743,15 +1151,65 @@ async def run_agent_task(
 ):
     agent = None
     success = False
+    raw_claim_id = dispatcher._claim_ids.get(ticket_id)
+    claim_id = raw_claim_id if isinstance(raw_claim_id, str) and raw_claim_id else None
+    mutation_headers = _mutation_headers(claim_id)
 
     try:
-        snapshot_factory = _make_llm_factory(config) if config else None
+        if status in (
+            "preparing_platform",
+            "awaiting_provision",
+            "executing_benchmark",
+        ):
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0, headers=mutation_headers
+            ) as client:
+                response = await client.get(
+                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                )
+                response.raise_for_status()
+                current_ticket = response.json()
+                if current_ticket.get("status") != status:
+                    return
+                if _resource_reconciliation_required_before_resume(
+                    status, current_ticket
+                ):
+                    transition = await client.post(
+                        f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
+                        json={
+                            "status": "awaiting_hardware",
+                            "comment": (
+                                "The active allocation requires reconciliation "
+                                f"before resuming {status}; returning to resource "
+                                "allocation."
+                            ),
+                        },
+                    )
+                    transition.raise_for_status()
+                    return
+
+        ticket_secrets = dispatcher._get_secrets_for_ticket(ticket_data)
+        agent_type = STATUS_AGENT_MAP.get(status, "")
+        api_key = (
+            await _resolve_api_key_secret(config, agent_type, ticket_secrets)
+            if config
+            else None
+        )
+        snapshot_factory = (
+            _make_llm_factory(
+                config,
+                api_keys={agent_type: api_key} if api_key is not None else {},
+            )
+            if config
+            else None
+        )
         snapshot_iterations = config.get_agent_max_iterations if config else None
         agent = dispatcher.create_agent(
             status,
             ticket_data=ticket_data,
             llm_factory=snapshot_factory,
             iterations_factory=snapshot_iterations,
+            secrets_provider=ticket_secrets,
         )
         if agent is None:
             return
@@ -806,11 +1264,26 @@ async def run_agent_task(
                             )
                     llm_override = cf.get("llm_override")
                     if llm_override and config:
+                        agent_type = STATUS_AGENT_MAP.get(status, "")
+                        agent_cfg = config.get_agent_llm_config(agent_type)
+                        agent_provider = (
+                            agent_cfg.get("provider") or config.llm_provider
+                        )
+                        override_provider = (
+                            llm_override.get("provider") or agent_provider
+                        )
+                        override_api_key = (
+                            api_key
+                            if _provider_family(override_provider)
+                            == _provider_family(agent_provider)
+                            else None
+                        )
                         override_llm = _make_llm_provider(
                             config,
-                            provider=llm_override.get("provider", ""),
+                            provider=override_provider,
                             model=llm_override.get("model", ""),
                             api=llm_override.get("api", ""),
+                            api_key=override_api_key,
                         )
                         override_llm.default_timeout = config.llm_timeout
                         override_effort = llm_override.get("reasoning_effort")
@@ -941,6 +1414,7 @@ async def run_agent_task(
                         ticket_id,
                         f"Agent task timed out after {agent_task_timeout}s",
                         event_bus=dispatcher.events,
+                        claim_id=claim_id,
                     )
             else:
                 await agent.run(ticket_id)
@@ -952,7 +1426,7 @@ async def run_agent_task(
         if config:
             try:
                 async with AuditedAsyncHTTPClient(
-                    timeout=10.0, headers=_auth_headers()
+                    timeout=10.0, headers=mutation_headers
                 ) as client:
                     # Preserve max_iterations_override when the
                     # agent paused (awaiting_customer_guidance) so
@@ -974,10 +1448,29 @@ async def run_agent_task(
             except Exception:
                 pass
     except asyncio.CancelledError:
-        logger.warning(f"Agent hard-stopped on ticket {ticket_id} (status={status})")
+        cancel_reason = _cancellation_reason(dispatcher, ticket_id)
+        logger.warning(
+            "Agent cancelled on ticket %s (status=%s): %s",
+            ticket_id,
+            status,
+            cancel_reason,
+        )
+        cancellation_reason = _cancellation_guidance_reason(cancel_reason)
+        cancellation_context = _cancellation_trace_context(
+            dispatcher, agent, ticket_id, status
+        )
+        cancellation_context_token = bind_trace_context(cancellation_context)
+        # The lost claim ID cannot authorize recovery. Leader-only fencing
+        # permits this write only if this process remains the active leader
+        # and no live claim now owns the ticket.
+        cancellation_headers = (
+            _mutation_headers(None)
+            if cancellation_reason == "claim_lost"
+            else mutation_headers
+        ) | trace_headers(cancellation_context)
         try:
             async with AuditedAsyncHTTPClient(
-                timeout=10.0, headers=_auth_headers()
+                timeout=10.0, headers=cancellation_headers
             ) as client:
                 # Check if ticket was already force-closed before
                 # trying to transition — avoids reopening a closed
@@ -993,19 +1486,34 @@ async def run_agent_task(
                             " skipping post-cancel transition"
                         )
                     else:
-                        await client.patch(
+                        fields = {
+                            "interrupted": True,
+                            "guidance_summary": _build_cancellation_guidance_summary(
+                                r.json(),
+                                status,
+                                cancellation_reason,
+                                agent_identity=getattr(agent, "agent_name", None),
+                            ),
+                        }
+                        response = await client.patch(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
-                            json={"fields": {"interrupted": True}},
+                            json={"fields": fields},
                         )
-                        await client.post(
+                        response.raise_for_status()
+                        response = await client.post(
                             f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
                             json={
                                 "status": "awaiting_customer_guidance",
-                                "comment": "Agent hard-stopped by user request",
+                                "comment": cancel_reason,
                             },
                         )
+                        response.raise_for_status()
         except Exception:
-            logger.exception(f"Failed to transition hard-stopped ticket {ticket_id}")
+            logger.exception(
+                "Failed to record cancellation guidance for ticket %s", ticket_id
+            )
+        finally:
+            reset_trace_context(cancellation_context_token)
         if dispatcher.events:
             dispatcher.events.emit(
                 ticket_id,
@@ -1035,6 +1543,7 @@ async def run_agent_task(
                 ticket_id,
                 reason,
                 event_bus=dispatcher.events,
+                claim_id=claim_id,
             )
         except Exception:
             logger.exception(
@@ -1072,7 +1581,7 @@ async def run_agent_task(
         if success and not deposed and status == "triage_pending":
             try:
                 async with AuditedAsyncHTTPClient(
-                    timeout=10.0, headers=_auth_headers()
+                    timeout=10.0, headers=mutation_headers
                 ) as _stop_client:
                     r = await _stop_client.get(
                         f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
@@ -1101,6 +1610,20 @@ async def run_agent_task(
             except Exception:
                 logger.exception(f"stop_after_step triage check failed for {ticket_id}")
 
+        try:
+            await _record_dispatch_retry_outcome(
+                dispatcher,
+                ticket_id,
+                status,
+                claim_id=claim_id,
+            )
+        except Exception:
+            logger.exception(
+                "Could not update dispatch retry state for %s at %s",
+                ticket_id,
+                status,
+            )
+
         dispatcher.clear_agent(ticket_id)
         await dispatcher.mark_done(ticket_id)
         logger.info(f"mark_done completed for {ticket_id}")
@@ -1111,11 +1634,96 @@ async def run_agent_task(
                 pass
 
 
+def _cancellation_guidance_reason(cancel_reason: str) -> str:
+    """Map the cancellation cause to the stable guidance reason."""
+    if cancel_reason == "Agent stopped by user request":
+        return "hard_stop"
+    if cancel_reason == "Agent stopped: orchestrator claim lost":
+        return "claim_lost"
+    return "task_cancelled"
+
+
+def _cancellation_trace_context(
+    dispatcher: Dispatcher,
+    agent: Any,
+    ticket_id: str,
+    status: str,
+) -> TraceContext:
+    """Restore the ticket context after the agent's context token is reset."""
+    context = getattr(agent, "trace_context", None)
+    if not isinstance(context, TraceContext):
+        contexts = getattr(dispatcher, "_trace_contexts", None)
+        context = contexts.get(ticket_id) if isinstance(contexts, dict) else None
+    if not isinstance(context, TraceContext):
+        agent_id = getattr(agent, "agent_name", None)
+        if not isinstance(agent_id, str) or not agent_id:
+            agent_id = STATUS_AGENT_MAP.get(status, status) or "orchestrator"
+        context = new_trace_context(ticket_id=ticket_id, agent_id=agent_id)
+    elif context.ticket_id != ticket_id:
+        context = context.model_copy(update={"ticket_id": ticket_id})
+    return context
+
+
+def _build_cancellation_guidance_summary(
+    ticket: dict[str, Any],
+    status: str,
+    reason: str,
+    *,
+    agent_identity: str | None = None,
+) -> dict[str, Any]:
+    """Build a guidance summary for a cancelled running agent.
+
+    Only comments authored by the running agent are included. If its identity
+    is unavailable, omit comment context rather than risk attributing a
+    multi-user comment to the agent.
+    """
+    agent = STATUS_AGENT_MAP.get(status, "unknown")
+
+    comments = ticket.get("comments", [])
+    last_agent_message = ""
+    if isinstance(agent_identity, str) and agent_identity:
+        for comment in reversed(comments):
+            author = comment.get("author", "")
+            body = comment.get("body", "")
+            is_agent_comment = author == agent_identity or (
+                isinstance(author, str) and author.startswith(f"{agent_identity}/")
+            )
+            if is_agent_comment and isinstance(body, str) and body:
+                last_agent_message = body[:2000]
+                break
+
+    custom_fields = ticket.get("custom_fields", {})
+    benchmark_results = custom_fields.get("benchmark_results")
+    partial_context = ""
+    if benchmark_results:
+        partial_context = " Partial benchmark results are available in the ticket."
+
+    details = f"The {agent} agent was interrupted before it could complete."
+    if last_agent_message:
+        # Truncate to keep the summary concise
+        snippet = last_agent_message[:500]
+        details += f" Last agent activity: {snippet}"
+    if partial_context:
+        details += partial_context
+
+    return {
+        "agent": agent,
+        "reason": reason,
+        "details": details,
+        "suggested_actions": [
+            "Retry — re-dispatch the ticket to resume from the current stage",
+            "Review partial results if any benchmark data was collected",
+            "Abort if the investigation is no longer needed",
+        ],
+    }
+
+
 async def _transition_to_guidance(
     store_url: str,
     ticket_id: str,
     comment: str,
     event_bus: EventBus | None = None,
+    claim_id: str | None = None,
 ) -> None:
     """Transition a ticket to awaiting_customer_guidance.
 
@@ -1129,7 +1737,7 @@ async def _transition_to_guidance(
     context_token = bind_trace_context(trace_context)
     try:
         async with AuditedAsyncHTTPClient(
-            timeout=10.0, headers=_auth_headers()
+            timeout=10.0, headers=_mutation_headers(claim_id)
         ) as client:
             await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
@@ -1232,6 +1840,7 @@ async def _check_stale_tasks(
                     f" {round(idle_seconds)}s (threshold:"
                     f" {round(stale_timeout)}s)",
                     event_bus=event_bus,
+                    claim_id=dispatcher._claim_ids.get(tid),
                 )
                 task.cancel()
 
@@ -1240,35 +1849,76 @@ async def _block_absent_suite(
     store_url: str,
     ticket_id: str,
     event_bus: EventBus | None = None,
-) -> None:
-    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
-        suite = ""
-        try:
-            r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
-            suite = r.json().get("custom_fields", {}).get("benchmark_suite", "unknown")
-        except Exception:
-            pass
-        await client.post(
-            f"{store_url}/api/v1/tickets/{ticket_id}/comments",
-            json={
-                "author": "orchestrator",
-                "body": (
-                    f"**Blocked:** No automation harness supports the "
-                    f"'{suite}' benchmark. The ticket cannot proceed to "
-                    f"hardware allocation.\n\n"
-                    f"Please specify a supported benchmark or harness, "
-                    f"or configure the harness that provides this benchmark."
-                ),
-            },
-        )
-        await client.post(
-            f"{store_url}/api/v1/tickets/{ticket_id}/transition",
-            json={
-                "status": "awaiting_customer_guidance",
-                "comment": "Absent benchmark suite — no harness can run this",
-            },
-        )
+) -> bool:
+    """Transition an absent-suite ticket to awaiting_customer_guidance.
 
+    Returns True if the transition succeeded, False otherwise.
+    """
+    try:
+        # Use auth-only headers — no orchestrator fencing.
+        # This is an internal orchestrator action, not a dispatched
+        # agent write.  Sending session+epoch without a claim ID
+        # triggers a 409 "invalid mutation fence" from the fencing
+        # middleware.
+        token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        auth_only = {"Authorization": f"Bearer {token}"} if token else {}
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=auth_only) as client:
+            suite = ""
+            try:
+                r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+                suite = (
+                    r.json().get("custom_fields", {}).get("benchmark_suite", "unknown")
+                )
+            except Exception:
+                pass
+            comment_r = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                json={
+                    "author": "orchestrator",
+                    "body": (
+                        f"**Blocked:** No automation harness supports the "
+                        f"'{suite}' benchmark. The ticket cannot proceed "
+                        f"to hardware allocation.\n\n"
+                        f"Please specify a supported benchmark or harness, "
+                        f"or configure the harness that provides this "
+                        f"benchmark."
+                    ),
+                },
+            )
+            if comment_r.status_code >= 300:
+                logger.warning(
+                    "Failed to post absent-suite comment on %s: %s",
+                    ticket_id,
+                    comment_r.status_code,
+                )
+            transition_r = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                json={
+                    "status": "awaiting_customer_guidance",
+                    "comment": (
+                        "Absent benchmark suite \u2014 no harness can run this"
+                    ),
+                },
+            )
+            if transition_r.status_code >= 300:
+                logger.error(
+                    "Failed to transition absent-suite ticket %s: %s %s",
+                    ticket_id,
+                    transition_r.status_code,
+                    transition_r.text[:200],
+                )
+                return False
+            return True
+    except Exception:
+        logger.exception("_block_absent_suite failed for %s", ticket_id)
+        return False
+
+
+# Tickets already transitioned for absent_suite.  Prevents the
+# orchestrator from retrying the transition every poll cycle when
+# the ticket has already been blocked (or the transition succeeded
+# but the ticket hasn't been re-fetched yet).
+_absent_suite_blocked: set[str] = set()
 
 # Jumpstarter lifecycle functions extracted to
 # providers/resource/jumpstarter_lifecycle.py
@@ -1295,7 +1945,9 @@ async def _redirect_to_investigation(
     path, the orchestrator corrects it here.
     """
 
-    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(
+        timeout=10.0, headers=_mutation_headers(None)
+    ) as client:
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
             json={
@@ -1346,18 +1998,50 @@ async def _block_handoff_failed(
     reason: str,
     current_status: str = "",
     event_bus: EventBus | None = None,
-) -> None:
+) -> bool:
+    """Attempt to recover a handoff-blocked ticket to HITL.
+
+    Returns True if the ticket was successfully transitioned to
+    awaiting_customer_guidance, False if the transition failed.
+    """
     retry_status = HANDOFF_RETRY_STATUS.get(current_status)
 
-    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
+    async with AuditedAsyncHTTPClient(
+        timeout=10.0, headers=_mutation_headers(None)
+    ) as client:
         if retry_status:
             rewind_comment = (
                 f"Rewinding to {retry_status} so the agent"
                 f" can retry after user guidance"
             )
-            await client.post(
+            resp = await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/transition",
                 json={"status": retry_status, "comment": rewind_comment},
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    "Rewind %s → %s failed (HTTP %d) for %s; "
+                    "will transition directly to awaiting_customer_guidance",
+                    current_status,
+                    retry_status,
+                    resp.status_code,
+                    ticket_id,
+                )
+        # This lookup only improves the failure log; a store read error must
+        # not prevent the HITL recovery attempt or stop the poll loop.
+        actual_status = current_status
+        try:
+            ticket_resp = await client.get(
+                f"{store_url}/api/v1/tickets/{ticket_id}",
+            )
+            if ticket_resp.status_code == 200:
+                actual_status = ticket_resp.json().get("status", current_status)
+        except Exception:
+            logger.warning(
+                "Could not re-fetch %s after handoff rewind; using known status %s",
+                ticket_id,
+                current_status,
+                exc_info=True,
             )
         await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/comments",
@@ -1372,13 +2056,23 @@ async def _block_handoff_failed(
             },
         )
         block_comment = f"Handoff validation failed: {reason}"
-        await client.post(
+        hitl_resp = await client.post(
             f"{store_url}/api/v1/tickets/{ticket_id}/transition",
             json={
                 "status": "awaiting_customer_guidance",
                 "comment": block_comment,
             },
         )
+        if hitl_resp.status_code >= 400:
+            logger.error(
+                "HITL transition to awaiting_customer_guidance failed "
+                "(HTTP %d) for %s from status %s — will retry",
+                hitl_resp.status_code,
+                ticket_id,
+                actual_status,
+            )
+            return False
+    return True
 
 
 async def _process_stop_requests(
@@ -1419,8 +2113,9 @@ async def _process_stop_requests(
                     # — it doesn't notify the dispatcher to kill the
                     # running asyncio task.
                     if dispatcher.is_active(tid):
+                        # run_agent_task owns cleanup after its cancellation
+                        # handler reads the user-stop reason and exits.
                         dispatcher.stop_agent(tid, "hard")
-                        await dispatcher.mark_done(tid)
                         logger.info(f"Cancelled agent task for {tid}")
                     resp = await client.post(
                         f"{store_url}/api/v1/tickets/{tid}/force-close",
@@ -1479,6 +2174,8 @@ def _maybe_start_introspection(
     """
     if dispatcher.is_introspection_active(ticket_id):
         return
+    if ticket_id in dispatcher._introspection_starting:
+        return
 
     cf = ticket.get("custom_fields", {})
     per_ticket = cf.get("introspection_enabled")
@@ -1489,9 +2186,60 @@ def _maybe_start_introspection(
     if per_ticket is not True and not config.introspection_enabled:
         return
 
+    if dispatcher._introspection_llm:
+        intro_cfg = config.get_agent_llm_config("introspection")
+        if intro_cfg.get("api_key_secret") is not None:
+            dispatcher._introspection_starting.add(ticket_id)
+            asyncio.create_task(
+                _start_introspection_with_secret(
+                    dispatcher,
+                    config,
+                    ticket,
+                    ticket_id,
+                ),
+                name=f"introspection-llm-setup-{ticket_id}",
+            )
+            return
+
     started = dispatcher.start_introspection(ticket_id)
     if started:
         logger.info(f"Introspection started for {ticket_id}")
+
+
+async def _start_introspection_with_secret(
+    dispatcher: Dispatcher,
+    config: OrchestratorConfig,
+    ticket: dict[str, Any],
+    ticket_id: str,
+) -> None:
+    """Resolve an introspection credential before creating its LLM client."""
+    api_key = None
+    try:
+        secrets_provider = dispatcher._get_secrets_for_ticket(ticket)
+        api_key = await _resolve_api_key_secret(
+            config,
+            "introspection",
+            secrets_provider,
+        )
+        factory = _make_llm_factory(
+            config,
+            api_keys={"introspection": api_key} if api_key is not None else {},
+        )
+        if dispatcher.start_introspection(ticket_id, llm_factory=factory):
+            logger.info("Introspection started for %s", ticket_id)
+    except Exception as exc:
+        failure = (
+            f"provider setup failed ({type(exc).__name__})"
+            if api_key is not None
+            else str(exc)
+        )
+        logger.error(
+            "Could not start introspection for %s: %s",
+            ticket_id,
+            failure,
+        )
+    finally:
+        dispatcher._introspection_starting.discard(ticket_id)
 
 
 async def _add_comment(
@@ -1504,7 +2252,7 @@ async def _add_comment(
     try:
         async with AuditedAsyncHTTPClient(
             timeout=10.0,
-            headers=_auth_headers(),
+            headers=_mutation_headers(None),
         ) as client:
             await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/comments",
@@ -1514,25 +2262,297 @@ async def _add_comment(
         logger.exception("Failed to add comment on %s", ticket_id)
 
 
+# Pending writes preserve safety limits during a state-store outage. Durable
+# ticket metadata remains authoritative once the write succeeds; this buffer
+# exists only to avoid immediately retrying a failed operation in this process.
+_pending_retry_writes: dict[str, tuple[dict[str, Any], float]] = {}
+_retry_write_locks: dict[str, asyncio.Lock] = {}
+
+
+def _overlay_pending_retry_state(ticket: dict[str, Any]) -> None:
+    ticket_id = ticket.get("id", "")
+    pending = _pending_retry_writes.get(ticket_id)
+    if pending is None:
+        return
+    state, next_write_at = pending
+    state = prune_stale_retry_entries(
+        {RETRY_STATE_FIELD: state}, ticket.get("status", "")
+    )
+    if state is None:
+        _pending_retry_writes.pop(ticket_id, None)
+        return
+    _pending_retry_writes[ticket_id] = (state, next_write_at)
+    ticket.setdefault("custom_fields", {})[RETRY_STATE_FIELD] = state
+
+
+async def _reconcile_pending_retry_state(
+    store_url: str, ticket: dict[str, Any]
+) -> None:
+    """Apply unsaved limits and retry their durable write without hot looping."""
+    _overlay_pending_retry_state(ticket)
+    ticket_id = ticket.get("id", "")
+    pending = _pending_retry_writes.get(ticket_id)
+    if pending is not None and time.time() >= pending[1]:
+        await _persist_retry_state(
+            store_url, ticket_id, pending[0], expected_pending=pending
+        )
+
+
+async def _persist_retry_state(
+    store_url: str,
+    ticket_id: str,
+    state: dict[str, Any] | None,
+    *,
+    claim_id: str | None = None,
+    trace_context: Any | None = None,
+    comment: str = "",
+    expected_pending: tuple[dict[str, Any], float] | None = None,
+) -> bool:
+    """Persist retry metadata without letting one ticket stop the poll loop.
+
+    A failed comment must not undo a stored retry limit. Cancellation still
+    propagates so shutdown and leader loss can stop in-flight recovery.
+    """
+    # A poller flush and an agent completion may overlap. Serialize their
+    # requests so an older PATCH cannot commit after a newer attempt count.
+    lock = _retry_write_locks.setdefault(ticket_id, asyncio.Lock())
+    async with lock:
+        if (
+            expected_pending is not None
+            and _pending_retry_writes.get(ticket_id) is not expected_pending
+        ):
+            return False
+        headers = _mutation_headers(claim_id)
+        if trace_context is not None:
+            headers.update(trace_headers(trace_context))
+        persisted = False
+        try:
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                response = await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={"fields": {RETRY_STATE_FIELD: state}},
+                )
+                response.raise_for_status()
+                persisted = True
+                if comment:
+                    response = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                        json={"author": "orchestrator", "body": comment},
+                    )
+                    response.raise_for_status()
+        except Exception:
+            if not persisted and state is not None:
+                _pending_retry_writes[ticket_id] = (
+                    state,
+                    time.time() + HANDOFF_RETRY_BASE_SECONDS,
+                )
+            logger.exception(
+                "Could not %s for %s",
+                "post retry exhaustion comment" if persisted else "persist retry state",
+                ticket_id,
+            )
+        if persisted:
+            _pending_retry_writes.pop(ticket_id, None)
+        return persisted
+
+
+async def _prune_stale_retry_state(
+    store_url: str,
+    ticket: dict[str, Any],
+) -> None:
+    """Reset retry limits when a ticket moves away from the failed status."""
+    ticket_id = ticket.get("id", "")
+    custom_fields = ticket.get("custom_fields", {})
+    if not ticket_id or not isinstance(custom_fields, dict):
+        return
+
+    stored_state = custom_fields.get(RETRY_STATE_FIELD)
+    retry_state = prune_stale_retry_entries(custom_fields, ticket.get("status", ""))
+    if retry_state == stored_state:
+        return
+
+    try:
+        if await _persist_retry_state(store_url, ticket_id, retry_state):
+            custom_fields[RETRY_STATE_FIELD] = retry_state
+    except Exception:
+        logger.exception("Could not clear stale retry state for %s", ticket_id)
+
+
+async def _record_dispatch_retry_outcome(
+    dispatcher: Dispatcher,
+    ticket_id: str,
+    dispatched_status: str,
+    *,
+    claim_id: str | None,
+) -> None:
+    """Back off repeated agent failures and stop after the configured cap."""
+    if (
+        dispatcher.is_deposed()
+        or not claim_id
+        or dispatched_status not in PLAN_AGENT_STATUS.values()
+    ):
+        return
+
+    context = dispatcher._trace_contexts.get(ticket_id)
+    headers = _mutation_headers(claim_id)
+    if context is not None:
+        headers.update(trace_headers(context))
+
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+        response = await client.get(
+            f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+        )
+        if response.status_code != 200:
+            return
+        ticket = response.json()
+        ticket.setdefault("id", ticket_id)
+        _overlay_pending_retry_state(ticket)
+        custom_fields = ticket.get("custom_fields", {})
+        current_status = ticket.get("status", "")
+
+        if current_status != dispatched_status:
+            retry_state = clear_retry_entry(custom_fields, "dispatch")
+            if retry_state != custom_fields.get(RETRY_STATE_FIELD):
+                await _persist_retry_state(
+                    dispatcher.store_url,
+                    ticket_id,
+                    retry_state,
+                    claim_id=claim_id,
+                    trace_context=context,
+                )
+            return
+
+        retry_state, exhausted, attempts = record_retry_failure(
+            custom_fields,
+            "dispatch",
+            dispatched_status,
+            now=time.time(),
+            retry_limit=DISPATCH_RETRY_LIMIT,
+            base_seconds=DISPATCH_RETRY_BASE_SECONDS,
+            max_seconds=DISPATCH_RETRY_MAX_SECONDS,
+        )
+        comment = ""
+        if exhausted:
+            comment = (
+                f"**Automatic dispatch paused:** {DISPATCH_RETRY_LIMIT} "
+                f"consecutive failures at {dispatched_status}. The "
+                "orchestrator stopped retrying this stage to protect system "
+                "resources. Review the agent failure, then clear "
+                "orchestrator_retry_state or move the ticket to another "
+                "status before resuming."
+            )
+        await _persist_retry_state(
+            dispatcher.store_url,
+            ticket_id,
+            retry_state,
+            claim_id=claim_id,
+            trace_context=context,
+            comment=comment,
+        )
+        if exhausted:
+            logger.error(
+                "Stopped dispatching %s at %s after %d consecutive failures",
+                ticket_id,
+                dispatched_status,
+                attempts,
+            )
+
+
 async def _renew_leader_lease(
     lease: Any,
     interval: float,
     on_lost: Any | None = None,
     started: asyncio.Event | None = None,
 ) -> None:
-    """Keep the control-plane lease fenced while the poll loop is active."""
+    """Keep the control-plane lease fenced while the poll loop is active.
+
+    Retry transient transport and server errors with bounded backoff, but
+    stop before the last confirmed lease expiration if renewal cannot succeed.
+    """
+
     if started is not None:
         started.set()
+
+    max_consecutive_failures = 3
+    consecutive_failures = 0
+    loss_notified = False
+    loop = asyncio.get_running_loop()
+    ttl_seconds = float(getattr(lease, "ttl_seconds", interval * 3))
+    safety_margin = min(1.0, max(0.01, ttl_seconds * 0.05))
+
+    def mark_lost() -> None:
+        nonlocal loss_notified
+        if not loss_notified:
+            loss_notified = True
+            if on_lost is not None:
+                on_lost()
+
+    def fail_lost(exc: Exception) -> None:
+        mark_lost()
+        raise RuntimeError("orchestrator leader lease lost") from exc
+
+    def safe_remaining() -> float:
+        deadline = getattr(lease, "confirmed_deadline", None)
+        if deadline is None:
+            return 0.0
+        return deadline - loop.time() - safety_margin
+
+    next_delay = interval
+
     try:
         while True:
-            await asyncio.sleep(interval)
+            remaining = safe_remaining()
+            if remaining <= 0:
+                fail_lost(RuntimeError("no confirmed lease time remains"))
+            if next_delay >= remaining:
+                # Preserve time for a renewal attempt when the usual cadence
+                # would consume the remaining confirmed lease window.
+                next_delay = remaining / 2
+            await asyncio.sleep(next_delay)
+            remaining = safe_remaining()
+            if remaining <= 0:
+                fail_lost(RuntimeError("confirmed lease deadline reached"))
+
             try:
-                await lease.renew()
+                await asyncio.wait_for(lease.renew(), timeout=remaining)
+                if consecutive_failures > 0:
+                    logger.info(
+                        "Orchestrator lease renewal recovered "
+                        "after %d transient failure(s)",
+                        consecutive_failures,
+                    )
+                consecutive_failures = 0
+                next_delay = interval
             except Exception as exc:
-                logger.critical("Orchestrator leader lease renewal failed: %s", exc)
-                if on_lost is not None:
-                    on_lost()
-                raise RuntimeError("orchestrator leader lease lost") from exc
+                retryable = isinstance(exc, httpx.TransportError) or (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and 500 <= exc.response.status_code < 600
+                )
+                if not retryable:
+                    logger.critical(
+                        "Orchestrator leader lease renewal rejected: %s", exc
+                    )
+                    fail_lost(exc)
+
+                consecutive_failures += 1
+                logger.warning(
+                    "Orchestrator lease renewal transient failure %d/%d: %s",
+                    consecutive_failures,
+                    max_consecutive_failures,
+                    exc,
+                )
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.critical(
+                        "Orchestrator lease renewal failed %d consecutive times "
+                        "— declaring lease lost",
+                        consecutive_failures,
+                    )
+                    fail_lost(exc)
+
+                remaining = safe_remaining()
+                if remaining <= 0:
+                    fail_lost(exc)
+                next_delay = min(2.0 * consecutive_failures, interval / 2, remaining)
     finally:
         await lease.release()
 
@@ -1651,57 +2671,50 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     # Bind a durable control trace before using the audited HTTP client; ticket
     # traces are created later by the dispatcher for individual work items.
     bind_trace_context(new_trace_context(ticket_id="control", agent_id="orchestrator"))
-    lease_renew_task: asyncio.Task | None = None
-    lease_renewal_started = asyncio.Event()
+    # Mutable container so _poll_loop_after_lease can store
+    # the renewal task for cleanup in the finally block.
+    lease_state: dict[str, Any] = {
+        "renew_task": None,
+        "started": asyncio.Event(),
+    }
     try:
-        await leader_lease.acquire()
-        if leader_lease.epoch is None:
-            raise RuntimeError("state store returned no leader fencing epoch")
-        os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(
-            leader_lease.session_id
-        )
-        os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
+        # Lease acquisition is deferred until after initialization
+        # completes inside _poll_loop_after_lease.  Initialization
+        # (model checks, MCP connections, telemetry) can take 30+
+        # seconds on slow storage, which would expire a 30s TTL
+        # lease acquired here.
         lease_loss_gate = _LeaseLossGate()
-        lease_renew_task = asyncio.create_task(
-            _renew_leader_lease(
-                leader_lease,
-                config.leader_lease_renew_interval,
-                lease_loss_gate.mark_deposed,
-                lease_renewal_started,
-            )
-        )
         await _poll_loop_after_lease(
             config,
             leader_lease,
-            lease_renew_task,
             lease_loss_gate,
+            lease_state,
         )
     finally:
-        if lease_renew_task is None:
+        renew_task = lease_state["renew_task"]
+        started = lease_state["started"]
+        if renew_task is None:
             await leader_lease.release()
         else:
-            await _cancel_and_await(lease_renew_task)
-            if not lease_renewal_started.is_set():
+            await _cancel_and_await(renew_task)
+            if not started.is_set():
                 await leader_lease.release()
 
 
 async def _poll_loop_after_lease(
     config: OrchestratorConfig,
     leader_lease: Any,
-    lease_renew_task: asyncio.Task,
     lease_loss_gate: _LeaseLossGate,
+    lease_state: dict[str, Any],
 ) -> None:
+    """Initialize the orchestrator and run the poll loop.
+
+    Lease acquisition is deferred to after initialization completes
+    so the TTL doesn't expire during slow startup I/O.
+    """
     dispatcher: Dispatcher | None = None
     trace_sweep_task: asyncio.Task | None = None
-    await _validate_models(config)
-
-    llm = _make_llm_provider(config)
-    llm.default_timeout = config.llm_timeout
-    if config.llm_reasoning_effort:
-        llm.reasoning_effort = config.llm_reasoning_effort
-    llm.max_tokens = config.llm_max_tokens
-    llm_factory = _make_llm_factory(config)
-
+    lease_renew_task: asyncio.Task | None = None
     repo_cache = RepoCache()
 
     # Create an MCP client for arcaflow plugin discovery
@@ -1745,6 +2758,16 @@ async def _poll_loop_after_lease(
         catalog_only=True,
         arcaflow_mcp_client=arcaflow_mcp,
     )
+
+    # Collect harness-contributed directive schemas so the
+    # normalization framework knows about harness-specific keys.
+    # Provider-backed harnesses register via get_directive_schema().
+    # Standalone harnesses register at module import.
+    import providers.skills.boot_time  # noqa: F401
+    from providers.directives import collect_from_providers
+
+    collect_from_providers(skills)
+
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")
 
@@ -1788,6 +2811,29 @@ async def _poll_loop_after_lease(
             secrets = local_secrets
     else:
         secrets = local_secrets
+
+    has_api_key_secret_refs = config.llm_api_key_secret is not None or any(
+        isinstance(agent_cfg, dict) and "api_key_secret" in agent_cfg
+        for agent_cfg in config._agent_models.values()
+    )
+    # The dispatcher needs a fallback provider object, but real dispatches
+    # construct their client from the effective per-agent config. Avoid
+    # eagerly constructing an unauthenticated vendor client when credentials
+    # are ticket-scoped or configured only for individual agents.
+    llm = (
+        create_llm_provider(provider="mock")
+        if has_api_key_secret_refs
+        else _make_llm_provider(config)
+    )
+    llm.default_timeout = config.llm_timeout
+    if config.llm_reasoning_effort:
+        llm.reasoning_effort = config.llm_reasoning_effort
+    llm.max_tokens = config.llm_max_tokens
+    llm_factory = _make_llm_factory(config)
+
+    record_orchestrator_status("validating_models")
+    await _validate_models(config, secrets)
+    record_orchestrator_status("initializing_providers")
 
     from providers.redaction import get_shared_redactor
 
@@ -1853,12 +2899,6 @@ async def _poll_loop_after_lease(
         )
         lease_loss_gate.bind(dispatcher)
 
-        logger.info(
-            f"Orchestrator started (store={config.state_store_url}, "
-            f"poll={config.poll_interval}s, llm={config.llm_provider}, "
-            f"max_agents={config.max_concurrent_agents})"
-        )
-
         # System-wide budget check (per orchestrator session)
         system_budget = None
         if config.budget_session_cost_usd > 0:
@@ -1869,12 +2909,47 @@ async def _poll_loop_after_lease(
             )
             logger.info(f"System session budget: ${config.budget_session_cost_usd:.2f}")
 
+        # Acquire the leader lease now that initialization is
+        # complete.  The TTL clock starts here, not during the
+        # 30+ seconds of model checks and MCP connections.
+        record_orchestrator_status("acquiring_lease")
+        await leader_lease.acquire()
+        if leader_lease.epoch is None:
+            raise RuntimeError("state store returned no leader fencing epoch")
+        os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(
+            leader_lease.session_id
+        )
+        os.environ["AGENTIC_PERF_ORCHESTRATOR_EPOCH"] = str(leader_lease.epoch)
+        record_orchestrator_status("lease_acquired")
+        # Update the dispatcher with the real lease credentials.
+        # It was constructed before acquire() with placeholder values.
+        dispatcher._session_id = str(leader_lease.session_id)
+        dispatcher._fencing_epoch = leader_lease.epoch
+        lease_renewal_started = lease_state["started"]
+        lease_renew_task = asyncio.create_task(
+            _renew_leader_lease(
+                leader_lease,
+                config.leader_lease_renew_interval,
+                lease_loss_gate.mark_deposed,
+                lease_renewal_started,
+            )
+        )
+        lease_state["renew_task"] = lease_renew_task
+        logger.info(
+            "Orchestrator started (store=%s, poll=%ss, llm=%s, max_agents=%s)",
+            config.state_store_url,
+            config.poll_interval,
+            config.llm_provider,
+            config.max_concurrent_agents,
+        )
+        record_orchestrator_status("running")
+
         status_names = list(STATUS_AGENT_MAP)
         status_offset = 0
         was_at_capacity = False
         last_trace_sweep = 0.0
-        trace_sweep_task: asyncio.Task | None = None
         repos_refreshed = False
+        normalization_delivery_states: dict[str, dict[str, Any]] = {}
 
         while True:
             if lease_renew_task is not None and lease_renew_task.done():
@@ -1923,6 +2998,25 @@ async def _poll_loop_after_lease(
                 await asyncio.sleep(config.poll_interval)
                 continue
 
+            # Clear retry limits as soon as any ticket leaves the status
+            # where its failures occurred. Guidance and terminal statuses
+            # are not dispatched below, so this must happen before filtering
+            # tickets by the dispatchable status list.
+            for ticket in all_fetched:
+                await _reconcile_pending_retry_state(config.state_store_url, ticket)
+                await _prune_stale_retry_state(config.state_store_url, ticket)
+
+            # Reconcile against every fetched ticket before status filtering.
+            # In particular, awaiting_customer_guidance is not dispatched, but
+            # observing it must clear a block left at the previous source status.
+            dispatcher.reconcile_handoff_blocked(
+                {
+                    ticket["id"]: ticket.get("status", "")
+                    for ticket in all_fetched
+                    if ticket.get("id")
+                }
+            )
+
             tickets_by_status: dict[str, list[dict[str, Any]]] = {}
             for t in all_fetched:
                 tickets_by_status.setdefault(t.get("status", ""), []).append(t)
@@ -1948,6 +3042,18 @@ async def _poll_loop_after_lease(
                         at_capacity = True
                         break
 
+                    if status == "awaiting_teardown":
+                        active_teardowns = dispatcher.active_tasks_for_status(
+                            "awaiting_teardown"
+                        )
+                        if active_teardowns >= config.max_concurrent_teardowns:
+                            logger.info(
+                                f"Teardowns at capacity ({active_teardowns}/"
+                                f"{config.max_concurrent_teardowns})"
+                                f" — deferring remaining teardown tickets"
+                            )
+                            break
+
                     tid = ticket["id"]
                     if dispatcher.is_active(tid):
                         logger.info(f"Skipping {tid} at {status}: is_active")
@@ -1958,11 +3064,38 @@ async def _poll_loop_after_lease(
                         logger.info(f"Skipping {tid}: review already submitted")
                         continue
 
-                    # Deterministic enrichment for webhook tickets.
-                    # Resolve directives from run metadata before
-                    # any agent sees the ticket. Best-effort —
-                    # agents handle gaps if enrichment fails.
+                    # Normalize directive keys before any agent sees the ticket.
+                    # A failed PATCH keeps raw persisted values out of triage.
                     if status == "triage_pending":
+                        cf = ticket.get("custom_fields", {})
+                        raw_directives = cf.get("directives", {})
+                        if raw_directives or tid in normalization_delivery_states:
+                            try:
+                                (
+                                    triage_directives,
+                                    normalization_ready,
+                                ) = await _normalize_ticket_directives(
+                                    config.state_store_url,
+                                    tid,
+                                    raw_directives,
+                                    events,
+                                    normalization_delivery_states,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Directive normalization failed for %s",
+                                    tid,
+                                    exc_info=True,
+                                )
+                                continue
+                            if not normalization_ready:
+                                continue
+                            cf["directives"] = triage_directives
+
+                        # Deterministic enrichment for webhook tickets.
+                        # Resolve directives from run metadata before
+                        # any agent sees the ticket. Best-effort —
+                        # agents handle gaps if enrichment fails.
                         cf = ticket.get("custom_fields", {})
                         if cf.get("trigger_source"):
                             try:
@@ -1984,12 +3117,26 @@ async def _poll_loop_after_lease(
                     if status == "awaiting_hardware" and ticket.get(
                         "custom_fields", {}
                     ).get("absent_suite"):
-                        logger.warning(
-                            f"Ticket {tid} has absent_suite=True, pausing for human input"
-                        )
-                        await _block_absent_suite(
-                            config.state_store_url, tid, event_bus=dispatcher.events
-                        )
+                        if tid not in _absent_suite_blocked:
+                            logger.warning(
+                                "Ticket %s has absent_suite=True, "
+                                "pausing for human input",
+                                tid,
+                            )
+                            ok = await _block_absent_suite(
+                                config.state_store_url,
+                                tid,
+                                event_bus=dispatcher.events,
+                            )
+                            if ok:
+                                _absent_suite_blocked.add(tid)
+                            else:
+                                logger.error(
+                                    "Could not block absent-suite "
+                                    "ticket %s — will retry next "
+                                    "cycle",
+                                    tid,
+                                )
                         continue
 
                     # Code-enforce investigation routing.
@@ -2031,18 +3178,68 @@ async def _poll_loop_after_lease(
 
                     ok, reason = check_handoff(status, ticket)
                     if not ok:
+                        if retry_is_suppressed(cf, "handoff", status, now=time.time()):
+                            continue
                         if not dispatcher.is_handoff_blocked(tid, status):
                             logger.warning(
                                 f"Handoff blocked for {tid} at {status}: {reason}"
                             )
-                            dispatcher.mark_handoff_blocked(tid, status)
-                            await _block_handoff_failed(
-                                config.state_store_url,
-                                tid,
-                                reason,
-                                status,
-                                event_bus=dispatcher.events,
-                            )
+                            try:
+                                recovered = await _block_handoff_failed(
+                                    config.state_store_url,
+                                    tid,
+                                    reason,
+                                    status,
+                                    event_bus=dispatcher.events,
+                                )
+                            except Exception:
+                                logger.exception("Handoff recovery failed for %s", tid)
+                                recovered = False
+                            if recovered:
+                                dispatcher.mark_handoff_blocked(tid, status)
+                                retry_state = clear_retry_entry(cf, "handoff")
+                                if retry_state != cf.get(RETRY_STATE_FIELD):
+                                    await _persist_retry_state(
+                                        config.state_store_url,
+                                        tid,
+                                        retry_state,
+                                    )
+                            else:
+                                retry_state, exhausted, attempts = record_retry_failure(
+                                    cf,
+                                    "handoff",
+                                    status,
+                                    now=time.time(),
+                                    retry_limit=HANDOFF_RETRY_LIMIT,
+                                    base_seconds=HANDOFF_RETRY_BASE_SECONDS,
+                                    max_seconds=HANDOFF_RETRY_MAX_SECONDS,
+                                )
+                                comment = ""
+                                if exhausted:
+                                    comment = (
+                                        "**Handoff recovery paused:** "
+                                        f"{HANDOFF_RETRY_LIMIT} recovery attempts "
+                                        f"failed at {status}. The ticket remains "
+                                        "at its current status for human review; "
+                                        "the orchestrator will not keep retrying "
+                                        "the same failed transitions. Move the "
+                                        "ticket to another status to clear this "
+                                        "retry limit before resuming."
+                                    )
+                                await _persist_retry_state(
+                                    config.state_store_url,
+                                    tid,
+                                    retry_state,
+                                    comment=comment,
+                                )
+                                if exhausted:
+                                    logger.error(
+                                        "Stopped handoff recovery for %s at %s "
+                                        "after %d failed attempts",
+                                        tid,
+                                        status,
+                                        attempts,
+                                    )
                         continue
 
                     # Per-user/group quota check (multi-user only).
@@ -2092,6 +3289,9 @@ async def _poll_loop_after_lease(
                         else:
                             dispatcher.clear_quota_blocked(tid)
 
+                    if retry_is_suppressed(cf, "dispatch", status, now=time.time()):
+                        continue
+
                     if not dispatcher.try_claim(tid, status):
                         logger.info(f"Skipping {tid} at {status}: claim held")
                         continue
@@ -2127,16 +3327,20 @@ async def _poll_loop_after_lease(
                                     [],
                                 )
 
+                    snapshot = _fresh_config(config)
+
                     # Start introspection BEFORE the pipeline agent
-                    # so no events are missed in a startup race.
+                    # so no events are missed in a startup race. Use
+                    # the same per-ticket config snapshot as dispatch.
                     _maybe_start_introspection(
                         dispatcher,
-                        config,
+                        snapshot,
                         ticket,
                         tid,
                     )
 
-                    snapshot = _fresh_config(config)
+                    if lease_renew_task is not None and lease_renew_task.done():
+                        lease_renew_task.result()
                     logger.info(f"Dispatching {status} agent for ticket {tid}")
                     task = asyncio.create_task(
                         run_agent_task(
@@ -2148,7 +3352,7 @@ async def _poll_loop_after_lease(
                             ticket_data=ticket,
                         )
                     )
-                    dispatcher.set_task(tid, task)
+                    dispatcher.set_task(tid, task, status=status)
 
             await _process_stop_requests(
                 dispatcher,
@@ -2160,7 +3364,7 @@ async def _poll_loop_after_lease(
             # tickets are closed or no longer active.
             await _sweep_orphaned_leases(
                 config.state_store_url,
-                auth_headers=_auth_headers(),
+                auth_headers=_mutation_headers(None),
             )
 
             # Stale-task watchdog: cancel tasks with no events
@@ -2196,15 +3400,23 @@ async def _poll_loop_after_lease(
 
 _lock_fd: int | None = None
 _lock_file_identity: tuple[int, int] | None = None
+_lock_filesystem = None
 
 
 def _acquire_lock() -> None:
-    global _lock_fd, _lock_file_identity
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(LOCK_FILE), os.O_WRONLY | os.O_CREAT, 0o644)
+    global _lock_fd, _lock_file_identity, _lock_filesystem
+    from providers.execution import AuditedFilesystem
+
+    filesystem = AuditedFilesystem.system(LOCK_FILE.parent)
+    filesystem.mkdir(".", mode=0o777)
+    _lock_filesystem = filesystem
+    fd = filesystem.open_descriptor(
+        LOCK_FILE.name, os.O_WRONLY | os.O_CREAT, mode=0o644
+    )
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        filesystem.lock_descriptor(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        filesystem.forget_descriptor(fd)
         os.close(fd)
         try:
             old_pid = LOCK_FILE.read_text().strip()
@@ -2216,8 +3428,12 @@ def _acquire_lock() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    os.ftruncate(fd, 0)
-    os.write(fd, str(os.getpid()).encode())
+    filesystem.write_descriptor(
+        fd,
+        str(os.getpid()).encode(),
+        truncate=True,
+        seek_start=True,
+    )
     _lock_fd = fd
     lock_stat = os.fstat(fd)
     _lock_file_identity = (lock_stat.st_dev, lock_stat.st_ino)
@@ -2225,28 +3441,34 @@ def _acquire_lock() -> None:
 
 
 def _release_lock() -> None:
-    global _lock_fd, _lock_file_identity
+    global _lock_fd, _lock_file_identity, _lock_filesystem
     if _lock_fd is not None:
         # Remove only the pathname that this process actually opened, and do
         # so while still holding the flock.  A replacement orchestrator cannot
         # acquire the lock or race the pathname check until after this point.
         try:
+            from providers.execution import AuditedFilesystem
+
+            filesystem = AuditedFilesystem.system(LOCK_FILE.parent)
             lock_stat = os.stat(LOCK_FILE)
             current_pid = LOCK_FILE.read_text().strip()
             if _lock_file_identity == (
                 lock_stat.st_dev,
                 lock_stat.st_ino,
             ) and current_pid == str(os.getpid()):
-                LOCK_FILE.unlink(missing_ok=True)
+                filesystem.unlink(LOCK_FILE.name, missing_ok=True)
         except OSError:
             pass
         try:
-            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            if _lock_filesystem is not None:
+                _lock_filesystem.lock_descriptor(_lock_fd, fcntl.LOCK_UN)
+                _lock_filesystem.forget_descriptor(_lock_fd)
             os.close(_lock_fd)
         except OSError:
             pass
         _lock_fd = None
         _lock_file_identity = None
+        _lock_filesystem = None
 
 
 def _setup_api_token() -> None:
@@ -2274,6 +3496,20 @@ def _auth_headers() -> dict[str, str]:
                 "X-Agentic-Perf-Orchestrator-Epoch": epoch,
             }
         )
+    return headers
+
+
+def _mutation_headers(claim_id: str | None) -> dict[str, str]:
+    """Fence agent writes by claim and unclaimed recovery by the leader lease."""
+    headers = _auth_headers()
+    if (
+        "X-Agentic-Perf-Orchestrator-Session" in headers
+        and "X-Agentic-Perf-Orchestrator-Epoch" in headers
+    ):
+        if claim_id:
+            headers["X-Agentic-Perf-Claim-Id"] = claim_id
+        else:
+            headers["X-Agentic-Perf-Mutation-Scope"] = "leader"
     return headers
 
 
@@ -2325,13 +3561,27 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    from state_store.status import record_orchestrator_status
+
+    clear_orchestrator_status()
+    record_orchestrator_status("acquiring_lock")
     _acquire_lock()
     _setup_api_token()
+    record_orchestrator_status("initializing_configuration")
     config = OrchestratorConfig()
     try:
         asyncio.run(poll_loop(config))
     except KeyboardInterrupt:
         logger.info("Orchestrator stopped")
+    finally:
+        clear_orchestrator_status()
+        try:
+            AuditedSubprocessRunner.reset_default_recorder()
+        except Exception:
+            logger.warning(
+                "Failed to close the default subprocess trace recorder",
+                exc_info=True,
+            )
 
 
 if __name__ == "__main__":

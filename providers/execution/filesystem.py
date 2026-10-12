@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import inspect
 import os
@@ -12,21 +13,15 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, BinaryIO
 
-from providers.tracing import (
-    ActionDescriptor,
-    ActionType,
-    ErrorDescriptor,
-    LifecycleDescriptor,
-    LifecycleState,
-    OperationOutcome,
-    TraceContext,
-    TraceEventV1,
-    child_context,
-    current_trace_context,
-    new_trace_context,
-)
+if TYPE_CHECKING:
+    from providers.tracing import (
+        ErrorDescriptor,
+        LifecycleState,
+        TraceContext,
+        TraceEventV1,
+    )
 
 _TARGET_LOCKS: dict[Path, threading.Lock] = {}
 _TARGET_LOCKS_GUARD = threading.Lock()
@@ -72,12 +67,37 @@ class RootedPath:
         self.physical_prefix = physical_prefix.strip("/")
         self.logical_prefix = logical_prefix.strip("/")
 
-    def resolve(self, relative: str | Path) -> tuple[Path, str]:
-        target = (self.root / str(relative).removeprefix(f"{self.scheme}://")).resolve()
+    def resolve(
+        self, relative: str | Path, *, follow_final: bool = False
+    ) -> tuple[Path, str]:
+        """Resolve contained parents while preserving the final directory entry.
+
+        Unlink, rename, and atomic replacement operate on the final link entry.
+        Callers that follow a final symlink opt in and still reject targets
+        outside the root.
+        """
+        raw = Path(str(relative).removeprefix(f"{self.scheme}://"))
+        candidate = raw if raw.is_absolute() else self.root / raw
+        candidate = Path(os.path.normpath(str(candidate)))
+        if candidate == self.root:
+            entry = self.root
+        else:
+            parent = candidate.parent.resolve()
+            try:
+                parent.relative_to(self.root)
+            except ValueError as exc:
+                raise ValueError("filesystem target escapes its audited root") from exc
+            entry = parent / candidate.name
+        target = entry.resolve() if follow_final else entry
         try:
-            clean = target.relative_to(self.root)
+            clean = entry.relative_to(self.root)
         except ValueError as exc:
             raise ValueError("filesystem target escapes its audited root") from exc
+        if follow_final:
+            try:
+                target.relative_to(self.root)
+            except ValueError as exc:
+                raise ValueError("filesystem target escapes its audited root") from exc
         parts = clean.parts
         prefix = Path(self.physical_prefix).parts
         if prefix and parts[: len(prefix)] == prefix:
@@ -104,10 +124,22 @@ class RootedPath:
 class AuditedStream:
     """A write handle whose filesystem action completes only on close."""
 
-    def __init__(self, filesystem, handle, path, target, context, started, attributes):
+    def __init__(
+        self,
+        filesystem,
+        handle,
+        path,
+        target,
+        context,
+        started,
+        attributes,
+        *,
+        sensitive: bool = False,
+    ):
         self._filesystem, self._handle, self._path = filesystem, handle, path
         self._target, self._context, self._started = target, context, started
         self._attributes, self._closed = attributes, False
+        self._sensitive = sensitive
 
     def __getattr__(self, name: str):
         return getattr(self._handle, name)
@@ -122,14 +154,21 @@ class AuditedStream:
         if self._closed:
             return
         self._closed = True
+        if self._filesystem._system_context:
+            try:
+                self._handle.flush()
+                os.fsync(self._handle.fileno())
+            finally:
+                self._handle.close()
+            return
+        from providers.tracing import LifecycleState
+
         try:
             self._handle.flush()
             os.fsync(self._handle.fileno())
-            data = self._path.read_bytes()
-            descriptor = (
-                {"size_bytes": len(data), "sensitive": True}
-                if self._filesystem._sensitive_name(self._path.name)
-                else self._filesystem._descriptor(data)
+            descriptor = self._filesystem._path_descriptor(
+                self._path,
+                sensitive=self._sensitive,
             )
             self._handle.close()
             self._filesystem._record(
@@ -187,14 +226,46 @@ class AuditedFilesystem:
             )
         if critical and system_context:
             raise ValueError("critical filesystem mutations cannot use system context")
+        if emit is None and not system_context:
+            raise FilesystemAuditError(
+                "filesystem mutations without an audit recorder require system_context"
+            )
         self.root, self.ticket_id, self._emit = root, ticket_id, emit
         self._critical = critical
+        self._system_context = system_context
+        self._descriptor_targets: dict[int, str] = {}
+
+    @classmethod
+    def system(cls, root: str | Path, *, scheme: str = "system") -> AuditedFilesystem:
+        """Create a deliberately unaudited wrapper for non-ticket system state."""
+        return cls(
+            RootedPath(root, scheme),
+            ticket_id="system",
+            system_context=True,
+        )
 
     @staticmethod
     def _descriptor(data: bytes) -> dict[str, Any]:
         return {
             "size_bytes": len(data),
             "digest": hashlib.sha256(data).hexdigest(),
+            "digest_kind": "sha256",
+        }
+
+    @staticmethod
+    def _path_descriptor(path: Path, *, sensitive: bool = False) -> dict[str, Any]:
+        size = 0
+        digest = None if sensitive else hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                size += len(chunk)
+                if digest is not None:
+                    digest.update(chunk)
+        if digest is None:
+            return {"size_bytes": size, "sensitive": True}
+        return {
+            "size_bytes": size,
+            "digest": digest.hexdigest(),
             "digest_kind": "sha256",
         }
 
@@ -211,6 +282,8 @@ class AuditedFilesystem:
 
     @staticmethod
     def _error(exc: BaseException) -> tuple[ErrorDescriptor, str]:
+        from providers.tracing import ErrorDescriptor
+
         digest = hashlib.sha256(
             f"{type(exc).__module__}.{type(exc).__qualname__}:{exc}".encode()
         ).hexdigest()
@@ -253,6 +326,15 @@ class AuditedFilesystem:
         attributes: dict[str, Any] | None = None,
         error: ErrorDescriptor | None = None,
     ) -> TraceEventV1:
+        from providers.tracing import (
+            ActionDescriptor,
+            ActionType,
+            LifecycleDescriptor,
+            LifecycleState,
+            OperationOutcome,
+            TraceEventV1,
+        )
+
         return TraceEventV1(
             ticket_id=self.ticket_id,
             agent_id=context.agent_id,
@@ -277,6 +359,15 @@ class AuditedFilesystem:
     def _cleanup_failure(self, target: str, exc: BaseException) -> None:
         # Cleanup is an independent operation: its failure must not replace the
         # original write/archive failure or disclose temporary physical paths.
+        if self._system_context:
+            return
+        from providers.tracing import (
+            LifecycleState,
+            child_context,
+            current_trace_context,
+            new_trace_context,
+        )
+
         parent = current_trace_context() or new_trace_context(
             ticket_id=self.ticket_id, agent_id="system"
         )
@@ -303,6 +394,15 @@ class AuditedFilesystem:
         *,
         attributes: dict[str, Any] | None = None,
     ) -> Any:
+        if self._system_context:
+            return action()
+        from providers.tracing import (
+            LifecycleState,
+            child_context,
+            current_trace_context,
+            new_trace_context,
+        )
+
         started = time.monotonic()
         parent = current_trace_context()
         context = (
@@ -351,18 +451,273 @@ class AuditedFilesystem:
         )
         return result
 
-    def mkdir(self, relative: str | Path, *, mode: int = 0o700) -> Path:
+    def mkdir(
+        self,
+        relative: str | Path,
+        *,
+        mode: int = 0o700,
+        parents: bool = True,
+        exist_ok: bool = True,
+    ) -> Path:
         path, logical = self.root.resolve(relative)
         return self._mutate(
             "mkdir",
             logical,
-            lambda: (path.mkdir(parents=True, exist_ok=True, mode=mode), path)[1],
+            lambda: (
+                path.mkdir(parents=parents, exist_ok=exist_ok, mode=mode),
+                path,
+            )[1],
+            attributes={"mode": oct(mode), "parents": parents, "exist_ok": exist_ok},
+        )
+
+    def rmdir(self, relative: str | Path) -> None:
+        path, logical = self.root.resolve(relative)
+        return self._mutate("rmdir", logical, path.rmdir)
+
+    def touch(self, relative: str | Path, *, mode: int = 0o600) -> Path:
+        path, logical = self.root.resolve(relative, follow_final=True)
+        return self._mutate(
+            "touch",
+            logical,
+            lambda: (path.touch(mode=mode), path)[1],
             attributes={"mode": oct(mode)},
+        )
+
+    def chmod(self, relative: str | Path, mode: int) -> None:
+        path, logical = self.root.resolve(relative, follow_final=True)
+        return self._mutate(
+            "chmod",
+            logical,
+            lambda: os.chmod(path, mode),
+            attributes={"mode": oct(mode)},
+        )
+
+    def temporary_directory(
+        self,
+        relative_parent: str | Path = ".",
+        *,
+        prefix: str = "tmp-",
+    ) -> Path:
+        parent, logical_parent = self.root.resolve(relative_parent, follow_final=True)
+
+        def create() -> Path:
+            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            return Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
+
+        return self._mutate(
+            "temporary_directory",
+            logical_parent,
+            create,
+        )
+
+    def temporary_file(
+        self,
+        relative_parent: str | Path = ".",
+        *,
+        prefix: str = "tmp-",
+        suffix: str = "",
+        mode: int = 0o600,
+    ) -> Path:
+        parent, logical_parent = self.root.resolve(relative_parent, follow_final=True)
+
+        def create() -> Path:
+            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=parent)
+            try:
+                os.fchmod(fd, mode)
+            except BaseException:
+                try:
+                    os.unlink(name)
+                except OSError:
+                    pass
+                raise
+            finally:
+                os.close(fd)
+            return Path(name)
+
+        return self._mutate(
+            "temporary_file", logical_parent, create, attributes={"mode": oct(mode)}
+        )
+
+    def open_descriptor(
+        self,
+        relative: str | Path,
+        flags: int,
+        *,
+        mode: int = 0o600,
+    ) -> int:
+        path, logical = self.root.resolve(relative)
+
+        def open_file() -> int:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if nofollow and flags & nofollow:
+                return os.open(path, flags, mode)
+            followed = path.resolve()
+            try:
+                followed.relative_to(self.root.root)
+            except ValueError as exc:
+                raise ValueError("filesystem target escapes its audited root") from exc
+            return os.open(followed, flags, mode)
+
+        fd = self._mutate(
+            "open_descriptor",
+            logical,
+            open_file,
+            attributes={"mode": oct(mode)},
+        )
+        self._descriptor_targets[fd] = logical
+        return fd
+
+    def write_descriptor(
+        self,
+        fd: int,
+        data: bytes,
+        *,
+        truncate: bool = False,
+        seek_start: bool = False,
+        sync: bool = False,
+    ) -> None:
+        logical = self._descriptor_targets.get(fd, "descriptor://unknown")
+
+        def write_data() -> None:
+            if truncate:
+                os.ftruncate(fd, 0)
+            if seek_start:
+                os.lseek(fd, 0, os.SEEK_SET)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short filesystem write")
+                view = view[written:]
+            if sync:
+                os.fsync(fd)
+
+        self._mutate("descriptor_write", logical, write_data)
+
+    def set_descriptor_mode(self, fd: int, mode: int) -> None:
+        logical = self._descriptor_targets.get(fd, "descriptor://unknown")
+        self._mutate(
+            "descriptor_chmod",
+            logical,
+            lambda: os.fchmod(fd, mode),
+            attributes={"mode": oct(mode)},
+        )
+
+    def forget_descriptor(self, fd: int) -> None:
+        self._descriptor_targets.pop(fd, None)
+
+    def lock_descriptor(self, fd: int, operation: int) -> None:
+        logical = self._descriptor_targets.get(fd, "descriptor://unknown")
+        self._mutate("descriptor_lock", logical, lambda: fcntl.flock(fd, operation))
+
+    def hardlink(self, source: str | Path, destination: str | Path) -> Path:
+        source_path, source_logical = self.root.resolve(source, follow_final=True)
+        destination_path, destination_logical = self.root.resolve(destination)
+        return self._mutate(
+            "hardlink",
+            source_logical,
+            lambda: (os.link(source_path, destination_path), destination_path)[1],
+            attributes={"destination": destination_logical},
+        )
+
+    def append(
+        self,
+        relative: str | Path,
+        content: str | bytes,
+        *,
+        encoding: str = "utf-8",
+        sync: bool = False,
+    ) -> Path:
+        path, logical = self.root.resolve(relative, follow_final=True)
+        data = content if isinstance(content, bytes) else content.encode(encoding)
+
+        def append_data() -> Path:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with path.open("ab", buffering=0) as stream:
+                view = memoryview(data)
+                while view:
+                    written = stream.write(view)
+                    if written is None or written <= 0:
+                        raise OSError("short filesystem append")
+                    view = view[written:]
+                if sync:
+                    os.fsync(stream.fileno())
+            return path
+
+        return self._mutate(
+            "append",
+            logical,
+            append_data,
+            attributes={"size_bytes": len(data)},
+        )
+
+    def write_stream(
+        self,
+        relative: str | Path,
+        source: BinaryIO,
+        *,
+        mode: int = 0o600,
+        chunk_bytes: int = 64 * 1024,
+    ) -> Path:
+        """Copy a binary input stream to a file and durably flush it."""
+        path, logical = self.root.resolve(relative, follow_final=True)
+
+        def write_data() -> Path:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with open(path, "wb") as destination:
+                os.chmod(path, mode)
+                while block := source.read(chunk_bytes):
+                    view = memoryview(block)
+                    while view:
+                        written = destination.write(view)
+                        if written is None or written <= 0:
+                            raise OSError("short filesystem stream write")
+                        view = view[written:]
+                destination.flush()
+                os.fsync(destination.fileno())
+            return path
+
+        return self._mutate(
+            "stream_copy", logical, write_data, attributes={"mode": oct(mode)}
         )
 
     def open_stream(self, relative: str | Path, *, mode: int = 0o600) -> AuditedStream:
         """Open an audited output stream; callers must close it to finalize."""
-        path, logical = self.root.resolve(relative)
+        path, logical = self.root.resolve(relative, follow_final=True)
+        sensitive = self._sensitive_name(relative) or self._sensitive_name(
+            path.relative_to(self.root.root)
+        )
+        attributes = {"mode": oct(mode), "atomic": False, "stream": True}
+        if sensitive:
+            attributes["sensitive"] = True
+        if self._system_context:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            handle = open(path, "wb")
+            try:
+                os.chmod(path, mode)
+            except Exception:
+                handle.close()
+                raise
+            return AuditedStream(
+                self,
+                handle,
+                path,
+                logical,
+                None,
+                time.monotonic(),
+                attributes,
+                sensitive=sensitive,
+            )
+
+        from providers.tracing import (
+            LifecycleState,
+            child_context,
+            current_trace_context,
+            new_trace_context,
+        )
+
         started = time.monotonic()
         parent = current_trace_context()
         context = (
@@ -370,7 +725,6 @@ class AuditedFilesystem:
             if parent
             else new_trace_context(ticket_id=self.ticket_id, agent_id="system")
         )
-        attributes = {"mode": oct(mode), "atomic": False, "stream": True}
         self._record(
             self._event(
                 context,
@@ -386,7 +740,14 @@ class AuditedFilesystem:
             handle = open(path, "wb")
             os.chmod(path, mode)
             return AuditedStream(
-                self, handle, path, logical, context, started, attributes
+                self,
+                handle,
+                path,
+                logical,
+                context,
+                started,
+                attributes,
+                sensitive=sensitive,
             )
         except Exception as exc:
             error, digest = self._error(exc)
@@ -410,22 +771,26 @@ class AuditedFilesystem:
         content: str | bytes,
         *,
         encoding: str = "utf-8",
-        mode: int = 0o600,
+        mode: int | None = 0o600,
         atomic: bool = True,
     ) -> Path:
-        path, logical = self.root.resolve(relative)
+        path, logical = self.root.resolve(relative, follow_final=not atomic)
         data = content if isinstance(content, bytes) else content.encode(encoding)
-        operation = "replace" if path.exists() else "create"
+        operation = "replace" if path.exists() or path.is_symlink() else "create"
+        sensitive = self._sensitive_name(relative) or self._sensitive_name(
+            path.relative_to(self.root.root)
+        )
         descriptor = (
             {"size_bytes": len(data), "sensitive": True}
-            if self._sensitive_name(relative)
+            if sensitive
             else self._descriptor(data)
         )
         attributes = descriptor | {
-            "mode": oct(mode),
             "atomic": atomic,
             "write_kind": operation,
         }
+        if mode is not None:
+            attributes["mode"] = oct(mode)
 
         def write_file() -> Path:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -437,7 +802,8 @@ class AuditedFilesystem:
                 else:
                     handle = open(path, "wb")
                 with handle:
-                    os.chmod(temporary or path, mode)
+                    if mode is not None:
+                        os.chmod(temporary or path, mode)
                     if handle.write(data) != len(data):
                         raise OSError("short filesystem write")
                     handle.flush()
@@ -445,7 +811,7 @@ class AuditedFilesystem:
                 if temporary:
                     os.replace(temporary, path)
                     temporary = None
-                if self._descriptor(path.read_bytes()) != self._descriptor(data):
+                if self._path_descriptor(path) != self._descriptor(data):
                     raise OSError("filesystem write verification failed")
                 return path
             except Exception as primary:
@@ -474,7 +840,7 @@ class AuditedFilesystem:
         return self._mutate(
             "rename",
             source_logical,
-            lambda: (source_path.rename(destination_path), destination_path)[1],
+            lambda: (os.replace(source_path, destination_path), destination_path)[1],
             attributes={"destination": destination_logical, "atomic": True},
         )
 
@@ -489,11 +855,24 @@ class AuditedFilesystem:
 
     def archive(self, destination: str | Path, members: Iterable[str | Path]) -> Path:
         target, logical = self.root.resolve(destination)
-        resolved = [self.root.resolve(member) for member in members]
+        resolved = []
+        sensitive = self._sensitive_name(destination) or self._sensitive_name(
+            target.relative_to(self.root.root)
+        )
+        for member in members:
+            member_path, member_logical = self.root.resolve(member, follow_final=True)
+            resolved.append((member_path, member_logical))
+            sensitive = (
+                sensitive
+                or self._sensitive_name(member)
+                or self._sensitive_name(member_path.relative_to(self.root.root))
+            )
         attributes = {
             "members": [reference for _, reference in resolved],
             "atomic": True,
         }
+        if sensitive:
+            attributes["sensitive"] = True
 
         def create_archive() -> Path:
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -508,7 +887,7 @@ class AuditedFilesystem:
                 os.replace(temporary, target)
                 if not target.is_file() or not target.stat().st_size:
                     raise OSError("archive verification failed")
-                attributes.update(self._descriptor(target.read_bytes()))
+                attributes.update(self._path_descriptor(target, sensitive=sensitive))
                 return target
             except Exception as primary:
                 try:

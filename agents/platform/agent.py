@@ -38,8 +38,10 @@ class PlatformAgent(AgentBase):
         llm_provider: LLMProvider,
         state_store_url: str,
         event_bus: EventBus | None = None,
+        skill_provider=None,
         **kwargs: Any,
     ) -> None:
+        self._skill_provider = skill_provider
         super().__init__(
             agent_name="platform-agent",
             llm_provider=llm_provider,
@@ -55,26 +57,54 @@ class PlatformAgent(AgentBase):
         self._ticket_id = ticket_id
 
         ticket = await self._get_ticket(ticket_id)
-        ticket.get("custom_fields", {})
+        cf = ticket.get("custom_fields", {})
+        flash_info = cf.get("jumpstarter_flash", {})
+        flash_error = flash_info.get("error", "")
+        if flash_error and "image_version" in flash_error.lower():
+            self._emit(
+                ticket_id,
+                "agent_started",
+                {"reason": "missing_image_version"},
+            )
+            try:
+                await self._add_comment(
+                    ticket_id,
+                    f"**Platform setup blocked — missing user input**\n\n"
+                    f"{flash_error}\n\n"
+                    f"Please update the ticket directives with the "
+                    f"required image_version and retry.",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=(
+                        "Platform agent: missing image_version — user input required"
+                    ),
+                )
+            except Exception as exc:
+                self._emit(ticket_id, "agent_error", {"reason": str(exc)})
+                raise
+            self._emit(ticket_id, "agent_finished")
+            return
 
         platform_server = str(Path(__file__).with_name("server.py"))
         mcp = AgentMCPClient()
-        await mcp.connect_ticket_server(
-            platform_server,
-            name="platform",
-            ticket_id=ticket_id,
-            state_store_url=self.store_url,
-            agent_name=self.agent_name,
-        )
-
         self._mcp = mcp
-        self.tools = await mcp.list_tools()
-
         try:
+            await mcp.connect_ticket_server(
+                platform_server,
+                name="platform",
+                ticket_id=ticket_id,
+                state_store_url=self.store_url,
+                agent_name=self.agent_name,
+            )
+            self.tools = await mcp.list_tools()
             await super().run(ticket_id)
         finally:
-            await mcp.disconnect()
-            self._mcp = None
+            try:
+                await mcp.disconnect()
+            finally:
+                self._mcp = None
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         return PLATFORM_SYSTEM_PROMPT
@@ -155,6 +185,7 @@ class PlatformAgent(AgentBase):
 
         platform_ready = result.get("platform_ready", False)
         hosts = result.get("hosts_provisioned", [])
+        ticket: dict[str, Any] | None = None
 
         fields: dict[str, Any] = {
             "platform_ready": platform_ready,
@@ -169,18 +200,60 @@ class PlatformAgent(AgentBase):
                 ticket = await self._get_ticket(ticket_id)
                 provider = ticket.get("custom_fields", {}).get("resource_provider", "")
             except Exception:
+                ticket = None
                 provider = ""
             if provider == "jumpstarter":
-                fields["assigned_hardware_ips"] = {
-                    "controller": hosts[0],
-                    "targets": [h for h in hosts[1:] if h != hosts[0]],
-                }
+                cf = ticket.get("custom_fields", {})
+                if "execution_model" in cf:
+                    execution_model = cf["execution_model"]
+                else:
+                    from providers.skills.catalog import resolve_ticket_execution_model
+
+                    execution_model = await resolve_ticket_execution_model(
+                        self._skill_provider, ticket
+                    )
+                from providers.skills.base import EXECUTION_MODEL_DIRECT
+
+                if execution_model == EXECUTION_MODEL_DIRECT:
+                    # Direct harnesses: all discovered IPs are
+                    # targets.  The orchestrator runs tools —
+                    # no dedicated controller host exists.
+                    fields["assigned_hardware_ips"] = {
+                        "controller": "",
+                        "targets": hosts,
+                    }
+                else:
+                    # Controller harnesses: first host is the
+                    # controller, rest are targets.
+                    fields["assigned_hardware_ips"] = {
+                        "controller": hosts[0],
+                        "targets": [h for h in hosts[1:] if h != hosts[0]],
+                    }
         if result.get("ssh_user"):
             fields["ssh_user"] = result["ssh_user"]
         if result.get("ssh_key_path"):
             fields["ssh_key_path"] = result["ssh_key_path"]
         if result.get("board_name"):
             fields["platform_board"] = result["board_name"]
+
+        board = result.get("board_name", "unknown")
+        if not platform_ready:
+            # The ticket owns the authoritative Jumpstarter exporter name.
+            # Early provisioning failures may not return a board name.
+            if ticket is None:
+                ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            if (
+                not result.get("board_name")
+                and cf.get("resource_provider") == "jumpstarter"
+            ):
+                board = (
+                    cf.get("resource_provider_metadata", {}).get("exporter_name")
+                    or "unknown"
+                )
+                if board != "unknown":
+                    fields["platform_board"] = board
+
         if result.get("flash_duration_s"):
             fields["platform_flash_duration_s"] = result["flash_duration_s"]
         if result.get("boot_duration_s"):
@@ -206,7 +279,6 @@ class PlatformAgent(AgentBase):
                 )
         else:
             diag = result.get("diagnostics", "No details")
-            board = result.get("board_name", "unknown")
             summary = f"**Platform Setup Failed**\n\n- **Diagnostics:** {diag}\n"
             if board != "unknown":
                 summary += f"- **Board:** {board}\n"
@@ -216,7 +288,6 @@ class PlatformAgent(AgentBase):
             # recording and routing to next board.
             from providers.fleet import is_fleet_investigation
 
-            ticket = await self._get_ticket(ticket_id)
             cf = ticket.get("custom_fields", {})
             if is_fleet_investigation(cf):
                 await self._transition_ticket(

@@ -260,6 +260,7 @@ def test_advance_plan_blocks_when_host_tuning_missing():
     mock_response.json.return_value = {
         "status": "awaiting_provision",
         "custom_fields": {
+            "provisioning_complete": True,
             "parsed_specs": {"irq_pinning_cpu": 2},
             "configuration_applied": {},
             "execution_plan": _provision_plan(),
@@ -297,6 +298,7 @@ def test_advance_plan_allows_when_host_tuning_applied():
     mock_response.json.return_value = {
         "status": "awaiting_provision",
         "custom_fields": {
+            "provisioning_complete": True,
             "parsed_specs": {"irq_pinning_cpu": 2},
             "configuration_applied": {"irq_pinning": "cpu2 verified"},
             "execution_plan": _provision_plan(),
@@ -331,6 +333,7 @@ def test_advance_plan_allows_when_no_tuning_requested():
     mock_response.json.return_value = {
         "status": "awaiting_provision",
         "custom_fields": {
+            "provisioning_complete": True,
             "parsed_specs": {"benchmark_tool": "fio"},
             "configuration_applied": {},
             "execution_plan": _provision_plan(),
@@ -353,6 +356,40 @@ def test_advance_plan_allows_when_no_tuning_requested():
         patch_call = client.patch.call_args
         updated_plan = patch_call.kwargs["json"]["fields"]["execution_plan"]
         assert updated_plan["steps"][0]["status"] == "completed"
+
+
+def test_advance_plan_blocks_incomplete_provisioning_with_hosts():
+    """Hosts alone must not let an incomplete provision step reach benchmark."""
+    from orchestrator.main import _advance_plan
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "status": "awaiting_provision",
+        "custom_fields": {
+            "provisioning_complete": False,
+            "hosts_provisioned": ["10.0.0.1", "10.0.0.2"],
+            "execution_plan": _provision_plan(),
+        },
+    }
+
+    client = _async_client()
+    client.get.return_value = mock_response
+    client.post.return_value = MagicMock(status_code=200)
+
+    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
+        factory.return_value.__aenter__ = AsyncMock(return_value=client)
+        factory.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        asyncio.run(
+            _advance_plan("http://localhost:8090", "PERF-TEST", "awaiting_provision")
+        )
+
+    client.patch.assert_not_called()
+    transition_call = client.post.call_args
+    assert transition_call.kwargs["json"]["status"] == "awaiting_customer_guidance"
+    assert "did not report completion" in transition_call.kwargs["json"]["comment"]
+    assert "10.0.0.1" in transition_call.kwargs["json"]["comment"]
 
 
 def test_advance_plan_final_step_no_transition():

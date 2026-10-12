@@ -1,9 +1,8 @@
 """Pydantic models for Investigation Records.
 
 These define the backend-agnostic contract for storing and querying
-investigation outcomes. Any storage backend (file, OpenSearch,
-Horreum, PostgreSQL, etc.) must serialize and deserialize
-these models.
+investigation outcomes. Storage providers serialize and deserialize
+these models; the registry currently provides file storage.
 """
 
 from __future__ import annotations
@@ -85,6 +84,7 @@ class BuildHistoryEntry(BaseModel):
     """Tracks a regression across nightly builds."""
 
     build_id: str
+    ticket_id: str = ""
     action: str  # FULL_INVESTIGATION or SKIP_MATCHED
     comment: str = ""
     timestamp: datetime = Field(

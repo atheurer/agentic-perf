@@ -2,8 +2,9 @@
 
 This opt-in gate starts from a prepared isolated instance and processes one real
 ticket through the production state store, orchestrator, full LLM agents, MCP
-servers, and a live Crucible controller. The workload is one five-second
+servers, and a live Crucible controller. The default workload is one five-second
 `sleep` sample with client ID 1 on one separately approved system under test.
+For lease-renewal validation, the same gate can run one 1,200-second sample.
 
 The gate is intentionally not part of public CI. It uses private infrastructure
 and a configured LLM provider. Hostnames are command arguments and are never
@@ -21,8 +22,11 @@ python3 scripts/live-ticket-gate.py \
 ```
 
 That is the normal interface: two hostnames plus the explicit acknowledgement
-that they are live systems. Optional flags can change the five-second duration,
-total timeout, artifact destination, or reuse services that are already running.
+that they are live systems. Optional flags can change the sleep duration, total
+timeout, artifact destination, or reuse services that are already running. The
+lease-renewal check uses `--seconds 1200 --timeout-seconds 3600`; the 60-minute
+gate timeout leaves time for setup, review, and teardown around the 20-minute
+sleep.
 By default the gate manages the isolated instance services and writes artifacts
 under its private runtime home.
 

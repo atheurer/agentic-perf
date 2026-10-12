@@ -63,7 +63,7 @@ class TestDashboardTokenInjection:
     def legacy_app(self, monkeypatch):
         monkeypatch.setattr(
             "state_store.main._load_config_file",
-            lambda: {},
+            lambda *, strict=False: {},
         )
         app = (
             create_app.__wrapped__(initialize_immediately=True)

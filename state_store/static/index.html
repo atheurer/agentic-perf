@@ -1476,9 +1476,9 @@ th.col-right { text-align: right; }
 .chat-bar {
   display: flex;
   gap: 8px;
-  align-items: center;
+  align-items: flex-end;
 }
-.chat-bar input {
+.chat-bar textarea {
   flex: 1;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -1487,8 +1487,13 @@ th.col-right { text-align: right; }
   padding: 8px 12px;
   font-size: 14px;
   font-family: inherit;
+  resize: none;
+  overflow-y: hidden;
+  min-height: 36px;
+  max-height: 150px;
+  line-height: 1.4;
 }
-.chat-bar input:focus { outline: none; border-color: var(--accent); }
+.chat-bar textarea:focus { outline: none; border-color: var(--accent); }
 .chat-bar button {
   background: var(--accent);
   color: #fff;
@@ -1611,7 +1616,7 @@ th.col-right { text-align: right; }
     <h4>Chat Agent <span class="chat-help-icon" title="Ask questions about tickets, create tests, send interjections, or get help. Try: 'show recent tickets', 'run uperf on my cluster', or 'help' for more.">?</span></h4>
     <div class="chat-messages" id="chat-messages"></div>
     <div class="chat-bar">
-      <input type="text" id="chat-input" placeholder="Ask about tickets, create tests, or get help..." autocomplete="off">
+      <textarea id="chat-input" placeholder="Ask about tickets, create tests, or get help..." autocomplete="off" rows="1"></textarea>
       <button id="chat-send" onclick="sendChatMessage()">Send</button>
     </div>
     <div class="chat-cost" id="chat-cost"></div>
@@ -2028,6 +2033,7 @@ function statusBadge(status) {
 
 function ticketOutcome(ticket) {
   var cf = ticket.custom_fields || {};
+  var status = ticket.status || '';
   var verdict = cf.verdict;
   var dedup = cf.dedup_result;
   var synth = cf.synthesis_result;
@@ -2066,8 +2072,9 @@ function ticketOutcome(ticket) {
       escHtml(sOutcome || 'COMPLETE') + '</span>';
   }
 
-  // Evaluation result (pre-synthesis)
-  if (evalR) {
+  // Evaluation result (pre-synthesis) — only show for terminal tickets so
+  // in-progress tickets don't display a stale intermediate result.
+  if (evalR && isTicketTerminal(status)) {
     var eOutcome = String(evalR.decision || '').toUpperCase();
     var eCls = 'inconclusive';
     if (eOutcome === 'CONVERGED') eCls = 'pass';
@@ -2076,16 +2083,16 @@ function ticketOutcome(ticket) {
       escHtml(eOutcome) + '</span>';
   }
 
-  // Analysis-only conclusion
-  if (analysis && analysis.conclusive) {
-    return '<span class="outcome outcome-pass">ANALYSIS CONCLUSIVE</span>';
-  }
-  if (analysis && !analysis.conclusive) {
+  // Analysis-only conclusion — only show for terminal tickets to avoid
+  // displaying an intermediate analysis result while later stages run.
+  if (analysis && isTicketTerminal(status)) {
+    if (analysis.conclusive) {
+      return '<span class="outcome outcome-pass">ANALYSIS CONCLUSIVE</span>';
+    }
     return '<span class="outcome outcome-inconclusive">NEEDS DATA</span>';
   }
 
   // Aborted / cancelled
-  var status = ticket.status || '';
   if (cf.abort_requested || cf.stop_requested) {
     return '<span class="outcome outcome-abort">ABORTED</span>';
   }
@@ -2131,10 +2138,11 @@ function truncate(s, n) {
 
 var EXPAND_LIMIT = 300;
 
-function expandableText(text, limit) {
+function expandableText(text, limit, stateKey) {
   limit = limit || EXPAND_LIMIT;
   if (!text || text.length <= limit) return escHtml(text || '');
-  return '<span class="expandable-text">' +
+  var keyAttr = stateKey ? ' data-expand-key="' + escHtml(stateKey) + '"' : '';
+  return '<span class="expandable-text"' + keyAttr + '>' +
     '<span class="expand-truncated">' + escHtml(text.substring(0, limit)) +
       '<span class="expand-toggle">…</span>' +
     '</span>' +
@@ -2431,7 +2439,7 @@ async function renderDetail(ticketId) {
               '<h4 style="color:var(--accent)">Chat Agent <span class="chat-help-icon" title="Ask about this ticket, send interjections, or get help. The chat has full context of the current ticket.">?</span></h4>' +
               '<div class="chat-messages" id="ticket-chat-messages"></div>' +
               '<div class="chat-bar">' +
-                '<input type="text" id="ticket-chat-input" placeholder="Ask about this ticket..." autocomplete="off">' +
+                '<textarea id="ticket-chat-input" placeholder="Ask about this ticket..." autocomplete="off" rows="1"></textarea>' +
                 '<button onclick="sendTicketChatMessage()">Send</button>' +
               '</div>' +
               '<div class="chat-cost" id="ticket-chat-cost"></div>' +
@@ -2515,7 +2523,7 @@ async function renderDetail(ticketId) {
       var initData = await api('/tickets/' + ticketId + '/transcript');
       var initEvents = initData.events || [];
       if (initEvents.length > 0) {
-        lastSeq = initEvents[initEvents.length - 1].seq || 0;
+        lastSeq = maxEventSeq(initEvents);
         renderNewEvents(initEvents);
       }
     } catch (e) {
@@ -2734,7 +2742,7 @@ function renderHypothesisCard(ticket) {
       ) + '</div>';
     html += '<div class="result-summary">' +
       'Confidence: ' + (dedupResult.match_confidence || 0) + ' \u2014 ' +
-      expandableText(String(dedupResult.match_rationale || ''), 200) + '</div>';
+      expandableText(String(dedupResult.match_rationale || ''), 200, 'dedup-match-rationale') + '</div>';
   }
   if (!verdict && synthResult) {
     var sCls = 'inconclusive';
@@ -3141,12 +3149,12 @@ function renderCustomFields(ticket) {
 
 var _lastResultHash = '';
 
-async function refreshResultSection(ticketId) {
+async function refreshResultSection(ticketId, cachedTicket) {
   if (!ticketId) return;
   if (resultPollInFlight) return;
   resultPollInFlight = true;
   try {
-    var ticket = await api('/tickets/' + ticketId);
+    var ticket = cachedTicket || await api('/tickets/' + ticketId);
     // Skip rebuild if ticket data hasn't changed.
     // innerHTML comparison fails because browsers normalize HTML.
     var dataHash = JSON.stringify(ticket.custom_fields || {});
@@ -3164,11 +3172,13 @@ async function refreshResultSection(ticketId) {
           if (s) openDetails[s.textContent.trim()] = d.open;
         }
       });
+      var expandedTexts = captureExpandedText(el);
       el.innerHTML = renderCustomFields(ticket);
       el.querySelectorAll('details').forEach(function(d) {
         var key = d.id || (d.querySelector('summary') || {}).textContent;
         if (key && openDetails[key.trim()] !== undefined) d.open = openDetails[key.trim()];
       });
+      restoreExpandedText(el, expandedTexts);
     }
     var hypo = document.getElementById('hypothesis-section');
     if (hypo) {
@@ -3180,11 +3190,13 @@ async function refreshResultSection(ticketId) {
           if (s) hypoOpen[s.textContent.trim()] = d.open;
         }
       });
+      var hypoExpanded = captureExpandedText(hypo);
       hypo.innerHTML = renderHypothesisCard(ticket);
       hypo.querySelectorAll('details').forEach(function(d) {
         var key = d.id || (d.querySelector('summary') || {}).textContent;
         if (key && hypoOpen[key.trim()] !== undefined) d.open = hypoOpen[key.trim()];
       });
+      restoreExpandedText(hypo, hypoExpanded);
     }
     // Also refresh introspection on transitions
     var cf = ticket.custom_fields || {};
@@ -3251,9 +3263,9 @@ async function pollEvents(ticketId) {
       actionEl.innerHTML = actionButtonsHtml(ticket.status, ticket);
       bindActionButtons(ticketId);
     }
-    refreshResultSection(ticketId);
+    refreshResultSection(ticketId, ticket);
     updateUsageSidebar(ticketId);
-    updateIntrospectionCard(ticketId);
+    updateIntrospectionCard(ticketId, ticket);
 
     // Proactive HITL: notify chat when ticket needs guidance
     if (chatEnabled && ticket.status === 'awaiting_customer_guidance') {
@@ -3285,7 +3297,7 @@ async function pollEvents(ticketId) {
   }
 }
 
-function updateIntrospectionCard(ticketId) {
+function updateIntrospectionCard(ticketId, cachedTicket) {
   if (!ticketId) return;
   var card = document.getElementById('introspection-card');
   var content = document.getElementById('introspection-content');
@@ -3293,7 +3305,10 @@ function updateIntrospectionCard(ticketId) {
   if (introspectionPollInFlight) return;
   introspectionPollInFlight = true;
 
-  api('/tickets/' + ticketId).then(function(ticket) {
+  var ticketPromise = cachedTicket
+    ? Promise.resolve(cachedTicket)
+    : api('/tickets/' + ticketId);
+  ticketPromise.then(function(ticket) {
     var cf = ticket.custom_fields || {};
     var summary = cf.introspection_summary;
     var intro = cf.introspection;
@@ -3725,6 +3740,26 @@ function restoreOpenDetails(container, open) {
   });
 }
 
+function captureExpandedText(container) {
+  var expanded = new Set();
+  if (!container) return expanded;
+  container.querySelectorAll('.expandable-text.expanded').forEach(function(el) {
+    var key = el.dataset.expandKey;
+    if (key) expanded.add(key);
+  });
+  return expanded;
+}
+
+function restoreExpandedText(container, expanded) {
+  if (!container || !expanded.size) return;
+  container.querySelectorAll('.expandable-text').forEach(function(el) {
+    var key = el.dataset.expandKey;
+    if (key && expanded.has(key)) {
+      el.classList.add('expanded');
+    }
+  });
+}
+
 function renderEventGroup(group) {
   if (group.events.length === 1) return renderEvent(group.events[0]);
   var first = group.events[0];
@@ -3750,6 +3785,7 @@ function renderEventStream() {
   var container = document.getElementById('event-stream');
   if (!container) return;
   var open = captureOpenDetails(container);
+  var expandedTexts = captureExpandedText(container);
   var visible = eventRecords.filter(function(evt) {
     return eventMatchesView(evt) && eventMatchesSearch(evt);
   });
@@ -3765,6 +3801,7 @@ function renderEventStream() {
   });
   container.innerHTML = groups.map(renderEventGroup).join('');
   restoreOpenDetails(container, open);
+  restoreExpandedText(container, expandedTexts);
 
   renderedEventCount = visible.length;
   var countEl = document.getElementById('event-count');
@@ -3781,18 +3818,34 @@ function renderEventStream() {
 }
 
 function renderNewEvents(events) {
+  var added = 0;
+  var priorMaxSeq = maxRenderedSeq;
+  var pageMaxSeq = priorMaxSeq;
+  var seenSeqs = new Set();
   for (var i = 0; i < events.length; i++) {
     var evt = events[i];
-    if (evt.seq <= maxRenderedSeq) continue;
-    maxRenderedSeq = evt.seq;
+    if (evt.seq <= priorMaxSeq || seenSeqs.has(evt.seq)) continue;
+    seenSeqs.add(evt.seq);
+    pageMaxSeq = Math.max(pageMaxSeq, evt.seq);
     eventRecords.push(evt);
+    added++;
   }
+  maxRenderedSeq = pageMaxSeq;
   // Keep the browser-side projection bounded. Raw forensic records remain
   // available through the trace endpoint and are never deleted here.
   if (eventRecords.length > 10000) {
     eventRecords = eventRecords.slice(eventRecords.length - 10000);
   }
-  renderEventStream();
+  // Only rebuild DOM when new events arrived.
+  if (added > 0) {
+    renderEventStream();
+  }
+}
+
+function maxEventSeq(events) {
+  return events.reduce(function(maxSeq, evt) {
+    return Math.max(maxSeq, (evt && evt.seq) || 0);
+  }, 0);
 }
 
 function renderAuditEvent(evt) {
@@ -3983,6 +4036,22 @@ function renderEvent(evt) {
         '<span>' + escHtml(data.error || 'Unknown error') + '</span>' +
       '</div>';
 
+    case 'directive_normalization':
+      var normApplied = (data.applied || []).map(function(a) {
+        return '<li>' + escHtml(a) + '</li>';
+      }).join('');
+      var normUnrecognized = (data.unrecognized || []).map(function(u) {
+        return '<li>' + escHtml(u) + '</li>';
+      }).join('');
+      return '<div class="event" style="border-left:3px solid var(--accent);padding-left:8px">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label" style="background:var(--accent);color:#fff">DIRECTIVES</span>' +
+        '<div style="margin-top:4px;font-size:12px">' +
+          (normApplied ? '<div><strong>Normalized:</strong><ul style="margin:2px 0 4px 16px;padding:0">' + normApplied + '</ul></div>' : '') +
+          (normUnrecognized ? '<div><strong>Unrecognized:</strong><ul style="margin:2px 0 0 16px;padding:0">' + normUnrecognized + '</ul></div>' : '') +
+        '</div>' +
+      '</div>';
+
     case 'anomaly_detected':
       var aSev = (data.severity || 'medium').toUpperCase();
       var aColor = aSev === 'CRITICAL' ? '#d32f2f' : (aSev === 'HIGH' ? '#e65100' : 'var(--accent)');
@@ -4004,7 +4073,7 @@ function renderEvent(evt) {
         '<span class="event-label" style="background:#1565c0;color:#fff">💡 INTROSPECTION</span>' +
         '<div style="margin-top:4px">' +
           (data.agent ? '<strong>' + escHtml(data.agent) + '</strong>: ' : '') + escHtml(data.reason || 'needs guidance') +
-          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + expandableText(data.details || '') + '</div>' +
+          '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + expandableText(data.details || '', null, 'event-' + evt.seq + '-guidance-details') + '</div>' +
           (gActions ? '<ul style="font-size:12px;margin:4px 0 0 16px;padding:0">' + gActions + '</ul>' : '') +
           gSuggestion +
         '</div>' +
@@ -4018,7 +4087,7 @@ function renderEvent(evt) {
       return '<div class="event tool-progress">' +
         '<span class="event-ts">' + ts + '</span>' +
         '<span class="event-label label-progress">PROGRESS</span>' +
-        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ') ' + expandableText(data.body || '') + '</span>' +
+        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ') ' + expandableText(data.body || '', null, 'event-' + evt.seq + '-progress-body') + '</span>' +
       '</div>';
 
     case 'comment':
@@ -4026,7 +4095,23 @@ function renderEvent(evt) {
         '<span class="event-ts">' + ts + '</span>' +
         '<span class="event-label label-comment">COMMENT</span>' +
         '<span style="color:var(--text-muted)">(' + escHtml(agent) + ')</span>' +
-        '<div class="event-text short">' + expandableText(data.body || '') + '</div>' +
+        '<div class="event-text short">' + expandableText(data.body || '', null, 'event-' + evt.seq + '-comment-body') + '</div>' +
+      '</div>';
+
+    case 'user_interjection':
+      return '<div class="event" style="border-left:3px solid #7b1fa2;padding-left:8px">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label" style="background:#7b1fa2;color:#fff">USER INTERJECTION</span>' +
+        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ')</span>' +
+        '<span>' + escHtml(data.message || '') + '</span>' +
+      '</div>';
+
+    case 'user_reply':
+      return '<div class="event" style="border-left:3px solid #00695c;padding-left:8px">' +
+        '<span class="event-ts">' + ts + '</span>' +
+        '<span class="event-label" style="background:#00695c;color:#fff">USER REPLY</span>' +
+        '<span style="color:var(--text-muted)">(' + escHtml(agent) + ')</span>' +
+        '<span>' + escHtml(data.message || '') + '</span>' +
       '</div>';
 
     default:
@@ -4071,7 +4156,7 @@ function renderAgentStarted(evt, ts, agent, data) {
       keys.forEach(function(k) {
         var v = data[k];
         var display = typeof v === 'object' ? JSON.stringify(v) : String(v);
-        dataHtml += '<div><strong>' + escHtml(k) + ':</strong> ' + expandableText(display) + '</div>';
+        dataHtml += '<div><strong>' + escHtml(k) + ':</strong> ' + expandableText(display, null, 'event-' + evt.seq + '-agent-data-' + k) + '</div>';
       });
       dataHtml += '</div>';
     }
@@ -4327,6 +4412,12 @@ function stopPolling() {
     }
   }
   _chartInstances = {};
+
+  // Clear chart sync groups accumulated across navigations
+  window._cdmSyncGroups = {};
+
+  // Clear cached ticket data
+  _lastResultHash = '';
 }
 
 // ── Main render ──
@@ -4461,6 +4552,7 @@ async function sendChatMessage() {
   if (!msg) return;
 
   input.value = '';
+  input.style.height = 'auto';
   btn.disabled = true;
   appendChatMessage('chat-messages', 'user', msg);
   appendChatMessage('chat-messages', 'system', 'Thinking...');
@@ -4509,6 +4601,7 @@ async function sendTicketChatMessage() {
   if (!msg || !currentTicketForChat) return;
 
   input.value = '';
+  input.style.height = 'auto';
   appendChatMessage('ticket-chat-messages', 'user', msg);
   appendChatMessage('ticket-chat-messages', 'system', 'Thinking...');
 
@@ -4541,7 +4634,7 @@ async function sendTicketChatMessage() {
   input.focus();
 }
 
-// Enter key support
+// Enter key support (Enter sends, Shift+Enter inserts newline)
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
     if (e.target.id === 'chat-input') {
@@ -4551,6 +4644,15 @@ document.addEventListener('keydown', function(e) {
       e.preventDefault();
       sendTicketChatMessage();
     }
+  }
+});
+
+// Auto-resize textarea inputs
+document.addEventListener('input', function(e) {
+  if (e.target.id === 'chat-input' || e.target.id === 'ticket-chat-input') {
+    e.target.style.height = 'auto';
+    e.target.style.height = Math.min(e.target.scrollHeight, 150) + 'px';
+    e.target.style.overflowY = e.target.scrollHeight > 150 ? 'auto' : 'hidden';
   }
 });
 

@@ -41,6 +41,11 @@
           "title": "Build Id",
           "type": "string"
         },
+        "ticket_id": {
+          "default": "",
+          "title": "Ticket Id",
+          "type": "string"
+        },
         "action": {
           "title": "Action",
           "type": "string"
@@ -255,6 +260,11 @@
     },
     "operational_metrics": {
       "$ref": "#/$defs/OperationalMetrics"
+    },
+    "record_url": {
+      "default": "",
+      "title": "Record Url",
+      "type": "string"
     },
     "build_history": {
       "items": {

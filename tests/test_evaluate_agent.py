@@ -287,6 +287,96 @@ class TestDeterministicCheck:
 
 
 class TestHandleCompletion:
+    def _make_completion_agent(self, deterministic_outcome):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._deterministic_outcome = deterministic_outcome
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "custom_fields": {
+                    "execution_plan": {"steps": []},
+                    "investigation_ledger": [],
+                },
+            },
+        )
+        agent._append_ledger_entry = AsyncMock()
+        agent._update_fields = AsyncMock()
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        return agent
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "llm_decision",
+        [
+            "converged",
+            "loop_plan",
+            "loop_provision",
+            "loop_analyze",
+            "loop_fleet",
+            "stalled",
+        ],
+    )
+    async def test_fleet_complete_normalizes_llm_decision_and_gate(self, llm_decision):
+        from providers.llm.base import LLMResponse, ToolCall
+
+        agent = self._make_completion_agent(
+            "FLEET_COMPLETE — all eligible hosts tested",
+        )
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_evaluation_result",
+                    input={
+                        "decision": llm_decision,
+                        "convergence_gate": "deterministic_threshold",
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        await agent._handle_completion("PERF-TEST", response)
+
+        saved_result = agent._update_fields.await_args.args[1]["evaluation_result"]
+        assert saved_result["decision"] == "converged"
+        assert saved_result["convergence_gate"] == "fleet_complete"
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_preserves_stalled_decision(self):
+        from providers.llm.base import LLMResponse, ToolCall
+
+        agent = self._make_completion_agent(
+            "BUDGET_EXHAUSTED — iteration budget reached",
+        )
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_evaluation_result",
+                    input={
+                        "decision": "stalled",
+                        "convergence_gate": "entropy_stall",
+                    },
+                ),
+            ],
+            stop_reason="tool_use",
+        )
+
+        await agent._handle_completion("PERF-TEST", response)
+
+        saved_result = agent._update_fields.await_args.args[1]["evaluation_result"]
+        assert saved_result["decision"] == "stalled"
+        assert saved_result["convergence_gate"] == "entropy_stall"
+
     @pytest.mark.asyncio
     async def test_converged_transitions_to_synthesis(self):
         from agents.evaluate.agent import EvaluateAgent
@@ -996,3 +1086,131 @@ class TestArtifactGuidance:
         messages = agent._build_messages(ticket)
         content = messages[0]["content"]
         assert "list_benchmark_artifacts" not in content
+
+
+class TestFleetConvergence:
+    """Fleet exhaustion should trigger deterministic convergence."""
+
+    def test_fleet_exhausted_hard(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {
+            "fleet_investigation": {
+                "enabled": True,
+                "tested_hosts": [
+                    {"host_id": "board-01", "status": "completed"},
+                    {"host_id": "board-02", "status": "partial"},
+                ],
+                "fleet_exhausted": {"hard": True},
+            },
+        }
+        outcome = agent._check_deterministic(cf)
+        assert "FLEET_COMPLETE" in outcome
+        assert "2 tested" in outcome
+        assert "1 completed" in outcome
+        assert "1 partial" in outcome
+
+    @pytest.mark.parametrize("max_iterations_reached", [False, True])
+    def test_fleet_exhaustion_precedes_budget_and_max_iterations(
+        self,
+        max_iterations_reached,
+    ):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {
+            "fleet_investigation": {
+                "enabled": True,
+                "tested_hosts": [
+                    {"host_id": "board-01", "status": "completed"},
+                    {"host_id": "board-02", "status": "partial"},
+                ],
+                "fleet_exhausted": {"hard": True},
+            },
+        }
+        if max_iterations_reached:
+            cf["convergence_criteria"] = {"max_iterations": 2}
+            cf["iteration_results"] = [
+                {"iteration": 0, "metric_value": 100.0},
+                {"iteration": 1, "metric_value": 99.0},
+            ]
+        ticket = {
+            "comments": [
+                {"author": "benchmark-agent", "body": "Budget exhausted"},
+            ],
+        }
+
+        outcome = agent._check_deterministic(cf, ticket=ticket)
+
+        assert "FLEET_COMPLETE" in outcome
+        assert "BUDGET_EXHAUSTED" not in outcome
+        assert "MAX_ITERATIONS" not in outcome
+
+    def test_fleet_exhausted_soft(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {
+            "fleet_investigation": {
+                "enabled": True,
+                "tested_hosts": [
+                    {"host_id": "board-01", "status": "completed"},
+                    {"host_id": "board-02", "status": "completed"},
+                    {"host_id": "board-03", "status": "completed"},
+                ],
+                "fleet_exhausted": {
+                    "soft": True,
+                    "unavailable_hosts": ["(duplicate assignment)"],
+                },
+            },
+        }
+        outcome = agent._check_deterministic(cf)
+        assert "FLEET_COMPLETE" in outcome
+        assert "3 tested" in outcome
+
+    def test_fleet_not_exhausted_returns_empty(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {
+            "fleet_investigation": {
+                "enabled": True,
+                "tested_hosts": [
+                    {"host_id": "board-01", "status": "completed"},
+                ],
+            },
+        }
+        outcome = agent._check_deterministic(cf)
+        assert "FLEET_COMPLETE" not in outcome
+
+    def test_non_fleet_ticket_unaffected(self):
+        from agents.evaluate.agent import EvaluateAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = EvaluateAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        cf = {
+            "convergence_criteria": {},
+            "iteration_results": [],
+        }
+        outcome = agent._check_deterministic(cf)
+        assert outcome == ""

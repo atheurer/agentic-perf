@@ -36,6 +36,24 @@ def ticket_in_benchmark(store):
 
 
 class TestDoubleRequestClarification:
+    def test_preparing_platform_can_return_to_resource_reconciliation(self, store):
+        from state_store.models import CreateTicketRequest
+
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="test", description="test")
+        )
+        for status in (
+            "triage_pending",
+            "awaiting_hardware",
+            "preparing_platform",
+            "awaiting_customer_guidance",
+            "preparing_platform",
+            "awaiting_hardware",
+        ):
+            store.transition_ticket(ticket.id, TransitionRequest(status=status))
+
+        assert store.get_ticket(ticket.id).status == TicketStatus.AWAITING_HARDWARE
+
     def test_single_pause_and_resume(self, store, ticket_in_benchmark):
         """Normal case: pause once, resume back to executing_benchmark."""
         tid = ticket_in_benchmark.id

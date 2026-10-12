@@ -182,7 +182,7 @@ async def test_contiguous_window_no_cursor_skip(
             break
         for e in page:
             all_seqs.append(e["seq"])
-        cursor = page[-1]["seq"]
+        cursor = max(event["seq"] for event in page)
 
     assert len(all_seqs) == 251
     assert all_seqs == list(range(1, 252))

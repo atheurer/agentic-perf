@@ -37,6 +37,7 @@ EVENT_TYPES = {
     "llm_usage",
     "agent_stopped",
     "user_interjection",
+    "user_reply",
     "escalation",
     "circuit_breaker",
 }
@@ -95,6 +96,7 @@ class CumulativeUsage:
         "llm_calls",
         "total_duration_ms",
         "models_used",
+        "estimated_cost_usd",
     )
 
     def __init__(self) -> None:
@@ -105,6 +107,7 @@ class CumulativeUsage:
         self.llm_calls: int = 0
         self.total_duration_ms: int = 0
         self.models_used: set[str] = set()
+        self.estimated_cost_usd: float = 0.0
 
     def record(
         self,
@@ -124,6 +127,15 @@ class CumulativeUsage:
         self.llm_calls += 1
         if model:
             self.models_used.add(model)
+        from providers.cost import estimate_cost
+
+        self.estimated_cost_usd += estimate_cost(
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Snapshot of accumulated usage."""
@@ -136,6 +148,7 @@ class CumulativeUsage:
             "llm_calls": self.llm_calls,
             "total_duration_ms": self.total_duration_ms,
             "models_used": sorted(self.models_used),
+            "estimated_cost_usd": self.estimated_cost_usd,
         }
 
 
@@ -156,7 +169,11 @@ class EventBus:
                 "trace dual-write comparison mode requires a comparison sink"
             )
         self._log_dir = Path(log_dir) if log_dir is not None else paths.LOG_DIR
-        self._log_dir.mkdir(parents=True, exist_ok=True)
+        from providers.execution import AuditedFilesystem
+
+        AuditedFilesystem.system(self._log_dir.parent).mkdir(
+            self._log_dir.name, mode=0o777
+        )
         self._redactor = redactor
         self._events: dict[str, list[Event]] = {}
         self._seq: dict[str, int] = {}
@@ -173,8 +190,8 @@ class EventBus:
         self._ticket_owners: dict[str, tuple[str, list[str]]] = {}
         self._legacy_usage_cache: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
         self._legacy_usage_cache_lock = threading.Lock()
-        # Per-ticket merged event cache.  Each entry is
-        # (jsonl_mtime_ns, jsonl_size, trace_count, merged_events)
+        # Per-ticket merged event cache. Each entry is
+        # (jsonl_mtime_ns, jsonl_size, trace_count, cursor_ordered_events)
         # and invalidates when the JSONL file or trace store changes.
         # Bounded to _MAX_CACHED_TICKETS to prevent unbounded growth.
         self._merged_event_cache: dict[
@@ -458,6 +475,7 @@ class EventBus:
                 total.cache_creation_input_tokens += usage.cache_creation_input_tokens
                 total.llm_calls += usage.llm_calls
                 total.total_duration_ms += usage.total_duration_ms
+                total.estimated_cost_usd += usage.estimated_cost_usd
                 total.models_used.update(usage.models_used)
             return total.to_dict()
 
@@ -494,7 +512,11 @@ class EventBus:
                 trace_to_legacy(event)
                 for event in self._trace_store.list_events(ticket_id)
             ]
-        merged = sorted(legacy + traces, key=event_order_key)
+        # Cursor values follow each source's immutable sequence: JSONL line
+        # order first, then the trace store's per-ticket insertion order. New
+        # backdated traces therefore cannot renumber events already delivered.
+        traces.sort(key=lambda item: item["seq"])
+        merged = legacy + traces
         for cursor, item in enumerate(merged, start=1):
             item["seq"] = cursor
 
@@ -518,10 +540,17 @@ class EventBus:
         since: int = 0,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
+        """Return the next cursor page in chronological display order.
+
+        Cursor selection happens before display sorting so a late or backdated
+        event cannot move an already delivered event across the ``since``
+        boundary. Callers should advance to the greatest returned ``seq``.
+        """
         merged = self._get_merged_events(ticket_id)
-        # Return shallow copies — callers (e.g. api/stream.py)
-        # may mutate the dicts, which would corrupt the cache.
-        return [dict(item) for item in merged if item["seq"] > since][:limit]
+        # Select by stable cursor before sorting for display. Return shallow
+        # copies because callers (e.g. api/stream.py) may mutate the dicts.
+        page = [dict(item) for item in merged if item["seq"] > since][:limit]
+        return sorted(page, key=event_order_key)
 
     def get_usage_events(
         self,

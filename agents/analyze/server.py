@@ -18,6 +18,7 @@ if _project_root not in sys.path:
 
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import read_skill_documents
+from providers.skills.base import HARNESS_ALIASES
 
 mcp = create_ticket_mcp("analyze-agent")
 
@@ -121,7 +122,19 @@ async def search_tickets(
             continue
         cf = t.get("custom_fields", {})
         directives = cf.get("directives", {})
-        if harness and directives.get("harness") != harness:
+        ticket_harness = directives.get("harness", "")
+        # Normalize aliases so searches match across the
+        # 'arcaflow' / 'arcaflow-plugins' boundary.
+        ticket_harness = (
+            ticket_harness.lower() if isinstance(ticket_harness, str) else ""
+        )
+        normalized_filter = harness.lower() if isinstance(harness, str) else ""
+        ticket_harness = HARNESS_ALIASES.get(ticket_harness, ticket_harness)
+        normalized_filter = HARNESS_ALIASES.get(
+            normalized_filter,
+            normalized_filter,
+        )
+        if harness and ticket_harness != normalized_filter:
             continue
         if board_type:
             selector = directives.get("board_selector", "") or cf.get(

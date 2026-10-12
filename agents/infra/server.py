@@ -19,6 +19,7 @@ import shlex
 import sys
 import tempfile
 from contextlib import AsyncExitStack
+from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
@@ -26,8 +27,10 @@ _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from fastmcp.tools.base import ToolResult
 from pydantic import BaseModel, ConfigDict
 
+from agents.ethtool import flow_rule_is_verifiable, parse_ethtool_flow_rules
 from agents.infra.topology import discover_cache_topology
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
@@ -52,8 +55,9 @@ CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 _ssh: SSHExecutor | None = None
 _ssh_key_stack: AsyncExitStack | None = None
 _secrets_provider = None
-_state_store_url: str | None = None
 _ticket_id: str | None = None
+_ssh_has_key = False
+_ssh_context_lock = asyncio.Lock()
 
 
 def _store_headers() -> dict[str, str]:
@@ -67,6 +71,95 @@ def _get_ssh() -> SSHExecutor:
     if _ssh is None:
         raise RuntimeError("SSH context not set. Call set_ssh_context() first.")
     return _ssh
+
+
+class _SSHContextRequiredError(RuntimeError):
+    """Raised when an SSH tool has no ticket identity to initialize from."""
+
+
+class _SSHTicketContextMismatchError(ValueError):
+    """Raised when a tool attempts to bind SSH to a different ticket."""
+
+
+def _ssh_context_required_result() -> ToolResult:
+    payload = {
+        "status": "precondition_required",
+        "error": "ssh_context_required",
+        "required_action": "set_ssh_context",
+        "retryable": True,
+        "message": (
+            "SSH context is unavailable because no ticket ID is configured. "
+            "Call set_ssh_context with the ticket ID, then retry this tool."
+        ),
+    }
+    return ToolResult(
+        content=json.dumps(payload, sort_keys=True),
+        structured_content=payload,
+        is_error=True,
+    )
+
+
+async def _initialize_ssh_context(ticket_id: str) -> tuple[SSHExecutor, bool]:
+    """Initialize the process SSH executor once for its owning ticket."""
+    global _ssh, _ssh_has_key, _ticket_id
+
+    ticket_id = ticket_id.strip()
+    if not ticket_id:
+        raise _SSHContextRequiredError
+
+    async with _ssh_context_lock:
+        if _ssh is not None:
+            if _ticket_id != ticket_id:
+                raise _SSHTicketContextMismatchError(
+                    "SSH context is already bound to another ticket"
+                )
+            return _ssh, _ssh_has_key
+
+        expected_ticket_id = os.environ.get("TICKET_ID", "").strip()
+        if expected_ticket_id and ticket_id != expected_ticket_id:
+            raise _SSHTicketContextMismatchError(
+                "SSH context ticket does not match this MCP session"
+            )
+
+        state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+        # build_ssh_from_ticket binds the ticket launch trace context while it
+        # fetches credentials. Keep that binding inside a child task so it
+        # cannot replace the MCP request context for the rest of this call.
+        ssh, ticket = await asyncio.create_task(
+            build_ssh_from_ticket(ticket_id, state_store_url)
+        )
+        fields = ticket.get("custom_fields", {})
+        _ssh = ssh
+        _ticket_id = ticket_id
+        _ssh_has_key = fields.get("ssh_key_path") is not None
+        return ssh, _ssh_has_key
+
+
+async def _ensure_ssh_context() -> SSHExecutor:
+    """Lazily initialize SSH from the ticket identity supplied to this server."""
+    if _ssh is not None:
+        return _ssh
+
+    ticket_id = _ticket_id or os.environ.get("TICKET_ID", "")
+    if not ticket_id:
+        raise _SSHContextRequiredError
+
+    ssh, _ = await _initialize_ssh_context(ticket_id)
+    return ssh
+
+
+def _requires_ssh_context(tool: Any) -> Any:
+    """Preflight SSH-dependent tools without leaking an uninitialized error."""
+
+    @wraps(tool)
+    async def wrapped(*args: Any, **kwargs: Any) -> str | ToolResult:
+        try:
+            await _ensure_ssh_context()
+        except _SSHContextRequiredError:
+            return _ssh_context_required_result()
+        return await tool(*args, **kwargs)
+
+    return wrapped
 
 
 def _get_secrets():
@@ -122,33 +215,50 @@ def _crucible_command(
 
 
 @mcp.tool()
-async def set_ssh_context(ticket_id: str) -> str:
-    """Set SSH credentials by reading them from a ticket's custom_fields.
+async def set_ssh_context(ticket_id: str) -> str | ToolResult:
+    """Set SSH credentials from a ticket's custom_fields; safe to call repeatedly.
 
-    Must be called before any SSH operations. Resolves ssh_key_path and
-    ssh_user from the ticket so credentials never appear in tool inputs.
+    SSH tools initialize this context automatically when the ticket ID is
+    available. This explicit operation remains available when that identity is
+    missing. Credentials never appear in tool inputs or results.
     """
-    global _ssh, _state_store_url, _ticket_id
-
-    _ticket_id = ticket_id
-
-    _state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-    # Use the ticket-owned constructor so SSH operations preserve the same
-    # durable trace context and recorder as every other local MCP server.
-    _ssh, ticket = await build_ssh_from_ticket(ticket_id, _state_store_url)
-    fields = ticket.get("custom_fields", {})
-    ssh_key = fields.get("ssh_key_path")
-    ssh_user = _ssh.user
+    ticket_id = ticket_id.strip()
+    expected_ticket_id = os.environ.get("TICKET_ID", "").strip()
+    if expected_ticket_id and ticket_id != expected_ticket_id:
+        payload = {
+            "status": "rejected",
+            "error": "ticket_context_mismatch",
+        }
+        return ToolResult(
+            content=json.dumps(payload, sort_keys=True),
+            structured_content=payload,
+            is_error=True,
+        )
+    try:
+        ssh, has_key = await _initialize_ssh_context(ticket_id)
+    except _SSHContextRequiredError:
+        return _ssh_context_required_result()
+    except _SSHTicketContextMismatchError:
+        payload = {
+            "status": "rejected",
+            "error": "ticket_context_mismatch",
+        }
+        return ToolResult(
+            content=json.dumps(payload, sort_keys=True),
+            structured_content=payload,
+            is_error=True,
+        )
     return json.dumps(
         {
             "status": "ok",
-            "ssh_user": ssh_user,
-            "has_key": ssh_key is not None,
+            "ssh_user": ssh.user,
+            "has_key": has_key,
         }
     )
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def check_host(host: str) -> str:
     """Test SSH connectivity and gather system info (OS, CPU, RAM, hostname)."""
     ssh = _get_ssh()
@@ -181,6 +291,7 @@ async def check_host(host: str) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def write_remote_file(host: str, remote_path: str, content: str) -> str:
     """Write content to a file on a remote host. Creates parent directories."""
     ssh = _get_ssh()
@@ -206,17 +317,14 @@ async def write_remote_file(host: str, remote_path: str, content: str) -> str:
         name = f"agentic-perf-{ticket_id}-{os.urandom(8).hex()}.tmp"
         local_path = str(staging.write(name, content))
     else:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".tmp", delete=False) as f:
-            f.write(content)
-            local_path = f.name
+        staging = AuditedFilesystem.system(Path(tempfile.gettempdir()))
+        name = f"agentic-perf-{os.urandom(8).hex()}.tmp"
+        local_path = str(staging.write(name, content))
 
     try:
         scp_result = await ssh.copy_to(host, local_path, remote_path, mutating=True)
     finally:
-        if ticket_id:
-            staging.unlink(Path(local_path).name, missing_ok=True)
-        else:
-            Path(local_path).unlink(missing_ok=True)
+        staging.unlink(name, missing_ok=True)
 
     return json.dumps(
         {
@@ -229,6 +337,7 @@ async def write_remote_file(host: str, remote_path: str, content: str) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def read_remote_file(host: str, remote_path: str, max_bytes: int = 10000) -> str:
     """Read a file from a remote host. Truncates to max_bytes."""
     ssh = _get_ssh()
@@ -239,6 +348,7 @@ async def read_remote_file(host: str, remote_path: str, max_bytes: int = 10000) 
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def list_controller_userenvs(controller: str) -> str:
     """List userenvs available from a running Crucible controller.
 
@@ -250,6 +360,7 @@ async def list_controller_userenvs(controller: str) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def run_crucible_command(
     controller: str,
     command: CrucibleCommand,
@@ -274,6 +385,7 @@ async def run_crucible_command(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str:
     """Copy a remote directory to a local temp directory.
 
@@ -296,7 +408,8 @@ async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str
     else:
         # Direct server invocation is a documented no-ticket compatibility
         # mode; ticket-owned MCP connections always set TICKET_ID.
-        local_dir = tempfile.mkdtemp(prefix="remote-dir-")
+        filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
+        local_dir = str(filesystem.temporary_directory(prefix="remote-dir-"))
     result = await ssh.copy_from(host, remote_path, local_dir)
     if result.exit_code != 0:
         return json.dumps(
@@ -380,6 +493,7 @@ def _filter_ethtool_data(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def get_ethtool_info(
     host: str,
     iface: str,
@@ -390,14 +504,18 @@ async def get_ethtool_info(
     """Get ethtool information for a network interface as structured JSON.
 
     mode='features' returns offload feature flags (ethtool -k / ethtool --json -k),
-    mode='stats' returns NIC statistics (ethtool -S / ethtool --json -S).
+    mode='stats' returns NIC statistics (ethtool -S / ethtool --json -S), and
+    mode='flow_rules' returns RX ntuple flow rules (ethtool -u), preserving
+    the original flow-type/action text and each qualifier's label, value, and
+    mask alongside the unmodified command output. Partial or unsupported rule
+    details remain visible and are marked with ``partial=true``.
 
     Args:
         host: IP to SSH into
         iface: Network interface name (e.g. eth0)
-        mode: 'features' or 'stats'
-        pattern: Case-insensitive regex to filter keys (e.g. 'rx|tx'
-            returns only keys matching that pattern). Empty = all keys.
+        mode: 'features', 'stats', or 'flow_rules'
+        pattern: Case-insensitive regex to filter feature/stat keys (e.g.
+            'rx|tx' returns only keys matching that pattern). Empty = all keys.
         active_only: (features mode only) When True (the default), return
             only non-fixed active features — the subset the agent reasons
             about. Set False to include all feature flags. Ignored in stats
@@ -405,6 +523,13 @@ async def get_ethtool_info(
     """
     compiled = None
     if pattern:
+        if mode == "flow_rules":
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "pattern filtering is supported only in features and stats modes",
+                }
+            )
         try:
             compiled = re.compile(pattern, re.IGNORECASE)
         except re.error as exc:
@@ -421,27 +546,59 @@ async def get_ethtool_info(
         flag = "-k"
     elif mode == "stats":
         flag = "-S"
+    elif mode == "flow_rules":
+        flag = "-u"
     else:
         return json.dumps(
             {
                 "success": False,
-                "error": f"Unknown mode {mode!r}. Use 'features' or 'stats'.",
+                "error": (
+                    f"Unknown mode {mode!r}. Use 'features', 'stats', or 'flow_rules'."
+                ),
             }
         )
 
-    # Try native JSON output first
-    result = await ssh.run(host, f"ethtool --json {flag} {quoted}", timeout=30)
-    if result.exit_code != 0 or not result.stdout.strip().startswith(("{", "[")):
-        # Fallback to standard ethtool
+    if mode == "flow_rules":
         result = await ssh.run(host, f"ethtool {flag} {quoted}", timeout=30)
+    else:
+        # Try native JSON output first
+        result = await ssh.run(host, f"ethtool --json {flag} {quoted}", timeout=30)
+        if result.exit_code != 0 or not result.stdout.strip().startswith(("{", "[")):
+            # Fallback to standard ethtool
+            result = await ssh.run(host, f"ethtool {flag} {quoted}", timeout=30)
 
     if result.exit_code != 0:
         return _format_result(result)
 
-    parsed_data = _parse_ethtool_output(result.stdout, mode)
-    filtered_data = _filter_ethtool_data(
-        parsed_data, mode, compiled=compiled, active_only=active_only
-    )
+    try:
+        if mode == "flow_rules":
+            parsed_data = {"rules": parse_ethtool_flow_rules(result.stdout)}
+        else:
+            parsed_data = _parse_ethtool_output(result.stdout, mode)
+    except ValueError as exc:
+        return json.dumps(
+            {
+                "host": host,
+                "iface": iface,
+                "mode": mode,
+                "exit_code": result.exit_code,
+                "success": False,
+                "error": str(exc),
+                "stdout": result.stdout,
+            },
+            indent=2,
+        )
+    if mode == "flow_rules":
+        for rule in parsed_data["rules"]:
+            rule["partial"] = bool(rule.get("partial")) or not flow_rule_is_verifiable(
+                rule
+            )
+    if mode == "flow_rules":
+        filtered_data = parsed_data
+    else:
+        filtered_data = _filter_ethtool_data(
+            parsed_data, mode, compiled=compiled, active_only=active_only
+        )
 
     response: dict[str, Any] = {
         "host": host,
@@ -450,6 +607,11 @@ async def get_ethtool_info(
         "exit_code": result.exit_code,
         "data": filtered_data,
     }
+    if mode == "flow_rules":
+        response["rule_count"] = len(filtered_data["rules"])
+        response["partial"] = any(
+            not flow_rule_is_verifiable(rule) for rule in filtered_data["rules"]
+        )
     # stdout is useful for backwards-compatible unfiltered responses, but it
     # defeats the purpose of server-side filtering by retaining the complete
     # raw dump in the tool result.  Keep it only when no filter was requested.
@@ -466,6 +628,7 @@ async def get_ethtool_info(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def get_sysctl_values(host: str, params: list[str]) -> str:
     """Read sysctl parameter values from a remote host as structured JSON.
 
@@ -505,6 +668,7 @@ async def get_sysctl_values(host: str, params: list[str]) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def get_hardware_topology(
     host: str,
     iface: str | None = None,
@@ -551,6 +715,7 @@ async def get_hardware_topology(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def get_cache_topology(
     host: str,
     socket: int | None = None,
@@ -590,6 +755,7 @@ async def get_cache_topology(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def verify_ssh_path(host: str, target_host: str) -> str:
     """Verify SSH reachability from one host to another.
 
@@ -615,6 +781,7 @@ async def verify_ssh_path(host: str, target_host: str) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def list_interfaces(host: str) -> str:
     """List network interfaces that are UP with their assigned IP addresses."""
     ssh = _get_ssh()
@@ -725,6 +892,7 @@ def _apply_iface_filters(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def get_interface_inventory(
     host: str,
     name_regex: str = "",
@@ -816,6 +984,7 @@ async def get_interface_inventory(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
     """Deploy a secret file to a remote host.
 
@@ -856,6 +1025,7 @@ async def deploy_secret(host: str, secret_path: str, remote_path: str) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def transfer_file(
     host: str,
     local_path: str,
@@ -889,6 +1059,7 @@ async def transfer_file(
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def check_hosts(hosts: list[str]) -> str:
     """Test SSH connectivity and gather system info for multiple hosts at once.
 
@@ -945,6 +1116,7 @@ async def check_hosts(hosts: list[str]) -> str:
 
 
 @mcp.tool()
+@_requires_ssh_context
 async def test_port_connectivity(
     server_ssh_host: str,
     client_ssh_host: str,

@@ -214,18 +214,20 @@ class BitwardenSecretsProvider(SecretsProvider):
             yield None
             return
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="bws-"))
+        from providers.execution import AuditedFilesystem
+
+        filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
+        tmp_dir = filesystem.temporary_directory(prefix="bws-")
         try:
-            tmp_dir.chmod(0o700)
+            filesystem.chmod(tmp_dir, 0o700)
             tmp_file = tmp_dir / "secret"
-            tmp_file.write_text(content, encoding="utf-8")
-            tmp_file.chmod(0o600)
+            filesystem.write(tmp_file, content, encoding="utf-8", mode=0o600)
             yield tmp_file
         finally:
             try:
                 for child in tmp_dir.iterdir():
-                    child.unlink(missing_ok=True)
-                tmp_dir.rmdir()
+                    filesystem.unlink(child, missing_ok=True)
+                filesystem.rmdir(tmp_dir)
             except OSError:
                 logger.warning(
                     "Could not remove ephemeral dir %s",

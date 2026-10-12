@@ -146,6 +146,54 @@ class TestCheckAvailable:
         assert result["available"] is False
         assert result["matching_devices"] == 0
 
+    @pytest.mark.asyncio
+    async def test_all_excluded_requires_every_selector_match_to_be_tested(self):
+        provider = JumpstarterResourceProvider(
+            client_name="test",
+            default_selector="board-type=qc8775",
+        )
+        exporter = MagicMock()
+        exporter.name = "board-01"
+        exporter.labels = {"board-type": "qc8775", "pool": "open"}
+        exporter.online = True
+        exporter.status = "AVAILABLE"
+        result = MagicMock()
+        result.exporters = [exporter]
+        service = AsyncMock()
+        service.ListExporters = AsyncMock(return_value=result)
+        provider._service = service
+
+        availability = await provider.check_available({"exclude_hosts": ["board-01"]})
+
+        assert availability["all_excluded"] is True
+        assert availability["matching_devices"] == 1
+        assert availability["excluded_hosts"] == ["board-01"]
+
+    @pytest.mark.asyncio
+    async def test_unavailable_untested_selector_match_is_not_exhausted(self):
+        provider = JumpstarterResourceProvider(
+            client_name="test",
+            default_selector="board-type=qc8775",
+        )
+        exporter = MagicMock()
+        exporter.name = "board-01"
+        exporter.labels = {"board-type": "qc8775", "pool": "open"}
+        exporter.online = True
+        exporter.status = "LEASED"
+        result = MagicMock()
+        result.exporters = [exporter]
+        service = AsyncMock()
+        service.ListExporters = AsyncMock(return_value=result)
+        provider._service = service
+
+        availability = await provider.check_available(
+            {"exclude_hosts": ["unrelated-tested-board"]}
+        )
+
+        assert availability["available"] is False
+        assert availability["matching_devices"] == 0
+        assert "all_excluded" not in availability
+
 
 # --- Name selector ---
 

@@ -30,9 +30,9 @@ def _crucible_fixture(
         "validation_id": "val-788",
         "attempt_id": "attempt-1",
         "execution_intent_id": "intent-1",
-        "run_file": {"benchmarks": [{"name": "uperf"}]},
+        "run_file": {"benchmarks": [{"name": "uperf"}], "tags": {}},
         "runfile_fingerprint": benchmark_server._runfile_fingerprint(
-            {"benchmarks": [{"name": "uperf"}]}
+            {"benchmarks": [{"name": "uperf"}], "tags": {}}
         ),
         "harness": "crucible",
         "controller": "controller",
@@ -169,7 +169,7 @@ async def test_terminal_write_failure_is_reclassified_indeterminate(
         return {}
 
     monkeypatch.setattr(operation, "transition", transition)
-    assert await operation.terminalize({}, "complete", {"result": "ok"})
+    assert not await operation.terminalize({}, "complete", {"result": "ok"})
     assert calls == ["complete", "indeterminate"]
 
 
@@ -200,7 +200,7 @@ async def test_execute_path_duplicate_replay_does_not_launch(monkeypatch) -> Non
     """The actual server entrypoint returns the durable cached operation."""
     record = {
         "validation_id": "val-1",
-        "run_file": {"benchmark": "demo"},
+        "run_file": {"benchmark": "demo", "tags": {}},
         "runfile_fingerprint": "fp",
         "harness": "crucible",
         "controller": "controller",

@@ -196,6 +196,80 @@ class TestContextGuardConfig:
 
 
 class TestGetContextWindow:
+    @pytest.mark.parametrize(
+        "model",
+        ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"],
+    )
+    def test_gpt6_models_have_large_context_window(
+        self,
+        model: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import providers.cost as cost_module
+        from providers.cost import get_context_window
+
+        monkeypatch.setattr(
+            cost_module,
+            "_USER_PRICING",
+            tmp_path / "missing-pricing.yaml",
+        )
+        monkeypatch.setattr(cost_module, "_pricing_cache", None)
+
+        assert get_context_window(model) == 1_050_000
+
+    @pytest.mark.parametrize(
+        ("model", "expected_window"),
+        [
+            ("gpt-5.5", 1_050_000),
+            ("gpt-5.5-pro", 1_050_000),
+            ("gpt-5.4", 1_050_000),
+            ("gpt-5.4-nano", 400_000),
+            ("gpt-5.2", 400_000),
+            ("gpt-5.1", 400_000),
+            ("gpt-5.1-codex-max", 400_000),
+            ("gpt-daybreak-blue-latest", 1_050_000),
+        ],
+    )
+    def test_openai_model_context_windows(
+        self,
+        model: str,
+        expected_window: int,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import providers.cost as cost_module
+        from providers.cost import get_context_window
+
+        monkeypatch.setattr(
+            cost_module,
+            "_USER_PRICING",
+            tmp_path / "missing-pricing.yaml",
+        )
+        monkeypatch.setattr(cost_module, "_pricing_cache", None)
+
+        assert get_context_window(model) == expected_window
+
+    def test_custom_pricing_without_context_uses_bundled_model_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import providers.cost as cost_module
+        from providers.cost import get_context_window
+
+        custom_pricing = tmp_path / "pricing.yaml"
+        custom_pricing.write_text(
+            "models:\n"
+            "  gpt-6-sol:\n"
+            "    input_per_token: 0.000003\n"
+            "    output_per_token: 0.00002\n"
+        )
+        monkeypatch.setattr(cost_module, "_USER_PRICING", custom_pricing)
+        monkeypatch.setattr(cost_module, "_pricing_cache", None)
+
+        assert get_context_window("gpt-6-sol") == 1_050_000
+
     def test_exact_match(self):
         from providers.cost import get_context_window
 

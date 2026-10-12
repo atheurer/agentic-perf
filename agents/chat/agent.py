@@ -34,6 +34,17 @@ _DEFAULT_TIMEOUT = 60
 logger = logging.getLogger(__name__)
 
 
+def _safe_exception_summary(exc: Exception) -> str:
+    """Return useful provider error metadata without logging response text."""
+    status_code = getattr(exc, "status_code", None)
+    if type(status_code) is not int:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    if type(status_code) is int:
+        return f"{type(exc).__name__} (HTTP {status_code})"
+    return type(exc).__name__
+
+
 def _is_confirmation(message: str) -> bool:
     """Return whether a conversational reply approves a pending action."""
     normalized = message.lower().strip().rstrip(".!?")
@@ -131,9 +142,28 @@ class ChatSession:
         self.llm_calls += 1
 
     def _truncate(self) -> None:
-        if len(self.messages) > _MAX_HISTORY:
-            # Keep first message (context) and last N
-            self.messages = self.messages[-_MAX_HISTORY:]
+        if len(self.messages) <= _MAX_HISTORY:
+            return
+        # Slice from the end, but ensure we don't orphan
+        # tool_result blocks from their tool_use blocks.
+        cut = self.messages[-_MAX_HISTORY:]
+        # Start on a normal user turn: assistant-first histories and
+        # tool_results without their preceding tool_use are invalid.
+        while cut and (cut[0].get("role") != "user" or self._is_tool_result(cut[0])):
+            cut = cut[1:]
+        self.messages = cut
+
+    @staticmethod
+    def _is_tool_result(msg: dict[str, Any]) -> bool:
+        """Check if a message contains tool_result blocks."""
+        if msg.get("role") != "user":
+            return False
+        content = msg.get("content")
+        if isinstance(content, list):
+            return any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+            )
+        return False
 
 
 class ChatSessionStore:
@@ -477,7 +507,7 @@ class ChatAgent:
                 logger.warning(
                     "Chat LLM call failed on round %d: %s",
                     _round + 1,
-                    exc,
+                    _safe_exception_summary(exc),
                 )
                 if _round > 0:
                     # Later rounds: return partial results.
@@ -504,7 +534,11 @@ class ChatAgent:
                         "I wasn't able to use my tools for "
                         "this request. Could you try rephrasing?"
                     )
-                except Exception:
+                except Exception as retry_exc:
+                    logger.warning(
+                        "Chat retry without tools also failed: %s",
+                        _safe_exception_summary(retry_exc),
+                    )
                     text = (
                         "I'm having trouble processing your "
                         "request right now. Please try again."

@@ -6,7 +6,8 @@ the board, discovered the IP, and injected SSH keys.
 
 For self-installing harnesses (boot-time, arcaflow-plugins),
 no additional provisioning is needed — the provisioning agent
-auto-completes.
+auto-completes using the platform agent's recorded board flash
+and verification result.
 
 For other harnesses, the board is SSH-reachable at the IP
 in `hosts_provisioned`. Install the harness as you would on

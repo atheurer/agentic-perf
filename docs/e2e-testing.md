@@ -18,9 +18,13 @@ git clone https://github.com/atheurer/agentic-perf.git
 cd agentic-perf
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install -e '.[vertex,jumpstarter]'
+python3 -m pip install --extra-index-url https://pkg.jumpstarter.dev/simple \
+  -e '.[vertex,jumpstarter]'
 python3 cli.py --help
 ```
+
+The Jumpstarter packages are published on `pkg.jumpstarter.dev`, so include
+that package index when installing the `jumpstarter` extra.
 
 This repository has no installed console entry point, so all commands below
 use `python3 cli.py`. Use `.[openai]` or `.[gemini]` for those LLM providers;

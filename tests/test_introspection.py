@@ -770,6 +770,19 @@ class TestSkillLoading:
 
 
 class TestIntrospectionAgent:
+    def test_remembers_max_cursor_across_chronologically_sorted_page(self) -> None:
+        agent = IntrospectionAgent(state_store_url="http://localhost:8090")
+        agent._last_seq = 1
+        events = [
+            _make_event(3, "tool_result"),
+            _make_event(2, "llm_request"),
+        ]
+
+        agent._remember_events(events)
+
+        assert agent._all_events == events
+        assert agent._last_seq == 3
+
     def test_builds_observation_with_anomalies(self) -> None:
         agent = IntrospectionAgent(
             state_store_url="http://localhost:8090",
@@ -1199,8 +1212,10 @@ class TestMaybeStartIntrospection:
 
         config = MagicMock(spec=OrchestratorConfig)
         config.introspection_enabled = True
+        config.get_agent_llm_config.return_value = {}
         dispatcher = MagicMock()
         dispatcher.is_introspection_active.return_value = False
+        dispatcher._introspection_llm = False
         dispatcher.start_introspection.return_value = True
         ticket = {"custom_fields": {}}
 
@@ -1228,8 +1243,10 @@ class TestMaybeStartIntrospection:
 
         config = MagicMock(spec=OrchestratorConfig)
         config.introspection_enabled = False
+        config.get_agent_llm_config.return_value = {}
         dispatcher = MagicMock()
         dispatcher.is_introspection_active.return_value = False
+        dispatcher._introspection_llm = False
         dispatcher.start_introspection.return_value = True
         ticket = {"custom_fields": {"introspection_enabled": True}}
 

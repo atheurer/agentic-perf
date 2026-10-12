@@ -60,6 +60,7 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     ],
     TicketStatus.PREPARING_PLATFORM: [
         TicketStatus.AWAITING_PROVISION,
+        TicketStatus.AWAITING_HARDWARE,  # allocation changed during resume
         TicketStatus.COORDINATING_FLEET,  # fleet: flash failed
         TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],

@@ -219,7 +219,7 @@ def _read_events(ticket_id, last_seq):
         events = bus.get_events(ticket_id, since=last_seq, limit=100_000)
     finally:
         bus.close()
-    new_seq = events[-1]["seq"] if events else last_seq
+    new_seq = max((event["seq"] for event in events), default=last_seq)
     return events, new_seq
 
 
@@ -397,6 +397,7 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
             json={"author": "user", "body": message},
         )
         r.raise_for_status()
+        _emit_user_reply(client, ticket_id, message)
         r = client.post(
             f"/api/v1/tickets/{ticket_id}/transition",
             json={"status": "awaiting_teardown", "comment": "User /close command"},
@@ -427,6 +428,7 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
             json={"author": "user", "body": message},
         )
         r.raise_for_status()
+        _emit_user_reply(client, ticket_id, message)
         resumed = _resume_ticket(client, ticket, ticket_id)
         if resumed:
             print(f"Model switched to {cmd_arg} — ticket resumed.")
@@ -453,6 +455,7 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
             json={"author": "user", "body": message},
         )
         r.raise_for_status()
+        _emit_user_reply(client, ticket_id, message)
         resumed = _resume_ticket(client, ticket, ticket_id)
         if resumed:
             print(f"Iterations extended by {n} (new max: {new_max}) — ticket resumed.")
@@ -569,6 +572,7 @@ def cmd_reply(args):
                 json={"author": "user", "body": args.message},
             )
             comment.raise_for_status()
+            _emit_user_reply(client, args.ticket_id, args.message)
             comment_id = comment.json().get("id")
             resolved = client.post(
                 f"/api/v1/tickets/{args.ticket_id}/approvals/"
@@ -597,6 +601,7 @@ def cmd_reply(args):
         },
     )
     r.raise_for_status()
+    _emit_user_reply(client, args.ticket_id, args.message)
 
     if args.abort:
         r = client.post(
@@ -667,6 +672,21 @@ def cmd_reply(args):
     if overrides:
         msg += f" ({', '.join(overrides)})"
     print(msg)
+
+
+def _emit_user_reply(client: httpx.Client, ticket_id: str, message: str) -> None:
+    """Best-effort feed event after the reply comment has been accepted."""
+    try:
+        response = client.post(
+            f"/api/v1/tickets/{ticket_id}/user-reply",
+            json={"message": message},
+        )
+        response.raise_for_status()
+    except Exception:
+        print(
+            "Warning: reply was accepted but its activity event could not be recorded.",
+            file=sys.stderr,
+        )
 
 
 def cmd_approve(args):
@@ -1148,8 +1168,12 @@ def cmd_trace(args):
     response.raise_for_status()
     if args.export:
         if args.output:
-            with open(args.output, "w", encoding="utf-8") as stream:
-                stream.write(response.text)
+            from providers.execution import AuditedFilesystem
+
+            output = Path(args.output)
+            AuditedFilesystem.system(output.parent).write(
+                output.name, response.text, mode=None, atomic=False
+            )
         else:
             print(response.text, end="" if response.text.endswith("\n") else "\n")
         return

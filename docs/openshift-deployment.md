@@ -45,7 +45,6 @@ OpenAI requires the optional `openai` extra in a derived image.
 │  ├─ Secret (LLM creds)        │               │
 │  ├─ Secret (Jumpstarter)       │               │
 │  ├─ Secret (Domain MCP)        │               │
-│  └─ Secret (Horreum API key)   │               │
 │                                │               │
 │  Route ─────────────────────>──┘               │
 └─────────────────────────────────────────────────┘
@@ -132,18 +131,6 @@ stringData:
   token: <domain-mcp-token>
 ```
 
-### Horreum API Key (for investigation records)
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agentic-perf-horreum
-type: Opaque
-stringData:
-  api-key: <HUSR_...>
-```
-
 ### Webhook Service Account Token
 
 Webhook service account tokens are stored in the state store's
@@ -178,11 +165,7 @@ data:
         "enabled": true
       },
       "investigation_records": {
-        "backend": "horreum",
-        "url": "https://horreum.example.com",
-        "secret": "horreum/api-key",
-        "test_id": 426,
-        "tls_verify": false
+        "backend": "file"
       },
       "external_mcp_servers": [
         {
@@ -214,6 +197,21 @@ data:
       ]
     }
 ```
+
+## RBAC for Stale Lock Recovery
+
+When using PVC-backed persistence, the state store detects stale
+locks left by previous pods via the Kubernetes API. This requires
+narrowly scoped pod-read RBAC:
+
+```bash
+oc apply -f deploy/lock-recovery-rbac.yaml -n <namespace>
+```
+
+Without this, cross-pod lock recovery fails closed (the new pod
+cannot verify whether the previous pod is dead) and requires
+manual lock file removal. The Role grants only `get` on `pods` —
+no list, watch, or delete access.
 
 ## PVC
 
@@ -260,10 +258,6 @@ spec:
               mkdir -p /data/agentic-perf/secrets/domain-mcp
               cp /ext-secrets/domain-mcp/token /data/agentic-perf/secrets/domain-mcp/token
 
-              # Horreum API key
-              mkdir -p /data/agentic-perf/secrets/horreum
-              cp /ext-secrets/horreum/api-key /data/agentic-perf/secrets/horreum/api-key
-
               # Jumpstarter client config
               mkdir -p /opt/app-root/src/.config/jumpstarter/clients
               cp /ext-secrets/jumpstarter/perf-ci.yaml /opt/app-root/src/.config/jumpstarter/clients/perf-ci.yaml
@@ -282,10 +276,6 @@ spec:
               readOnly: true
             - name: jumpstarter-client
               mountPath: /ext-secrets/jumpstarter
-              readOnly: true
-            - name: horreum-api-key
-              mountPath: /ext-secrets/horreum/api-key
-              subPath: api-key
               readOnly: true
       containers:
         - name: agentic-perf
@@ -317,18 +307,39 @@ spec:
               mountPath: /data/gcp/adc.json
               subPath: adc.json
               readOnly: true
+          startupProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8090
+            # Allow up to 180s for the state store to load
+            # tickets from disk.  Deployments with 200+ tickets
+            # may need 30-60s.  The startup probe runs before
+            # the liveness probe activates.
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            timeoutSeconds: 10
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /api/v1/health
               port: 8090
-            initialDelaySeconds: 15
+            initialDelaySeconds: 60
+            timeoutSeconds: 10
             periodSeconds: 30
+            failureThreshold: 5
           resources:
             requests:
-              memory: 512Mi
+              memory: 1Gi
               cpu: 500m
             limits:
-              memory: 2Gi
+              # 4Gi recommended for deployments with 200+ tickets.
+              # The state store keeps active tickets in memory and
+              # loads closed tickets on demand.  Concurrent agent
+              # dispatch (up to max_concurrent_agents=8), MCP
+              # servers, and trace processing all contribute to
+              # memory usage.  Deployments with fewer than 100
+              # tickets can use 2Gi.
+              memory: 4Gi
               cpu: "2"
       volumes:
         - name: data
@@ -348,9 +359,6 @@ spec:
         - name: gcp-adc
           secret:
             secretName: agentic-perf-gcp-adc
-        - name: horreum-api-key
-          secret:
-            secretName: agentic-perf-horreum
 ```
 
 ## Service and Route
@@ -523,7 +531,6 @@ All persistent data lives on the PVC at
 | `investigation-records/` | Local investigation records (if using file backend) |
 | `secrets/api-token` | Auto-generated deployment token |
 | `secrets/domain-mcp/token` | Domain MCP auth token |
-| `secrets/horreum/api-key` | Horreum API key |
 | `users.json` | User accounts and token hashes |
 | `artifacts/<ticket>/<run>/` | Persistent benchmark artifacts |
 | `tickets/<ticket>/workspace/` | Workspace files and generated charts |

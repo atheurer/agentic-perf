@@ -145,9 +145,10 @@ class TestOpenAIReasoningEffort:
         assert "reasoning_effort" not in kwargs
 
     @pytest.mark.asyncio
-    async def test_reasoning_model_uses_max_completion_tokens(self):
+    @pytest.mark.parametrize("model", ["gpt-5.6-luna", "gpt-6-luna"])
+    async def test_reasoning_model_uses_max_completion_tokens(self, model):
         provider, client = self._make_provider(None)
-        provider._model = "gpt-5.6-luna"
+        provider._model = model
         provider.max_tokens = 1234
         await provider.complete(
             system_prompt="test",

@@ -156,13 +156,67 @@ def _check_executing_benchmark(ticket: dict[str, Any]) -> tuple[bool, str]:
     """Validate provisioning before benchmark execution."""
     cf = ticket.get("custom_fields", {})
 
-    if not cf.get("provisioning_complete", False):
+    if cf.get("provisioning_complete") is not True:
         hosts = cf.get("hosts_provisioned", [])
         harness = cf.get("harness_name", "unknown")
         return (
             False,
             f"Provisioning not marked complete "
             f"(harness={harness}, hosts_provisioned={hosts})",
+        )
+
+    # Require actionable host identities even if the stored field is truthy.
+    hosts = cf.get("hosts_provisioned", [])
+    if (
+        not isinstance(hosts, list)
+        or not hosts
+        or any(
+            not isinstance(host, str) or not host.strip() or host != host.strip()
+            for host in hosts
+        )
+    ):
+        return (
+            False,
+            "Provisioning marked complete but hosts_provisioned must contain "
+            "at least one non-empty host string — no actionable provisioning result",
+        )
+
+    allocation = cf.get("assigned_hardware_ips", {})
+    allocated_hosts: set[str] = set()
+    if isinstance(allocation, dict):
+        controller = allocation.get("controller")
+        targets = allocation.get("targets", [])
+        if isinstance(controller, str) and controller.strip():
+            allocated_hosts.add(controller)
+        if isinstance(targets, list):
+            allocated_hosts.update(
+                target
+                for target in targets
+                if isinstance(target, str) and target.strip()
+            )
+    if not allocated_hosts:
+        return (
+            False,
+            "Provisioning marked complete but the ticket has no assigned host identities",
+        )
+    unallocated_hosts = sorted(set(hosts) - allocated_hosts)
+    if unallocated_hosts:
+        return (
+            False,
+            "Provisioned hosts do not match assigned_hardware_ips: "
+            + ", ".join(unallocated_hosts),
+        )
+
+    verification = cf.get("provisioning_verification")
+    if (
+        not isinstance(verification, dict)
+        or verification.get("status") != "verified"
+        or not isinstance(verification.get("details"), str)
+        or not verification["details"].strip()
+    ):
+        return (
+            False,
+            "Provisioning marked complete without successful verification details",
         )
 
     plan = cf.get("execution_plan", {})
@@ -217,8 +271,27 @@ def _check_awaiting_review(ticket: dict[str, Any]) -> tuple[bool, str]:
 def _check_evaluating_convergence(
     ticket: dict[str, Any],
 ) -> tuple[bool, str]:
-    """Validate benchmark execution before convergence evaluation."""
+    """Validate benchmark execution before convergence evaluation.
+
+    Fleet investigations may reach evaluating_convergence from the
+    fleet coordinator after exhausting all boards — some iterations
+    may have failed at resource or provisioning stages without ever
+    running a benchmark.  When fleet_exhausted is set, the fleet
+    coordinator has already determined the fleet state and the
+    evaluate agent must be allowed to run.
+    """
     cf = ticket.get("custom_fields", {})
+
+    # Only a current, explicitly enabled fleet investigation with a
+    # confirmed hard/soft exhaustion result bypasses the benchmark gate.
+    fleet = cf.get("fleet_investigation", {})
+    exhaustion = fleet.get("fleet_exhausted")
+    confirmed_exhaustion = isinstance(exhaustion, dict) and (
+        exhaustion.get("hard") is True or exhaustion.get("soft") is True
+    )
+    if fleet.get("enabled") is True and confirmed_exhaustion:
+        return True, ""
+
     benchmark_status = cf.get("benchmark_status")
     run_id = cf.get("run_id")
 

@@ -6,14 +6,26 @@ optional — sensible defaults are used when a field is absent.
 The config path can be changed by setting the `AGENTIC_PERF_HOME`
 environment variable (defaults to `~/.agentic-perf`).
 
+The state store validates configuration before initializing its persistence
+lock, authentication, or writable backends. A malformed or unreadable existing
+file prevents startup. JSON syntax errors report the config path, parse reason,
+line, and column in the startup log without printing the file contents. The
+health endpoint and dashboard are unavailable until startup succeeds; fix the
+configuration and restart the service. An absent file uses secure defaults,
+including required bearer authentication and disabled anonymous reads.
+
+The config root and `auth` section must be JSON objects. `auth.multi_user` and
+`auth.anonymous_read` must be JSON booleans, and `auth.token_ttl_days` must be a
+non-negative integer.
+
 ### Live config updates
 
 The orchestrator re-reads `config.json` at each agent dispatch.
 Changes to the following fields take effect on the next dispatch
 without a restart:
 
-- `llm.*` (provider, model, backend, region, timeout, max_tokens,
-  reasoning_effort)
+- `llm.*` (provider, model, backend, region, API-key secret reference,
+  timeout, max_tokens, reasoning_effort)
 - `agent_models.*` (per-agent LLM overrides)
 - `agent_iterations.*` and `global_max_iterations`
 - `agent_task_timeout`
@@ -135,6 +147,7 @@ overridden by `agent_models`.
 | `base_url` | string | — | `OPENAI_BASE_URL` | Base URL for OpenAI-compatible endpoints |
 | `api` | string | `"chat_completions"` | `OPENAI_API` | OpenAI API mode: `"chat_completions"` or `"responses"`. Applies only to the `openai` provider. |
 | `gemini_api_key` | string | — | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | API key for Gemini provider |
+| `api_key_secret` | string | — | — | Secret path resolved through the configured secrets provider for agents using the global provider |
 | `timeout` | float | `120` | `LLM_TIMEOUT` | Per-request timeout in seconds. `0` disables. |
 | `max_tokens` | int | `8000` | `LLM_MAX_TOKENS` | Maximum output-token budget per completion. Reasoning tokens share this budget where supported. |
 | `reasoning_effort` | string | — | `LLM_REASONING_EFFORT` | Global reasoning effort level: `"low"`, `"medium"`, `"high"`. Provider-specific values also accepted (e.g. Claude's `"xhigh"`/`"max"`, Gemini's `"minimal"`). Startup validation probes each model with its configured effort; an incompatible combination (e.g. `reasoning_effort` on a model without extended thinking) logs an error naming the affected agents. |
@@ -152,11 +165,42 @@ overridden by `agent_models`.
 
 | Provider | How to authenticate |
 |---|---|
-| Claude (direct) | Set `ANTHROPIC_API_KEY` env var |
+| Claude (direct) | Set `ANTHROPIC_API_KEY` env var or configure `llm.api_key_secret` |
 | Claude (Vertex) | Install the `vertex` extra, run `gcloud auth application-default login`, and set `project_id` and `region` |
-| Gemini (direct) | Set `GOOGLE_API_KEY` or `GEMINI_API_KEY` env var, or `llm.gemini_api_key` in config |
+| Gemini (direct) | Set `GOOGLE_API_KEY` or `GEMINI_API_KEY` env var, configure `llm.gemini_api_key`, or configure `llm.api_key_secret` |
 | Gemini (Vertex) | Install the `vertex` extra, run `gcloud auth application-default login`, and set `project_id` and `region` (or `GOOGLE_CLOUD_PROJECT`/`GOOGLE_CLOUD_LOCATION`) |
-| OpenAI | Set `OPENAI_API_KEY` env var |
+| OpenAI | Set `OPENAI_API_KEY` env var or configure `llm.api_key_secret` |
+
+`api_key_secret` names a secret path, not a credential value. The path is
+resolved through the same secrets provider used by the agent (including the
+local files, vault, and per-user cascade when configured). A global reference
+applies only to agents using the global `llm.provider`. Set
+`agent_models.<agent_type>.api_key_secret` when an agent uses a different
+provider or needs its own credential. If an agent overrides the provider,
+the global reference is not carried over automatically.
+
+An explicitly configured secret reference takes precedence over the provider's
+environment variable. If that reference cannot be resolved or is empty, the
+agent fails with a clear error instead of falling back to an environment key.
+Without a reference, existing environment-variable behavior remains in place.
+For example, a mixed-provider configuration can use:
+
+```json
+{
+    "llm": {
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "api_key_secret": "openai/api-key"
+    },
+    "agent_models": {
+        "review": {
+            "provider": "claude",
+            "model": "claude-sonnet-4-5",
+            "api_key_secret": "anthropic/api-key"
+        }
+    }
+}
+```
 
 The OpenAI provider uses `max_completion_tokens` for GPT-5 and o-series
 models, which reject the legacy `max_tokens` parameter. Older
@@ -197,9 +241,10 @@ only when you want a specific agent to use a different model.
 1. `agent_models.<agent_type>` — per-agent override
 2. `llm.*` — global default
 
-Each override object supports `provider`, `model`, `api`, `reasoning_effort`,
-and `max_tokens` keys. The `api` key is honored both at startup validation
-and at runtime when the override selects the `openai` provider. A per-agent
+Each override object supports `provider`, `model`, `api`, `api_key_secret`,
+`reasoning_effort`, and `max_tokens` keys. The `api` key is honored both at
+startup validation and at runtime when the override selects the `openai`
+provider. A per-agent
 `reasoning_effort` is probed at startup alongside the model; if the model
 does not support it, the log names the affected agent(s) and suggests
 removing `reasoning_effort` or switching models.
@@ -700,10 +745,16 @@ stops automatically when the ticket reaches a terminal status. See
 
 ### investigation_records — Investigation Record Backend
 
-Investigation tools use the file backend unless configured otherwise. The
-backend is selected by configuration; Horreum requires its endpoint and
-credentials. See the investigation provider section in Architecture for the
-supported shapes and behavior.
+Investigation tools use the file backend by default. The registry currently
+supports file storage; composite configuration can combine file providers
+for multi-read setups. See the investigation provider section in
+[Architecture](architecture.md) for the supported shapes and behavior.
+
+When upgrading from a version that used the Horreum investigation-record
+backend, remove or change `"backend": "horreum"` to a supported backend such
+as `"file"`. A config that still selects `horreum` fails with an unknown
+backend error. The file provider does not import existing records from
+Horreum, so switching backends does not migrate records automatically.
 
     {
         "investigation_records": {

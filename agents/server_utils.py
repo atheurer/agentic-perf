@@ -127,6 +127,10 @@ def build_skill_provider(
             mcp_client=arcaflow_mcp_client,
         ),
     }
+    # arcaflow-workflows uses the same catalog/discovery as
+    # arcaflow-plugins but routes through the Arcaflow MCP
+    # workflow engine instead of direct podman execution.
+    harnesses["arcaflow-workflows"] = harnesses["arcaflow-plugins"]
 
     if catalog_only:
         harnesses["crucible"] = CrucibleCatalogSkillProvider(
@@ -199,6 +203,9 @@ def _public_context_document(document: dict[str, Any]) -> dict[str, Any]:
         for key, value in document.items()
         if key not in _CONTEXT_PRIVATE_KEYS
     }
+    content = document.get("content")
+    if isinstance(content, str) and "size_bytes" not in public:
+        public["size_bytes"] = len(content.encode("utf-8"))
     public.pop("source_path", None)
     return public
 
@@ -255,6 +262,9 @@ def _public_context_result(
             for item in public["documents"]
             if isinstance(item, dict)
         ]
+        if public.get("operation") in {"bootstrap", "read"}:
+            for document in public["documents"]:
+                document.pop("content", None)
     if isinstance(public.get("document"), dict):
         public["document"] = _public_context_document(public["document"])
     if isinstance(public.get("results"), list):
@@ -592,13 +602,16 @@ def main():
                 continue
             try:
                 if entry.is_dir(follow_symlinks=True):
-                    if pattern.search(path) and not emit("NAME\td\t" + path):
+                    if pattern.search(path) and not emit("NAME\td\t\t" + path):
                         break
                     child_directories.append(path)
                     continue
                 if not entry.is_file(follow_symlinks=True):
                     continue
-                if pattern.search(path) and not emit("NAME\tf\t" + path):
+                file_size = entry.stat(follow_symlinks=True).st_size
+                if pattern.search(path) and not emit(
+                    "NAME\tf\t{}\t{}".format(file_size, path)
+                ):
                     break
                 visited_files += 1
                 if visited_files > MAX_FILES or total_file_bytes >= MAX_TOTAL_FILE_BYTES:
@@ -655,10 +668,11 @@ main()
         if kind == "TRUNCATED":
             remote_truncated = True
             continue
+        raw_size = ""
         if kind == "NAME":
-            if len(fields) != 3:
+            if len(fields) != 4:
                 continue
-            file_type, value = fields[1:]
+            file_type, raw_size, value = fields[1:]
             raw_path = value
             line_number = ""
             content = ""
@@ -690,10 +704,22 @@ main()
                 "ref": relative,
                 "uri": f"crucible://{relative}",
                 "type": "directory" if file_type == "d" else "file",
+                "size_bytes": (
+                    int(raw_size)
+                    if kind == "NAME" and file_type == "f" and raw_size.isdigit()
+                    else None
+                ),
                 "match_kinds": [],
                 "matches": [],
             },
         )
+        if (
+            kind == "NAME"
+            and entry.get("size_bytes") is None
+            and file_type == "f"
+            and raw_size.isdigit()
+        ):
+            entry["size_bytes"] = int(raw_size)
         match_kind = "name" if kind == "NAME" else "content"
         if match_kind not in entry["match_kinds"]:
             entry["match_kinds"].append(match_kind)
@@ -705,6 +731,24 @@ main()
             }
         )
     files = list(grouped.values())
+    missing_sizes = [
+        "/opt/crucible/" + entry["ref"]
+        for entry in files
+        if entry["type"] == "file" and entry.get("size_bytes") is None
+    ]
+    if missing_sizes:
+        stat_command = shlex.join(["stat", "--printf=%n\\t%s\\n", "--", *missing_sizes])
+        stat_result = await ssh.run(controller_host, stat_command, timeout=15)
+        sizes_by_path = {}
+        for line in stat_result.stdout.splitlines():
+            fields = line.split("\t", 1)
+            if len(fields) == 2 and fields[1].isdigit():
+                relative = _controller_relative_path(fields[0])
+                if relative:
+                    sizes_by_path[relative] = int(fields[1])
+        for entry in files:
+            if entry.get("size_bytes") is None:
+                entry["size_bytes"] = sizes_by_path.get(entry["ref"])
     for entry in files:
         entry["match_count"] = len(entry["matches"])
     return {
@@ -728,7 +772,6 @@ async def _read_controller_document(
     ssh: Any,
     controller_host: str,
     relative: str,
-    max_bytes: int = 262144,
 ) -> Any:
     """Read a controller document only after resolving symlinks safely.
 
@@ -743,7 +786,7 @@ async def _read_controller_document(
         "root=$(realpath -e -- /opt/crucible) && "
         f"candidate=$(realpath -e -- {quoted_path}) && "
         'case "$candidate" in "$root"/*) '
-        f'test -f "$candidate" && head -c {max_bytes} "$candidate";; '
+        'test -f "$candidate" && cat -- "$candidate";; '
         "*) exit 2;; esac"
     )
     return await ssh.run(controller_host, command, timeout=30)
@@ -761,6 +804,8 @@ async def controller_context_gateway(
     path: str = "",
     query: str = "",
     include_alternates: bool = False,
+    max_bytes: int = 16 * 1024,
+    offset_bytes: int = 0,
 ) -> str:
     """Read controller context by following paths supplied by AGENTS.md.
 
@@ -775,7 +820,12 @@ async def controller_context_gateway(
     if operation == "bootstrap":
         path = "AGENTS.md"
     if operation == "read":
-        cached = manager.read_document(path, include_alternates=include_alternates)
+        cached = manager.read_document(
+            path,
+            include_alternates=include_alternates,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
+        )
         if cached.get("status") == "ok":
             result = {
                 "found": True,
@@ -864,6 +914,7 @@ async def controller_context_gateway(
             "provenance": provenance,
             "entrypoint": relative == "AGENTS.md",
             "content": content,
+            "size_bytes": len(content.encode("utf-8")),
             "workspace_ref": saved.get("files", {}).get(relative),
         }
         manager.index_context_documents([document])
@@ -881,6 +932,22 @@ async def controller_context_gateway(
             "document": document,
             "documents": [document],
         }
+        if operation in {"bootstrap", "read"}:
+            page = manager.read_document(
+                relative,
+                include_alternates=include_alternates,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
+            )
+            if page.get("status") != "ok":
+                return json.dumps(
+                    {
+                        "found": False,
+                        "operation": operation,
+                        **page,
+                    }
+                )
+            result["document"] = {**document, **page}
     elif operation == "search":
         result = await _search_controller_source(
             ssh=ssh,
@@ -927,6 +994,8 @@ async def crucible_context_gateway(
     subject_area: str | list[str] = "all",
     include_alternates: bool = False,
     query: str = "",
+    max_bytes: int = 16 * 1024,
+    offset_bytes: int = 0,
 ) -> str:
     """Expose and persist the phase-owned Crucible context gateway.
 
@@ -950,7 +1019,10 @@ async def crucible_context_gateway(
         )
         if operation == "bootstrap":
             cached = manager.read_document(
-                "core/AGENTS.md", include_alternates=include_alternates
+                "core/AGENTS.md",
+                include_alternates=include_alternates,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
             )
             if cached.get("status") == "ok":
                 return json.dumps(
@@ -976,7 +1048,12 @@ async def crucible_context_gateway(
                 }
             )
         if operation == "read" and path:
-            cached = manager.read_document(path, include_alternates=include_alternates)
+            cached = manager.read_document(
+                path,
+                include_alternates=include_alternates,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
+            )
             if cached.get("status") == "ok":
                 return json.dumps(
                     _public_context_result(
@@ -1117,7 +1194,10 @@ async def crucible_context_gateway(
         }
         if requested_operation == "read":
             workspace_document = manager.read_document(
-                path, include_alternates=include_alternates
+                path,
+                include_alternates=include_alternates,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
             )
             if workspace_document.get("status") == "ok":
                 metadata = next(
@@ -1131,7 +1211,7 @@ async def crucible_context_gateway(
                 )
                 result["document"] = {
                     **metadata,
-                    "content": workspace_document["content"],
+                    **workspace_document,
                 }
         elif requested_operation == "search":
             result = {

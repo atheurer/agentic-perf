@@ -7,6 +7,7 @@ factory is unsafe when two clients connect at once.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from collections.abc import AsyncIterator, Callable
@@ -32,8 +33,30 @@ from mcp.os.win32.utilities import (
     terminate_windows_process_tree,
 )
 from mcp.shared.message import SessionMessage
+from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_server_stdout_line(line: str) -> SessionMessage | Exception | None:
+    """Parse JSON-RPC output while ignoring plain-text subprocess noise."""
+    if not line.strip():
+        return None
+    try:
+        message = types.JSONRPCMessage.model_validate_json(line)
+    except ValidationError as exc:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            is_jsonrpc_candidate = '"jsonrpc"' in line
+        else:
+            is_jsonrpc_candidate = isinstance(payload, dict) and "jsonrpc" in payload
+        if is_jsonrpc_candidate:
+            logger.exception("Failed to parse JSONRPC message from server")
+            return exc
+        logger.debug("Ignoring non-JSONRPC line from server")
+        return None
+    return SessionMessage(message)
 
 
 async def _create_process(
@@ -116,15 +139,9 @@ async def audited_stdio_client(
                     lines = (buffer + chunk).split("\n")
                     buffer = lines.pop()
                     for line in lines:
-                        try:
-                            message = types.JSONRPCMessage.model_validate_json(line)
-                        except Exception as exc:  # pragma: no cover
-                            logger.exception(
-                                "Failed to parse JSONRPC message from server"
-                            )
-                            await read_writer.send(exc)
-                            continue
-                        await read_writer.send(SessionMessage(message))
+                        parsed = _parse_server_stdout_line(line)
+                        if parsed is not None:
+                            await read_writer.send(parsed)
         except anyio.ClosedResourceError:  # pragma: no cover
             await anyio.lowlevel.checkpoint()
 

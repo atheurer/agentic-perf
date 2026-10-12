@@ -1,0 +1,34 @@
+# RBAC for stale PVC lock recovery.
+#
+# The state store checks whether the previous pod is still alive
+# by querying the Kubernetes API for pod existence.  This requires
+# read access to pods in the deployment namespace.
+#
+# Apply once per namespace:
+#   oc apply -f deploy/lock-recovery-rbac.yaml -n <namespace>
+#
+# The Role is narrowly scoped: only "get" on "pods" — no list,
+# watch, delete, or access to other resources.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agentic-perf-pod-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agentic-perf-pod-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agentic-perf-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: default

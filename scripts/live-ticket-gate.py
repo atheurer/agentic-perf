@@ -22,6 +22,11 @@ class GateError(RuntimeError):
     """The live gate could not safely complete."""
 
 
+MAX_SLEEP_SECONDS = 20 * 60
+MIN_GATE_OVERHEAD_SECONDS = 20 * 60
+DEFAULT_TIMEOUT_SECONDS = 60 * 60
+
+
 @dataclass(frozen=True)
 class ClientTarget:
     """One approved Crucible client engine and host."""
@@ -41,7 +46,7 @@ class GateConfig:
     seconds: int = 5
     samples: int = 1
     poll_seconds: float = 2.0
-    timeout_seconds: int = 1800
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
 
     @classmethod
     def from_runtime(
@@ -51,7 +56,7 @@ class GateConfig:
         runtime: dict[str, Any],
         *,
         seconds: int = 5,
-        timeout_seconds: int = 1800,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     ) -> GateConfig:
         if not controller.strip() or not system_under_test.strip():
             raise GateError("controller and system-under-test hostnames are required")
@@ -73,8 +78,15 @@ class GateConfig:
             seconds=seconds,
             timeout_seconds=timeout_seconds,
         )
-        if not 1 <= config.seconds <= 30:
-            raise GateError("seconds must be between 1 and 30")
+        if not 1 <= config.seconds <= MAX_SLEEP_SECONDS:
+            raise GateError(
+                f"seconds must be between 1 and {MAX_SLEEP_SECONDS} for this live gate"
+            )
+        if config.timeout_seconds < config.seconds + MIN_GATE_OVERHEAD_SECONDS:
+            raise GateError(
+                "total timeout must leave at least "
+                f"{MIN_GATE_OVERHEAD_SECONDS} seconds for setup and teardown"
+            )
         if config.samples != 1:
             raise GateError("the live gate requires exactly one sample")
         if not re.fullmatch(r"[A-Za-z0-9._-]+", config.ssh_user):
@@ -247,6 +259,22 @@ def _pending_approval(ticket: dict[str, Any]) -> dict[str, Any]:
     return pending[0]
 
 
+def _resume_after_approval(
+    client: httpx.Client, ticket_id: str, ticket: dict[str, Any]
+) -> None:
+    previous_status = ticket.get("previous_status")
+    if previous_status:
+        _request(
+            client,
+            "POST",
+            f"/api/v1/tickets/{ticket_id}/transition",
+            json={
+                "status": previous_status,
+                "comment": "Benchmark approval resolved; resuming pipeline",
+            },
+        )
+
+
 def _description(config: GateConfig) -> str:
     return f"""Live black-box agentic-perf gate.
 
@@ -307,7 +335,11 @@ def _request(client: httpx.Client, method: str, path: str, **kwargs: Any) -> Any
 
 
 def _save_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    from providers.execution import AuditedFilesystem
+
+    AuditedFilesystem.system(path.parent).write(
+        path.name, json.dumps(value, indent=2, sort_keys=True) + "\n", mode=0o644
+    )
 
 
 def _contains_in_order(values: list[str], required: tuple[str, ...]) -> bool:
@@ -420,8 +452,11 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
         raise GateError("AGENTIC_PERF_HOME must name a prepared isolated instance")
     runtime_config = json.loads((home / "config.json").read_text())
     store_url = os.environ.get("STATE_STORE_URL", runtime_config["state_store"]["url"])
-    artifacts.mkdir(parents=True, exist_ok=False)
-    artifacts.chmod(0o700)
+    from providers.execution import AuditedFilesystem
+
+    artifact_filesystem = AuditedFilesystem.system(artifacts)
+    artifact_filesystem.mkdir(".", mode=0o777, parents=True, exist_ok=False)
+    artifact_filesystem.chmod(".", 0o700)
     git_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repo,
@@ -542,6 +577,7 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
                             ),
                         },
                     )
+                    _resume_after_approval(client, ticket_id, ticket)
                     approved = True
                 time.sleep(config.poll_seconds)
             if closed_with_claim:
@@ -555,7 +591,7 @@ def run_gate(config: GateConfig, artifacts: Path, manage_services: bool) -> str:
             home / "logs" / "state-store.log",
         ):
             if source.exists():
-                (artifacts / source.name).write_bytes(source.read_bytes())
+                artifact_filesystem.write(source.name, source.read_bytes(), mode=0o644)
 
 
 _RECOVERABLE_SSH_CONTEXT_RETRY = re.compile(
@@ -606,7 +642,7 @@ def main() -> int:
     parser.add_argument("system_under_test", help="single remote system hostname")
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--seconds", type=int, default=5)
-    parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument(
         "--services-already-running",
         action="store_true",
@@ -639,11 +675,25 @@ def main() -> int:
             Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
             / "agentic-perf-live-gate.lock"
         )
-        with lock_path.open("w") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise GateError("another live gate is already running") from error
+        from providers.execution import AuditedFilesystem
+
+        lock_filesystem = AuditedFilesystem.system(lock_path.parent)
+        lock_fd = lock_filesystem.open_descriptor(
+            lock_path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            mode=0o644,
+        )
+        try:
+            lock_filesystem.lock_descriptor(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(lock_fd)
+            lock_filesystem.forget_descriptor(lock_fd)
+            raise GateError("another live gate is already running") from error
+        except BaseException:
+            lock_filesystem.forget_descriptor(lock_fd)
+            os.close(lock_fd)
+            raise
+        try:
             manage_services = not args.services_already_running
             ticket_id = run_gate(
                 config,
@@ -654,10 +704,16 @@ def main() -> int:
                 _validate_managed_service_shutdown(
                     home, Path(__file__).resolve().parents[1]
                 )
-            _save_json(
-                artifacts / "result.json",
-                {"status": "passed", "ticket_id": ticket_id},
-            )
+        finally:
+            try:
+                lock_filesystem.lock_descriptor(lock_fd, fcntl.LOCK_UN)
+            finally:
+                lock_filesystem.forget_descriptor(lock_fd)
+                os.close(lock_fd)
+        _save_json(
+            artifacts / "result.json",
+            {"status": "passed", "ticket_id": ticket_id},
+        )
         print(f"Live gate passed: {ticket_id}")
         return 0
     except (GateError, httpx.HTTPError, OSError, ValueError) as error:
