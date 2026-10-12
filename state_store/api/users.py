@@ -82,6 +82,9 @@ class UpdateUserRequest(BaseModel):
     # Pydantic sets it to None.  When the field is absent,
     # we need to skip it.  model_fields_set tracks which
     # keys the caller actually provided.
+    #
+    # Note: allowed_sources is a full replacement, not an append.
+    # To add a source, GET the user first, add to the list, then PATCH.
 
 
 @router.patch("/{username}")
