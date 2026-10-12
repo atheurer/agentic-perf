@@ -4010,7 +4010,7 @@ INVENTORY_DISPOSITIONS = {
         "2027-12-31",
     ),
     ("state_store/api/webhooks.py", "receive_webhook", "mutating_http_state"): (
-    ("state_store/api/users.py", "update_user", "mutating_http_state"),
+        ("state_store/api/users.py", "update_user", "mutating_http_state"),
         "system_only",
         "state-store-maintainers",
         "state_store/api/webhooks.py:receive_webhook",
