@@ -138,7 +138,7 @@ class TestNormalizationComment:
             c for c in comments if "normalization" in c.get("body", "").lower()
         ]
         assert len(norm_comments) == 1
-        assert "cycles" in norm_comments[0]["body"]
+        assert "samples" in norm_comments[0]["body"]
         assert "sample_count" in norm_comments[0]["body"]
 
     def test_no_comment_when_no_aliases(self, client, ticket_id):
