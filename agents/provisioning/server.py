@@ -43,6 +43,7 @@ from agents.server_utils import (
     build_ssh_from_ticket,
     read_skill_documents,
 )
+from providers.execution import AuditedAsyncHTTPClient
 from providers.llm.base import ToolDefinition
 from providers.rhel_kernel import KernelSpec
 from providers.ssh import SSHExecutor
@@ -3735,11 +3736,10 @@ async def reboot_hosts_and_verify(
         import os as _os
 
         from agents.server_utils import ticket_state_headers
-        from providers.execution import (
-            AuditedAsyncHTTPClient as _AuditedClient,
-        )
 
-        async with _AuditedClient(
+        # Module-level import so tests can substitute a fake client
+        # without touching the shared providers.execution symbol.
+        async with AuditedAsyncHTTPClient(
             timeout=10.0, headers=ticket_state_headers()
         ) as client:
             store_url = _os.environ.get("STATE_STORE_URL", "http://localhost:8090")

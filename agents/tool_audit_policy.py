@@ -126,6 +126,7 @@ TOOL_AUDIT_POLICY = (
     *_side_effecting(
         "agents.mcp_audit.MCPAuditMiddleware.operation_transition",
         "agents/benchmark/server.py:execute_benchmark",
+        "agents/provisioning/server.py:reboot_hosts_and_verify",
         # This is the registered entry point; its private cancellation helper
         # has its direct MCP boundary inventoried separately.
         "agents/benchmark/agent.py:execute_arcaflow_workflow",
@@ -190,6 +191,7 @@ TOOL_AUDIT_POLICY = (
         "agents/provisioning/server.py:get_flow_steering_rules",
         "agents/provisioning/server.py:get_private_config",
         "agents/provisioning/server.py:get_kernel_inventory",
+        "agents/provisioning/server.py:capture_environment_fingerprint",
     ),
     *_side_effecting(
         "providers.ssh.SSHExecutor",
@@ -215,6 +217,7 @@ TOOL_AUDIT_POLICY = (
         "agents/provisioning/server.py:prepare_kernel_change",
         "agents/provisioning/server.py:install_kernel",
         "agents/provisioning/server.py:select_default_kernel",
+        "agents/provisioning/server.py:verify_kernel_state",
     ),
     *_read_only(
         "agents/resource/server.py:parse_host_config",

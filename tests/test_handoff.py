@@ -521,6 +521,17 @@ class TestKernelTransitionHandoff:
         ticket = {
             "custom_fields": {
                 "provisioning_complete": True,
+                # Upstream #1169 requires actionable, allocated hosts and a
+                # verification record before any benchmark handoff.
+                "hosts_provisioned": ["10.0.0.1", "10.0.0.2"],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.100",
+                    "targets": ["10.0.0.1", "10.0.0.2"],
+                },
+                "provisioning_verification": {
+                    "status": "verified",
+                    "details": "harness verified on all hosts",
+                },
                 "execution_plan": {
                     "current_step": 3,
                     "steps": [
@@ -548,6 +559,17 @@ class TestKernelTransitionHandoff:
         ticket = {
             "custom_fields": {
                 "provisioning_complete": True,
+                # Upstream #1169 requires actionable, allocated hosts and a
+                # verification record before any benchmark handoff.
+                "hosts_provisioned": ["10.0.0.1", "10.0.0.2"],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.100",
+                    "targets": ["10.0.0.1", "10.0.0.2"],
+                },
+                "provisioning_verification": {
+                    "status": "verified",
+                    "details": "harness verified on all hosts",
+                },
                 "execution_plan": {
                     "current_step": 3,
                     "steps": [
@@ -576,6 +598,17 @@ class TestKernelTransitionHandoff:
         ticket = {
             "custom_fields": {
                 "provisioning_complete": True,
+                # Upstream #1169 requires actionable, allocated hosts and a
+                # verification record before any benchmark handoff.
+                "hosts_provisioned": ["10.0.0.1", "10.0.0.2"],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.100",
+                    "targets": ["10.0.0.1", "10.0.0.2"],
+                },
+                "provisioning_verification": {
+                    "status": "verified",
+                    "details": "harness verified on all hosts",
+                },
                 "execution_plan": {
                     "current_step": 2,
                     "steps": [

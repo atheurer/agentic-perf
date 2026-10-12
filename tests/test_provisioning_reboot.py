@@ -49,6 +49,69 @@ def mock_ticket_active():
         yield
 
 
+class FakeStoreClient:
+    """Stand-in for AuditedAsyncHTTPClient so the checkpoint writer never
+    needs a live state store.  Records every PATCH/POST for assertions."""
+
+    custom_fields: dict = {}
+    patches: list[dict] = []
+    posts: list[tuple[str, dict]] = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def get(self, url, *args, **kwargs):
+        cf = dict(FakeStoreClient.custom_fields)
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"custom_fields": cf}
+
+        return _Resp()
+
+    async def patch(self, url, *args, **kwargs):
+        body = kwargs.get("json", {})
+        FakeStoreClient.patches.append(body)
+        FakeStoreClient.custom_fields.update(body.get("fields", {}))
+
+        class _Resp:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+        return _Resp()
+
+    async def post(self, url, *args, **kwargs):
+        FakeStoreClient.posts.append((str(url), kwargs.get("json", {})))
+
+        class _Resp:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+        return _Resp()
+
+
+@pytest.fixture(autouse=True)
+def fake_store():
+    """Unit tests must never depend on a running state store."""
+    FakeStoreClient.custom_fields = {}
+    FakeStoreClient.patches = []
+    FakeStoreClient.posts = []
+    with patch("agents.provisioning.server.AuditedAsyncHTTPClient", FakeStoreClient):
+        yield FakeStoreClient
+
+
 @pytest.fixture(autouse=True)
 def patch_sleep():
     """Skip real sleeps in the poll loop."""
@@ -323,3 +386,27 @@ class TestVerifyKernelState:
             c for c in fleet_ssh.calls if "systemctl reboot" in c["command"]
         ]
         assert len(reboot_calls) == 0
+
+
+class TestCheckpointPersistence:
+    """The verified transition must reach the ticket without a live store."""
+
+    @pytest.mark.asyncio
+    async def test_serial_success_persists_verified_checkpoint(
+        self, handlers, fleet_ssh, fake_store
+    ):
+        result = await handlers["reboot_hosts_and_verify"](
+            hosts=["10.0.0.1", "10.0.0.2"],
+            expected_kernel=KERNEL_B,
+            approval_request_id="test",
+            reconnect_timeout_seconds=300,
+            poll_interval_seconds=1,
+        )
+        assert result["status"] == "verified"
+        assert fake_store.patches, "checkpoint was never written"
+        transitions = fake_store.patches[-1]["fields"]["kernel_transitions"]
+        record = transitions["2"]
+        assert record["state"] == "verified"
+        assert record["kernel"] == KERNEL_B
+        assert set(record["hosts"]) == {"10.0.0.1", "10.0.0.2"}
+        assert all(h["state"] == "verified" for h in record["hosts"].values())
