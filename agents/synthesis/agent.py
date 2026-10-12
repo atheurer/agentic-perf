@@ -44,6 +44,13 @@ class SynthesisAgent(AgentBase):
         )
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
+        from providers.fleet import is_fleet_investigation
+
+        cf = ticket.get("custom_fields", {})
+        if is_fleet_investigation(cf):
+            from .prompts import FLEET_SYNTHESIS_ADDENDUM
+
+            return SYNTHESIS_SYSTEM_PROMPT + FLEET_SYNTHESIS_ADDENDUM
         return SYNTHESIS_SYSTEM_PROMPT
 
     def _build_messages(
@@ -109,6 +116,31 @@ class SynthesisAgent(AgentBase):
                 f"```json\n{json.dumps(change_ctx, indent=2)}\n"
                 f"```\n\n"
             )
+
+        # Fleet investigation: include per-board results
+        from providers.fleet import is_fleet_investigation
+
+        fleet = cf.get("fleet_investigation", {})
+        if is_fleet_investigation(cf):
+            tested = fleet.get("tested_hosts", [])
+            content += f"**Fleet Results ({len(tested)} boards tested):**\n"
+            for host in tested:
+                host_id = host.get("host_id", "?")
+                status = host.get("status", "?")
+                metrics = host.get("metrics", {})
+                reason = host.get("failure_reason", "")
+                iter_data = host.get("iteration_data", {})
+                samples = metrics.get(
+                    "sample_count", iter_data.get("samples_collected", "?")
+                )
+                avg_boot = metrics.get("avg_total_boot_s", "N/A")
+                content += f"- **{host_id}**: {status}"
+                if status == "completed" and avg_boot != "N/A":
+                    content += f" ({samples} samples, avg {avg_boot}s boot)"
+                elif reason:
+                    content += f" — {reason[:200]}"
+                content += "\n"
+            content += "\n"
 
         content += (
             "Produce the final Investigation Record summary "
