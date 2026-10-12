@@ -261,6 +261,40 @@ _PRUNE_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
 _PRUNE_MAX_AGE_SECONDS = 3600  # 1 hour
 
 
+def _try_prune_file(path: Path, spool_dir: Path) -> bool:
+    """Try to remove a spool file, respecting active locks.
+
+    For .spool files, attempt to acquire an exclusive lock on the
+    corresponding .lock file.  If the lock is held (BlockingIOError),
+    the spool is actively owned by a producer — skip it.
+
+    On POSIX, unlink() succeeds even on open/locked files, so we
+    must check the lock BEFORE unlinking to avoid deleting active
+    spool data.
+    """
+    if path.suffix == ".spool" or path.name.endswith(".spool"):
+        lock_path = spool_dir / path.name.replace(".spool", ".lock")
+        if lock_path.exists():
+            try:
+                fd = os.open(str(lock_path), os.O_RDWR)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except BlockingIOError:
+                    os.close(fd)
+                    return False  # actively owned
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass  # lock file gone, safe to prune
+    try:
+        path.unlink()
+        logger.debug("Pruned spool file %s", path.name)
+        return True
+    except OSError:
+        return False
+
+
 def prune_spool_directory(
     directory: Path,
     *,
@@ -300,11 +334,9 @@ def prune_spool_directory(
     remaining: list[tuple[Path, float, int]] = []
     for path, mtime, size in entries:
         if now - mtime > max_age_seconds:
-            try:
-                path.unlink()
+            if _try_prune_file(path, root):
                 removed += 1
-                logger.debug("Pruned expired spool file %s", path.name)
-            except OSError:
+            else:
                 remaining.append((path, mtime, size))
         else:
             remaining.append((path, mtime, size))
@@ -315,13 +347,9 @@ def prune_spool_directory(
     for path, _mtime, size in remaining:
         if total <= max_total_bytes:
             break
-        try:
-            path.unlink()
+        if _try_prune_file(path, root):
             removed += 1
             total -= size
-            logger.debug("Pruned oversized spool file %s", path.name)
-        except OSError:
-            pass
 
     return removed
 
