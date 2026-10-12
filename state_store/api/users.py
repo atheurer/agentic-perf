@@ -98,6 +98,11 @@ def update_user(username: str, body: UpdateUserRequest, request: Request):
 
     kwargs: dict = {}
     if "allowed_sources" in body.model_fields_set:
+        if body.allowed_sources is None:
+            raise HTTPException(
+                status_code=422,
+                detail="allowed_sources cannot be null; pass an empty list to clear or omit the field to leave unchanged",
+            )
         kwargs["allowed_sources"] = body.allowed_sources
     if "max_requests_per_hour" in body.model_fields_set:
         kwargs["max_requests_per_hour"] = body.max_requests_per_hour
