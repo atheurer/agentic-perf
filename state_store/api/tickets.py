@@ -19,13 +19,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
-_directive_normalizer = None
-
-
-def set_directive_normalizer(fn):
-    global _directive_normalizer
-    _directive_normalizer = fn
-
 
 async def _require_claim_control(request: Request) -> Principal:
     """Restrict claim control-plane operations to trusted principals."""
@@ -171,6 +164,19 @@ def create_ticket(body: CreateTicketRequest, request: Request):
     # Advisory quota check at creation time.
     quota_warning = _check_creation_quota(request, created_by)
 
+    # Normalize directives at creation time so tickets always
+    # start with canonical keys regardless of user terminology.
+    if body.custom_fields and "directives" in body.custom_fields:
+        try:
+            import providers.skills.boot_time  # noqa: F401 — register aliases
+            from providers.directives import normalize_directives
+
+            body.custom_fields["directives"] = normalize_directives(
+                body.custom_fields["directives"]
+            )[0]
+        except Exception:
+            pass
+
     ticket = store.create_ticket(
         body,
         created_by=created_by,
@@ -244,9 +250,15 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
     require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
     fields = body.fields
-    if "directives" in fields and _directive_normalizer is not None:
-        fields = dict(fields)
-        fields["directives"] = _directive_normalizer(fields["directives"])
+    if "directives" in fields:
+        try:
+            import providers.skills.boot_time  # noqa: F401 — register aliases
+            from providers.directives import normalize_directives
+
+            fields = dict(fields)
+            fields["directives"] = normalize_directives(fields["directives"])[0]
+        except Exception:
+            pass  # normalization is best-effort; raw keys still work
 
     try:
         session_id, epoch, claim_id, leader_only = mutation_fence(request)
