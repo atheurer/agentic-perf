@@ -82,7 +82,7 @@ class TestDirectiveNormalizationOnCreate:
                     "directives": {
                         "harness": "boot-time",
                         "delay_seconds": 30,
-                        "cycles": 10,
+                        "samples": 10,
                     }
                 },
             },
@@ -126,7 +126,9 @@ class TestNormalizationComment:
             json={
                 "summary": "test",
                 "description": "desc",
-                "custom_fields": {"directives": {"harness": "boot-time", "cycles": 10}},
+                "custom_fields": {
+                    "directives": {"harness": "boot-time", "samples": 10}
+                },
             },
         )
         tid = r.json()["id"]
