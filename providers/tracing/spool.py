@@ -272,23 +272,35 @@ def _try_prune_file(path: Path, spool_dir: Path) -> bool:
     must check the lock BEFORE unlinking to avoid deleting active
     spool data.
     """
+    from providers.execution import AuditedFilesystem
+
+    fs = AuditedFilesystem.system(spool_dir)
     if path.suffix == ".spool" or path.name.endswith(".spool"):
         lock_path = spool_dir / path.name.replace(".spool", ".lock")
         if lock_path.exists():
             try:
-                fd = os.open(str(lock_path), os.O_RDWR)
+                fd = fs.open_descriptor(
+                    lock_path.name,
+                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                    mode=0o600,
+                )
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     fcntl.flock(fd, fcntl.LOCK_UN)
                 except BlockingIOError:
+                    fs.forget_descriptor(fd)
                     os.close(fd)
                     return False  # actively owned
                 finally:
-                    os.close(fd)
+                    fs.forget_descriptor(fd)
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
             except OSError:
                 pass  # lock file gone, safe to prune
     try:
-        path.unlink()
+        fs.unlink(path.name, missing_ok=True)
         logger.debug("Pruned spool file %s", path.name)
         return True
     except OSError:
