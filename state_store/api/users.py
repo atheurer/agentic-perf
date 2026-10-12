@@ -91,7 +91,7 @@ def update_user(username: str, body: UpdateUserRequest, request: Request):
     require_admin(principal)
     store = _get_store(request)
 
-    from state_store.identity import _UNSET
+    from state_store.identity import UNSET
 
     kwargs: dict = {}
     if "allowed_sources" in body.model_fields_set:
@@ -99,9 +99,9 @@ def update_user(username: str, body: UpdateUserRequest, request: Request):
     if "max_requests_per_hour" in body.model_fields_set:
         kwargs["max_requests_per_hour"] = body.max_requests_per_hour
     else:
-        kwargs["max_requests_per_hour"] = _UNSET
+        kwargs["max_requests_per_hour"] = UNSET
 
-    if not kwargs or (len(kwargs) == 1 and kwargs.get("max_requests_per_hour") is _UNSET):
+    if not kwargs or (len(kwargs) == 1 and kwargs.get("max_requests_per_hour") is UNSET):
         raise HTTPException(status_code=422, detail="No mutable fields provided")
 
     try:

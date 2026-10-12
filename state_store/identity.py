@@ -24,7 +24,7 @@ from paths import AGENTIC_PERF_HOME
 logger = logging.getLogger(__name__)
 
 _USERNAME_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
-_UNSET = object()  # sentinel for "field not provided"
+UNSET = object()  # sentinel for "field not provided"
 DEFAULT_USERS_PATH = AGENTIC_PERF_HOME / "users.json"
 
 
@@ -171,7 +171,7 @@ class UserStore:
         username: str,
         *,
         allowed_sources: list[str] | None = None,
-        max_requests_per_hour: int | None | object = _UNSET,
+        max_requests_per_hour: int | None | object = UNSET,
     ) -> User:
         """Update mutable fields on an existing user.
 
@@ -197,7 +197,7 @@ class UserStore:
                         "Service accounts must have at least one allowed_sources entry"
                     )
                 user.allowed_sources = list(allowed_sources)
-            if max_requests_per_hour is not _UNSET:
+            if max_requests_per_hour is not UNSET:
                 user.max_requests_per_hour = max_requests_per_hour  # type: ignore[assignment]
             self._save()
             return user.model_copy()
