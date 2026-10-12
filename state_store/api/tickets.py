@@ -19,6 +19,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
+_directive_normalizer = None
+
+
+def set_directive_normalizer(fn):
+    global _directive_normalizer
+    _directive_normalizer = fn
+
 
 async def _require_claim_control(request: Request) -> Principal:
     """Restrict claim control-plane operations to trusted principals."""
@@ -236,11 +243,16 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
 
     require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
+    fields = body.fields
+    if "directives" in fields and _directive_normalizer is not None:
+        fields = dict(fields)
+        fields["directives"] = _directive_normalizer(fields["directives"])
+
     try:
         session_id, epoch, claim_id, leader_only = mutation_fence(request)
         return store.update_fields(
             ticket_id,
-            body.fields,
+            fields,
             session_id=session_id,
             epoch=epoch,
             claim_id=claim_id,

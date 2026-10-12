@@ -2716,9 +2716,13 @@ async def _poll_loop_after_lease(
     # Provider-backed harnesses register via get_directive_schema().
     # Standalone harnesses register at module import.
     import providers.skills.boot_time  # noqa: F401
-    from providers.directives import collect_from_providers
+    from providers.directives import collect_from_providers, normalize_directives
 
     collect_from_providers(skills)
+
+    from state_store.api.tickets import set_directive_normalizer
+
+    set_directive_normalizer(lambda d: normalize_directives(d)[0])
 
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")
