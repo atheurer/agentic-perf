@@ -20,10 +20,12 @@ _UPSTREAM_PREFIX = "skill://upstream/"
 _CONFIG_PREFIX = "skill://configuration/"
 _LOCAL_SUBJECT_DIRS = {
     "harness/kube-burner": "kube-burner",
+    "harness/k8s-netperf": "k8s-netperf",
     "resource/aws": "resource/aws",
 }
 _UPSTREAM_REPOS = {
     "harness/kube-burner": "kube-burner",
+    "harness/k8s-netperf": "k8s-netperf",
 }
 _MAX_SOURCE_DOCUMENT_BYTES = 1024 * 1024
 _MAX_SOURCE_SEARCH_BYTES = 4 * 1024 * 1024

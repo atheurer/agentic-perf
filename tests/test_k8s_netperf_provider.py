@@ -36,7 +36,8 @@ async def test_endpoint_types_kube(provider: K8sNetperfSkillProvider):
 async def test_roles_and_min_hosts(provider: K8sNetperfSkillProvider):
     benchmarks = await provider.list_benchmarks()
     for b in benchmarks:
-        assert b.roles == ["client"]
+        # Client/server workloads are Kubernetes pods, not host allocations.
+        assert b.roles == []
         assert b.min_hosts == 1
 
 

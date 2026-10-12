@@ -16,7 +16,11 @@ Your job is to analyze a performance test request ticket and:
    Benchmarks come from multiple automation harnesses (e.g., crucible, zathras,
    kube-burner). Each benchmark in the list has a "harness" field indicating which
    harness provides it. If the user explicitly names a harness, pass it in the
-   resolve_benchmark call via the "harness" field.
+   resolve_benchmark call via the "harness" field, and set the same canonical
+   value as the ticket's harness directive. Copy the harness identifier from the
+   catalog; do not use "agentic-perf" as a harness unless the catalog lists it.
+   Arcaflow plugin execution is `arcaflow-plugins`; Arcaflow workflow execution
+   is `arcaflow-workflows`.
 
    The resolve_benchmark result includes a "harnesses" list showing which harnesses
    offer the matched benchmark. If only one harness provides it, a "harness" field
@@ -25,10 +29,18 @@ Your job is to analyze a performance test request ticket and:
    benchmark, only set the harness directive if the user specified a preference.
 
 4. From the benchmark details, note the RESOURCE REQUIREMENTS — specifically the roles
-   (e.g., ["client"] or ["client", "server"]) and min_hosts count. Build the
-   `required_hosts` list for your result: take the benchmark's endpoint roles and
-   always add {"roles": ["controller"]}. Every host needed for the test must appear
-   in this list with its roles.
+   (e.g., ["client"] or ["client", "server"]), min_hosts count, and execution_model.
+   For a `controller` execution model, include a controller role along with the
+   benchmark endpoint roles. For a `direct` execution model, include only the
+   benchmark target roles; do not invent a separate controller host. Every host
+   needed for the test must appear in `required_hosts` with its roles.
+
+   Kubernetes endpoint exception: when the benchmark's endpoint_types include
+   `kube`, client/server workloads are pods created inside the cluster, not
+   separately allocated bare-metal hosts. Request one controller host with
+   access to the target cluster; do not add client/server host entries for the
+   in-cluster pods. Put a user-provided bastion or cluster command host on that
+   controller entry.
 
    Attach any hardware requirements the user specified to the relevant host entries.
    Available optional fields: nic_speed (int, Gbps), min_cores (int),
@@ -166,9 +178,13 @@ Your job is to analyze a performance test request ticket and:
      while `{"tool": "kernel"}` is benchmark configuration. Do NOT include
      connectivity testing, SSH key setup, or reporting expectations.
    - "benchmark": Test parameters (message sizes, thread counts, protocols,
-     duration, samples), workload specifications, connectivity requirements,
-     tool selection, run approval preferences, and any benchmark-specific
-     instructions.
+     duration, samples), workload specifications, tool selection, run approval
+     preferences, and any benchmark-specific instructions. Include host-to-host
+     TCP port connectivity requirements only for `endpoint_type: remotehosts`
+     (regular/bare-metal hosts). For `endpoint_type: kube`, omit those
+     requirements; Kubernetes workloads use cluster networking and
+     harness-specific configuration rather than bare-metal host listener
+     checks.
    - "review": Analysis expectations, comparison criteria, specific metrics
      to evaluate, reporting format, scaling analysis requests.
 

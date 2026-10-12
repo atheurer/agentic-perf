@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import PurePosixPath
 from typing import Any
 
 from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
@@ -251,6 +252,17 @@ class KubeBurnerSkillProvider(SkillProvider):
             job["objects"].append(obj)
 
         config: dict[str, Any] = {
+            # Agentic-perf needs local result files to return measurements to
+            # the benchmark agent. An indexer is not created when this
+            # section is omitted from kube-burner's run configuration.
+            "metricsEndpoints": [
+                {
+                    "indexer": {
+                        "type": "local",
+                        "metricsDirectory": "collected-metrics",
+                    }
+                }
+            ],
             "global": {
                 "gc": merged.get("gc", True),
                 "measurements": [
@@ -288,6 +300,41 @@ class KubeBurnerSkillProvider(SkillProvider):
                     "type": "object",
                     "description": "kube-burner config YAML content",
                     "properties": {
+                        "metricsEndpoints": {
+                            "type": "array",
+                            "description": (
+                                "Result indexers. Include a local indexer so "
+                                "agentic-perf can retrieve measurement files."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "indexer": {
+                                        "type": "object",
+                                        "properties": {
+                                            "type": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "local",
+                                                    "elastic",
+                                                    "opensearch",
+                                                    "tsdb",
+                                                ],
+                                            },
+                                            "metricsDirectory": {
+                                                "type": "string",
+                                                "description": (
+                                                    "Directory relative to the "
+                                                    "run working directory."
+                                                ),
+                                            },
+                                        },
+                                        "required": ["type"],
+                                    }
+                                },
+                                "required": ["indexer"],
+                            },
+                        },
                         "global": {
                             "type": "object",
                             "properties": {
@@ -312,7 +359,7 @@ class KubeBurnerSkillProvider(SkillProvider):
                             },
                         },
                     },
-                    "required": ["global", "jobs"],
+                    "required": ["metricsEndpoints", "global", "jobs"],
                 },
                 "templates": {
                     "type": "object",
@@ -374,5 +421,36 @@ class KubeBurnerSkillProvider(SkillProvider):
                             f"Object references template '{tpl_name}' "
                             f"but it is not in 'templates'"
                         )
+
+        metrics_endpoints = config.get("metricsEndpoints")
+        local_indexers = (
+            [
+                endpoint["indexer"]
+                for endpoint in metrics_endpoints
+                if isinstance(endpoint, dict)
+                and isinstance(endpoint.get("indexer"), dict)
+                and endpoint["indexer"].get("type") == "local"
+            ]
+            if isinstance(metrics_endpoints, list)
+            else []
+        )
+        has_local_indexer = bool(local_indexers)
+        if not has_local_indexer:
+            errors.append(
+                "A local metricsEndpoints indexer is required so "
+                "agentic-perf can retrieve benchmark results"
+            )
+        for indexer in local_indexers:
+            metrics_directory = indexer.get("metricsDirectory")
+            if metrics_directory is None:
+                continue  # kube-burner defaults to collected-metrics-<uuid>
+            if not isinstance(metrics_directory, str) or not metrics_directory:
+                errors.append("Local indexer metricsDirectory must be a path")
+                continue
+            normalized = PurePosixPath(metrics_directory)
+            if normalized.is_absolute() or ".." in normalized.parts:
+                errors.append(
+                    "Local indexer metricsDirectory must stay inside the run directory"
+                )
 
         return {"valid": len(errors) == 0, "errors": errors}

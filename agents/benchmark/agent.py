@@ -602,6 +602,10 @@ class BenchmarkAgent(AgentBase):
             # From arcaflow_plugin_server.py:
             "get_plugin_schema",
             "execute_arcaflow_plugin",
+            # Large plugin schemas spill by reference; allow focused inspection.
+            "jq_file_from_workspace",
+            "read_file_from_workspace",
+            "list_files_from_workspace",
             # From external Arcaflow MCP (plugin discovery):
             "plugin_list",
             "plugin_describe",
@@ -644,6 +648,22 @@ class BenchmarkAgent(AgentBase):
         "kube-burner": {
             "list_harness_docs",
             "read_harness_doc",
+            # Controller-side validation and immutable run-file approval are
+            # currently Crucible-only. Kube-burner receives its run-file
+            # directly at execution and uses request_clarification for HITL.
+            "validate_benchmark",
+            "present_runfile_for_approval",
+            "resolve_benchmark_approval",
+        },
+        "k8s-netperf": {
+            "list_harness_docs",
+            "read_harness_doc",
+            # This harness has no controller-side run-file validation or
+            # immutable approval workflow. Its execution handler validates
+            # the bundle it consumes.
+            "validate_benchmark",
+            "present_runfile_for_approval",
+            "resolve_benchmark_approval",
         },
     }
 
@@ -717,6 +737,8 @@ class BenchmarkAgent(AgentBase):
             prompt += "\n\n" + skill_context_prompt("harness/crucible")
         elif harness == "kube-burner":
             prompt += "\n\n" + skill_context_prompt("harness/kube-burner")
+        elif harness == "k8s-netperf":
+            prompt += "\n\n" + skill_context_prompt("harness/k8s-netperf")
 
         if self._ticket_execution_model(ticket) == EXECUTION_MODEL_DIRECT:
             prompt += (
@@ -1120,7 +1142,10 @@ class BenchmarkAgent(AgentBase):
         )
 
         skills_dir = Path(__file__).resolve().parent.parent.parent / "skills" / harness
-        if harness not in {"crucible", "kube-burner"} and skills_dir.is_dir():
+        if (
+            harness not in {"crucible", "kube-burner", "k8s-netperf"}
+            and skills_dir.is_dir()
+        ):
             content += f"\n## {harness} Skills (read these first)\n"
             content += "These contain critical lessons from prior runs:\n\n"
             for f in sorted(skills_dir.glob("*.md")):
@@ -1144,7 +1169,11 @@ class BenchmarkAgent(AgentBase):
 
         # Crucible documentation is served by the source-aware gateway.  Keep
         # the generic cache path for harnesses that have not adopted it yet.
-        if self._repo_cache and harness not in {"crucible", "kube-burner"}:
+        if self._repo_cache and harness not in {
+            "crucible",
+            "kube-burner",
+            "k8s-netperf",
+        }:
             docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])
             if docs:
                 content += f"\n## Available {harness} Documentation\n"

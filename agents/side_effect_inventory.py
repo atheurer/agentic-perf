@@ -624,6 +624,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/resource/registry.py", "get_provider", "cloud_resource"),
     ("providers/resource/registry.py", "list_configured_providers", "cloud_resource"),
     ("providers/secrets/bitwarden.py", "secret_file", "filesystem"),
+    ("providers/secrets/git_reference.py", "secret_file", "filesystem"),
     ("providers/skills/arcaflow_plugins.py", "__init__", "filesystem"),
     ("providers/skills/arcaflow_plugins.py", "_benchmark_to_repo_name", "filesystem"),
     ("providers/skills/arcaflow_plugins.py", "_cache_path", "filesystem"),
@@ -3431,6 +3432,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/secrets/bitwarden.py:secret_file",
+        "2027-12-31",
+    ),
+    ("providers/secrets/git_reference.py", "secret_file", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "providers/secrets/git_reference.py:secret_file",
         "2027-12-31",
     ),
     ("providers/skills/arcaflow_plugins.py", "__init__", "filesystem"): (

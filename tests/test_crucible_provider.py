@@ -66,9 +66,11 @@ async def test_generate_runfile_with_tags(provider: CrucibleSkillProvider):
     assert result.template["tags"] == {"environment": "test", "ticket": "PERF-100"}
 
 
-@pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")
 @pytest.mark.asyncio
-async def test_generate_runfile_no_endpoints(provider: CrucibleSkillProvider):
+async def test_generate_runfile_no_endpoints():
+    # Isolate run-file generation from examples in the developer's Crucible
+    # checkout, which may carry ticket-specific tags of its own.
+    provider = CrucibleSkillProvider("/nonexistent")
     result = await provider.generate_runfile("fio", {})
     assert "endpoints" not in result.template
     assert result.template["tags"] == {}
@@ -1741,11 +1743,23 @@ async def test_validate_runfile_passes_for_generated(provider: CrucibleSkillProv
     )
 
 
-@pytest.mark.skipif(not HAS_CRUCIBLE, reason="CRUCIBLE_HOME not available")
 @pytest.mark.asyncio
-async def test_validate_runfile_rejects_extra_keys(provider: CrucibleSkillProvider):
+async def test_validate_runfile_rejects_extra_keys(
+    monkeypatch,
+):
     """Run-file with extra top-level keys must fail validation."""
-    bad_runfile = {"benchmarks": [], "harness": "crucible"}
+    provider = CrucibleSkillProvider("/nonexistent")
+    monkeypatch.setattr(
+        provider,
+        "_load_schema",
+        lambda: {
+            "type": "object",
+            "properties": {"benchmarks": {"type": "array"}},
+            "required": ["benchmarks"],
+            "additionalProperties": False,
+        },
+    )
+    bad_runfile = {"benchmarks": [], "tags": {}, "harness": "crucible"}
     validation = await provider.validate_runfile(bad_runfile)
     assert not validation["valid"]
     assert any("harness" in e for e in validation["errors"])

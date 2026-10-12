@@ -6,3 +6,6 @@ For kube endpoints (endpoint_type: "kube"):
 - The controller serves as both the benchmark controller and the K8s
   cluster host. Use the controller's private IP as the kube host address
 - Targets may be empty — workloads run as pods, not on separate hosts
+- Do not request or test bare-metal host-to-host TCP port connectivity, and
+  do not use `test_port_connectivity`; those checks apply to `remotehosts`
+  endpoints only

@@ -1771,8 +1771,20 @@ class ResourceAgent(AgentBase):
 
         required_hosts = fields.get("required_hosts", [])
         endpoint_type = directives.get("endpoint_type", "remotehosts")
+        execution_model = fields.get("execution_model", "controller")
         if required_hosts:
             content += "\n## Resource Requirements\n"
+            content += f"- **Execution model:** {execution_model}\n"
+            content += f"- **Endpoint type:** {endpoint_type}\n"
+            if execution_model == "direct":
+                content += (
+                    "- Allocate benchmark hosts as targets only; no controller.\n"
+                )
+            elif endpoint_type == "kube":
+                content += (
+                    "- Allocate one controller with cluster access; workload pods "
+                    "are not separate host allocations.\n"
+                )
             has_identity = any(h.get("host") for h in required_hosts)
             all_identity = has_identity and all(h.get("host") for h in required_hosts)
             for i, h in enumerate(required_hosts, 1):
@@ -1803,8 +1815,7 @@ class ResourceAgent(AgentBase):
                     "with validate_host and submit their exact identities.\n"
                 )
             if endpoint_type == "kube":
-                content += "- **Endpoint type:** kube (workloads run as pods)\n"
-                content += "- **Total hosts to provision:** 1 (single host: controller + K8s cluster)\n"
+                content += "- **Kubernetes cluster:** workloads run as pods\n"
 
         # Fleet investigation context
         fleet = fields.get("fleet_investigation", {})

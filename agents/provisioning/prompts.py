@@ -32,9 +32,10 @@ take a single host per call — call them once per host that needs tuning.
 ## Combined Tools
 
 **ensure_prerequisites** — checks what's installed and installs what's
-missing in one call. Pass controller_host when applicable. Pass
-extra_packages for user-requested packages (e.g., nmap-ncat) that go
-on ALL hosts.
+missing in one call. Pass controller_host when applicable. It reads the
+ticket's `endpoint_type`: the `nmap-ncat` connectivity helper is needed only
+for `remotehosts`, not for Kubernetes (`kube`) endpoints. Pass extra_packages
+for user-requested packages that go on ALL hosts.
 
 **ensure_harness_installed** — combines check_existing_install +
 install_harness + verify_harness_install into one batched call.
@@ -53,7 +54,10 @@ install_harness + verify_harness_install into one batched call.
    attempt installation.
 
 3. **Install prerequisites** with ensure_prerequisites on all hosts.
-   Include any user-requested packages in extra_packages.
+   Include any user-requested packages in extra_packages. The tool reads the
+   ticket's endpoint type and omits host connectivity-testing packages such
+   as `nmap-ncat` for `endpoint_type: kube`; those are only needed for
+   regular/bare-metal `remotehosts` tests.
    IMPORTANT: Do not assume benchmark tool binaries (e.g., uperf, fio)
    need to be installed on the host. Check the harness's skill
    configuration first — some harnesses run benchmark tools inside

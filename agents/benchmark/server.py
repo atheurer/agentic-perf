@@ -1402,14 +1402,14 @@ async def read_skills(docs: list[dict]) -> str:
     for doc in docs:
         harness = doc.get("harness") or doc.get("category", "")
         filename = doc.get("filename") or doc.get("name", "")
-        if harness == "kube-burner":
+        if harness in {"kube-burner", "k8s-netperf"}:
             results.append(
                 {
                     "found": False,
                     "harness": harness,
                     "filename": filename,
                     "message": (
-                        "Use get_skill_context(subject='harness/kube-burner', "
+                        f"Use get_skill_context(subject='harness/{harness}', "
                         "operation='bootstrap')."
                     ),
                 }
@@ -1430,11 +1430,11 @@ async def list_harness_docs(harness: str) -> str:
                 "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
             }
         )
-    if harness == "kube-burner":
+    if harness in {"kube-burner", "k8s-netperf"}:
         return json.dumps(
             {
                 "docs": [],
-                "message": "Use get_skill_context(subject='harness/kube-burner', operation='bootstrap').",
+                "message": f"Use get_skill_context(subject='harness/{harness}', operation='bootstrap').",
             }
         )
     if not _repo_cache:
@@ -1462,11 +1462,11 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
                 "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
             }
         )
-    if harness == "kube-burner":
+    if harness in {"kube-burner", "k8s-netperf"}:
         return json.dumps(
             {
                 "found": False,
-                "message": "Use get_skill_context(subject='harness/kube-burner', operation='bootstrap').",
+                "message": f"Use get_skill_context(subject='harness/{harness}', operation='bootstrap').",
             }
         )
     content = _repo_cache.read_file(harness, doc_path)
@@ -2943,16 +2943,84 @@ async def execute_benchmark(
             ),
         }
         if result.exit_code == 0:
-            metrics_result = await _ssh.run(
-                controller,
-                f"cat {template_dir}/collected-metrics/*.json 2>/dev/null | head -c 3000",
-                timeout=30,
-            )
-            if metrics_result.exit_code == 0 and metrics_result.stdout:
-                try:
-                    response["result_summary"] = json.loads(metrics_result.stdout)
-                except json.JSONDecodeError:
-                    response["result_summary"] = metrics_result.stdout[:3000]
+            response["output"] = (result.stdout or "")[-6000:]
+            local_indexers = [
+                endpoint["indexer"]
+                for endpoint in config.get("metricsEndpoints", [])
+                if isinstance(endpoint, dict)
+                and isinstance(endpoint.get("indexer"), dict)
+                and endpoint["indexer"].get("type") == "local"
+            ]
+            result_directories: list[str] = []
+            for indexer in local_indexers:
+                metrics_directory = indexer.get("metricsDirectory")
+                if not metrics_directory:
+                    metrics_directory = "collected-metrics-{{.UUID}}"
+                metrics_directory = str(metrics_directory).replace(
+                    "{{.UUID}}", run_uuid
+                )
+                result_directory = os.path.normpath(
+                    os.path.join(template_dir, metrics_directory)
+                )
+                if os.path.commonpath([template_dir, result_directory]) == template_dir:
+                    result_directories.append(result_directory)
+
+            response["result_directories"] = result_directories
+            result_files: list[str] = []
+            for result_directory in result_directories:
+                listing = await _ssh.run(
+                    controller,
+                    "find "
+                    f"{shlex.quote(result_directory)} "
+                    "-maxdepth 2 -type f -name '*.json' -printf '%P\\n' "
+                    "2>/dev/null | sort | head -20",
+                    timeout=30,
+                )
+                for relative_path in (listing.stdout or "").splitlines():
+                    if relative_path:
+                        result_files.append(
+                            os.path.join(result_directory, relative_path)
+                        )
+                    if len(result_files) >= 20:
+                        break
+                if len(result_files) >= 20:
+                    break
+
+            response["result_files"] = result_files
+            if result_files:
+                # Keep the model-facing payload bounded; the returned file
+                # list lets the agent retrieve individual artifacts if needed.
+                files_to_read = result_files[:20]
+                read_command = (
+                    "cat -- "
+                    + " ".join(shlex.quote(path) for path in files_to_read)
+                    + " 2>/dev/null | head -c 6000"
+                )
+                metrics_result = await _ssh.run(controller, read_command, timeout=30)
+                metrics_content = metrics_result.stdout or ""
+                if len(files_to_read) == 1 and len(metrics_content) < 6000:
+                    try:
+                        response["result_summary"] = json.loads(metrics_content)
+                    except json.JSONDecodeError:
+                        response["result_summary"] = {
+                            "files": files_to_read,
+                            "content": metrics_content,
+                            "truncated": False,
+                        }
+                else:
+                    response["result_summary"] = {
+                        "files": files_to_read,
+                        "content": metrics_content,
+                        "truncated": len(metrics_content) >= 6000,
+                    }
+            else:
+                response["result_collection"] = {
+                    "status": "empty",
+                    "message": (
+                        "kube-burner exited successfully but no local JSON result "
+                        "files were found in the configured metrics directory"
+                    ),
+                }
         if result.exit_code != 0:
             response["output"] = result.stdout[-3000:] if result.stdout else ""
             response["error"] = result.stderr[-1000:] if result.stderr else ""
@@ -3615,7 +3683,74 @@ async def execute_benchmark(
         template_dir = f"/tmp/k8s-netperf-{run_uuid}"
         config_path = f"{template_dir}/netperf.yml"
 
-        await _ssh.run(controller, f"mkdir -p {template_dir}")
+        namespace_probe = await _ssh.run(
+            controller,
+            "kubectl get namespace netperf -o name",
+            timeout=30,
+        )
+        if namespace_probe.exit_code == 0:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": 1,
+                    "harness": "k8s-netperf",
+                    "message": (
+                        "Refusing to run because namespace netperf already exists; "
+                        "the harness uses this namespace and cleanup would affect "
+                        "resources owned by another user"
+                    ),
+                }
+            )
+        if "notfound" not in (namespace_probe.stderr or "").lower():
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": namespace_probe.exit_code or 1,
+                    "harness": "k8s-netperf",
+                    "message": (
+                        "Could not verify that namespace netperf is absent; "
+                        "refusing to change the cluster"
+                    ),
+                    "error": (namespace_probe.stderr or "")[-1000:],
+                }
+            )
+
+        cluster_nodes = await _ssh.run(
+            controller,
+            "kubectl get nodes -o name",
+            timeout=60,
+        )
+        if cluster_nodes.exit_code != 0 or not (cluster_nodes.stdout or "").strip():
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": cluster_nodes.exit_code or 1,
+                    "harness": "k8s-netperf",
+                    "message": "Could not verify that the cluster has any nodes",
+                    "error": (cluster_nodes.stderr or "")[-1000:],
+                }
+            )
+
+        unlabeled_nodes = await _ssh.run(
+            controller,
+            "kubectl get nodes -l '!node-role.kubernetes.io/worker' -o name",
+            timeout=60,
+        )
+        if unlabeled_nodes.exit_code != 0:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": unlabeled_nodes.exit_code,
+                    "harness": "k8s-netperf",
+                    "message": "Could not determine which nodes need the worker label",
+                    "error": (unlabeled_nodes.stderr or "")[-1000:],
+                }
+            )
+        nodes_to_restore = [
+            node.strip()
+            for node in (unlabeled_nodes.stdout or "").splitlines()
+            if node.strip()
+        ]
 
         # v1 flat-dict YAML: k8s-netperf's Go yaml.v3 parser
         # expects {testName: Config} not {tests: [{testName: Config}]}
@@ -3637,51 +3772,171 @@ async def execute_benchmark(
                         lines.append(f"  {k}: {json.dumps(v)}")
         config_content = "\n".join(lines)
 
-        await _ssh.run(
-            controller,
-            f"cat > {config_path} << 'NPEOF'\n{config_content}\nNPEOF",
-        )
+        created_namespace = False
+        added_worker_labels: list[str] = []
+        cleanup_errors: list[dict[str, Any]] = []
+        response: dict[str, Any] | None = None
+        try:
+            namespace_create = await _ssh.run(
+                controller,
+                "kubectl create namespace netperf",
+                timeout=60,
+            )
+            if namespace_create.exit_code != 0:
+                response = {
+                    "status": "failed",
+                    "exit_code": namespace_create.exit_code,
+                    "harness": "k8s-netperf",
+                    "message": "Could not create the netperf namespace",
+                    "error": (namespace_create.stderr or "")[-1000:],
+                }
+            else:
+                created_namespace = True
 
-        setup_cmds = [
-            "kubectl create ns netperf --dry-run=client -o yaml | kubectl apply -f -",
-            "kubectl create sa netperf -n netperf --dry-run=client -o yaml | kubectl apply -f -",
-            "kubectl label node --all node-role.kubernetes.io/worker= --overwrite",
-            "kubectl delete ns netperf --wait=true --ignore-not-found",
-            "kubectl create ns netperf",
-            "kubectl create sa netperf -n netperf",
-        ]
-        for setup_cmd in setup_cmds:
-            await _ssh.run(controller, setup_cmd, timeout=60)
+            if response is None:
+                service_account = await _ssh.run(
+                    controller,
+                    "kubectl create serviceaccount netperf -n netperf",
+                    timeout=60,
+                )
+                if service_account.exit_code != 0:
+                    response = {
+                        "status": "failed",
+                        "exit_code": service_account.exit_code,
+                        "harness": "k8s-netperf",
+                        "message": "Could not create the netperf service account",
+                        "error": (service_account.stderr or "")[-1000:],
+                    }
 
-        flags_str = " ".join(cli_flags)
-        np_cmd = run_command or "k8s-netperf"
-        cmd = f"{np_cmd} --config {config_path} {flags_str} --json 2>&1"
-        logger.info(f"[benchmark] Executing k8s-netperf: {cmd}")
-        result = await _ssh.run_with_progress(
-            controller,
-            cmd,
-            progress_callback=_benchmark_progress,
-        )
+            if response is None:
+                for node in nodes_to_restore:
+                    label_cmd = shlex.join(
+                        [
+                            "kubectl",
+                            "label",
+                            node,
+                            "node-role.kubernetes.io/worker=",
+                            "--overwrite",
+                        ]
+                    )
+                    label_result = await _ssh.run(
+                        controller,
+                        label_cmd,
+                        timeout=60,
+                    )
+                    if label_result.exit_code != 0:
+                        response = {
+                            "status": "failed",
+                            "exit_code": label_result.exit_code,
+                            "harness": "k8s-netperf",
+                            "message": f"Could not add the worker label to {node}",
+                            "error": (label_result.stderr or "")[-1000:],
+                        }
+                        break
+                    added_worker_labels.append(node)
 
-        response = {
-            "status": "completed" if result.exit_code == 0 else "failed",
-            "exit_code": result.exit_code,
-            "run_id": f"k8s-netperf-{run_uuid}",
-            "harness": "k8s-netperf",
-            "message": (
-                "Benchmark completed"
-                if result.exit_code == 0
-                else f"Benchmark failed (exit {result.exit_code})"
-            ),
-        }
-        if result.exit_code == 0 and result.stdout:
-            try:
-                response["result_summary"] = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                response["result_summary"] = result.stdout[:3000]
-        if result.exit_code != 0:
-            response["output"] = result.stdout[-3000:] if result.stdout else ""
-            response["error"] = result.stderr[-1000:] if result.stderr else ""
+            if response is None:
+                await _ssh.run(controller, f"mkdir -p {shlex.quote(template_dir)}")
+                await _ssh.run(
+                    controller,
+                    f"cat > {shlex.quote(config_path)} << 'NPEOF'\n"
+                    f"{config_content}\nNPEOF",
+                )
+
+                flags_str = shlex.join(cli_flags)
+                np_cmd = run_command or "k8s-netperf"
+                cmd = f"{np_cmd} --config {shlex.quote(config_path)} {flags_str} --json 2>&1"
+                logger.info(f"[benchmark] Executing k8s-netperf: {cmd}")
+                result = await _ssh.run_with_progress(
+                    controller,
+                    cmd,
+                    progress_callback=_benchmark_progress,
+                )
+
+                response = {
+                    "status": "completed" if result.exit_code == 0 else "failed",
+                    "exit_code": result.exit_code,
+                    "run_id": f"k8s-netperf-{run_uuid}",
+                    "harness": "k8s-netperf",
+                    "message": (
+                        "Benchmark completed"
+                        if result.exit_code == 0
+                        else f"Benchmark failed (exit {result.exit_code})"
+                    ),
+                }
+                if result.exit_code == 0 and result.stdout:
+                    try:
+                        response["result_summary"] = json.loads(result.stdout)
+                    except json.JSONDecodeError:
+                        response["result_summary"] = result.stdout[:3000]
+                if result.exit_code != 0:
+                    response["output"] = result.stdout[-3000:] if result.stdout else ""
+                    response["error"] = result.stderr[-1000:] if result.stderr else ""
+        except Exception as exc:
+            logger.exception("[benchmark] k8s-netperf execution failed")
+            response = {
+                "status": "failed",
+                "exit_code": -1,
+                "harness": "k8s-netperf",
+                "message": "k8s-netperf execution raised an exception",
+                "error": str(exc)[:1000],
+            }
+        finally:
+            for node in added_worker_labels:
+                unlabel_cmd = shlex.join(
+                    ["kubectl", "label", node, "node-role.kubernetes.io/worker-"]
+                )
+                unlabel = await _ssh.run(controller, unlabel_cmd, timeout=60)
+                if unlabel.exit_code != 0:
+                    cleanup_errors.append(
+                        {
+                            "action": f"remove worker label from {node}",
+                            "exit_code": unlabel.exit_code,
+                            "error": (unlabel.stderr or "")[-500:],
+                        }
+                    )
+            if created_namespace:
+                delete_namespace = await _ssh.run(
+                    controller,
+                    "kubectl delete namespace netperf --wait=true --ignore-not-found",
+                    timeout=120,
+                )
+                if delete_namespace.exit_code != 0:
+                    cleanup_errors.append(
+                        {
+                            "action": "delete created namespace netperf",
+                            "exit_code": delete_namespace.exit_code,
+                            "error": (delete_namespace.stderr or "")[-500:],
+                        }
+                    )
+            remove_temp = await _ssh.run(
+                controller,
+                f"rm -rf {shlex.quote(template_dir)}",
+                timeout=30,
+            )
+            if remove_temp.exit_code != 0:
+                cleanup_errors.append(
+                    {
+                        "action": "remove temporary k8s-netperf directory",
+                        "exit_code": remove_temp.exit_code,
+                        "error": (remove_temp.stderr or "")[-500:],
+                    }
+                )
+
+        if response is None:
+            response = {
+                "status": "failed",
+                "exit_code": -1,
+                "harness": "k8s-netperf",
+                "message": "k8s-netperf did not produce a result",
+            }
+        if cleanup_errors:
+            response["cleanup_errors"] = cleanup_errors
+            if response.get("status") == "completed":
+                response["status"] = "failed"
+                response["message"] = (
+                    "Benchmark completed, but cluster cleanup was incomplete"
+                )
         return json.dumps(response)
 
     # Default: crucible (and any unknown harness that uses JSON run-files)
@@ -4245,7 +4500,18 @@ async def get_run_logs(
 
     byte_limit = min(max_kb, 200) * 1024
 
-    if run_id.startswith("/"):
+    if run_id.startswith("/") and harness == "kube-burner":
+        match = re.fullmatch(r"/tmp/kb-([0-9a-f]{8})", run_id)
+        if not match:
+            return json.dumps(
+                {
+                    "status": "invalid_run_id",
+                    "message": "Expected a kube-burner run ID or its /tmp/kb-<uuid> directory",
+                }
+            )
+        run_uuid = match.group(1)
+        run_dir = run_id
+    elif run_id.startswith("/"):
         run_dir = run_id
     elif harness == "zathras":
         search_pattern = results_dir_pattern or "/tmp/results_*"
@@ -4254,6 +4520,17 @@ async def get_run_logs(
             f"ls -dt {search_pattern} 2>/dev/null | head -1",
         )
         run_dir = result.stdout.strip()
+    elif harness == "kube-burner":
+        match = re.fullmatch(r"kube-burner-([0-9a-f]{8})", run_id)
+        if not match:
+            return json.dumps(
+                {
+                    "status": "invalid_run_id",
+                    "message": "Expected a kube-burner run ID returned by execute_benchmark",
+                }
+            )
+        run_uuid = match.group(1)
+        run_dir = f"/tmp/kb-{run_uuid}"
     else:
         result = await _ssh.run(
             controller,
@@ -4271,6 +4548,23 @@ async def get_run_logs(
             controller,
             f"find {run_dir} -name '*.log' -o -name '*.out' | head -5 | xargs tail -50 2>/dev/null",
         )
+    elif harness == "kube-burner":
+        log_path = f"{run_dir}/kube-burner-{run_uuid}.log"
+        log_result = await _ssh.run(
+            controller,
+            f"test -f {shlex.quote(log_path)}"
+            f" && tail -c {byte_limit} {shlex.quote(log_path)}",
+            timeout=60,
+        )
+        if log_result.exit_code != 0:
+            return json.dumps(
+                {
+                    "run_dir": run_dir,
+                    "log_file": log_path,
+                    "status": "not_found",
+                    "message": "kube-burner log file was not found for this run",
+                }
+            )
     else:
         log_result = await _ssh.run(
             controller,

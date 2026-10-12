@@ -15,6 +15,7 @@ below.  These exclusions are deliberately per-file, not directory-wide:
 | `providers/skills/arcaflow_plugins.py`, `providers/skills/crucible.py` | Provider discovery/bootstrap compatibility paths without a ticket argument. |
 | `providers/tracing/client.py` | The trace delivery transport itself; wrapping it would recursively audit its own persistence call. |
 | `providers/execution/http.py` | The audited boundary implementation. |
+| `providers/secrets/git_reference.py` | Anonymous, host-pinned GitLab HTTPS fetch for explicitly configured secret-file pointers; no credentials, redirects, proxy environment, or ticket-bound HTTP client are involved. |
 
 Every listed exclusion must remain narrow and be removed when that caller gets
 a ticket-bound lifecycle.  Production files not listed above must not create a

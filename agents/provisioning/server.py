@@ -325,10 +325,11 @@ async def _ensure_prerequisites_one(
     host: str,
     is_controller: bool,
     extra_packages: list[str],
+    endpoint_type: str,
 ) -> dict:
     """Check and install missing prerequisites on a single host."""
     already_present = []
-    to_install = list(BASE_HOST_PACKAGES)
+    to_install = list(BASE_HOST_PACKAGES) if endpoint_type == "remotehosts" else []
     for pkg in extra_packages:
         if pkg not in to_install:
             to_install.append(pkg)
@@ -860,10 +861,37 @@ async def _verify_harness_install_one(
     path = install_path or provisioning.get(
         "install_target_path", f"/opt/{harness_name}"
     )
-    verify_cmd = provisioning.get("verify_command", f"{path}/bin/{harness_name} help")
+    default_verify_cmd = (
+        f"{path}/bin/burden -h"
+        if harness_name == "zathras"
+        else f"{path}/bin/{harness_name} help"
+    )
+    verify_cmd = provisioning.get("verify_command", default_verify_cmd)
+    zathras_help_command = False
+    if harness_name == "zathras":
+        try:
+            verify_args = shlex.split(verify_cmd)
+        except ValueError:
+            verify_args = []
+        if (
+            len(verify_args) == 2
+            and Path(verify_args[0]).name == "burden"
+            and verify_args[-1] in {"-h", "--usage"}
+        ):
+            zathras_help_command = True
+            # Normalize the older organization setting while it is updated.
+            if verify_args[-1] == "--usage":
+                verify_args[-1] = "-h"
+                verify_cmd = shlex.join(verify_args)
 
     result = await _ssh.run(host, verify_cmd)
-    harness_verified = result.exit_code == 0
+    help_output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    zathras_help_succeeded = (
+        zathras_help_command
+        and result.exit_code == 1
+        and re.search(r"\busage\b", help_output, re.IGNORECASE) is not None
+    )
+    harness_verified = result.exit_code == 0 or zathras_help_succeeded
     context: dict[str, Any] | None = None
 
     # The context gateway bootstraps Crucible from the controller's installed
@@ -1188,25 +1216,33 @@ async def ensure_prerequisites(
     """Check and install missing prerequisites on all hosts in one call.
 
     Harness prerequisites (podman, git, jq, curl) are checked and installed
-    only on the controller_host. Base host packages (nmap-ncat) are always
-    installed on ALL hosts for connectivity testing. Additional extra_packages
-    are also installed on all hosts. Use this instead of calling
+    only on the controller_host. The base host package nmap-ncat is installed
+    on all hosts only for remotehosts endpoints, where host-to-host TCP
+    connectivity is tested. It is omitted for kube endpoints. Additional
+    extra_packages are installed on all hosts. Use this instead of calling
     check_host_prerequisites then install_packages separately.
 
     Args:
         hosts: List of host IPs to process
         extra_packages: Additional packages to install on all hosts
-            beyond the base host packages
+            beyond the endpoint-specific base host packages
         controller_host: The controller IP — harness prereqs are only
             installed here. If empty, harness prereqs are skipped on
             all hosts (only extra_packages are installed).
     """
     await _ensure_init()
+    custom_fields = _ticket.get("custom_fields", {})
+    directives = custom_fields.get("directives", {})
+    endpoint_type = directives.get("endpoint_type", "remotehosts")
+    if endpoint_type not in {"remotehosts", "kube"}:
+        return json.dumps({"error": "endpoint_type must be 'remotehosts' or 'kube'."})
     extras = extra_packages or []
 
     async def _run_one(host: str) -> dict:
         is_controller = host == controller_host
-        return await _ensure_prerequisites_one(host, is_controller, extras)
+        return await _ensure_prerequisites_one(
+            host, is_controller, extras, endpoint_type
+        )
 
     results = await _gather_for_hosts(hosts, _run_one)
     return json.dumps(_summarize(results))

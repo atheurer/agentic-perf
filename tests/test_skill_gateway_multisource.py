@@ -536,6 +536,62 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
     assert unlisted_upstream_read["reason"] == "invalid_document"
 
 
+def test_k8s_netperf_gateway_exposes_local_and_cached_upstream_docs(
+    tmp_path: Path,
+) -> None:
+    skills = tmp_path / "skills"
+    local = skills / "k8s-netperf"
+    local.mkdir(parents=True)
+    (local / "config-guide.md").write_text("Local execution contract.\n")
+    cache_root = tmp_path / "cache"
+    upstream = cache_root / "k8s-netperf" / "docs"
+    upstream.mkdir(parents=True)
+    (upstream / "README.md").write_text("Upstream k8s-netperf reference.\n")
+    git_config = cache_root / "k8s-netperf" / ".git" / "config"
+    git_config.parent.mkdir()
+    git_config.write_text(
+        '[remote "origin"]\n\turl = https://github.com/cloud-bulldozer/k8s-netperf.git\n'
+    )
+
+    from providers.skills.repo_cache import RepoCache
+
+    cache = RepoCache(cache_dir=cache_root)
+    resolver = OrganizationSkillResolver.from_instance_config({})
+
+    class Provider:
+        organization_resolver = resolver
+
+    bootstrap = json.loads(
+        asyncio.run(
+            skill_context_gateway(
+                Provider(),
+                ticket_id="TEST-K8S-NETPERF-CONTEXT",
+                agent_name="benchmark-agent",
+                phase="benchmark",
+                subject="harness/k8s-netperf",
+                local_skills_dir=skills,
+                repo_cache=cache,
+            )
+        )
+    )
+
+    assert bootstrap["found"] is True
+    assert {(item["scope"], item["status"]) for item in bootstrap["sources"]} >= {
+        ("local", "available"),
+        ("upstream", "available"),
+    }
+    assert any(
+        item["path"] == "config-guide.md" and item["scope"] == "local"
+        for item in bootstrap["documents"]
+    )
+    upstream_doc = next(
+        item for item in bootstrap["documents"] if item["scope"] == "upstream"
+    )
+    assert (
+        upstream_doc["source"] == "https://github.com/cloud-bulldozer/k8s-netperf.git"
+    )
+
+
 def test_repo_cache_origin_redacts_credentials(tmp_path: Path) -> None:
     from providers.skills.repo_cache import RepoCache
 
