@@ -104,7 +104,9 @@ def update_user(username: str, body: UpdateUserRequest, request: Request):
     else:
         kwargs["max_requests_per_hour"] = UNSET
 
-    if not kwargs or (len(kwargs) == 1 and kwargs.get("max_requests_per_hour") is UNSET):
+    if not kwargs or (
+        len(kwargs) == 1 and kwargs.get("max_requests_per_hour") is UNSET
+    ):
         raise HTTPException(status_code=422, detail="No mutable fields provided")
 
     try:
