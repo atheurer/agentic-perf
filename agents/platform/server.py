@@ -143,32 +143,7 @@ async def _provision_jumpstarter(
         _last_infra_error = None
         _last_infra_variant = None
 
-    # Point agent to full artifact files for deeper analysis
-    artifact_files = []
-    if artifact_dir:
-        _ad = Path(artifact_dir)
-        for _af in ("flash-diagnostics.json", "serial-capture.log"):
-            if (_ad / _af).exists():
-                artifact_files.append(str(_ad / _af))
-
-    response: dict[str, Any] = {
-        "success": result.success,
-        "ip": result.ip,
-        "board_name": result.board_name,
-        "ssh_user": result.ssh_user,
-        "ssh_key_path": result.ssh_key_path,
-        "diagnostics": result.diagnostics,
-        "flash_duration_s": result.flash_duration_s,
-        "boot_duration_s": result.boot_duration_s,
-        "serial_log_path": result.serial_log_path,
-        "infrastructure_error": result.infrastructure_error,
-    }
-    if artifact_files:
-        response["full_output_hint"] = (
-            "Full diagnostics available via read_artifact_file(): "
-            + ", ".join(artifact_files)
-        )
-    return json.dumps(response)
+    return json.dumps(result.to_tool_response(artifact_dir=artifact_dir))
 
 
 async def _provision_ready_host(cf: dict[str, Any]) -> str:

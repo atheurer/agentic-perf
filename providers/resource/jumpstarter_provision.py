@@ -88,6 +88,37 @@ class ProvisionResult:
     serial_log_path: str = ""
     infrastructure_error: bool = False
 
+    def to_tool_response(self, artifact_dir: str = "") -> dict[str, Any]:
+        """Build a provider-agnostic tool response dict.
+
+        Keeps Jumpstarter-specific field names (flash_duration_s,
+        board_name, infrastructure_error) in the Jumpstarter module
+        instead of the generic platform server.
+        """
+        response: dict[str, Any] = {
+            "success": self.success,
+            "ip": self.ip,
+            "board_name": self.board_name,
+            "ssh_user": self.ssh_user,
+            "ssh_key_path": self.ssh_key_path,
+            "diagnostics": self.diagnostics,
+            "flash_duration_s": self.flash_duration_s,
+            "boot_duration_s": self.boot_duration_s,
+            "infrastructure_error": self.infrastructure_error,
+        }
+        if artifact_dir:
+            artifact_files = []
+            _ad = Path(artifact_dir)
+            for name in ("flash-diagnostics.json", "serial-capture.log"):
+                if (_ad / name).exists():
+                    artifact_files.append(str(_ad / name))
+            if artifact_files:
+                response["full_output_hint"] = (
+                    "Full diagnostics available via read_artifact_file(): "
+                    + ", ".join(artifact_files)
+                )
+        return response
+
 
 _DEFAULT_PROVISION_LEASE_DURATION_SECONDS = 14_400
 
