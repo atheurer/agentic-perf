@@ -691,3 +691,107 @@ async def _run_provision_steps(
         ip,
     )
     return result
+
+
+async def prepare_and_provision(
+    custom_fields: dict[str, Any],
+    ticket_id: str = "",
+) -> tuple[ProvisionResult, str]:
+    """Prepare arguments from ticket fields and run provisioning.
+
+    Maps Jumpstarter ticket metadata (jumpstarter_flash,
+    resource_provider_metadata, directives) to provision_jumpstarter()
+    parameters.  This keeps ticket-field parsing in the Jumpstarter
+    module instead of the generic platform server.
+
+    Returns:
+        (ProvisionResult, artifact_dir) tuple.
+    """
+    flash_info = custom_fields.get("jumpstarter_flash") or {}
+    metadata = custom_fields.get("resource_provider_metadata") or {}
+
+    if flash_info.get("error"):
+        return (
+            ProvisionResult(
+                diagnostics=[
+                    f"Flash resolution error: {flash_info['error']}",
+                    f"Available variants: {flash_info.get('available_variants', [])}",
+                ],
+            ),
+            "",
+        )
+
+    # Resolve flash URL(s) from structured targets or legacy command string.
+    flash_targets = flash_info.get("flash_targets", [])
+    if flash_targets:
+        if len(flash_targets) == 1:
+            flash_url: str | dict[str, str] = flash_targets[0].get("url", "")
+        else:
+            flash_url = {
+                t["partition"]: t["url"]
+                for t in flash_targets
+                if t.get("partition") and t.get("url")
+            }
+    else:
+        flash_command = flash_info.get("flash_command", "")
+        if not flash_command:
+            return (
+                ProvisionResult(
+                    diagnostics=[
+                        "No flash_targets or flash_command in jumpstarter_flash"
+                    ],
+                ),
+                "",
+            )
+        flash_url = ""
+        for part in flash_command.split():
+            if part.startswith("http"):
+                flash_url = part
+                break
+        if not flash_url:
+            flash_url = flash_command.replace("j storage flash ", "").strip()
+
+    ssh_public_key = flash_info.get("ssh_public_key", "")
+    ssh_key_path = flash_info.get("ssh_key_path", "") or custom_fields.get(
+        "ssh_key_path", ""
+    )
+
+    if not ssh_public_key and ssh_key_path:
+        pub_path = (
+            Path(ssh_key_path)
+            .expanduser()
+            .with_suffix(Path(ssh_key_path).suffix + ".pub")
+        )
+        if pub_path.exists():
+            ssh_public_key = pub_path.read_text().strip()
+
+    board_name = metadata.get("exporter_name", "")
+    lease_id = metadata.get("lease_id", "")
+    selector = metadata.get("selector", "")
+    lease_duration_seconds = metadata.get("duration_seconds")
+
+    directives = custom_fields.get("directives") or {}
+    serial_enabled = directives.get("serial_capture", False)
+
+    artifact_dir = ""
+    if ticket_id:
+        from paths import create_artifact_dir
+
+        artifact_dir = str(create_artifact_dir(ticket_id, "platform-provision"))
+
+    provision_kwargs: dict[str, Any] = {
+        "lease_name": lease_id,
+        "flash_url": flash_url,
+        "ssh_public_key": ssh_public_key,
+        "ssh_key_path": ssh_key_path,
+        "board_name": board_name,
+        "selector": selector,
+        "serial_capture": serial_enabled,
+        "artifact_dir": artifact_dir,
+        "ticket_id": ticket_id,
+    }
+    if isinstance(lease_duration_seconds, int) and lease_duration_seconds > 0:
+        provision_kwargs["lease_duration_seconds"] = lease_duration_seconds
+
+    result = await provision_jumpstarter(**provision_kwargs)
+    return result, artifact_dir
