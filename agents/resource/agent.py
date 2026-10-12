@@ -1296,6 +1296,19 @@ class ResourceAgent(AgentBase):
                 str(provider_name), provider_metadata
             )
             if not reservation_id:
+                # Fleet investigations clear reservation fields between
+                # iterations (the lease was already released by the fleet
+                # coordinator).  If an abort arrives after that cleanup,
+                # there is nothing left to tear down.
+                from providers.fleet import is_fleet_investigation
+
+                if is_fleet_investigation(fields):
+                    await self._add_comment(
+                        ticket_id,
+                        f"Resources released ({provider_name} lease already "
+                        "cleaned up by fleet coordinator).",
+                    )
+                    return True
                 await self._add_comment(
                     ticket_id,
                     f"Cannot confirm teardown for {provider_name}: no reservation "
