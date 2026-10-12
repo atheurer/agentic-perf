@@ -3652,7 +3652,7 @@ INVENTORY_DISPOSITIONS = {
         "2027-12-31",
     ),
     ("providers/tracing/spool.py", "pending", "filesystem"): (
-    ("providers/tracing/spool.py", "_try_prune_file", "filesystem"),
+        ("providers/tracing/spool.py", "_try_prune_file", "filesystem"),
         "audited",
         "observability-maintainers",
         "providers/tracing/spool.py:pending",
