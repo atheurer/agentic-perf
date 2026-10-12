@@ -310,7 +310,9 @@ class TestHostStateTransitions:
     def test_terminal_states_have_no_transitions(self):
         for state in TERMINAL_STATES:
             if state == "indeterminate":
-                assert HOST_STATE_TRANSITIONS.get(state) == frozenset({"verified"})
+                assert HOST_STATE_TRANSITIONS.get(state) == frozenset(
+                    {"verified", "fallback_boot", "kernel_mismatch"}
+                )
             else:
                 assert state not in HOST_STATE_TRANSITIONS or (
                     HOST_STATE_TRANSITIONS[state] == frozenset()

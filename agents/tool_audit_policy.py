@@ -295,6 +295,8 @@ TOOL_AUDIT_POLICY = (
         "agents/benchmark/agent.py:request_clarification",
         "agents/provisioning/agent.py:request_clarification",
         "agents/provisioning/agent.py:submit_provisioning_result",
+        "agents/provisioning/agent.py:present_kernel_change_for_approval",
+        "agents/provisioning/agent.py:resolve_kernel_approval",
         "agents/resource/agent.py:submit_resource_result",
         "agents/retrospective/agent.py:submit_retrospective",
         "agents/review/agent.py:request_clarification",

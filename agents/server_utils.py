@@ -455,7 +455,24 @@ def is_self_host(host: str) -> bool:
     host_addrs = resolve_addrs(host)
     if not host_addrs:
         return True
+    if any(_is_local_address(addr) for addr in host_addrs):
+        return True
     return bool(host_addrs & _self_addrs())
+
+
+def _is_local_address(addr: str) -> bool:
+    """True for loopback or unspecified addresses (127.0.0.2, ::, ...).
+
+    A literal allowlist misses the rest of 127.0.0.0/8 and IPv6 loopback
+    spellings; address properties do not.
+    """
+    import ipaddress
+
+    try:
+        parsed = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    return parsed.is_loopback or parsed.is_unspecified
 
 
 def _controller_relative_path(path: str) -> str | None:

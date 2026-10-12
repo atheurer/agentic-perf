@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +82,53 @@ _LOCAL_TOOLS = [
             "additionalProperties": False,
         },
     ),
+    ToolDefinition(
+        name="present_kernel_change_for_approval",
+        description=(
+            "Present a prepared kernel change intent (from prepare_kernel_change) "
+            "to the user for approval. Pauses for the human decision and returns "
+            "the approval status. install_kernel, select_default_kernel and "
+            "reboot_hosts_and_verify refuse to run without the resulting approval."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "intent_id": {
+                    "type": "string",
+                    "description": "intent_id returned by prepare_kernel_change",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "One paragraph for the user: what changes and why",
+                },
+            },
+            "required": ["intent_id"],
+        },
+    ),
+    ToolDefinition(
+        name="resolve_kernel_approval",
+        description=(
+            "Resolve the active kernel change approval after interpreting the "
+            "user's natural-language reply. Use approved only when the user "
+            "clearly authorizes the kernel install/boot-entry change/reboot; use "
+            "changes_requested or rejected otherwise. Never run a kernel action "
+            "while approval is pending."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": ["approved", "changes_requested", "rejected"],
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Brief explanation for a non-approval decision",
+                },
+            },
+            "required": ["decision"],
+        },
+    ),
 ]
 
 
@@ -96,14 +144,32 @@ class ProvisioningAgent(AgentBase):
         self._skill_provider = skill_provider
         self._secrets_provider = secrets_provider
         self._ticket_id: str | None = None
+        self._active_kernel_approval_id: str | None = None
+        self._active_kernel_approval: dict[str, Any] | None = None
 
         local_tools = list(_LOCAL_TOOLS)
 
         async def _request_clarification(question: str) -> str:
             return await self._do_request_clarification(question)
 
+        async def _present_kernel_change_for_approval(
+            intent_id: str = "",
+            summary: str | None = None,
+        ) -> str:
+            return await self._request_kernel_approval(
+                intent_id=intent_id, summary=summary
+            )
+
+        async def _resolve_kernel_approval(
+            decision: str,
+            reason: str | None = None,
+        ) -> str:
+            return await self._resolve_kernel_approval(decision=decision, reason=reason)
+
         local_handlers = {
             "request_clarification": _request_clarification,
+            "present_kernel_change_for_approval": _present_kernel_change_for_approval,
+            "resolve_kernel_approval": _resolve_kernel_approval,
         }
 
         super().__init__(
@@ -119,6 +185,208 @@ class ProvisioningAgent(AgentBase):
         if self._ticket_id:
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
+
+    # ------------------------------------------------------------------
+    # Kernel change approval (kind="kernel_change")
+    # ------------------------------------------------------------------
+
+    def _kernel_fence_headers(self, cf: dict[str, Any]) -> dict[str, str]:
+        from providers.tracing import current_trace_context
+
+        context = current_trace_context() or self.trace_context
+        headers = {
+            "X-Agentic-Perf-Orchestrator-Session": os.environ.get(
+                "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", ""
+            ),
+            "X-Agentic-Perf-Orchestrator-Epoch": os.environ.get(
+                "AGENTIC_PERF_ORCHESTRATOR_EPOCH", ""
+            ),
+            "X-Agentic-Perf-Claim-Id": os.environ.get("AGENTIC_PERF_CLAIM_ID", "")
+            or (cf.get("claim") or {}).get("claim_id", ""),
+            "X-Agentic-Perf-Invocation-Id": str(context.invocation_id)
+            if context and context.invocation_id
+            else "",
+            "X-Agentic-Perf-Tool-Call-Id": context.tool_call_id
+            if context and context.tool_call_id
+            else "",
+        }
+        return {key: value for key, value in headers.items() if value}
+
+    async def _request_kernel_approval(
+        self,
+        *,
+        intent_id: str,
+        summary: str | None,
+    ) -> str:
+        """Create one kernel_change approval bound to a persisted intent and wait.
+
+        Mirrors the benchmark run-file approval: the human decision is bound
+        to the intent digest the provisioning server persisted, never to text
+        the LLM produced.
+        """
+        if not self._ticket_id:
+            return "No ticket context available."
+        from agents.provisioning.kernel import find_intent, read_intents
+        from providers.tracing import current_trace_context
+
+        ticket = await self._get_ticket(self._ticket_id)
+        cf = ticket.get("custom_fields", {})
+        intent = find_intent(cf, intent_id) if intent_id else None
+        if intent is None:
+            return (
+                "Approval rejected: no persisted kernel change intent with that "
+                "intent_id. Call prepare_kernel_change first."
+            )
+        digest = intent.get("intent_digest", "")
+        context = current_trace_context() or self.trace_context
+        claim_id = os.environ.get("AGENTIC_PERF_CLAIM_ID") or (
+            cf.get("claim") or {}
+        ).get("claim_id")
+        request = await self._client.post(
+            f"{self.store_url}/api/v1/tickets/{self._ticket_id}/approvals",
+            headers=self._kernel_fence_headers(cf),
+            json={
+                "kind": "kernel_change",
+                "validation_id": intent_id,
+                "presented_run_file_digest": digest,
+                "execution_intent_digest": digest,
+                "summary": summary or "Kernel change approval",
+                "invocation_id": str(context.invocation_id)
+                if context and context.invocation_id
+                else None,
+                "tool_call_id": context.tool_call_id if context else None,
+                "session_id": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"),
+                "session_epoch": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH"),
+                "waiter_owner": (
+                    str(context.invocation_id)
+                    if context and context.invocation_id
+                    else None
+                ),
+                "ticket_attempt": claim_id,
+                "claim_id": claim_id,
+            },
+        )
+        request.raise_for_status()
+        approval = request.json()
+        approval_id = approval["approval_request_id"]
+        self._active_kernel_approval_id = approval_id
+        self._active_kernel_approval = approval
+
+        # Record the binding on the intent so the ticket is self-describing.
+        records = dict(read_intents(cf))
+        bound = dict(records.get(intent_id, intent))
+        bound["approval_request_id"] = approval_id
+        records[intent_id] = bound
+        await self._update_fields(
+            self._ticket_id, {"kernel_change_intents": {"records": records}}
+        )
+
+        kernel = intent.get("kernel", {})
+        question = (
+            f"Approval request {approval_id} for a kernel change.\n"
+            f"Intent ID: {intent_id}\n"
+            f"Kernel: {kernel.get('package', 'kernel')}-{kernel.get('release', '?')}\n"
+            f"Hosts: {', '.join(intent.get('hosts', []))}\n"
+            f"Actions: {', '.join(intent.get('actions_required', []))}\n"
+            f"Intent digest: {digest}\n\n"
+            f"{summary or ''}\n\n"
+            "Reply approve / request changes / reject, or use the structured "
+            "approval action."
+        )
+        await self._add_comment(self._ticket_id, f"**Approval requested:**\n{question}")
+        return await self._wait_for_kernel_approval(approval_id)
+
+    async def _wait_for_kernel_approval(self, approval_id: str) -> str:
+        reply = await self._request_human_input(
+            self._ticket_id,
+            "Review the kernel change above and reply naturally with your "
+            "decision. I will interpret your response before any package, "
+            "boot-entry or reboot action.",
+        )
+        approvals_response = await self._client.get(
+            f"{self.store_url}/api/v1/tickets/{self._ticket_id}/approvals"
+        )
+        approvals_response.raise_for_status()
+        record = next(
+            (
+                item
+                for item in approvals_response.json().get("approvals", [])
+                if item.get("approval_request_id") == approval_id
+            ),
+            None,
+        )
+        if record and record.get("status") == "approved":
+            return (
+                f"Approval already granted for request {approval_id}; pass "
+                f"approval request ID {approval_id} to install_kernel, "
+                "select_default_kernel and reboot_hosts_and_verify."
+            )
+        if record and record.get("status") != "pending":
+            return f"Approval {record.get('status')} for request {approval_id}."
+        return (
+            f"The user replied: {reply}\n\n"
+            "Interpret this response. If it clearly authorizes the kernel change, "
+            f"call resolve_kernel_approval(decision='approved') for request "
+            f"{approval_id}; otherwise resolve it as changes_requested or rejected. "
+            "Do not run install_kernel, select_default_kernel or "
+            "reboot_hosts_and_verify while approval remains pending."
+        )
+
+    async def _resolve_kernel_approval(
+        self,
+        *,
+        decision: str,
+        reason: str | None = None,
+    ) -> str:
+        if decision not in {"approved", "changes_requested", "rejected"}:
+            return f"Unsupported approval decision: {decision}"
+        approval_id = self._active_kernel_approval_id
+        approval = self._active_kernel_approval or {}
+        if not approval_id:
+            return "No active kernel change approval request is awaiting a decision."
+        response = await self._client.post(
+            f"{self.store_url}/api/v1/tickets/{self._ticket_id}/approvals/"
+            f"{approval_id}/resolve",
+            json={
+                "decision": decision,
+                "reason": reason,
+                "validation_id": approval.get("validation_id"),
+                "presented_run_file_digest": approval.get("presented_run_file_digest"),
+                "execution_intent_digest": approval.get("execution_intent_digest"),
+            },
+        )
+        response.raise_for_status()
+        if decision == "approved":
+            return (
+                f"Approval granted for request {approval_id}; pass approval "
+                f"request ID {approval_id} to install_kernel, select_default_kernel "
+                "and reboot_hosts_and_verify."
+            )
+        return (
+            f"Approval {decision} for request {approval_id}. Do not change "
+            "kernels or reboot."
+        )
+
+    async def _kernel_step_verification(
+        self, ticket_id: str, ticket: dict[str, Any] | None = None
+    ) -> tuple[bool, bool, dict[str, str]]:
+        """Return (is_kernel_step, verified, verification) from the checkpoint.
+
+        A kernel step's completion evidence is the reboot tool's checkpoint
+        (written after live probes), never the LLM's own summary.
+        """
+        from agents.provisioning.kernel import (
+            current_kernel_step,
+            verification_from_transition,
+        )
+
+        if ticket is None:
+            ticket = await self._get_ticket(ticket_id)
+        step = current_kernel_step(ticket)
+        if step is None:
+            return False, False, {}
+        ok, verification = verification_from_transition(ticket, step[0])
+        return True, ok, verification
 
     async def _validate_submit_call(
         self, ticket_id: str, submit_call: ToolCall
@@ -252,6 +520,21 @@ class ProvisioningAgent(AgentBase):
                             + ", ".join(unallocated_hosts)
                             + ". Use only assigned_hardware_ips identities"
                         )
+
+        if not errors and complete is True:
+            (
+                is_kernel_step,
+                verified,
+                verification,
+            ) = await self._kernel_step_verification(ticket_id)
+            if is_kernel_step and not verified:
+                errors.append(
+                    "this is a kernel transition step and its checkpoint is not "
+                    f"verified ({verification.get('details', 'no checkpoint')}); "
+                    "run reboot_hosts_and_verify (or verify_kernel_state to "
+                    "reconcile) until every host is verified, or submit "
+                    "provisioning_complete=false"
+                )
 
         if not errors:
             return None
@@ -832,6 +1115,38 @@ class ProvisioningAgent(AgentBase):
         harness = result.get("harness_name", "unknown")
         prov_complete = result.get("provisioning_complete", False)
         verification = result.get("verification")
+
+        # One ticket read serves both the kernel gate and the SSH role
+        # projection below.  A completed kernel step is judged by its
+        # checkpoint; the submit-time validator already read the live ticket,
+        # so a lookup failure here is logged rather than treated as evidence.
+        ticket_cache: dict[str, Any] | None = None
+        is_kernel_step, kernel_verified, kernel_verification = False, False, {}
+        if prov_complete or result.get("hosts_provisioned"):
+            try:
+                fetched = await self._get_ticket(ticket_id)
+                ticket_cache = fetched if isinstance(fetched, dict) else None
+            except Exception as exc:
+                logger.warning(
+                    "[provisioning] %s: ticket lookup failed: %s", ticket_id, exc
+                )
+        if prov_complete and ticket_cache is not None:
+            (
+                is_kernel_step,
+                kernel_verified,
+                kernel_verification,
+            ) = await self._kernel_step_verification(ticket_id, ticket_cache)
+        if is_kernel_step:
+            # Code decides whether a kernel step is complete: the checkpoint,
+            # not the model's summary, is the evidence.
+            verification = kernel_verification
+            if not kernel_verified and prov_complete:
+                logger.warning(
+                    "[provisioning] %s: forcing provisioning_complete=False; "
+                    "kernel transition not verified",
+                    ticket_id,
+                )
+                prov_complete = False
         if (
             not prov_complete
             and getattr(self, "_harness_self_installing", False)
@@ -872,7 +1187,11 @@ class ProvisioningAgent(AgentBase):
         if fields.get("hosts_provisioned"):
             allocation_loaded = False
             try:
-                ticket = await self._get_ticket(ticket_id)
+                ticket = (
+                    ticket_cache
+                    if ticket_cache is not None
+                    else await self._get_ticket(ticket_id)
+                )
                 custom_fields = ticket.get("custom_fields", {})
                 assigned = custom_fields.get("assigned_hardware_ips", {})
                 ssh_assigned = custom_fields.get("ssh_hardware_ips", {})

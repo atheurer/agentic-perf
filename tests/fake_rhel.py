@@ -38,6 +38,12 @@ class FakeRHELHost:
     version_id: str = "9.5"
     behavior: str = "normal"
     reconnect_after_polls: int = 3
+    # "normal" | "timeout_installs" (dnf times out but installs) |
+    # "timeout_fails" (dnf times out and nothing is installed)
+    dnf_behavior: str = "normal"
+    # "normal" | "timeout_sets" | "timeout_fails"
+    grubby_behavior: str = "normal"
+    _cancel_next_probe: bool = field(default=False, init=False)
     boot_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     _down_polls_remaining: int = field(default=0, init=False)
@@ -50,6 +56,12 @@ class FakeRHELHost:
     def handle(self, command: str) -> SSHResult:
         if self.behavior == "unreachable":
             return SSHResult(stdout="", stderr="Connection refused", exit_code=255)
+
+        if self._cancel_next_probe and "@@boot_id" in command:
+            import asyncio
+
+            self._cancel_next_probe = False
+            raise asyncio.CancelledError()
 
         if self._down_polls_remaining > 0:
             self._down_polls_remaining -= 1
@@ -153,6 +165,8 @@ class FakeRHELHost:
         )
 
     def _handle_install(self, command: str) -> SSHResult:
+        if self.dnf_behavior == "timeout_fails":
+            return SSHResult(stdout="", stderr="Command timed out", exit_code=-1)
         installed_any = False
         for rel in list(self.available):
             if rel in command:
@@ -161,6 +175,8 @@ class FakeRHELHost:
                     self.installed.append(rel)
                 installed_any = True
         if installed_any:
+            if self.dnf_behavior == "timeout_installs":
+                return SSHResult(stdout="", stderr="Command timed out", exit_code=-1)
             return SSHResult(stdout="Complete!", stderr="", exit_code=0)
         return SSHResult(
             stdout="",
@@ -169,10 +185,16 @@ class FakeRHELHost:
         )
 
     def _handle_select(self, command: str) -> SSHResult:
+        if self.grubby_behavior == "timeout_fails":
+            return SSHResult(stdout="", stderr="Command timed out", exit_code=-1)
         for rel in self.installed:
             vmlinuz = f"/boot/vmlinuz-{rel}"
             if vmlinuz in command:
                 self.default = vmlinuz
+                if self.grubby_behavior == "timeout_sets":
+                    return SSHResult(
+                        stdout="", stderr="Command timed out", exit_code=-1
+                    )
                 return SSHResult(
                     stdout=f"{vmlinuz}",
                     stderr="",
@@ -190,10 +212,13 @@ class FakeRHELHost:
             self._down_polls_remaining = 999999
             return SSHResult(stdout="@@rebooting", stderr="", exit_code=0)
 
+        if self.behavior == "cancel_after_reboot":
+            self._cancel_next_probe = True
+
         self._down_polls_remaining = self.reconnect_after_polls
         self.boot_id = str(uuid.uuid4())
 
-        if self.behavior == "normal":
+        if self.behavior in ("normal", "cancel_after_reboot"):
             for rel in self.installed:
                 if self.default and rel in self.default:
                     self.running = rel
@@ -311,3 +336,170 @@ class FakeFleetSSH:
         progress_callback: Any = None,
     ) -> SSHResult:
         return await self.run(host, command)
+
+
+# ---------------------------------------------------------------------------
+# Fake state-store client
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: Any = None) -> None:
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+
+    def json(self) -> Any:
+        return json.loads(json.dumps(self._payload))
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class FakeKernelStore:
+    """Stand-in for ``AuditedAsyncHTTPClient`` with the state-store routes the
+    kernel tools use: ticket read, field PATCH, approvals list / create /
+    resolve / consume, and ticket transition.  Class-level state so the
+    class itself can be patched in as the client.  ``tamper_versions``
+    makes every re-read report a foreign ``record_version`` to exercise
+    the checkpoint writer's overwrite check."""
+
+    ticket: dict[str, Any] = {}
+    approvals: dict[str, dict[str, Any]] = {}
+    patches: list[dict[str, Any]] = []
+    posts: list[tuple[str, dict[str, Any]]] = []
+    consumes: list[dict[str, Any]] = []
+    transitions: list[dict[str, Any]] = []
+    tamper_versions: bool = False
+    _counter: int = 0
+
+    @classmethod
+    def reset(cls, ticket: dict[str, Any]) -> None:
+        cls.ticket = ticket
+        cls.approvals = {}
+        cls.patches = []
+        cls.posts = []
+        cls.consumes = []
+        cls.transitions = []
+        cls.tamper_versions = False
+        cls._counter = 0
+
+    @classmethod
+    def custom_fields(cls) -> dict[str, Any]:
+        return cls.ticket.setdefault("custom_fields", {})
+
+    @classmethod
+    def seed_intent(cls, intent: dict[str, Any]) -> None:
+        records = cls.custom_fields().setdefault(
+            "kernel_change_intents", {"records": {}}
+        )["records"]
+        records[intent["intent_id"]] = intent
+
+    @classmethod
+    def intent(cls, intent_id: str) -> dict[str, Any]:
+        return cls.custom_fields()["kernel_change_intents"]["records"][intent_id]
+
+    @classmethod
+    def seed_approval(
+        cls,
+        intent: dict[str, Any],
+        *,
+        status: str = "approved",
+        consumed: bool = False,
+        kind: str = "kernel_change",
+        expires_at: str | None = None,
+        digest: str | None = None,
+    ) -> str:
+        cls._counter += 1
+        approval_id = f"apr-{cls._counter:032x}"
+        cls.approvals[approval_id] = {
+            "approval_request_id": approval_id,
+            "ticket_id": cls.ticket.get("id", ""),
+            "kind": kind,
+            "validation_id": intent["intent_id"],
+            "presented_run_file_digest": digest or intent["intent_digest"],
+            "execution_intent_digest": digest or intent["intent_digest"],
+            "status": status,
+            "consumed_at": "2026-01-01T00:00:00Z" if consumed else None,
+            "expires_at": expires_at,
+        }
+        return approval_id
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    async def __aenter__(self) -> FakeKernelStore:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def get(self, url: str, *args: Any, **kwargs: Any) -> _FakeResponse:
+        url = str(url)
+        if url.endswith("/approvals"):
+            return _FakeResponse(200, {"approvals": list(self.approvals.values())})
+        ticket = json.loads(json.dumps(self.ticket))
+        if self.tamper_versions:
+            for record in (
+                ticket.get("custom_fields", {}).get("kernel_transitions", {}).values()
+            ):
+                record["record_version"] = 999
+        return _FakeResponse(200, ticket)
+
+    async def patch(self, url: str, *args: Any, **kwargs: Any) -> _FakeResponse:
+        body = kwargs.get("json", {})
+        type(self).patches.append(json.loads(json.dumps(body)))
+        self.custom_fields().update(body.get("fields", {}))
+        return _FakeResponse(200, {})
+
+    async def post(self, url: str, *args: Any, **kwargs: Any) -> _FakeResponse:
+        url = str(url)
+        body = kwargs.get("json", {})
+        type(self).posts.append((url, json.loads(json.dumps(body))))
+        if url.endswith("/transition"):
+            type(self).transitions.append(body)
+            self.ticket["status"] = body.get("status", self.ticket.get("status"))
+            return _FakeResponse(200, {})
+        if url.endswith("/consume"):
+            approval_id = url.rsplit("/", 2)[-2]
+            approval = self.approvals.get(approval_id)
+            type(self).consumes.append({"approval_id": approval_id, **body})
+            if approval is None:
+                return _FakeResponse(404, {"detail": "not found"})
+            if approval["status"] != "approved":
+                return _FakeResponse(409, {"detail": "not approved"})
+            if approval["consumed_at"] is not None:
+                return _FakeResponse(409, {"detail": "already consumed"})
+            if approval["kind"] != body.get("kind", "benchmark_run_file"):
+                return _FakeResponse(409, {"detail": "kind mismatch"})
+            if approval["validation_id"] != body.get("validation_id"):
+                return _FakeResponse(409, {"detail": "validation mismatch"})
+            approval["consumed_at"] = "2026-01-01T00:00:01Z"
+            return _FakeResponse(200, approval)
+        if url.endswith("/resolve"):
+            approval_id = url.rsplit("/", 2)[-2]
+            approval = self.approvals.get(approval_id)
+            if approval is None:
+                return _FakeResponse(404, {})
+            approval["status"] = body.get("decision", approval["status"])
+            return _FakeResponse(200, approval)
+        if url.endswith("/approvals"):
+            type(self)._counter += 1
+            approval_id = f"apr-{type(self)._counter:032x}"
+            approval = {
+                "approval_request_id": approval_id,
+                "ticket_id": self.ticket.get("id", ""),
+                "kind": body.get("kind", "benchmark_run_file"),
+                "validation_id": body.get("validation_id"),
+                "presented_run_file_digest": body.get("presented_run_file_digest"),
+                "execution_intent_digest": body.get("execution_intent_digest"),
+                "status": "pending",
+                "consumed_at": None,
+                "expires_at": None,
+                "summary": body.get("summary", ""),
+            }
+            self.approvals[approval_id] = approval
+            return _FakeResponse(201, approval)
+        if url.endswith("/comments"):
+            return _FakeResponse(200, {"id": "c-1"})
+        return _FakeResponse(200, {})

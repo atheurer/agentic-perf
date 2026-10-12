@@ -407,6 +407,9 @@ HOST_STATE_TRANSITIONS: dict[str, frozenset[str]] = {
             "refused",
             "rebooting",
             "verified",
+            # verify_kernel_state can observe a never-attempted host already
+            # running the wrong kernel.
+            "kernel_mismatch",
             "not_attempted",
         }
     ),
@@ -430,9 +433,13 @@ HOST_STATE_TRANSITIONS: dict[str, frozenset[str]] = {
             "indeterminate",
         }
     ),
+    # A reconciliation after an indeterminate record can discover any
+    # post-reboot outcome, not only success.
     "indeterminate": frozenset(
         {
             "verified",
+            "fallback_boot",
+            "kernel_mismatch",
         }
     ),
 }
@@ -469,11 +476,119 @@ def prelaunch_kernel_check(
 
 
 def validate_host_transition(from_state: str, to_state: str) -> None:
-    """Raise ValueError if the transition is not legal."""
+    """Raise ValueError if the transition is not legal.
+
+    Writing the same state again (a checkpoint refresh) is always legal.
+    """
     if from_state not in HOST_STATES:
         raise ValueError(f"unknown host state: {from_state!r}")
     if to_state not in HOST_STATES:
         raise ValueError(f"unknown host state: {to_state!r}")
+    if from_state == to_state:
+        return
     allowed = HOST_STATE_TRANSITIONS.get(from_state, frozenset())
     if to_state not in allowed:
         raise ValueError(f"illegal host transition: {from_state!r} -> {to_state!r}")
+
+
+# Recovery decisions returned by recover_host().  They are deliberately not
+# host states: the reboot driver maps each decision onto a state transition
+# that the table above permits.
+RECOVERY_DECISIONS = frozenset(
+    {
+        "normal",  # no usable prior record: run the ordinary pre-check path
+        "already_verified",  # prior verified and the live probe still matches
+        "refresh",  # prior verified, expected kernel, new boot_id, if_needed
+        "reconciled",  # reboot already happened; expected kernel is up
+        "fallback_boot",
+        "kernel_mismatch",
+        "in_flight",  # reboot sent but the host is still on the old boot
+        "continue_reconnect",  # reboot sent and the host is unreachable
+        "indeterminate",
+    }
+)
+
+_RECOVERABLE_STATES = frozenset({"rebooting", "reconnecting", "indeterminate"})
+
+
+def recover_host(
+    prior: dict[str, Any] | None,
+    probe: ProbeResult | None,
+    reachable: bool,
+    spec: KernelSpec,
+    reboot_policy: str,
+) -> tuple[str, str]:
+    """Decide what a reboot invocation must do for *host* before anything else.
+
+    This is the recovery table from the kernel A/B design: every invocation
+    probes first, and a reboot that already happened in this plan step is
+    never repeated.  ``prior`` is the host's checkpoint record from the
+    current step (or None), ``probe`` is the live PROBE result (None when
+    unparsable or unreachable), ``reachable`` says whether SSH answered.
+
+    Returns ``(decision, note)`` with ``decision`` in RECOVERY_DECISIONS.
+    """
+    state = (prior or {}).get("state", "pending")
+    if prior is None or state == "pending":
+        return "normal", ""
+
+    if state in ("verified", "already_verified"):
+        if not reachable:
+            return "normal", "previously verified host is unreachable"
+        if probe is None:
+            return "indeterminate", "unparsable probe on a verified host"
+        if probe.kernel != spec.release:
+            return "normal", "kernel changed since verification"
+        if probe.boot_id == prior.get("post_boot_id"):
+            return "already_verified", ""
+        note = "boot_drift: host rebooted after verification"
+        if reboot_policy == "if_needed":
+            return "refresh", note
+        return "normal", note + "; rebooting again for parity"
+
+    if state in _RECOVERABLE_STATES:
+        if not reachable:
+            return "continue_reconnect", ""
+        if probe is None:
+            return "indeterminate", "unparsable probe during recovery"
+        if probe.boot_id != prior.get("pre_boot_id"):
+            if probe.kernel == spec.release:
+                return "reconciled", "reboot completed before this invocation"
+            if probe.kernel == prior.get("pre_kernel"):
+                return "fallback_boot", ""
+            return "kernel_mismatch", ""
+        if state == "indeterminate":
+            return "normal", "indeterminate prior record, host still on old boot"
+        return "in_flight", "reboot command was sent; host still on the old boot"
+
+    # Every other terminal failure state starts over; the caller must have a
+    # fresh approval for any new reboot.
+    return "normal", f"prior state {state!r} requires a new attempt"
+
+
+def transition_state(
+    host_records: dict[str, dict[str, Any]],
+    required_hosts: list[str],
+) -> str:
+    """Summarise per-host records into the step-level transition state.
+
+    ``verified`` requires every required host to be verified; a missing or
+    refused host can never produce ``verified``.
+    """
+    states = {
+        host: host_records.get(host, {}).get("state", "") for host in required_hosts
+    }
+    if not required_hosts:
+        return "failed"
+    if all(state in ("verified", "already_verified") for state in states.values()):
+        return "verified"
+    if any(
+        state in ("pending", "rebooting", "reconnecting", "")
+        for state in states.values()
+    ):
+        return "in_progress"
+    if any(state == "indeterminate" for state in states.values()):
+        return "indeterminate"
+    if any(state in ("verified", "already_verified") for state in states.values()):
+        return "partial_failure"
+    return "failed"
