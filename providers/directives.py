@@ -76,8 +76,6 @@ _CORE_DESCRIPTIONS: dict[str, str] = {
     "image_type": "Image type: 'regular' or 'ostree'",
     "release": "Release path (e.g. 'monthly/autosd10-202608', 'nightly')",
     "harness": "Benchmark harness to use (e.g. 'boot-time', 'crucible')",
-    "serial_capture": "Capture serial console output (bool)",
-    "reboot_method": "'warm' (SSH reboot) or 'cold' (hardware power cycle)",
 }
 
 # ── Suffix / prefix normalization ─────────────────────────
@@ -405,7 +403,7 @@ def format_directive_schema_for_prompt(
     """Format the directive schema as a prompt-ready string.
 
     If harness_keys is provided, only include those keys.
-    Otherwise include all contributed directives.
+    Otherwise include only harness-specific contributed keys.
 
     Returns a string suitable for injection into an agent's
     system prompt, listing canonical keys with descriptions
