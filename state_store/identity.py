@@ -196,10 +196,27 @@ class UserStore:
                     raise ValueError(
                         "Service accounts must have at least one allowed_sources entry"
                     )
+            if max_requests_per_hour is not UNSET and max_requests_per_hour is not None:
+                if (
+                    not isinstance(max_requests_per_hour, int)
+                    or max_requests_per_hour < 0
+                ):
+                    raise ValueError(
+                        "max_requests_per_hour must be a non-negative integer or null"
+                    )
+            # Save prior values for rollback on persistence failure.
+            prior_sources = list(user.allowed_sources)
+            prior_rate = user.max_requests_per_hour
+            if allowed_sources is not None:
                 user.allowed_sources = list(allowed_sources)
             if max_requests_per_hour is not UNSET:
                 user.max_requests_per_hour = max_requests_per_hour  # type: ignore[assignment]
-            self._save()
+            try:
+                self._save()
+            except Exception:
+                user.allowed_sources = prior_sources
+                user.max_requests_per_hour = prior_rate
+                raise
             return user.model_copy()
 
     def disable_user(self, username: str) -> User:

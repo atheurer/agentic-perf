@@ -105,6 +105,11 @@ def update_user(username: str, body: UpdateUserRequest, request: Request):
             )
         kwargs["allowed_sources"] = body.allowed_sources
     if "max_requests_per_hour" in body.model_fields_set:
+        if body.max_requests_per_hour is not None and body.max_requests_per_hour < 0:
+            raise HTTPException(
+                status_code=422,
+                detail="max_requests_per_hour must be a non-negative integer or null",
+            )
         kwargs["max_requests_per_hour"] = body.max_requests_per_hour
     else:
         kwargs["max_requests_per_hour"] = UNSET
