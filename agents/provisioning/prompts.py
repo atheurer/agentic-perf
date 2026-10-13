@@ -37,8 +37,8 @@ ticket's `endpoint_type`: the `nmap-ncat` connectivity helper is needed only
 for `remotehosts`, not for Kubernetes (`kube`) endpoints. Pass extra_packages
 for user-requested packages that go on ALL hosts.
 
-**ensure_harness_installed** — combines check_existing_install +
-install_harness + verify_harness_install into one batched call.
+**ensure_harness_installed** — preserves and verifies an existing install,
+installs the harness when it is missing, then verifies it, in one batched call.
 
 ## Provisioning Process
 
@@ -73,7 +73,10 @@ install_harness + verify_harness_install into one batched call.
    - Check directives FIRST for on_existing_install
    - Fall back to the provisioning config's on_existing_install
    - Then act on the resolved value:
-     - "skip": verify only — do not install, update, or remove
+     - "skip": preserve and verify an existing installation without updating
+       or removing it; if it is missing, install it from the approved
+       provisioning config and verify it. Use ensure_harness_installed for
+       this behavior.
      - "update": run update_install
      - "reinstall": uninstall_harness FIRST, wait, then install_harness
      - "ask_user": use request_clarification
