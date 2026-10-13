@@ -276,7 +276,8 @@ def _try_prune_file(path: Path, spool_dir: Path) -> bool:
 
     fs = AuditedFilesystem.system(spool_dir)
     if path.suffix == ".spool" or path.name.endswith(".spool"):
-        lock_path = spool_dir / path.name.replace(".spool", ".lock")
+        lock_name = str(path.name).replace(".spool", ".lock")
+        lock_path = spool_dir / lock_name
         if lock_path.exists():
             try:
                 fd = fs.open_descriptor(
