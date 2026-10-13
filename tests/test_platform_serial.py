@@ -34,6 +34,19 @@ class FakeProvisionResult:
     serial_log_path: str = ""
     infrastructure_error: bool = False
 
+    def to_tool_response(self, artifact_dir: str = "") -> dict:
+        return {
+            "success": self.success,
+            "ip": self.ip,
+            "board_name": self.board_name,
+            "ssh_user": self.ssh_user,
+            "ssh_key_path": self.ssh_key_path,
+            "diagnostics": self.diagnostics,
+            "flash_duration_s": self.flash_duration_s,
+            "boot_duration_s": self.boot_duration_s,
+            "infrastructure_error": self.infrastructure_error,
+        }
+
 
 class TestProvisionSerialCapture:
     """Test serial capture is skipped during Jumpstarter provisioning."""
