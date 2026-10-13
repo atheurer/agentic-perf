@@ -196,6 +196,8 @@ def create_ticket(body: CreateTicketRequest, request: Request):
             ticket.id,
             AddCommentRequest(author="system", body=normalization_report),
         )
+        # Re-fetch so the response includes the comment
+        ticket = store.get_ticket(ticket.id)
 
     result = ticket.model_dump(mode="json")
     result["action_required"] = after_create(ticket)
@@ -299,7 +301,13 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
             store.add_comment(
                 ticket_id,
                 AddCommentRequest(author="system", body=normalization_report),
+                session_id=session_id,
+                epoch=epoch,
+                claim_id=claim_id,
+                leader_only=leader_only,
             )
+            # Re-fetch so the response includes the comment
+            result = store.get_ticket(ticket_id).model_dump(mode="json")
         return result
     except ClaimFenceError as e:
         raise HTTPException(
