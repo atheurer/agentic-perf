@@ -150,6 +150,11 @@ def collect_from_providers(skill_provider: Any) -> None:
 
 def get_recognized_directives() -> set[str]:
     """Return the full set of recognized directive keys."""
+    # Ensure standalone harness registrations have run.
+    try:
+        import providers.skills.boot_time  # noqa: F401
+    except ImportError:
+        pass
     return _CORE_DIRECTIVES | _contributed_directives
 
 
@@ -398,24 +403,36 @@ def format_normalization_report(
 
 
 def format_directive_schema_for_prompt(
-    harness_keys: set[str] | None = None,
+    keys: set[str],
 ) -> str:
     """Format the directive schema as a prompt-ready string.
 
-    If harness_keys is provided, only include those keys.
-    Otherwise include only harness-specific contributed keys.
+    Args:
+        keys: set of canonical directive key names to include.
+            Use get_recognized_directives() for the full set.
+
+    Only keys that have a registered description are included.
+    Keys without descriptions are omitted to avoid confusing
+    the LLM with unexplained names.
 
     Returns a string suitable for injection into an agent's
     system prompt, listing canonical keys with descriptions
     and instructing the LLM to map user intent to these keys.
     """
-    keys = harness_keys or _contributed_directives
     if not keys:
         return ""
 
     # Merge core + contributed descriptions
     all_descriptions = dict(_CORE_DESCRIPTIONS)
     all_descriptions.update(_contributed_descriptions)
+
+    # Only include keys that have descriptions — unnamed keys
+    # without context would confuse rather than guide the LLM.
+    described = {
+        key: all_descriptions[key] for key in sorted(keys) if key in all_descriptions
+    }
+    if not described:
+        return ""
 
     lines = [
         "## Recognized Directives",
@@ -425,12 +442,8 @@ def format_directive_schema_for_prompt(
         "name for the same concept, map it to the canonical key.",
         "",
     ]
-    for key in sorted(keys):
-        desc = all_descriptions.get(key, "")
-        if desc:
-            lines.append(f"- **{key}**: {desc}")
-        else:
-            lines.append(f"- **{key}**")
+    for key, desc in described.items():
+        lines.append(f"- **{key}**: {desc}")
     lines.append("")
     lines.append(
         "Do NOT invent new directive keys. If a user's intent does "
