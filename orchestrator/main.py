@@ -3486,6 +3486,9 @@ def _sweep_trace_spools() -> None:
 
     token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
     if not token:
+        # No token means we can't deliver to the state store,
+        # but we should still prune old/oversized spool files.
+        prune_spool_directory(TRACE_SPOOL_DIR)
         return
     url, _ = resolve_state_store()
     client = TraceClient(url, token, spool_dir=TRACE_SPOOL_DIR)

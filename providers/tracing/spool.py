@@ -329,7 +329,9 @@ def prune_spool_directory(
 
     now = time.time()
     entries: list[tuple[Path, float, int]] = []  # (path, mtime, size)
-    suffixes = (".spool", ".ack", ".lock", ".bad")
+    # .lock files are NOT pruned independently — they are only
+    # removed alongside their .spool file in _try_prune_file.
+    suffixes = (".spool", ".ack", ".bad")
     for path in root.iterdir():
         if path.is_symlink() or not path.is_file():
             continue
