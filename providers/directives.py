@@ -68,6 +68,18 @@ _CORE_ALIASES: dict[str, str] = {
     "exclude_host": "exclude_hosts",
 }
 
+_CORE_DESCRIPTIONS: dict[str, str] = {
+    "board_selector": "Jumpstarter board label selector (e.g. 'board-type=nxp-s32g-vnp-rdb3')",
+    "resource_provider": "Resource provider: 'jumpstarter', 'quads', 'aws', or 'user_provided'",
+    "image_version": "OS image version (e.g. 'AutoSD-10', 'RHIVOS-2')",
+    "image_name": "Image variant name (e.g. 'qa', 'ps', 'fusa-minimal')",
+    "image_type": "Image type: 'regular' or 'ostree'",
+    "release": "Release path (e.g. 'monthly/autosd10-202608', 'nightly')",
+    "harness": "Benchmark harness to use (e.g. 'boot-time', 'crucible')",
+    "serial_capture": "Capture serial console output (bool)",
+    "reboot_method": "'warm' (SSH reboot) or 'cold' (hardware power cycle)",
+}
+
 # ── Suffix / prefix normalization ─────────────────────────
 
 _DURATION_SUFFIXES = (
@@ -91,20 +103,32 @@ _contributed_directives: set[str] = set()
 _contributed_aliases: dict[str, str] = {}
 
 
+_contributed_descriptions: dict[str, str] = {}
+
+
 def register_directives(
     recognized: set[str] | None = None,
     aliases: dict[str, str] | None = None,
+    descriptions: dict[str, str] | None = None,
 ) -> None:
     """Register harness-specific directives and aliases.
 
     Called by standalone harnesses (boot-time, etc.) at module
     load, or by collect_from_providers() for provider-backed
     harnesses at orchestrator startup.
+
+    Args:
+        recognized: canonical directive key names.
+        aliases: variant name → canonical key mappings.
+        descriptions: canonical key → human-readable description
+            for inclusion in agent prompts.
     """
     if recognized:
         _contributed_directives.update(recognized)
     if aliases:
         _contributed_aliases.update(aliases)
+    if descriptions:
+        _contributed_descriptions.update(descriptions)
 
 
 def collect_from_providers(skill_provider: Any) -> None:
@@ -372,3 +396,45 @@ def format_normalization_report(
         for hint in unrecognized:
             parts.append(f"- ⚠️ {hint}")
     return "\n".join(parts)
+
+
+def format_directive_schema_for_prompt(
+    harness_keys: set[str] | None = None,
+) -> str:
+    """Format the directive schema as a prompt-ready string.
+
+    If harness_keys is provided, only include those keys.
+    Otherwise include all contributed directives.
+
+    Returns a string suitable for injection into an agent's
+    system prompt, listing canonical keys with descriptions
+    and instructing the LLM to map user intent to these keys.
+    """
+    keys = harness_keys or _contributed_directives
+    if not keys:
+        return ""
+
+    # Merge core + contributed descriptions
+    all_descriptions = dict(_CORE_DESCRIPTIONS)
+    all_descriptions.update(_contributed_descriptions)
+
+    lines = [
+        "## Recognized Directives",
+        "",
+        "When working with ticket directives, use these EXACT",
+        "canonical key names. If the user or ticket uses a different",
+        "name for the same concept, map it to the canonical key.",
+        "",
+    ]
+    for key in sorted(keys):
+        desc = all_descriptions.get(key, "")
+        if desc:
+            lines.append(f"- **{key}**: {desc}")
+        else:
+            lines.append(f"- **{key}**")
+    lines.append("")
+    lines.append(
+        "Do NOT invent new directive keys. If a user's intent does "
+        "not match any recognized directive, ask for clarification."
+    )
+    return "\n".join(lines)

@@ -938,6 +938,17 @@ class TriageAgent(AgentBase):
             self._mcp = None
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
+        from providers.directives import (
+            format_directive_schema_for_prompt,
+            get_recognized_directives,
+        )
+
+        directive_schema = format_directive_schema_for_prompt(
+            get_recognized_directives()
+        )
+        # Triage needs all directives; benchmark needs harness-specific
+        if directive_schema:
+            return TRIAGE_SYSTEM_PROMPT + "\n\n" + directive_schema
         return TRIAGE_SYSTEM_PROMPT
 
     def _has_external_data_tools(self) -> bool:

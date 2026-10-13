@@ -18,6 +18,13 @@ register_directives(
         "serial_capture",
         "kpi_pattern",
     },
+    descriptions={
+        "sample_count": "Number of reboot cycles to collect (int, e.g. 50)",
+        "reboot_method": "'warm' (SSH reboot) or 'cold' (hardware power cycle)",
+        "power_off_delay": "Seconds to wait between power off and power on for cold reboot (int, e.g. 20)",
+        "serial_capture": "Capture serial console output during test (bool)",
+        "kpi_pattern": "Regex pattern for KPI log line matching (string)",
+    },
     aliases={
         # Sample count variants
         "reboot_count": "sample_count",
