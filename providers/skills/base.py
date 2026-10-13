@@ -108,8 +108,10 @@ class SkillProvider(ABC):
         Returns a dict with:
           recognized: set of canonical directive key names
           aliases: dict mapping variant names to canonical keys
+          descriptions: dict mapping canonical keys to human-readable
+              descriptions for inclusion in agent prompts
 
         The default returns empty sets.  Harness providers
         override this to declare their directive vocabulary.
         """
-        return {"recognized": set(), "aliases": {}}
+        return {"recognized": set(), "aliases": {}, "descriptions": {}}

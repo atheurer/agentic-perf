@@ -146,6 +146,7 @@ def collect_from_providers(skill_provider: Any) -> None:
             register_directives(
                 recognized=schema.get("recognized"),
                 aliases=schema.get("aliases"),
+                descriptions=schema.get("descriptions"),
             )
 
 
