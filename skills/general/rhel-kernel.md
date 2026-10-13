@@ -64,8 +64,9 @@ SSH only to the canonical address that passed validation.
 
 ## After a pause
 
-Use `verify_kernel_state` to reconcile the checkpoint with what is
-actually running — it never reboots and needs no approval. If every host
+Use `verify_kernel_state` (with the full host list — it refuses a
+subset so a stale record can never hide) to reconcile the checkpoint
+with what is actually running — it never reboots and needs no approval. If every host
 is now on the expected kernel the step can complete. If a host needs
 another reboot, run `prepare_kernel_change` again and get a new approval;
 the previous approval was consumed.

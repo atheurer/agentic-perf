@@ -43,6 +43,8 @@ class FakeRHELHost:
     dnf_behavior: str = "normal"
     # "normal" | "timeout_sets" | "timeout_fails"
     grubby_behavior: str = "normal"
+    # "normal" | "timeout" (the reboot is queued but the SSH session times out)
+    reboot_behavior: str = "normal"
     _cancel_next_probe: bool = field(default=False, init=False)
     boot_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
@@ -228,6 +230,8 @@ class FakeRHELHost:
         elif self.behavior.startswith("wrong_kernel:"):
             self.running = self.behavior.split(":", 1)[1]
 
+        if self.reboot_behavior == "timeout":
+            return SSHResult(stdout="", stderr="Command timed out", exit_code=-1)
         return SSHResult(stdout="@@rebooting", stderr="", exit_code=0)
 
     def save(self, path: Path) -> None:

@@ -433,13 +433,16 @@ HOST_STATE_TRANSITIONS: dict[str, frozenset[str]] = {
             "indeterminate",
         }
     ),
-    # A reconciliation after an indeterminate record can discover any
-    # post-reboot outcome, not only success.
+    # An indeterminate record is resumed in flight (the reboot may still be
+    # queued), so it can reach any post-reboot outcome, not only success.
     "indeterminate": frozenset(
         {
+            "reconnecting",
             "verified",
             "fallback_boot",
             "kernel_mismatch",
+            "reconnect_timeout",
+            "reboot_not_observed",
         }
     ),
 }
@@ -557,8 +560,8 @@ def recover_host(
             if probe.kernel == prior.get("pre_kernel"):
                 return "fallback_boot", ""
             return "kernel_mismatch", ""
-        if state == "indeterminate":
-            return "normal", "indeterminate prior record, host still on old boot"
+        # The reboot command may still be queued (a timed-out or ambiguous
+        # send): never resend while the host sits on the old boot_id.
         return "in_flight", "reboot command was sent; host still on the old boot"
 
     # Every other terminal failure state starts over; the caller must have a

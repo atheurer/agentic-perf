@@ -110,16 +110,38 @@ def authorized_kernel_hosts(ticket: dict[str, Any]) -> dict[str, str]:
     return result
 
 
+def pin_address(host: str) -> str:
+    """Return the one address every SSH call for ``host`` must use.
+
+    An IP literal is its own address.  A name is resolved once here, after
+    it passed authorization, and the lowest IPv4 (then IPv6) address is
+    pinned so SSH never re-resolves the name to something else later.
+    """
+    cleaned = host.strip()
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(cleaned.split("%", 1)[0])
+        return cleaned
+    except ValueError:
+        pass
+    addrs = sorted(resolve_addrs(cleaned))
+    ipv4 = [a for a in addrs if ":" not in a]
+    chosen = ipv4 or addrs
+    return chosen[0] if chosen else cleaned
+
+
 def canonicalize_targets(
     hosts: list[str],
     ticket: dict[str, Any],
-) -> tuple[list[str], dict[str, dict[str, str]], dict[str, str]]:
+) -> tuple[list[str], dict[str, dict[str, str]], dict[str, str], dict[str, str]]:
     """Split caller-supplied hosts into canonical allowed hosts and refusals.
 
-    Returns ``(allowed_canonical, refused, requested_as)`` where
-    ``requested_as`` maps each canonical address back to the string the
-    caller used.  Every later SSH call targets the canonical address that
-    passed validation, never the caller string.
+    Returns ``(allowed_canonical, refused, requested_as, addresses)``:
+    ``requested_as`` maps each canonical identity back to the string the
+    caller used, and ``addresses`` maps it to the pinned address that
+    passed validation.  Every later SSH call targets that pinned address,
+    never the caller string and never a fresh DNS answer.
     """
     authorized = authorized_kernel_hosts(ticket)
     controller = ticket_controller_host(ticket)
@@ -127,6 +149,7 @@ def canonicalize_targets(
     allowed: list[str] = []
     refused: dict[str, dict[str, str]] = {}
     requested_as: dict[str, str] = {}
+    addresses: dict[str, str] = {}
     seen: set[str] = set()
 
     for raw in hosts:
@@ -162,7 +185,8 @@ def canonicalize_targets(
             continue
         allowed.append(canonical)
         requested_as[canonical] = host
-    return allowed, refused, requested_as
+        addresses[canonical] = pin_address(canonical)
+    return allowed, refused, requested_as, addresses
 
 
 def refuse_protected_targets(
@@ -170,7 +194,7 @@ def refuse_protected_targets(
     ticket: dict[str, Any],
 ) -> tuple[list[str], dict[str, dict[str, str]]]:
     """Compatibility wrapper around canonicalize_targets()."""
-    allowed, refused, _ = canonicalize_targets(hosts, ticket)
+    allowed, refused, _, _ = canonicalize_targets(hosts, ticket)
     return allowed, refused
 
 
@@ -444,6 +468,9 @@ async def authorize_action(
     ticket_id: str,
     approval_request_id: str,
     action: str,
+    *,
+    step_id: int | None = None,
+    spec: KernelSpec | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Authorize one mutating kernel action against a kernel-change approval.
 
@@ -503,10 +530,39 @@ async def authorize_action(
         if _is_expired(approval):
             return False, "approval_expired", {"expires_at": approval.get("expires_at")}
 
+        # The intent is for exactly this plan step and this kernel: in an
+        # ABBA plan the first baseline step's approval must not authorize
+        # the second baseline step, even though the kernel is the same.
+        if step_id is not None and intent.get("step_id") != step_id:
+            return (
+                False,
+                "approval_wrong_step",
+                {
+                    "intent_step": intent.get("step_id"),
+                    "current_step": step_id,
+                },
+            )
+        if spec is not None:
+            kernel = intent.get("kernel", {})
+            if (
+                kernel.get("release") != spec.release
+                or kernel.get("package", "kernel") != spec.package
+            ):
+                return (
+                    False,
+                    "approval_wrong_kernel",
+                    {
+                        "intent_kernel": kernel,
+                        "requested": spec.to_dict(),
+                    },
+                )
+
         actions = list(intent.get("actions_required", []))
         if action not in actions:
             return False, "action_not_required", {"actions_required": actions}
         progress = intent.get("progress", {})
+        if progress.get(action) == "done":
+            return False, "action_already_done", {"action": action}
         predecessors = actions[: actions.index(action)]
         pending = [a for a in predecessors if progress.get(a) != "done"]
         if pending:

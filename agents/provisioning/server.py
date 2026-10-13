@@ -3120,7 +3120,7 @@ async def _kernel_tool_context(
     step = current_kernel_step(ticket)
     assert step is not None  # assert_kernel_matches_step guarantees this
     step_id, spec = step
-    allowed, refused, requested_as = canonicalize_targets(hosts, ticket)
+    allowed, refused, requested_as, addresses = canonicalize_targets(hosts, ticket)
     if require_coverage:
         ok, detail = require_full_coverage(allowed, refused, ticket)
         if not ok:
@@ -3137,6 +3137,7 @@ async def _kernel_tool_context(
         "allowed": allowed,
         "refused": refused,
         "requested_as": requested_as,
+        "addresses": addresses,
     }, None
 
 
@@ -3145,11 +3146,16 @@ async def _authorize_or_reject(
     approval_request_id: str,
     action: str,
     allowed: list[str],
+    *,
+    step_id: int,
+    spec: KernelSpec,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Authorize a mutating action and check the intent covers ``allowed``."""
     from agents.provisioning.kernel import authorize_action
 
-    ok, reason, detail = await authorize_action(ticket_id, approval_request_id, action)
+    ok, reason, detail = await authorize_action(
+        ticket_id, approval_request_id, action, step_id=step_id, spec=spec
+    )
     if not ok:
         return None, {"status": "rejected", "reason_code": reason, **detail}
     intent = detail["intent"]
@@ -3176,8 +3182,10 @@ async def _progress(message: str, tool_name: str) -> None:
 async def _kernel_inventory_one(
     host: str,
     kernel: str | dict | KernelSpec | None = None,
+    address: str | None = None,
 ) -> dict[str, Any]:
-    """Gather kernel inventory for a single host."""
+    """Gather kernel inventory for a single host (SSH to the pinned address)."""
+    target = address or host
     from providers.rhel_kernel import (
         build_available_command,
         build_inventory_command,
@@ -3197,7 +3205,7 @@ async def _kernel_inventory_one(
             spec_error = str(exc)
     package = spec.package if spec else "kernel"
 
-    result = await _ssh.run(host, build_inventory_command(package), timeout=30)
+    result = await _ssh.run(target, build_inventory_command(package), timeout=30)
     if result.exit_code != 0:
         return {
             "host": host,
@@ -3229,7 +3237,7 @@ async def _kernel_inventory_one(
     if spec.release in inv.installed:
         response["requested"] = {"release": spec.release, "state": "installed"}
         return response
-    avail_result = await _ssh.run(host, build_available_command(spec), timeout=30)
+    avail_result = await _ssh.run(target, build_available_command(spec), timeout=30)
     state = classify_available(avail_result.exit_code, avail_result.stdout)
     response["requested"] = {"release": spec.release, "state": state}
     if state == "not_checked":
@@ -3256,15 +3264,20 @@ def _actions_for_host(spec: KernelSpec, inventory: dict[str, Any]) -> dict[str, 
     }
 
 
-async def _install_kernel_one(host: str, spec: KernelSpec) -> dict[str, Any]:
-    """Install a kernel on a single host (idempotent)."""
+async def _install_kernel_one(
+    host: str, spec: KernelSpec, address: str | None = None
+) -> dict[str, Any]:
+    """Install a kernel on a single host (idempotent; SSH to the pinned address)."""
+    target = address or host
     from providers.rhel_kernel import (
         build_install_command,
         build_inventory_command,
         parse_inventory,
     )
 
-    inv_before = await _ssh.run(host, build_inventory_command(spec.package), timeout=30)
+    inv_before = await _ssh.run(
+        target, build_inventory_command(spec.package), timeout=30
+    )
     try:
         before = parse_inventory(inv_before.stdout)
     except ValueError:
@@ -3282,7 +3295,7 @@ async def _install_kernel_one(host: str, spec: KernelSpec) -> dict[str, Any]:
         }
 
     result = await _ssh.run(
-        host, build_install_command(spec), timeout=900, mutating=True
+        target, build_install_command(spec), timeout=900, mutating=True
     )
     timed_out = result.exit_code == -1
     if result.exit_code != 0 and not timed_out:
@@ -3295,7 +3308,9 @@ async def _install_kernel_one(host: str, spec: KernelSpec) -> dict[str, Any]:
 
     # Re-read the host state: a timeout leaves the outcome unknown until the
     # inventory says otherwise, and a clean exit still needs proof.
-    inv_after = await _ssh.run(host, build_inventory_command(spec.package), timeout=30)
+    inv_after = await _ssh.run(
+        target, build_inventory_command(spec.package), timeout=30
+    )
     try:
         after = parse_inventory(inv_after.stdout)
     except ValueError:
@@ -3328,11 +3343,14 @@ async def _install_kernel_one(host: str, spec: KernelSpec) -> dict[str, Any]:
     }
 
 
-async def _select_default_kernel_one(host: str, spec: KernelSpec) -> dict[str, Any]:
+async def _select_default_kernel_one(
+    host: str, spec: KernelSpec, address: str | None = None
+) -> dict[str, Any]:
     """Select a kernel as the default boot entry on a single host (idempotent)."""
     from providers.rhel_kernel import build_select_command
 
-    before_result = await _ssh.run(host, "grubby --default-kernel 2>&1", timeout=15)
+    target = address or host
+    before_result = await _ssh.run(target, "grubby --default-kernel 2>&1", timeout=15)
     if before_result.exit_code in (255, -1):
         return {
             "host": host,
@@ -3349,7 +3367,7 @@ async def _select_default_kernel_one(host: str, spec: KernelSpec) -> dict[str, A
         }
 
     bootable = await _ssh.run(
-        host, f"test -f {spec.vmlinuz} && test -f {spec.initramfs}", timeout=10
+        target, f"test -f {spec.vmlinuz} && test -f {spec.initramfs}", timeout=10
     )
     if bootable.exit_code != 0:
         return {
@@ -3359,10 +3377,12 @@ async def _select_default_kernel_one(host: str, spec: KernelSpec) -> dict[str, A
             "before": before_default,
         }
 
-    result = await _ssh.run(host, build_select_command(spec), timeout=30, mutating=True)
+    result = await _ssh.run(
+        target, build_select_command(spec), timeout=30, mutating=True
+    )
     if result.exit_code == -1:
         # Timeout: ask the bootloader what it believes before judging.
-        recheck = await _ssh.run(host, "grubby --default-kernel 2>&1", timeout=15)
+        recheck = await _ssh.run(target, "grubby --default-kernel 2>&1", timeout=15)
         after_default = recheck.stdout.strip()
         if recheck.exit_code == 0 and after_default == spec.vmlinuz:
             return {
@@ -3413,7 +3433,7 @@ async def get_kernel_inventory(
     if active.get("status") == "rejected":
         return json.dumps(active)
     ticket = active.get("ticket", active)
-    allowed, refused, requested_as = canonicalize_targets(hosts, ticket)
+    allowed, refused, requested_as, addresses = canonicalize_targets(hosts, ticket)
     results: dict[str, Any] = dict(refused)
 
     # Prefer the plan step's spec so the package (kernel vs kernel-rt) is
@@ -3428,7 +3448,8 @@ async def get_kernel_inventory(
         query = step[1]
 
     raw = await asyncio.gather(
-        *[_kernel_inventory_one(h, query) for h in allowed], return_exceptions=True
+        *[_kernel_inventory_one(h, query, addresses.get(h)) for h in allowed],
+        return_exceptions=True,
     )
     for host, result in zip(allowed, raw):
         if isinstance(result, Exception):
@@ -3465,7 +3486,7 @@ async def prepare_kernel_change(
     # same identity, otherwise the plan itself is inconsistent.
     plan_hosts = step_kernel_hosts(ticket)
     if plan_hosts is not None:
-        plan_allowed, plan_refused, _ = canonicalize_targets(plan_hosts, ticket)
+        plan_allowed, plan_refused, _, _ = canonicalize_targets(plan_hosts, ticket)
         ok, detail = require_full_coverage(plan_allowed, plan_refused, ticket)
         if not ok:
             return json.dumps(
@@ -3481,7 +3502,7 @@ async def prepare_kernel_change(
     per_host: dict[str, Any] = {}
     unresolved: dict[str, str] = {}
     for host in allowed:
-        inv = await _kernel_inventory_one(host, spec)
+        inv = await _kernel_inventory_one(host, spec, ctx["addresses"].get(host))
         inventories[host] = inv
         if inv.get("state") != "ok":
             unresolved[host] = f"{inv.get('state')}: {inv.get('error', '')}".strip()
@@ -3543,7 +3564,12 @@ async def install_kernel(
     assert ctx is not None
     spec, allowed = ctx["spec"], ctx["allowed"]
     intent, rejection = await _authorize_or_reject(
-        ctx["ticket_id"], approval_request_id, "install", allowed
+        ctx["ticket_id"],
+        approval_request_id,
+        "install",
+        allowed,
+        step_id=ctx["step_id"],
+        spec=spec,
     )
     if rejection:
         return json.dumps(rejection)
@@ -3551,7 +3577,8 @@ async def install_kernel(
 
     results: dict[str, Any] = dict(ctx["refused"])
     raw = await asyncio.gather(
-        *[_install_kernel_one(h, spec) for h in allowed], return_exceptions=True
+        *[_install_kernel_one(h, spec, ctx["addresses"].get(h)) for h in allowed],
+        return_exceptions=True,
     )
     for host, result in zip(allowed, raw):
         if isinstance(result, Exception):
@@ -3583,7 +3610,12 @@ async def select_default_kernel(
     assert ctx is not None
     spec, allowed = ctx["spec"], ctx["allowed"]
     intent, rejection = await _authorize_or_reject(
-        ctx["ticket_id"], approval_request_id, "select_default", allowed
+        ctx["ticket_id"],
+        approval_request_id,
+        "select_default",
+        allowed,
+        step_id=ctx["step_id"],
+        spec=spec,
     )
     if rejection:
         return json.dumps(rejection)
@@ -3591,7 +3623,10 @@ async def select_default_kernel(
 
     results: dict[str, Any] = dict(ctx["refused"])
     raw = await asyncio.gather(
-        *[_select_default_kernel_one(h, spec) for h in allowed],
+        *[
+            _select_default_kernel_one(h, spec, ctx["addresses"].get(h))
+            for h in allowed
+        ],
         return_exceptions=True,
     )
     for host, result in zip(allowed, raw):
@@ -3606,11 +3641,13 @@ async def select_default_kernel(
     return json.dumps(summary)
 
 
-async def _probe_host(host: str, timeout: int = 15) -> tuple[bool, Any]:
-    """Run PROBE once. Returns (reachable, ProbeResult | None)."""
+async def _probe_host(
+    host: str, timeout: int = 15, address: str | None = None
+) -> tuple[bool, Any]:
+    """Run PROBE once against the pinned address. Returns (reachable, probe)."""
     from providers.rhel_kernel import build_probe_command, parse_probe
 
-    result = await _ssh.run(host, build_probe_command(), timeout=timeout)
+    result = await _ssh.run(address or host, build_probe_command(), timeout=timeout)
     if result.exit_code in (255, -1):
         return False, None
     if result.exit_code != 0:
@@ -3650,6 +3687,7 @@ async def _poll_until_rebooted(
     poll_interval_seconds: int,
     down_grace_seconds: int,
     checkpoint: Any,
+    address: str | None = None,
 ) -> str:
     """Poll with fresh SSH sessions until the host is back on a new boot_id.
 
@@ -3662,7 +3700,7 @@ async def _poll_until_rebooted(
     while _time.monotonic() - start < budget_seconds:
         record["attempts"] += 1
         await asyncio.sleep(poll_interval_seconds)
-        reachable, probe = await _probe_host(host, timeout=10)
+        reachable, probe = await _probe_host(host, timeout=10, address=address)
         if not reachable:
             if not record["went_down"]:
                 record["went_down"] = True
@@ -3706,6 +3744,7 @@ async def _reboot_and_verify_one(
     poll_interval_seconds: int,
     reboot_policy: str,
     down_grace_seconds: int = 120,
+    address: str | None = None,
 ) -> dict[str, Any]:
     """Drive one host through the recovery decision and, if needed, a reboot.
 
@@ -3766,6 +3805,7 @@ async def _reboot_and_verify_one(
             poll_interval_seconds=poll_interval_seconds,
             down_grace_seconds=down_grace_seconds,
             checkpoint=checkpoint,
+            address=address,
         )
         rec = _finish(record, state)
         await checkpoint(host, rec, f"{host}: {state}")
@@ -3804,13 +3844,18 @@ async def _reboot_and_verify_one(
     await checkpoint(host, record, f"{host}: rebooting to {spec.release}")
     try:
         reboot_result = await _ssh.run(
-            host, build_reboot_command(), timeout=15, mutating=True
+            address or host, build_reboot_command(), timeout=15, mutating=True
         )
-        if reboot_result.exit_code not in (0, 255):
+        # 0 = accepted, 255 = the session died first, -1 = the SSH session
+        # timed out but the nohup'd reboot may well be queued: all three mean
+        # "sent".  Anything else is an unexplained failure.
+        if reboot_result.exit_code not in (0, 255, -1):
             record["error"] = "reboot command failed"
             rec = _finish(record, "indeterminate")
             await checkpoint(host, rec, f"{host}: reboot command failed")
             return rec
+        if reboot_result.exit_code == -1:
+            record["note"] = "reboot command timed out; treating it as sent"
         record["rebooted"] = True
         state = await _poll_until_rebooted(
             host,
@@ -3820,6 +3865,7 @@ async def _reboot_and_verify_one(
             poll_interval_seconds=poll_interval_seconds,
             down_grace_seconds=down_grace_seconds,
             checkpoint=checkpoint,
+            address=address,
         )
     except asyncio.CancelledError:
         record["error"] = "operation cancelled while the host was rebooting"
@@ -3904,7 +3950,7 @@ async def reboot_hosts_and_verify(
     # Recovery pass: one live probe per host decides what happens next.
     decisions: dict[str, tuple[str, str, Any, bool]] = {}
     for host in allowed:
-        reachable, probe = await _probe_host(host)
+        reachable, probe = await _probe_host(host, address=ctx["addresses"].get(host))
         prior = transition.get("hosts", {}).get(host)
         decision, note = recover_host(prior, probe, reachable, spec, reboot_policy)
         decisions[host] = (decision, note, probe, reachable)
@@ -3913,7 +3959,12 @@ async def reboot_hosts_and_verify(
     intent: dict[str, Any] | None = None
     if needs_reboot:
         intent, rejection = await _authorize_or_reject(
-            ticket_id, approval_request_id, "reboot", allowed
+            ticket_id,
+            approval_request_id,
+            "reboot",
+            allowed,
+            step_id=step_id,
+            spec=spec,
         )
         if rejection:
             return json.dumps(rejection)
@@ -3956,6 +4007,7 @@ async def reboot_hosts_and_verify(
             reconnect_timeout_seconds=reconnect_timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
             reboot_policy=reboot_policy,
+            address=ctx["addresses"].get(host),
         )
         results[host] = dict(record)
         if record.get("recovery") == "already_verified":
@@ -3966,6 +4018,13 @@ async def reboot_hosts_and_verify(
 
     if stopped_at is not None:
         for remaining in allowed[allowed.index(stopped_at) + 1 :]:
+            prior = transition.get("hosts", {}).get(remaining)
+            if prior:
+                # A host with history (verified earlier, or mid-reboot) keeps
+                # its record; overwriting it would be an illegal transition
+                # and would discard evidence.
+                results[remaining] = dict(prior, recovery="untouched")
+                continue
             results[remaining] = {"host": remaining, "state": "not_attempted"}
             set_host_record(
                 transition, remaining, {"host": remaining, "state": "not_attempted"}
@@ -4021,8 +4080,10 @@ async def verify_kernel_state(
         write_transition,
     )
 
+    # Reconciliation covers every assigned host: probing a subset could leave
+    # a stale verified record for an unprobed host behind the gate.
     ctx, rejection = await _kernel_tool_context(
-        expected_kernel, hosts, require_coverage=False
+        expected_kernel, hosts, require_coverage=True
     )
     if rejection:
         return json.dumps(rejection)
@@ -4045,7 +4106,7 @@ async def verify_kernel_state(
 
     results: dict[str, Any] = dict(ctx["refused"])
     for host in allowed:
-        reachable, probe = await _probe_host(host)
+        reachable, probe = await _probe_host(host, address=ctx["addresses"].get(host))
         prior = dict(transition.get("hosts", {}).get(host, {}))
         if not reachable:
             results[host] = {"host": host, "state": "unreachable"}
@@ -4106,15 +4167,17 @@ async def verify_kernel_state(
     return json.dumps(summary)
 
 
-async def _capture_environment_one(host: str) -> dict[str, Any]:
-    """Capture environment snapshot for a single host."""
+async def _capture_environment_one(
+    host: str, address: str | None = None
+) -> dict[str, Any]:
+    """Capture environment snapshot for a single host (SSH to the pinned address)."""
     from providers.environment import (
         build_env_command,
         environment_fingerprint,
         parse_environment,
     )
 
-    result = await _ssh.run(host, build_env_command(), timeout=30)
+    result = await _ssh.run(address or host, build_env_command(), timeout=30)
     if result.exit_code != 0:
         return {
             "host": host,
@@ -4146,10 +4209,11 @@ async def capture_environment_fingerprint(
     if active.get("status") == "rejected":
         return json.dumps(active)
     ticket = active.get("ticket", active)
-    allowed, refused, requested_as = canonicalize_targets(hosts, ticket)
+    allowed, refused, requested_as, addresses = canonicalize_targets(hosts, ticket)
     results: dict[str, Any] = dict(refused)
     raw = await asyncio.gather(
-        *[_capture_environment_one(h) for h in allowed], return_exceptions=True
+        *[_capture_environment_one(h, addresses.get(h)) for h in allowed],
+        return_exceptions=True,
     )
     for host, result in zip(allowed, raw):
         if isinstance(result, Exception):

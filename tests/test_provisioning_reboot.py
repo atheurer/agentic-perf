@@ -231,6 +231,41 @@ class TestRebootFailures:
         )
 
     @pytest.mark.asyncio
+    async def test_reboot_command_timeout_is_treated_as_sent(
+        self, handlers, two_hosts_ready, fleet_ssh, approval
+    ):
+        """An SSH timeout on the nohup'd reboot means the reboot may well be
+        queued: poll for it instead of declaring the host indeterminate."""
+        for host in two_hosts_ready.values():
+            host.reboot_behavior = "timeout"
+        result = await run_reboot(handlers, approval)
+        assert result["status"] == "verified"
+        assert "timed out" in result["hosts"]["10.0.0.1"]["note"]
+        assert len(reboot_calls(fleet_ssh)) == 2
+
+    @pytest.mark.asyncio
+    async def test_earlier_failure_preserves_later_hosts_prior_record(
+        self, handlers, two_hosts_ready, fake_store, approval
+    ):
+        """Host 1 fails; host 2 was verified in an earlier invocation.  Its
+        record must survive (verified -> not_attempted is illegal and would
+        have crashed before the pause)."""
+        two_hosts_ready["10.0.0.1"].behavior = "never_returns"
+        h2 = two_hosts_ready["10.0.0.2"]
+        h2.running = KERNEL_B
+        seed_transition(
+            fake_store,
+            {"10.0.0.2": host_record("10.0.0.2", "verified", post_boot_id=h2.boot_id)},
+        )
+        result = await run_reboot(handlers, approval, reconnect_timeout_seconds=3)
+        assert result["status"] == "paused"
+        assert result["hosts"]["10.0.0.2"]["state"] == "verified"
+        assert result["hosts"]["10.0.0.2"]["recovery"] == "untouched"
+        final = checkpoints(fake_store)[-1]
+        assert final["hosts"]["10.0.0.2"]["state"] == "verified"
+        assert fake_store.transitions[-1]["status"] == "awaiting_customer_guidance"
+
+    @pytest.mark.asyncio
     async def test_cancellation_mid_reboot_checkpoints_indeterminate(
         self, handlers, two_hosts_ready, fake_store, approval
     ):
@@ -599,6 +634,26 @@ class TestRecovery:
         assert reboot_calls(fleet_ssh) == []
 
     @pytest.mark.asyncio
+    async def test_indeterminate_prior_on_old_boot_is_not_resent(
+        self, handlers, two_hosts_ready, fleet_ssh, fake_store, approval
+    ):
+        """A timed-out reboot was recorded indeterminate; the host still shows
+        the old boot_id.  The command may be queued, so never resend it."""
+        h1 = two_hosts_ready["10.0.0.1"]
+        h1.behavior = "ignores_reboot"
+        seed_transition(
+            fake_store,
+            {
+                "10.0.0.1": host_record(
+                    "10.0.0.1", "indeterminate", pre_boot_id=h1.boot_id
+                )
+            },
+        )
+        result = await run_reboot(handlers, approval, reconnect_timeout_seconds=3)
+        assert reboot_calls(fleet_ssh, "10.0.0.1") == []
+        assert result["hosts"]["10.0.0.1"]["recovery"] == "in_flight"
+
+    @pytest.mark.asyncio
     async def test_indeterminate_prior_with_fallback_kernel(
         self, handlers, two_hosts_ready, fleet_ssh, fake_store, approval
     ):
@@ -699,15 +754,27 @@ class TestVerifyKernelState:
         assert result["transition_state"] != "verified"
 
     @pytest.mark.asyncio
-    async def test_partial_hosts_do_not_verify_transition(
-        self, handlers, two_hosts_ready, fake_store
+    async def test_subset_is_rejected_so_stale_records_cannot_hide(
+        self, handlers, two_hosts_ready, fake_store, fleet_ssh
     ):
+        """Reconciling only some hosts could leave an old verified record for
+        an unprobed host behind the gate; the tool requires full coverage."""
         two_hosts_ready["10.0.0.1"].running = KERNEL_B
+        seed_transition(
+            fake_store,
+            {
+                "10.0.0.1": host_record("10.0.0.1", "kernel_mismatch"),
+                "10.0.0.2": host_record("10.0.0.2", "verified", post_boot_id="stale"),
+            },
+        )
         result = await handlers["verify_kernel_state"](
             hosts=["10.0.0.1"], expected_kernel=KERNEL_B
         )
-        assert result["results"]["10.0.0.1"]["state"] == "verified"
-        assert result["transition_state"] != "verified"
+        assert result["status"] == "rejected"
+        assert result["reason_code"] == "host_set_mismatch"
+        assert result["missing"] == ["10.0.0.2"]
+        assert not any("@@boot_id" in c["command"] for c in fleet_ssh.calls)
+        assert checkpoints(fake_store) == []
 
     @pytest.mark.asyncio
     async def test_never_reboots_and_needs_no_approval(
@@ -720,10 +787,34 @@ class TestVerifyKernelState:
     @pytest.mark.asyncio
     async def test_unassigned_host_refused(self, handlers, fleet_ssh):
         result = await handlers["verify_kernel_state"](
-            hosts=["10.5.5.5"], expected_kernel=KERNEL_B
+            hosts=HOSTS + ["10.5.5.5"], expected_kernel=KERNEL_B
         )
-        assert result["results"]["10.5.5.5"]["state"] == "refused"
+        assert result["status"] == "rejected"
+        assert result["refused"]["10.5.5.5"]["reason"] == "host_not_assigned"
         assert not any(c["host"] == "10.5.5.5" for c in fleet_ssh.calls)
+
+    @pytest.mark.asyncio
+    async def test_reconciles_every_host_and_supersedes_failed_records(
+        self, handlers, two_hosts_ready, fake_store
+    ):
+        for host in two_hosts_ready.values():
+            host.running = KERNEL_B
+        seed_transition(
+            fake_store,
+            {
+                "10.0.0.1": host_record("10.0.0.1", "kernel_mismatch"),
+                "10.0.0.2": host_record("10.0.0.2", "verified", post_boot_id="stale"),
+            },
+        )
+        result = await handlers["verify_kernel_state"](
+            hosts=HOSTS, expected_kernel=KERNEL_B
+        )
+        assert result["transition_state"] == "verified"
+        final = checkpoints(fake_store)[-1]
+        assert (
+            final["hosts"]["10.0.0.2"]["post_boot_id"]
+            == two_hosts_ready["10.0.0.2"].boot_id
+        )
 
 
 # ---------------------------------------------------------------------------

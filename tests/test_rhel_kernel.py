@@ -311,7 +311,14 @@ class TestHostStateTransitions:
         for state in TERMINAL_STATES:
             if state == "indeterminate":
                 assert HOST_STATE_TRANSITIONS.get(state) == frozenset(
-                    {"verified", "fallback_boot", "kernel_mismatch"}
+                    {
+                        "reconnecting",
+                        "verified",
+                        "fallback_boot",
+                        "kernel_mismatch",
+                        "reconnect_timeout",
+                        "reboot_not_observed",
+                    }
                 )
             else:
                 assert state not in HOST_STATE_TRANSITIONS or (

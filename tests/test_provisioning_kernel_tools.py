@@ -403,15 +403,66 @@ class TestInstallKernelApproval:
         dnf_calls = [c for c in fleet_ssh.calls if "dnf install" in c["command"]]
         assert len(dnf_calls) == 2
 
+        # A completed action is refused, never silently re-run.
         second = await handlers["install_kernel"](
             hosts=["10.0.0.1", "10.0.0.2"],
             kernel=KERNEL_B,
             approval_request_id=approval_id,
         )
-        assert second["results"]["10.0.0.1"]["state"] == "already_installed"
+        assert second["status"] == "rejected"
+        assert second["reason_code"] == "action_already_done"
         assert len(fake_store.consumes) == 1, "consumed approval must not be re-spent"
         dnf_calls = [c for c in fleet_ssh.calls if "dnf install" in c["command"]]
         assert len(dnf_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_approval_from_another_step_rejected(self, handlers, fake_store):
+        """ABBA: the first baseline step's approval must not authorize the
+        second baseline step even though the kernel is identical."""
+        from agents.provisioning.kernel import new_intent
+        from providers.rhel_kernel import KernelSpec
+
+        intent = new_intent(
+            "PERF-TEST",
+            6,
+            ["10.0.0.1", "10.0.0.2"],
+            KernelSpec(KERNEL_B),
+            ["install"],
+            {},
+        )
+        fake_store.seed_intent(intent)
+        approval_id = fake_store.seed_approval(intent)
+        result = await handlers["install_kernel"](
+            hosts=["10.0.0.1", "10.0.0.2"],
+            kernel=KERNEL_B,
+            approval_request_id=approval_id,
+        )
+        assert result["reason_code"] == "approval_wrong_step"
+        assert result["intent_step"] == 6 and result["current_step"] == 2
+        assert fake_store.consumes == []
+
+    @pytest.mark.asyncio
+    async def test_approval_for_another_kernel_rejected(self, handlers, fake_store):
+        from agents.provisioning.kernel import new_intent
+        from providers.rhel_kernel import KernelSpec
+
+        intent = new_intent(
+            "PERF-TEST",
+            2,
+            ["10.0.0.1", "10.0.0.2"],
+            KernelSpec(KERNEL_B, package="kernel-rt"),
+            ["install"],
+            {},
+        )
+        fake_store.seed_intent(intent)
+        approval_id = fake_store.seed_approval(intent)
+        result = await handlers["install_kernel"](
+            hosts=["10.0.0.1", "10.0.0.2"],
+            kernel=KERNEL_B,
+            approval_request_id=approval_id,
+        )
+        assert result["reason_code"] == "approval_wrong_kernel"
+        assert fake_store.consumes == []
 
     @pytest.mark.asyncio
     async def test_crash_after_consume_retry_runs_install_once(
@@ -597,18 +648,41 @@ class TestSelectDefaultKernel:
 
     @pytest.mark.asyncio
     async def test_already_default_is_idempotent(self, handlers, fake_store, two_hosts):
-        intent, approval_id = await self._after_install(handlers, fake_store, two_hosts)
-        await handlers["select_default_kernel"](
+        """A host already on the right default entry is reported, not touched,
+        and a completed action is refused rather than silently repeated."""
+        from agents.provisioning.kernel import new_intent
+        from providers.rhel_kernel import KernelSpec
+
+        for host in two_hosts.values():
+            host.installed.append(KERNEL_B)
+        two_hosts["10.0.0.1"].default = f"/boot/vmlinuz-{KERNEL_B}"
+        intent = new_intent(
+            "PERF-TEST",
+            2,
+            ["10.0.0.1", "10.0.0.2"],
+            KernelSpec(KERNEL_B),
+            ["select_default", "reboot"],
+            {},
+        )
+        fake_store.seed_intent(intent)
+        approval_id = fake_store.seed_approval(intent)
+        result = await handlers["select_default_kernel"](
             hosts=["10.0.0.1", "10.0.0.2"],
             kernel=KERNEL_B,
             approval_request_id=approval_id,
         )
+        assert result["results"]["10.0.0.1"]["state"] == "already_default"
+        assert result["results"]["10.0.0.2"]["state"] == "ok"
+        grubby_sets = [
+            c for c in fleet_ssh_calls(two_hosts, handlers) if "set-default" in c
+        ]
+        assert all("10.0.0.1" not in c for c in grubby_sets)
         again = await handlers["select_default_kernel"](
             hosts=["10.0.0.1", "10.0.0.2"],
             kernel=KERNEL_B,
             approval_request_id=approval_id,
         )
-        assert again["results"]["10.0.0.1"]["state"] == "already_default"
+        assert again["reason_code"] == "action_already_done"
 
     @pytest.mark.asyncio
     async def test_not_bootable(self, handlers, fake_store, two_hosts):
@@ -728,6 +802,13 @@ class TestPackageInjection:
             KernelSpec.parse({"release": KERNEL_A, "package": "kernel$(whoami)"})
 
 
+def fleet_ssh_calls(two_hosts, handlers):
+    """Commands issued so far, tagged with the SSH target host."""
+    import agents.provisioning.server as srv
+
+    return [f"{c['host']} {c['command']}" for c in srv._ssh.calls]
+
+
 class TestCanonicalization:
     def test_requested_as_keeps_caller_string(self, ticket):
         from agents.provisioning.kernel import canonicalize_targets
@@ -736,12 +817,49 @@ class TestCanonicalization:
         ticket["custom_fields"]["resource_provider_metadata"] = {
             "ip_mapping": {"203.0.113.5": "10.0.0.1"}
         }
-        allowed, refused, requested_as = canonicalize_targets(
+        allowed, refused, requested_as, addresses = canonicalize_targets(
             ["203.0.113.5", "10.0.0.2"], ticket
         )
         assert allowed == ["10.0.0.1", "10.0.0.2"]
         assert refused == {}
         assert requested_as == {"10.0.0.1": "203.0.113.5", "10.0.0.2": "10.0.0.2"}
+        assert addresses == {"10.0.0.1": "10.0.0.1", "10.0.0.2": "10.0.0.2"}
+
+    @pytest.mark.asyncio
+    async def test_ssh_uses_the_pinned_address_not_the_name(
+        self, handlers, fleet_ssh, monkeypatch
+    ):
+        """Targets given as names: validation resolves them once and every
+        SSH call goes to that address, so DNS cannot change the target."""
+        import socket
+
+        table = {
+            "sut1.lab": "10.0.0.1",
+            "sut2.lab": "10.0.0.2",
+            "orch.lab": "192.168.9.9",
+        }
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            if host in table:
+                return [(socket.AF_INET, 0, 0, "", (table[host], 0))]
+            try:
+                import ipaddress
+
+                ipaddress.ip_address(host)
+                return [(socket.AF_INET, 0, 0, "", (host, 0))]
+            except ValueError:
+                raise socket.gaierror("unknown")
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr(socket, "gethostname", lambda: "orch.lab")
+        monkeypatch.setattr(socket, "getfqdn", lambda: "orch.lab")
+        FakeKernelStore.reset(kernel_step_ticket(targets=["sut1.lab", "sut2.lab"]))
+        # Make DNS lie after validation: the pinned address must still win.
+        result = await handlers["get_kernel_inventory"](hosts=["sut1.lab", "sut2.lab"])
+        assert result["results"]["sut1.lab"]["state"] == "ok"
+        assert result["results"]["sut1.lab"]["requested_as"] == "sut1.lab"
+        targets = {c["host"] for c in fleet_ssh.calls}
+        assert targets == {"10.0.0.1", "10.0.0.2"}
 
     def test_full_coverage_requires_every_target(self, ticket):
         from agents.provisioning.kernel import require_full_coverage
