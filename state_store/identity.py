@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import threading
@@ -108,7 +109,14 @@ class UserStore:
         self._groups: dict[str, Group] = {}
         self._lock = threading.Lock()
         self._last_persisted: dict[str, float] = {}
-        self._file_mtime: float = 0.0
+        # Sample mtime BEFORE loading so a concurrent write between
+        # _load() and stat() doesn't cache new mtime with old content.
+        try:
+            self._file_mtime = (
+                self._path.stat().st_mtime if self._path.exists() else 0.0
+            )
+        except OSError:
+            self._file_mtime = 0.0
         self._load()
 
     # ------------------------------------------------------------------
@@ -139,20 +147,23 @@ class UserStore:
         raw_token = secrets.token_hex(32)
         token_h = hash_token(raw_token)
         with self._lock:
-            self._reload_if_stale()
-            if normalized in self._users:
-                raise DuplicateUser(f"User '{normalized}' already exists")
-            user = User(
-                username=normalized,
-                token_hash=token_h,
-                is_admin=is_admin,
-                token_issued_at=datetime.now(timezone.utc),
-                service_account=service_account,
-                allowed_sources=list(allowed_sources) if allowed_sources else [],
-                max_requests_per_hour=max_requests_per_hour,
-            )
-            self._users[normalized] = user
-            self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                if normalized in self._users:
+                    raise DuplicateUser(f"User '{normalized}' already exists")
+                user = User(
+                    username=normalized,
+                    token_hash=token_h,
+                    is_admin=is_admin,
+                    token_issued_at=datetime.now(timezone.utc),
+                    service_account=service_account,
+                    allowed_sources=list(allowed_sources) if allowed_sources else [],
+                    max_requests_per_hour=max_requests_per_hour,
+                )
+                self._users[normalized] = user
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
         return user, raw_token
 
     def get_user(self, username: str) -> User:
@@ -391,8 +402,38 @@ class UserStore:
     # Persistence
     # ------------------------------------------------------------------
 
-    def _save(self) -> None:
-        """Atomically persist the user and group records."""
+    def _acquire_file_lock(self) -> tuple:
+        """Acquire cross-process file lock and reload state.
+
+        Returns (filesystem, lock_fd).  Caller MUST call
+        _release_file_lock when done.  Must hold self._lock.
+
+        After return, self._users/_groups reflect disk state.
+        The caller mutates and calls _write_locked() to persist.
+        """
+        import fcntl
+
+        from providers.execution import AuditedFilesystem
+
+        filesystem = AuditedFilesystem.system(self._path.parent)
+        filesystem.mkdir(".", mode=0o777)
+        lock_path = self._path.with_suffix(".lock")
+        filesystem.touch(lock_path.name, mode=0o600)
+        lock_fd = filesystem.open_descriptor(lock_path.name, os.O_RDWR, mode=0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        self._reload_if_stale()
+        return filesystem, lock_fd
+
+    def _release_file_lock(self, filesystem, lock_fd: int) -> None:
+        """Release cross-process file lock."""
+        import fcntl
+
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        filesystem.forget_descriptor(lock_fd)
+        os.close(lock_fd)
+
+    def _write_locked(self, filesystem) -> None:
+        """Persist current state.  Must hold the file lock."""
         data = {
             "users": {
                 name: user.model_dump(mode="json") for name, user in self._users.items()
@@ -402,11 +443,19 @@ class UserStore:
                 for name, group in self._groups.items()
             },
         }
-        from providers.execution import AuditedFilesystem
-
-        filesystem = AuditedFilesystem.system(self._path.parent)
-        filesystem.mkdir(".", mode=0o777)
         filesystem.write(self._path.name, json.dumps(data, indent=2), mode=0o600)
+        try:
+            self._file_mtime = self._path.stat().st_mtime
+        except OSError:
+            pass
+
+    def _save(self) -> None:
+        """Acquire lock, reload, and write.  For simple mutations."""
+        filesystem, lock_fd = self._acquire_file_lock()
+        try:
+            self._write_locked(filesystem)
+        finally:
+            self._release_file_lock(filesystem, lock_fd)
         try:
             self._file_mtime = self._path.stat().st_mtime
         except OSError:
