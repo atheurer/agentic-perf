@@ -21,6 +21,7 @@ register_directives(
     aliases={
         # Sample count variants
         "reboot_count": "sample_count",
+        "reboot_cycles": "sample_count",
         "boot_count": "sample_count",
         "boot_cycles": "sample_count",
         "num_boots": "sample_count",

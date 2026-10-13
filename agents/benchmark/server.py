@@ -4632,13 +4632,27 @@ async def execute_boot_time_test(
                 f"[boot-time] Using Jumpstarter lease {lease_id} for serial capture"
             )
         elif is_jumpstarter:
-            # Enable Jumpstarter power control even without
-            # serial capture so cold boots use hardware
-            # power cycling instead of SSH reboots.
+            # Always pass the lease name so the script can use
+            # Jumpstarter for diagnostics (exporter status, power
+            # status, serial probe on failure).  When reboot_method
+            # is warm, disable hardware power cycling so the script
+            # uses SSH reboot while retaining diagnostic capability.
             cmd.append(f"--jumpstarter-lease-name={lease_id}")
-            logger.info(
-                f"[boot-time] Using Jumpstarter lease {lease_id} for power control"
-            )
+            requested_reboot = (
+                directives.get("reboot_method", "") or directives.get("boot_type", "")
+            ).lower()
+            if requested_reboot == "warm":
+                cmd.append("--no-jumpstarter-power")
+                logger.info(
+                    "[boot-time] reboot_method=warm — Jumpstarter power "
+                    "control disabled, using SSH reboot (lease %s "
+                    "retained for diagnostics)",
+                    lease_id,
+                )
+            else:
+                logger.info(
+                    f"[boot-time] Using Jumpstarter lease {lease_id} for power control"
+                )
 
         # Pass power-off delay from directives
         power_off_delay = directives.get("power_off_delay") or directives.get(
