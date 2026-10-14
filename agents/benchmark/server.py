@@ -4788,7 +4788,12 @@ async def execute_boot_time_test(
             mutating=True,
         )
         _STALL_CHECK_INTERVAL = 60
-        _STALL_TIMEOUT = 300
+        # Allow 360s so the boot-time script's failure diagnostics
+        # (exporter status, power status, serial probe) have time to
+        # run after wait_for_sut_up times out at 300s.  The diagnostics
+        # take ~30s and produce DIAGNOSTIC: lines that are critical for
+        # differentiating power control, gRPC, and boot failures.
+        _STALL_TIMEOUT = 360
 
         # Drain bounded chunks so an unterminated line cannot exceed the
         # StreamReader line limit and strand the benchmark subprocess.
