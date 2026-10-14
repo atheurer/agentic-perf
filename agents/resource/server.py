@@ -60,11 +60,6 @@ _registry = None
 # Set by check_available_resources, read by reserve_resources.
 _fleet_next_device: str | None = None
 
-# QUADS selections must come from options that satisfied this ticket's
-# requirements. A separate set is kept for each managed host requirement.
-_quads_eligible_hostnames_by_requirement: list[set[str]] | None = None
-_quads_eligibility_context: str | None = None
-
 # Guardrail: set after a successful or uncertain reservation outcome.
 # Prevents discovery after allocation and duplicate attempts when the provider
 # may have allocated resources before returning an error.
@@ -130,19 +125,19 @@ def _unknown_reservation_response(provider: str | None = None) -> dict[str, Any]
     return response
 
 
-def _quads_ticket_context_key() -> str:
-    """Identify the ticket requirements for which QUADS options were checked."""
-    return json.dumps(
-        {
-            "ticket_id": os.environ.get("TICKET_ID", "") or _ticket.get("id", ""),
-            "required_hosts": _ticket.get("custom_fields", {}).get(
-                "required_hosts", []
-            ),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
+def _reservation_ticket_context(
+    ticket_id: str | None = None,
+    ticket_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the explicit ticket context passed to provider contract hooks."""
+    fields = ticket_fields if isinstance(ticket_fields, dict) else {}
+    required_hosts = fields.get("required_hosts")
+    return {
+        "ticket_id": ticket_id
+        or os.environ.get("TICKET_ID", "")
+        or _ticket.get("id", ""),
+        "required_hosts": required_hosts if isinstance(required_hosts, list) else [],
+    }
 
 
 def _ticket_resource_provider() -> tuple[str | None, bool]:
@@ -611,22 +606,6 @@ async def check_available_resources(
             "reservation_selection_example": prov.reservation_selection_example(),
         }
 
-    global _quads_eligible_hostnames_by_requirement, _quads_eligibility_context
-    _quads_eligible_hostnames_by_requirement = None
-    _quads_eligibility_context = None
-
-    ticket_required_hosts = _ticket.get("custom_fields", {}).get("required_hosts")
-    if provider == "quads" and isinstance(ticket_required_hosts, list):
-        managed_ticket_hosts = [
-            host
-            for host in ticket_required_hosts
-            if isinstance(host, dict) and not host.get("host")
-        ]
-        if managed_ticket_hosts:
-            # QUADS discovery must apply the ticket's own per-host constraints;
-            # the model cannot replace them with a broader request.
-            required_hosts = managed_ticket_hosts
-
     # Code-enforce the directive's board_selector for
     # Jumpstarter. The LLM may use a wrong selector key.
     if provider == "jumpstarter":
@@ -664,6 +643,15 @@ async def check_available_resources(
                     fresh_cf = r.json().get("custom_fields", {})
         except Exception:
             pass
+    ticket_fields = fresh_cf if isinstance(fresh_cf, dict) else {}
+    ticket_hosts = ticket_fields.get("required_hosts")
+    ticket_context = _reservation_ticket_context(ticket_id, ticket_fields)
+    if isinstance(prov, ResourceProvider):
+        required_hosts = prov.required_hosts_for_availability(
+            required_hosts,
+            ticket_hosts if isinstance(ticket_hosts, list) else None,
+            ticket_context,
+        )
     if is_fleet_investigation(fresh_cf):
         tested_host_ids = set(get_tested_host_ids(fresh_cf))
         exclude = list(tested_host_ids)
@@ -696,25 +684,14 @@ async def check_available_resources(
                 host_req["exclude_hosts"] = list(set(exclude) | set(existing))
             result = await prov.check_available(host_req)
             availability_results.append(result)
-            rec = dict(host_req)
-            if result.get("options"):
-                rec["recommended"] = result["options"][0]
-            if provider == "quads":
-                # Keep every eligible hostname visible so the agent can choose
-                # distinct hosts when several requirements have the same best
-                # recommendation.
-                rec["options"] = result.get("options", [])
-            recommendations.append(rec)
-        if provider == "quads":
-            _quads_eligible_hostnames_by_requirement = [
-                {
-                    str(option.get("hostname") or option.get("host") or "").casefold()
-                    for option in result.get("options", [])
-                    if option.get("hostname") or option.get("host")
-                }
-                for result in availability_results
-            ]
-            _quads_eligibility_context = _quads_ticket_context_key()
+            if isinstance(prov, ResourceProvider):
+                recommendations.append(
+                    prov.availability_recommendation(host_req, result, ticket_context)
+                )
+            else:
+                recommendations.append(dict(host_req))
+        if isinstance(prov, ResourceProvider):
+            prov.record_availability_context(availability_results, ticket_context)
         response = {
             "provider": prov.provider_name,
             "per_host_recommendations": recommendations,
@@ -735,15 +712,8 @@ async def check_available_resources(
         return json.dumps(response)
     result = await prov.check_available(requirements or {})
     result.update(selection_guidance)
-
-    if provider == "quads":
-        eligible_hostnames = {
-            str(option.get("hostname") or option.get("host") or "").casefold()
-            for option in result.get("options", [])
-            if option.get("hostname") or option.get("host")
-        }
-        _quads_eligible_hostnames_by_requirement = [eligible_hostnames]
-        _quads_eligibility_context = _quads_ticket_context_key()
+    if isinstance(prov, ResourceProvider):
+        prov.record_availability_context([result], ticket_context)
 
     # Code-enforce: when a specific device was requested by
     # name and is unavailable, escalate to HITL immediately.
@@ -782,6 +752,95 @@ async def check_available_resources(
         _fleet_next_device = devices[0]["name"] if devices else None
 
     return json.dumps(result)
+
+
+@mcp.tool()
+async def prepare_reservation_selection(
+    provider: str,
+    selection: dict,
+    required_hosts: list[dict] | None = None,
+    ticket_id: str | None = None,
+) -> str:
+    """Validate and prepare an automatic selection through its provider contract.
+
+    Provider hooks may perform read-only availability discovery before returning
+    a normalized selection. This tool never starts a reservation.
+    """
+    if _reservation_uncertain:
+        return json.dumps(_unknown_reservation_response(provider))
+    if _resources_allocated:
+        return json.dumps(
+            {
+                "error": "Resources already allocated. "
+                "Call submit_resource_result to complete.",
+                "already_allocated": True,
+            }
+        )
+    if not isinstance(selection, dict):
+        return json.dumps(
+            {
+                "status": "invalid_selection",
+                "provider": provider,
+                "error": "Reservation selection must be an object.",
+                "provider_call_started": False,
+            }
+        )
+    await _ensure_init()
+    if _reservation_uncertain:
+        return json.dumps(_unknown_reservation_response(provider))
+    expected_provider, user_provided_only = _ticket_resource_provider()
+    if user_provided_only or (expected_provider and provider != expected_provider):
+        return json.dumps(
+            {
+                "status": "invalid_selection",
+                "provider": provider,
+                "error": f"Ticket is configured for '{expected_provider or 'user_provided'}'.",
+                "provider_call_started": False,
+            }
+        )
+    try:
+        prov = await _registry.get_provider(provider)
+        if not isinstance(prov, ResourceProvider):
+            raise ReservationSelectionError(
+                f"Provider '{provider}' has no reservation selection contract"
+            )
+        ticket_fields = _ticket.get("custom_fields", {})
+        ticket_hosts = ticket_fields.get("required_hosts")
+        effective_hosts = (
+            required_hosts
+            if isinstance(required_hosts, list)
+            else ticket_hosts
+            if isinstance(ticket_hosts, list)
+            else None
+        )
+        ticket_context = _reservation_ticket_context(
+            ticket_id, ticket_fields if isinstance(ticket_fields, dict) else {}
+        )
+        prepared = await prov.prepare_auto_reservation_selection(
+            selection,
+            required_hosts=effective_hosts,
+            ticket_context=ticket_context,
+        )
+    except (ReservationSelectionError, ValueError) as exc:
+        return json.dumps(
+            {
+                "status": "invalid_selection",
+                "provider": provider,
+                "error": str(exc),
+                "provider_call_started": False,
+            }
+        )
+    except Exception as exc:
+        logger.exception("[resource] Selection preparation failed for %s", provider)
+        return json.dumps(
+            {
+                "status": "preparation_failed",
+                "provider": provider,
+                "error": str(exc),
+                "provider_call_started": False,
+            }
+        )
+    return json.dumps({"status": "ready", "provider": provider, "selection": prepared})
 
 
 def _infer_os_from_ticket() -> str:
@@ -892,22 +951,19 @@ async def reserve_resources(
     prov = await _registry.get_provider(provider)
     if isinstance(prov, ResourceProvider):
         try:
-            required_hosts = _ticket.get("custom_fields", {}).get("required_hosts")
+            ticket_fields = _ticket.get("custom_fields", {})
+            required_hosts = ticket_fields.get("required_hosts")
             if not isinstance(required_hosts, list):
                 required_hosts = None
-            quads_eligibility = _quads_eligible_hostnames_by_requirement
-            if (
-                provider == "quads"
-                and _quads_eligibility_context != _quads_ticket_context_key()
-            ):
-                quads_eligibility = None
+            ticket_context = _reservation_ticket_context(
+                ticket_id,
+                ticket_fields if isinstance(ticket_fields, dict) else {},
+            )
             selection = prov.validate_reservation_selection(
                 selection,
                 required_hosts=required_hosts,
-                eligible_hostnames_by_requirement=(
-                    quads_eligibility if provider == "quads" else None
-                ),
-                require_eligible_hostnames=provider == "quads",
+                ticket_context=ticket_context,
+                preflight=True,
             )
         except ReservationSelectionError as exc:
             return json.dumps(

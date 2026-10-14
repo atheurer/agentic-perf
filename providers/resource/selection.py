@@ -7,6 +7,7 @@ known, before the write-ahead reservation marker or any allocation call.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +24,9 @@ from pydantic import (
 
 class ReservationSelectionError(ValueError):
     """A provider selection failed local validation before allocation."""
+
+
+SelectionValidator = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
 
 
 class _SelectionModel(BaseModel):
@@ -98,10 +102,130 @@ class ReservationSelectionContract:
     valid_example: dict[str, Any]
     invalid_examples: tuple[dict[str, Any], ...]
     prompt_fields: tuple[str, ...]
+    validator: SelectionValidator | None = None
 
     def json_schema(self) -> dict[str, Any]:
         """Return the JSON Schema represented by the validation model."""
         return self.model.model_json_schema()
+
+
+def _validation_error_message(error: ValidationError) -> str:
+    messages = []
+    for detail in error.errors(include_url=False):
+        location = ".".join(str(part) for part in detail["loc"]) or "selection"
+        messages.append(f"{location}: {detail['msg']}")
+    return "; ".join(messages)
+
+
+def _managed_host_count(required_hosts: list[dict[str, Any]] | None) -> int | None:
+    if not required_hosts:
+        return None
+    return sum(
+        1 for host in required_hosts if isinstance(host, dict) and not host.get("host")
+    )
+
+
+def _quads_hosts_in_requirement_order(
+    selected_hostnames: list[str],
+    eligible_hostnames_by_requirement: list[set[str]],
+) -> list[str] | None:
+    """Match distinct selected hosts and return them in requirement order."""
+    if len(eligible_hostnames_by_requirement) == 1 and len(selected_hostnames) > 1:
+        eligible_hostnames_by_requirement = eligible_hostnames_by_requirement * len(
+            selected_hostnames
+        )
+    candidates = [
+        [
+            hostname
+            for hostname in selected_hostnames
+            if hostname.casefold() in {host.casefold() for host in eligible}
+        ]
+        for eligible in eligible_hostnames_by_requirement
+    ]
+    if len(candidates) != len(selected_hostnames):
+        return None
+
+    assigned: set[str] = set()
+    by_requirement: dict[int, str] = {}
+
+    def assign(requirement_index: int, remaining: list[int]) -> bool:
+        if requirement_index == len(remaining):
+            return True
+        index = remaining[requirement_index]
+        for hostname in candidates[index]:
+            if hostname in assigned:
+                continue
+            assigned.add(hostname)
+            by_requirement[index] = hostname
+            if assign(requirement_index + 1, remaining):
+                return True
+            by_requirement.pop(index, None)
+            assigned.remove(hostname)
+        return False
+
+    ordered = sorted(range(len(candidates)), key=lambda index: len(candidates[index]))
+    if not assign(0, ordered):
+        return None
+    return [by_requirement[index] for index in range(len(candidates))]
+
+
+def _validate_quads_selection(
+    normalized: dict[str, Any], context: dict[str, Any]
+) -> dict[str, Any]:
+    hostnames = normalized["hostnames"]
+    expected_count = _managed_host_count(context.get("required_hosts"))
+    if expected_count is not None and len(hostnames) != expected_count:
+        raise ReservationSelectionError(
+            f"QUADS selection has {len(hostnames)} hostname(s), but the ticket "
+            f"requires {expected_count} managed host(s)"
+        )
+
+    eligible = context.get("eligible_hostnames_by_requirement")
+    if context.get("require_eligible_hostnames") and eligible is None:
+        raise ReservationSelectionError(
+            "QUADS eligible host options are unavailable; call "
+            "check_available_resources with the ticket's requirements first"
+        )
+    if eligible is not None:
+        ordered = _quads_hosts_in_requirement_order(hostnames, eligible)
+        if ordered is None:
+            raise ReservationSelectionError(
+                "QUADS hostnames must be distinct eligible options matching the "
+                "ticket's managed host requirements"
+            )
+        normalized["hostnames"] = ordered
+    return normalized
+
+
+def _validate_aws_selection(
+    normalized: dict[str, Any], context: dict[str, Any]
+) -> dict[str, Any]:
+    expected_count = _managed_host_count(context.get("required_hosts"))
+    if expected_count is None:
+        return normalized
+    specs = normalized.get("instance_specs")
+    if specs is not None:
+        selected_count = sum(spec.get("count", 1) for spec in specs)
+    else:
+        selected_count = normalized.get("count", normalized.get("instance_count", 1))
+    if selected_count != expected_count:
+        raise ReservationSelectionError(
+            f"AWS selection covers {selected_count} instance(s), but the ticket "
+            f"requires {expected_count} managed host(s)"
+        )
+    return normalized
+
+
+def _validate_jumpstarter_selection(
+    normalized: dict[str, Any], context: dict[str, Any]
+) -> dict[str, Any]:
+    expected_count = _managed_host_count(context.get("required_hosts"))
+    if expected_count is not None and expected_count != 1:
+        raise ReservationSelectionError(
+            "Jumpstarter leases one device per reservation, but the ticket "
+            f"requires {expected_count} managed host(s)"
+        )
+    return normalized
 
 
 RESERVATION_SELECTION_CONTRACTS: dict[str, ReservationSelectionContract] = {
@@ -114,6 +238,7 @@ RESERVATION_SELECTION_CONTRACTS: dict[str, ReservationSelectionContract] = {
             {"hostnames": ["host-01.example.com", "HOST-01.EXAMPLE.COM"]},
         ),
         prompt_fields=("hostnames",),
+        validator=_validate_quads_selection,
     ),
     "aws": ReservationSelectionContract(
         model=AWSSelection,
@@ -138,6 +263,7 @@ RESERVATION_SELECTION_CONTRACTS: dict[str, ReservationSelectionContract] = {
             "root_volume_gb",
             "role",
         ),
+        validator=_validate_aws_selection,
     ),
     "jumpstarter": ReservationSelectionContract(
         model=JumpstarterSelection,
@@ -155,6 +281,7 @@ RESERVATION_SELECTION_CONTRACTS: dict[str, ReservationSelectionContract] = {
             "count",
             "exporter_name",
         ),
+        validator=_validate_jumpstarter_selection,
     ),
     "psap-cc": ReservationSelectionContract(
         model=PSAPCCSelection,
@@ -163,58 +290,6 @@ RESERVATION_SELECTION_CONTRACTS: dict[str, ReservationSelectionContract] = {
         prompt_fields=("cluster_id",),
     ),
 }
-
-
-def _validation_error_message(error: ValidationError) -> str:
-    messages = []
-    for detail in error.errors(include_url=False):
-        location = ".".join(str(part) for part in detail["loc"]) or "selection"
-        messages.append(f"{location}: {detail['msg']}")
-    return "; ".join(messages)
-
-
-def _managed_host_count(required_hosts: list[dict[str, Any]] | None) -> int | None:
-    if not required_hosts:
-        return None
-    return sum(
-        1 for host in required_hosts if isinstance(host, dict) and not host.get("host")
-    )
-
-
-def _quads_hosts_match_requirements(
-    selected_hostnames: list[str],
-    eligible_hostnames_by_requirement: list[set[str]],
-) -> bool:
-    """Check that each selected host satisfies a distinct host requirement."""
-    selected = {hostname.casefold() for hostname in selected_hostnames}
-    if len(eligible_hostnames_by_requirement) == 1 and len(selected) > 1:
-        eligible_hostnames_by_requirement = eligible_hostnames_by_requirement * len(
-            selected
-        )
-    candidates = [
-        sorted(selected.intersection(host.casefold() for host in eligible))
-        for eligible in eligible_hostnames_by_requirement
-    ]
-    if len(candidates) != len(selected):
-        return False
-
-    assigned: set[str] = set()
-
-    def assign(requirement_index: int, remaining: list[int]) -> bool:
-        if requirement_index == len(remaining):
-            return True
-        index = remaining[requirement_index]
-        for hostname in candidates[index]:
-            if hostname in assigned:
-                continue
-            assigned.add(hostname)
-            if assign(requirement_index + 1, remaining):
-                return True
-            assigned.remove(hostname)
-        return False
-
-    ordered = sorted(range(len(candidates)), key=lambda index: len(candidates[index]))
-    return assign(0, ordered)
 
 
 def validate_reservation_selection(
@@ -240,49 +315,13 @@ def validate_reservation_selection(
         ) from None
 
     normalized = validated.model_dump(exclude_unset=True, exclude_none=True)
-    expected_count = _managed_host_count(required_hosts)
-
-    if provider == "quads":
-        hostnames = normalized["hostnames"]
-        if expected_count is not None and len(hostnames) != expected_count:
-            raise ReservationSelectionError(
-                f"QUADS selection has {len(hostnames)} hostname(s), but the ticket "
-                f"requires {expected_count} managed host(s)"
-            )
-        if require_eligible_hostnames and eligible_hostnames_by_requirement is None:
-            raise ReservationSelectionError(
-                "QUADS eligible host options are unavailable; call "
-                "check_available_resources with the ticket's requirements first"
-            )
-        if eligible_hostnames_by_requirement is not None and not (
-            _quads_hosts_match_requirements(
-                hostnames, eligible_hostnames_by_requirement
-            )
-        ):
-            raise ReservationSelectionError(
-                "QUADS hostnames must be distinct eligible options matching the "
-                "ticket's managed host requirements"
-            )
-
-    elif provider == "aws" and expected_count is not None:
-        specs = normalized.get("instance_specs")
-        if specs is not None:
-            selected_count = sum(spec.get("count", 1) for spec in specs)
-        else:
-            selected_count = normalized.get(
-                "count", normalized.get("instance_count", 1)
-            )
-        if selected_count != expected_count:
-            raise ReservationSelectionError(
-                f"AWS selection covers {selected_count} instance(s), but the ticket "
-                f"requires {expected_count} managed host(s)"
-            )
-
-    elif provider == "jumpstarter" and expected_count is not None:
-        if expected_count != 1:
-            raise ReservationSelectionError(
-                "Jumpstarter leases one device per reservation, but the ticket "
-                f"requires {expected_count} managed host(s)"
-            )
-
-    return normalized
+    if contract.validator is None:
+        return normalized
+    return contract.validator(
+        normalized,
+        {
+            "required_hosts": required_hosts,
+            "eligible_hostnames_by_requirement": eligible_hostnames_by_requirement,
+            "require_eligible_hostnames": require_eligible_hostnames,
+        },
+    )

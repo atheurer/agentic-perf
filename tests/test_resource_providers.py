@@ -1543,7 +1543,15 @@ class TestProviderCorrectAutoReservation:
             state_store_url="http://localhost:8090",
         )
         agent._mcp = AsyncMock()
-        agent._mcp.call_tool = AsyncMock(side_effect=mcp_call)
+
+        async def mcp_dispatch(name, arguments):
+            if name == "prepare_reservation_selection":
+                return json.dumps(
+                    {"status": "ready", "selection": arguments["selection"]}
+                )
+            return await mcp_call(name, arguments)
+
+        agent._mcp.call_tool = AsyncMock(side_effect=mcp_dispatch)
         agent._client = AsyncMock()
         ticket_response = AsyncMock(
             status_code=200,
@@ -1650,6 +1658,10 @@ class TestProviderCorrectAutoReservation:
                 if metadata_reads == 1:
                     return "{}"
                 return json.dumps({"instance_ids": ["i-new"]})
+            if name == "prepare_reservation_selection":
+                return json.dumps(
+                    {"status": "ready", "selection": arguments["selection"]}
+                )
             if name == "reserve_resources":
                 reserve_calls.append(arguments)
                 return json.dumps(
@@ -2596,25 +2608,10 @@ class TestProviderCorrectAutoReservation:
             "custom_fields": ticket_fields,
         }
         calls = []
-        mcp_calls = []
 
         async def mcp_call(name, arguments):
-            mcp_calls.append(name)
             if name == "get_accumulated_metadata":
                 return "{}"
-            if name == "check_available_resources" and provider == "quads":
-                options = [
-                    {"hostname": "host-a"},
-                    {"hostname": "host-b"},
-                ]
-                return json.dumps(
-                    {
-                        "per_host_recommendations": [
-                            {"options": options}
-                            for _ in arguments.get("required_hosts", [])
-                        ]
-                    }
-                )
             if name == "reserve_resources":
                 calls.append(arguments)
                 return json.dumps(reserve_result)
@@ -2634,10 +2631,11 @@ class TestProviderCorrectAutoReservation:
         assert fields["resource_reservation_id"] == expected_id
         assert fields.get("fresh_host", False) is fresh_host
         assert fields["assigned_hardware_ips"] == expected_hardware
+        call_names = [call.args[0] for call in agent._mcp.call_tool.await_args_list]
+        assert call_names.index("prepare_reservation_selection") < call_names.index(
+            "reserve_resources"
+        )
         if provider == "quads":
-            assert mcp_calls.index("check_available_resources") < mcp_calls.index(
-                "reserve_resources"
-            )
             assert (
                 fields["quads_assignment_id"]
                 == reserve_result["provider_metadata"]["assignment_id"]

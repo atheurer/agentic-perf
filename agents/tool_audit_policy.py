@@ -216,6 +216,7 @@ TOOL_AUDIT_POLICY = (
         "agents/resource/server.py:parse_host_config",
         "agents/resource/server.py:list_resource_providers",
         "agents/resource/server.py:check_available_resources",
+        "agents/resource/server.py:prepare_reservation_selection",
         "agents/resource/server.py:get_reservation_status",
         "agents/resource/server.py:validate_host",
         "agents/resource/server.py:get_host_inventory",

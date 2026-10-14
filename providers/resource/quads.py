@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
@@ -21,6 +22,115 @@ class QuadsResourceProvider(ResourceProvider):
         from providers.quads import QuadsClient
 
         self._client: QuadsClient = client
+        self._eligible_hostnames_by_requirement: list[set[str]] | None = None
+        self._availability_context_key: str | None = None
+
+    @staticmethod
+    def _context_key(ticket_context: dict[str, Any]) -> str:
+        return json.dumps(
+            ticket_context, sort_keys=True, separators=(",", ":"), default=str
+        )
+
+    def required_hosts_for_availability(
+        self,
+        requested_hosts: list[dict[str, Any]] | None,
+        ticket_hosts: list[dict[str, Any]] | None,
+        ticket_context: dict[str, Any],
+    ) -> list[dict[str, Any]] | None:
+        if isinstance(ticket_hosts, list):
+            managed = [
+                host
+                for host in ticket_hosts
+                if isinstance(host, dict) and not host.get("host")
+            ]
+            if managed:
+                return managed
+        return requested_hosts
+
+    def availability_recommendation(
+        self,
+        requirement: dict[str, Any],
+        result: dict[str, Any],
+        ticket_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        recommendation = super().availability_recommendation(
+            requirement, result, ticket_context
+        )
+        recommendation["options"] = result.get("options", [])
+        return recommendation
+
+    def record_availability_context(
+        self,
+        results: list[dict[str, Any]],
+        ticket_context: dict[str, Any],
+    ) -> None:
+        self._eligible_hostnames_by_requirement = [
+            {
+                str(option.get("hostname") or option.get("host")).casefold()
+                for option in result.get("options", [])
+                if isinstance(option, dict)
+                and (option.get("hostname") or option.get("host"))
+            }
+            for result in results
+        ]
+        self._availability_context_key = self._context_key(ticket_context)
+
+    def validate_reservation_selection(
+        self,
+        selection: Any,
+        *,
+        required_hosts: list[dict[str, Any]] | None = None,
+        eligible_hostnames_by_requirement: list[set[str]] | None = None,
+        require_eligible_hostnames: bool = False,
+        ticket_context: dict[str, Any] | None = None,
+        preflight: bool = False,
+    ) -> dict[str, Any]:
+        eligible = eligible_hostnames_by_requirement
+        require_eligible = require_eligible_hostnames or preflight
+        if preflight:
+            context_key = (
+                self._context_key(ticket_context)
+                if ticket_context is not None
+                else None
+            )
+            eligible = (
+                self._eligible_hostnames_by_requirement
+                if context_key == self._availability_context_key
+                else None
+            )
+        return super().validate_reservation_selection(
+            selection,
+            required_hosts=required_hosts,
+            eligible_hostnames_by_requirement=eligible,
+            require_eligible_hostnames=require_eligible,
+            ticket_context=ticket_context,
+            preflight=False,
+        )
+
+    async def prepare_auto_reservation_selection(
+        self,
+        selection: Any,
+        *,
+        required_hosts: list[dict[str, Any]] | None,
+        ticket_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        host_requirements = [
+            host
+            for host in (required_hosts or [])
+            if isinstance(host, dict) and not host.get("host")
+        ]
+        discovery_requirements = host_requirements or [{}]
+        results = [
+            await self.check_available(requirement)
+            for requirement in discovery_requirements
+        ]
+        self.record_availability_context(results, ticket_context)
+        return self.validate_reservation_selection(
+            selection,
+            required_hosts=required_hosts,
+            ticket_context=ticket_context,
+            preflight=True,
+        )
 
     @classmethod
     async def from_secrets(cls, secrets_provider) -> QuadsResourceProvider:

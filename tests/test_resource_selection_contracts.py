@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
+import inspect
 import json
 import re
+import textwrap
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -215,8 +218,23 @@ def test_registered_harness_guidance_is_scoped_to_its_assembled_prompt(monkeypat
     }
 
     assert registered_fragments
-    for fragment in registered_fragments.values():
-        assert fragment not in BENCHMARK_BASE_PROMPT
+    line_owners: dict[str, set[str]] = {}
+    for harness, fragment in registered_fragments.items():
+        for line in fragment.splitlines():
+            marker = line.strip()
+            if len(marker) >= 16:
+                line_owners.setdefault(marker, set()).add(harness)
+    scope_markers = {
+        harness: {
+            marker for marker, owners in line_owners.items() if owners == {harness}
+        }
+        for harness in registered_fragments
+    }
+
+    assert all(scope_markers.values()), "registered fragments need unique scope markers"
+    for markers in scope_markers.values():
+        for marker in markers:
+            assert marker not in BENCHMARK_BASE_PROMPT
 
     for harness, expected_fragment in registered_fragments.items():
         agent = BenchmarkAgent.__new__(BenchmarkAgent)
@@ -225,9 +243,45 @@ def test_registered_harness_guidance_is_scoped_to_its_assembled_prompt(monkeypat
             {"custom_fields": {"directives": {"harness": harness}}}
         )
         assert expected_fragment in prompt
-        for other_harness, other_fragment in registered_fragments.items():
+        for marker in scope_markers[harness]:
+            assert marker in {line.strip() for line in prompt.splitlines()}
+        for other_harness, other_markers in scope_markers.items():
             if other_harness != harness:
-                assert other_fragment not in prompt
+                for marker in other_markers:
+                    assert marker not in {line.strip() for line in prompt.splitlines()}
+
+
+def _provider_name_branches(function) -> set[str]:
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            continue
+        comparison = node.test
+        if not isinstance(comparison.left, ast.Name):
+            continue
+        if comparison.left.id not in {"provider", "rp"}:
+            continue
+        names.update(
+            comparator.value
+            for comparator in comparison.comparators
+            if isinstance(comparator, ast.Constant)
+            and isinstance(comparator.value, str)
+        )
+    return names
+
+
+def test_shared_resource_selection_flow_has_no_quads_name_branch():
+    from agents.resource.agent import _prepare_selection_via_resource_tool
+    from agents.resource.server import check_available_resources, reserve_resources
+
+    shared_selection_flow = [
+        check_available_resources,
+        reserve_resources,
+        _prepare_selection_via_resource_tool,
+    ]
+    for function in shared_selection_flow:
+        assert "quads" not in _provider_name_branches(function)
 
 
 def _configure_quads_server(monkeypatch, ticket):
@@ -248,8 +302,7 @@ def _configure_quads_server(monkeypatch, ticket):
     monkeypatch.setattr(srv, "_resources_allocated", False)
     monkeypatch.setattr(srv, "_reservation_uncertain", False)
     monkeypatch.setattr(srv, "_reservation_failures", 0)
-    monkeypatch.setattr(srv, "_quads_eligible_hostnames_by_requirement", None)
-    monkeypatch.setattr(srv, "_quads_eligibility_context", None)
+    monkeypatch.setattr(srv, "_last_reservation", {})
     monkeypatch.setattr(srv, "_persist_unknown_reservation_marker", marker)
     monkeypatch.setattr(srv, "_persist_known_reservation_outcome", AsyncMock())
     return srv, provider, marker
@@ -321,17 +374,16 @@ async def test_quads_rejects_eligibility_cached_for_a_different_ticket_context(
     monkeypatch,
 ):
     ticket = {
+        "id": "PERF-TEST",
         "custom_fields": {
             "resource_provider": "quads",
             "required_hosts": [{"roles": ["client"]}],
-        }
+        },
     }
     srv, provider, marker = _configure_quads_server(monkeypatch, ticket)
-    monkeypatch.setattr(
-        srv, "_quads_eligible_hostnames_by_requirement", [{"host-01.example.com"}]
-    )
-    monkeypatch.setattr(
-        srv, "_quads_eligibility_context", srv._quads_ticket_context_key()
+    provider.record_availability_context(
+        [{"options": [{"hostname": "host-01.example.com"}]}],
+        srv._reservation_ticket_context("PERF-TEST", ticket["custom_fields"]),
     )
     ticket["custom_fields"]["required_hosts"] = [{"roles": ["server"]}]
 
@@ -356,10 +408,11 @@ async def test_quads_per_host_discovery_exposes_options_for_distinct_selection(
 ):
     required_hosts = [{"roles": ["target"], "min_cores": 32} for _ in range(3)]
     ticket = {
+        "id": "PERF-TEST",
         "custom_fields": {
             "resource_provider": "quads",
             "required_hosts": required_hosts,
-        }
+        },
     }
     srv, provider, marker = _configure_quads_server(monkeypatch, ticket)
     options = [
@@ -405,6 +458,117 @@ async def test_quads_per_host_discovery_exposes_options_for_distinct_selection(
     assert selection["hostnames"] == [option["hostname"] for option in options]
     provider.reserve.assert_awaited_once()
     marker.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_quads_reorders_reversed_controller_target_selection_to_ticket_order(
+    monkeypatch,
+):
+    required_hosts = [
+        {"roles": ["controller"], "min_cores": 32},
+        {"roles": ["target"], "min_cores": 16},
+    ]
+    ticket = {
+        "id": "PERF-TEST",
+        "custom_fields": {
+            "resource_provider": "quads",
+            "required_hosts": required_hosts,
+        },
+    }
+    srv, provider, marker = _configure_quads_server(monkeypatch, ticket)
+    options_by_role = {
+        "controller": [{"hostname": "controller.example.com"}],
+        "target": [{"hostname": "target.example.com"}],
+    }
+    provider.check_available = AsyncMock(
+        side_effect=lambda requirements: {
+            "available_count": 1,
+            "options": options_by_role[requirements["roles"][0]],
+        }
+    )
+    provider.reserve.return_value = {
+        "status": "active",
+        "reservation_id": "74",
+        "provider_metadata": {"assignment_id": 74},
+        "hosts": ["controller.example.com", "target.example.com"],
+    }
+
+    await srv.check_available_resources(provider="quads", required_hosts=required_hosts)
+    raw = await srv.reserve_resources(
+        provider="quads",
+        selection={"hostnames": ["target.example.com", "controller.example.com"]},
+        description="reversed host response order",
+        ticket_id="PERF-TEST",
+    )
+
+    assert json.loads(raw)["status"] == "active", raw
+    assert provider.reserve.await_args.args[0]["hostnames"] == [
+        "controller.example.com",
+        "target.example.com",
+    ]
+    marker.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_auto_preparation_dispatches_to_provider_hook_without_reserving(
+    monkeypatch,
+):
+    required_hosts = [
+        {"roles": ["controller"]},
+        {"roles": ["target"]},
+    ]
+    ticket = {
+        "id": "PERF-TEST",
+        "custom_fields": {
+            "resource_provider": "quads",
+            "required_hosts": required_hosts,
+        },
+    }
+    srv, provider, marker = _configure_quads_server(monkeypatch, ticket)
+    options_by_role = {
+        "controller": [{"hostname": "controller.example.com"}],
+        "target": [{"hostname": "target.example.com"}],
+    }
+    provider.check_available = AsyncMock(
+        side_effect=lambda requirements: {
+            "available_count": 1,
+            "options": options_by_role[requirements["roles"][0]],
+        }
+    )
+
+    raw = await srv.prepare_reservation_selection(
+        provider="quads",
+        selection={"hostnames": ["target.example.com", "controller.example.com"]},
+        required_hosts=required_hosts,
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "ready"
+    assert result["selection"]["hostnames"] == [
+        "controller.example.com",
+        "target.example.com",
+    ]
+    assert provider.check_available.await_count == 2
+    provider.reserve.assert_not_awaited()
+    marker.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quads_adapter_structurally_validates_before_assignment_creation():
+    from providers.resource.quads import QuadsResourceProvider
+
+    client = MagicMock()
+    client.create_assignment = AsyncMock()
+    provider = QuadsResourceProvider(client)
+
+    with pytest.raises(ReservationSelectionError):
+        await provider.reserve(
+            {"hostnames": ["host-01.example.com"], "instance_type": "m5.xlarge"},
+            "invalid direct adapter call",
+        )
+
+    client.create_assignment.assert_not_awaited()
 
 
 def test_contract_metadata_covers_all_provider_prompt_fragments():

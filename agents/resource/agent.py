@@ -345,28 +345,33 @@ def _auto_reservation_selection(
     raise ValueError(f"No safe auto-reservation selection for provider '{provider}'")
 
 
-def _quads_eligible_hostnames_from_availability(
-    availability: dict[str, Any],
-) -> list[set[str]] | None:
-    """Extract QUADS host candidates from flat or per-host discovery output."""
-
-    def hostnames(options: Any) -> set[str]:
-        if not isinstance(options, list):
-            return set()
-        return {
-            str(option.get("hostname") or option.get("host")).casefold()
-            for option in options
-            if isinstance(option, dict)
-            and (option.get("hostname") or option.get("host"))
-        }
-
-    recommendations = availability.get("per_host_recommendations")
-    if isinstance(recommendations, list):
-        return [hostnames(item.get("options")) for item in recommendations]
-    options = availability.get("options")
-    if isinstance(options, list):
-        return [hostnames(options)]
-    return None
+async def _prepare_selection_via_resource_tool(
+    mcp_client: Any,
+    provider: str,
+    selection: dict[str, Any],
+    ticket_id: str,
+    required_hosts: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Use the resource service's provider hook to prepare an auto-selection."""
+    arguments: dict[str, Any] = {
+        "provider": provider,
+        "selection": selection,
+        "ticket_id": ticket_id,
+    }
+    if required_hosts is not None:
+        arguments["required_hosts"] = required_hosts
+    raw = await mcp_client.call_tool("prepare_reservation_selection", arguments)
+    response = json.loads(raw) if isinstance(raw, str) and raw else raw
+    if not isinstance(response, dict):
+        raise ValueError("Resource service returned an invalid preparation response")
+    if response.get("status") != "ready":
+        raise ValueError(
+            response.get("error") or "Resource service could not prepare the selection"
+        )
+    prepared = response.get("selection")
+    if not isinstance(prepared, dict):
+        raise ValueError("Resource service returned no prepared selection")
+    return prepared
 
 
 def _reservation_id_from_metadata(provider: str, metadata: dict[str, Any]) -> str:
@@ -1939,46 +1944,23 @@ class ResourceAgent(AgentBase):
                 if duration_hours is not None:
                     reserve_args["duration_hours"] = duration_hours
                 try:
-                    if rp == "quads":
-                        required_hosts = ticket_context.get("custom_fields", {}).get(
-                            "required_hosts"
-                        )
-                        availability_args: dict[str, Any] = {"provider": "quads"}
-                        if isinstance(required_hosts, list):
-                            availability_args["required_hosts"] = required_hosts
-                        raw_availability = await self._mcp.call_tool(
-                            "check_available_resources", availability_args
-                        )
-                        availability = (
-                            json.loads(raw_availability) if raw_availability else {}
-                        )
-                        if not isinstance(availability, dict):
-                            raise ValueError(
-                                "QUADS discovery returned an invalid response"
-                            )
-                        if availability.get("error") or availability.get(
-                            "allocation_unknown"
-                        ):
-                            raise ValueError(
-                                availability.get("error")
-                                or "QUADS discovery outcome is unknown"
-                            )
-                        selection = validate_reservation_selection(
-                            "quads",
-                            selection,
-                            required_hosts=(
-                                required_hosts
-                                if isinstance(required_hosts, list)
-                                else None
-                            ),
-                            eligible_hostnames_by_requirement=(
-                                _quads_eligible_hostnames_from_availability(
-                                    availability
-                                )
-                            ),
-                            require_eligible_hostnames=True,
-                        )
-                        reserve_args["selection"] = selection
+                    required_hosts = ticket_context.get("custom_fields", {}).get(
+                        "required_hosts"
+                    )
+                    selection = await _prepare_selection_via_resource_tool(
+                        self._mcp,
+                        rp,
+                        selection,
+                        ticket_id,
+                        required_hosts if isinstance(required_hosts, list) else None,
+                    )
+                    selection_record = {
+                        **selection,
+                        "duration_hours": (
+                            duration_hours if duration_hours is not None else 36
+                        ),
+                    }
+                    reserve_args["selection"] = selection
                     raw = await self._mcp.call_tool("reserve_resources", reserve_args)
                     parsed_result = json.loads(raw) if raw else {}
                     reserve_result = (

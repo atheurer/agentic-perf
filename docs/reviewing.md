@@ -77,7 +77,11 @@ complete diff with this checklist:
 
 Treat this as a review aid. CI contract tests remain the automated enforcement
 path and should derive coverage from the provider and harness registries where
-possible.
+possible. Harness prompt tests derive distinctive instruction-line markers
+from each registered fragment and assert that each marker appears only in its
+matching assembled prompt. This catches literal line leakage; CI cannot decide
+whether a paraphrase has moved harness-specific meaning into shared guidance,
+so the semantic scope review in this checklist still applies.
 
 ## Final review checklist
 
