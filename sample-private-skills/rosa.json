@@ -1,0 +1,1008 @@
+{
+  "skill_name": "rosa-kube-burner",
+  "version": "1.0.0",
+  "description": "Deploy ROSA (Red Hat OpenShift Service on AWS) HCP cluster with kube-burner-ocp for performance testing",
+  "author": "Performance Engineering",
+  "tags": ["rosa", "openshift", "aws", "kube-burner", "performance"],
+
+  "prerequisites": {
+    "overview": "This deployment requires CLI tools, cloud credentials, and sufficient AWS quotas. All tools must be installed on the machine running agentic-perf.",
+
+    "required_tools": [
+      {
+        "name": "rosa",
+        "description": "Red Hat OpenShift Service on AWS CLI - manages ROSA cluster lifecycle",
+        "required": true,
+        "min_version": "1.2.0",
+        "recommended_version": "1.2.41 or later",
+        "installation": {
+          "linux": {
+            "method": "Download official binary",
+            "commands": [
+              "# Download ROSA CLI",
+              "curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz",
+              "tar xzf rosa-linux.tar.gz",
+              "sudo mv rosa /usr/local/bin/rosa",
+              "sudo chmod +x /usr/local/bin/rosa"
+            ],
+            "alternative": "curl https://mirror.openshift.com/pub/openshift-v4/clients/rosa/1.2.41/rosa-linux-amd64 -o rosa && chmod +x rosa && sudo mv rosa /usr/local/bin/"
+          },
+          "macos": {
+            "method": "Download official binary",
+            "commands": [
+              "curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-darwin.tar.gz",
+              "tar xzf rosa-darwin.tar.gz",
+              "sudo mv rosa /usr/local/bin/rosa",
+              "sudo chmod +x /usr/local/bin/rosa"
+            ]
+          },
+          "windows": {
+            "method": "Download official binary",
+            "url": "https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-windows.zip",
+            "note": "Extract and add to PATH"
+          }
+        },
+        "verification": {
+          "command": "rosa version",
+          "expected_output_contains": "rosa version",
+          "example_output": "1.2.41"
+        },
+        "post_install": {
+          "description": "Authenticate with Red Hat",
+          "command": "rosa login",
+          "note": "Will prompt for Red Hat OpenShift token from https://console.redhat.com/openshift/token/rosa"
+        },
+        "documentation": "https://docs.openshift.com/rosa/rosa_cli/rosa-get-started-cli.html"
+      },
+      {
+        "name": "aws",
+        "description": "AWS Command Line Interface - manages AWS infrastructure",
+        "required": true,
+        "min_version": "2.0.0",
+        "recommended_version": "2.15.0 or later",
+        "installation": {
+          "linux": {
+            "method": "Install AWS CLI v2",
+            "commands": [
+              "# Download and install AWS CLI v2",
+              "curl 'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip' -o 'awscliv2.zip'",
+              "unzip awscliv2.zip",
+              "sudo ./aws/install",
+              "# Verify installation",
+              "aws --version"
+            ]
+          },
+          "macos": {
+            "method": "Install AWS CLI v2",
+            "commands": [
+              "curl 'https://awscli.amazonaws.com/AWSCLIV2.pkg' -o 'AWSCLIV2.pkg'",
+              "sudo installer -pkg AWSCLIV2.pkg -target /"
+            ]
+          },
+          "windows": {
+            "method": "Download MSI installer",
+            "url": "https://awscli.amazonaws.com/AWSCLIV2.msi"
+          }
+        },
+        "verification": {
+          "command": "aws --version",
+          "expected_output_contains": "aws-cli/2",
+          "example_output": "aws-cli/2.15.10 Python/3.11.6"
+        },
+        "post_install": {
+          "description": "Configure AWS credentials",
+          "command": "aws configure",
+          "environment_variables": [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_DEFAULT_REGION"
+          ],
+          "note": "Alternatively set environment variables or use AWS SSO"
+        },
+        "documentation": "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+      },
+      {
+        "name": "oc",
+        "description": "OpenShift Command Line Interface - interacts with OpenShift clusters",
+        "required": true,
+        "min_version": "4.12.0",
+        "recommended_version": "4.22.0 or later (match ROSA version)",
+        "installation": {
+          "linux": {
+            "method": "Download from OpenShift mirror",
+            "commands": [
+              "# Download OpenShift CLI (oc and kubectl included)",
+              "curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz",
+              "tar xzf openshift-client-linux.tar.gz",
+              "sudo mv oc kubectl /usr/local/bin/",
+              "sudo chmod +x /usr/local/bin/oc /usr/local/bin/kubectl"
+            ],
+            "specific_version": "curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.22.0/openshift-client-linux.tar.gz"
+          },
+          "macos": {
+            "method": "Download from OpenShift mirror",
+            "commands": [
+              "curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-mac.tar.gz",
+              "tar xzf openshift-client-mac.tar.gz",
+              "sudo mv oc kubectl /usr/local/bin/",
+              "sudo chmod +x /usr/local/bin/oc /usr/local/bin/kubectl"
+            ]
+          },
+          "windows": {
+            "method": "Download ZIP",
+            "url": "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-windows.zip",
+            "note": "Extract and add to PATH"
+          }
+        },
+        "verification": {
+          "command": "oc version --client",
+          "expected_output_contains": "Client Version:",
+          "example_output": "Client Version: 4.22.0"
+        },
+        "included_tools": [
+          "oc - OpenShift CLI",
+          "kubectl - Kubernetes CLI (included with oc)"
+        ],
+        "documentation": "https://docs.openshift.com/container-platform/4.22/cli_reference/openshift_cli/getting-started-cli.html"
+      },
+      {
+        "name": "jq",
+        "description": "JSON processor - required for parsing AWS/ROSA API responses",
+        "required": true,
+        "min_version": "1.5",
+        "installation": {
+          "linux": {
+            "debian_ubuntu": "sudo apt-get update && sudo apt-get install -y jq",
+            "rhel_centos_fedora": "sudo yum install -y jq",
+            "arch": "sudo pacman -S jq"
+          },
+          "macos": {
+            "homebrew": "brew install jq"
+          },
+          "windows": {
+            "method": "Download from GitHub releases",
+            "url": "https://github.com/jqlang/jq/releases"
+          }
+        },
+        "verification": {
+          "command": "jq --version",
+          "expected_output_contains": "jq-",
+          "example_output": "jq-1.6"
+        },
+        "documentation": "https://jqlang.github.io/jq/"
+      },
+      {
+        "name": "curl",
+        "description": "Data transfer tool - required for downloading tools and API calls",
+        "required": true,
+        "usually_preinstalled": true,
+        "verification": {
+          "command": "curl --version",
+          "expected_output_contains": "curl"
+        }
+      },
+      {
+        "name": "tar",
+        "description": "Archive extraction tool - required for extracting downloaded tools",
+        "required": true,
+        "usually_preinstalled": true,
+        "verification": {
+          "command": "tar --version"
+        }
+      },
+      {
+        "name": "unzip",
+        "description": "ZIP extraction tool - required for AWS CLI installation",
+        "required": true,
+        "installation": {
+          "linux": {
+            "debian_ubuntu": "sudo apt-get install -y unzip",
+            "rhel_centos_fedora": "sudo yum install -y unzip"
+          }
+        },
+        "verification": {
+          "command": "unzip -v"
+        }
+      }
+    ],
+
+    "optional_tools": [
+      {
+        "name": "ocm",
+        "description": "OpenShift Cluster Manager CLI - for advanced cluster lifecycle management",
+        "required": false,
+        "use_case": "Extending cluster expiration, managing subscriptions, advanced queries",
+        "min_version": "0.1.70",
+        "installation": {
+          "linux": {
+            "method": "Download from GitHub releases",
+            "commands": [
+              "# Download OCM CLI",
+              "curl -LO https://github.com/openshift-online/ocm-cli/releases/latest/download/ocm-linux-amd64",
+              "sudo mv ocm-linux-amd64 /usr/local/bin/ocm",
+              "sudo chmod +x /usr/local/bin/ocm"
+            ]
+          },
+          "macos": {
+            "homebrew": "brew install ocm"
+          }
+        },
+        "verification": {
+          "command": "ocm version",
+          "example_output": "0.1.73"
+        },
+        "post_install": {
+          "description": "Authenticate with OpenShift Cluster Manager",
+          "command": "ocm login --token=<YOUR_TOKEN>",
+          "note": "Get token from https://console.redhat.com/openshift/token"
+        },
+        "documentation": "https://github.com/openshift-online/ocm-cli"
+      },
+      {
+        "name": "session-manager-plugin",
+        "description": "AWS Systems Manager Session Manager plugin - for SSH-less bastion access",
+        "required": false,
+        "use_case": "Secure bastion access without SSH keys using 'aws ssm start-session'",
+        "installation": {
+          "linux": {
+            "rpm_based": [
+              "curl 'https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm' -o /tmp/session-manager-plugin.rpm",
+              "sudo yum install -y /tmp/session-manager-plugin.rpm"
+            ],
+            "deb_based": [
+              "curl 'https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb' -o /tmp/session-manager-plugin.deb",
+              "sudo dpkg -i /tmp/session-manager-plugin.deb"
+            ]
+          },
+          "macos": {
+            "commands": [
+              "curl 'https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac/sessionmanager-bundle.zip' -o sessionmanager-bundle.zip",
+              "unzip sessionmanager-bundle.zip",
+              "sudo ./sessionmanager-bundle/install -i /usr/local/sessionmanagerplugin -b /usr/local/bin/session-manager-plugin"
+            ]
+          }
+        },
+        "verification": {
+          "command": "session-manager-plugin --version",
+          "example_output": "1.2.463.0"
+        },
+        "documentation": "https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+      }
+    ],
+
+    "credentials": {
+      "required": [
+        {
+          "type": "aws_iam",
+          "name": "AWS IAM Credentials",
+          "description": "AWS access credentials with administrative permissions for ROSA operations",
+          "required_permissions": [
+            "ec2:* (VPC, subnets, instances, security groups, route tables)",
+            "iam:* (create/manage roles and policies for ROSA)",
+            "elasticloadbalancing:* (for ROSA load balancers)",
+            "route53:* (for ROSA DNS if applicable)",
+            "s3:* (for ROSA registry storage)",
+            "cloudformation:* (for ROSA stack management)",
+            "servicequotas:GetServiceQuota (to check limits)"
+          ],
+          "setup_methods": [
+            {
+              "method": "Environment Variables (Recommended for CI/CD)",
+              "steps": [
+                "export AWS_ACCESS_KEY_ID='YOUR_ACCESS_KEY'",
+                "export AWS_SECRET_ACCESS_KEY='YOUR_SECRET_KEY'",
+                "export AWS_DEFAULT_REGION='us-west-2'"
+              ]
+            },
+            {
+              "method": "AWS CLI Configuration",
+              "steps": [
+                "aws configure",
+                "# Enter: Access Key ID, Secret Access Key, Default region, Output format"
+              ],
+              "creates_files": [
+                "~/.aws/credentials",
+                "~/.aws/config"
+              ]
+            },
+            {
+              "method": "AWS SSO (for organizations using AWS Identity Center)",
+              "steps": [
+                "aws configure sso",
+                "aws sso login --profile <profile-name>"
+              ]
+            },
+            {
+              "method": "IAM Role (for EC2 instances)",
+              "note": "Attach IAM role to EC2 instance where agentic-perf runs",
+              "no_credentials_needed": true
+            }
+          ],
+          "verification": {
+            "commands": [
+              "# Verify credentials are configured",
+              "aws sts get-caller-identity",
+              "# Expected output shows your AWS account and user/role ARN",
+              "",
+              "# Test permissions",
+              "aws ec2 describe-vpcs --region us-west-2 --max-items 1",
+              "aws iam list-roles --max-items 1"
+            ]
+          },
+          "troubleshooting": {
+            "credential_error": "Check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set correctly",
+            "permission_denied": "Ensure IAM user/role has sufficient permissions (AdministratorAccess or ROSA-specific policy)",
+            "region_error": "Set AWS_DEFAULT_REGION or use --region flag"
+          },
+          "obtain_credentials": "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html"
+        },
+        {
+          "type": "rosa_token",
+          "name": "Red Hat OpenShift Token",
+          "description": "Authentication token for Red Hat OpenShift Service on AWS (ROSA)",
+          "obtain_from": "https://console.redhat.com/openshift/token/rosa",
+          "setup_methods": [
+            {
+              "method": "Interactive Login (Recommended)",
+              "steps": [
+                "# Run rosa login and paste your token when prompted",
+                "rosa login",
+                "# Or provide token directly:",
+                "rosa login --token='YOUR_OFFLINE_TOKEN'"
+              ]
+            },
+            {
+              "method": "Environment Variable",
+              "steps": [
+                "export OCM_TOKEN='YOUR_OFFLINE_TOKEN'",
+                "rosa login --token=$OCM_TOKEN"
+              ]
+            }
+          ],
+          "verification": {
+            "commands": [
+              "# Verify ROSA authentication",
+              "rosa whoami",
+              "# Expected output shows your Red Hat username and organization",
+              "",
+              "# List available regions",
+              "rosa list regions"
+            ],
+            "example_output": "AWS Account ID:               123456789012\nAWS Default Region:           us-east-1\nARN:                         arn:aws:iam::123456789012:user/rosa-user\nOCM API:                     https://api.openshift.com\nOCM Account ID:              1a2B3c4D\nOCM Account Username:        your-username\nOCM Account Email:           your-email@example.com\nOCM Organization ID:         5e6F7g8H\nOCM Organization Name:       Your Organization"
+          },
+          "token_expiration": "Offline tokens do not expire but can be revoked. Online tokens expire after 15 minutes.",
+          "obtain_token_steps": [
+            "1. Visit https://console.redhat.com/openshift/token/rosa",
+            "2. Log in with your Red Hat account",
+            "3. Click 'Load token'",
+            "4. Copy the 'Offline token' (very long string starting with 'eyJ...')",
+            "5. Use with: rosa login --token='<copied-token>'"
+          ],
+          "troubleshooting": {
+            "not_authorized": "Ensure you have an active ROSA subscription and entitlement",
+            "token_expired": "Generate a new token from the console",
+            "wrong_account": "Use 'rosa logout' then 'rosa login' with correct token"
+          }
+        }
+      ],
+      "optional": [
+        {
+          "type": "elasticsearch",
+          "name": "Elasticsearch Server (Optional)",
+          "description": "For indexing kube-burner metrics and viewing in Grafana dashboards",
+          "required": false,
+          "use_case": "When running kube-burner with --es-server flag for metric storage",
+          "format": "https://username:password@elasticsearch-host:9200",
+          "environment_variable": "ES_SERVER",
+          "note": "Can run kube-burner without Elasticsearch using --local-indexing flag"
+        }
+      ]
+    },
+
+    "aws_quotas": {
+      "description": "AWS Service Quotas that must be sufficient for your deployment",
+      "check_quotas_command": "aws service-quotas list-service-quotas --service-code ec2 --region us-west-2",
+      "required_quotas": [
+        {
+          "service": "Amazon EC2",
+          "quota_name": "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances",
+          "quota_code": "L-1216C47A",
+          "minimum_required": "Depends on configuration",
+          "calculation": "worker_replicas × instance_vcpus + bastion_vcpus",
+          "examples": [
+            {
+              "config": "24 × m6i.xlarge workers (4 vCPUs each) + 1 × t3.medium bastion (2 vCPUs)",
+              "required": "98 vCPUs",
+              "default_quota": "64 vCPUs (may need increase)"
+            },
+            {
+              "config": "48 × m6i.2xlarge workers (8 vCPUs each)",
+              "required": "386 vCPUs",
+              "default_quota": "64 vCPUs (definitely needs increase)"
+            }
+          ],
+          "check_command": "aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --region us-west-2",
+          "request_increase": "aws service-quotas request-service-quota-increase --service-code ec2 --quota-code L-1216C47A --desired-value 400 --region us-west-2"
+        },
+        {
+          "service": "Amazon VPC",
+          "quota_name": "VPCs per Region",
+          "quota_code": "L-F678F1CE",
+          "minimum_required": 1,
+          "default_quota": 5,
+          "note": "Usually sufficient unless deploying many clusters"
+        },
+        {
+          "service": "Amazon VPC",
+          "quota_name": "NAT gateways per Availability Zone",
+          "quota_code": "L-FE5A380F",
+          "minimum_required": 1,
+          "default_quota": 5,
+          "note": "ROSA creates 1 NAT gateway per AZ (typically 3 AZs = 3 NAT gateways)"
+        },
+        {
+          "service": "Amazon VPC",
+          "quota_name": "Elastic IP addresses for NAT gateways",
+          "minimum_required": 3,
+          "note": "1 Elastic IP per NAT gateway, default quota is usually 5"
+        },
+        {
+          "service": "Amazon EBS",
+          "quota_name": "Storage for General Purpose SSD (gp3) volumes",
+          "minimum_required": "Depends on worker count and disk size",
+          "calculation": "worker_replicas × root_volume_size (default 300 GiB per worker)",
+          "example": "24 workers × 300 GiB = 7,200 GiB (7.2 TiB)",
+          "default_quota": "50 TiB (usually sufficient)"
+        }
+      ],
+      "rosa_quotas": [
+        {
+          "quota_name": "ROSA Cluster Quota",
+          "description": "Number of ROSA clusters allowed in your Red Hat account",
+          "check_method": "View in https://console.redhat.com/openshift/quota or contact Red Hat support",
+          "default_quota": "Varies by subscription",
+          "note": "Contact Red Hat support to increase"
+        }
+      ],
+      "helpful_commands": {
+        "list_all_ec2_quotas": "aws service-quotas list-service-quotas --service-code ec2 --region us-west-2 --output table",
+        "check_current_usage": "aws ec2 describe-instances --region us-west-2 --query 'Reservations[*].Instances[*].[InstanceType]' --output text | sort | uniq -c",
+        "list_quota_increase_requests": "aws service-quotas list-requested-service-quota-change-history --service-code ec2 --region us-west-2"
+      }
+    },
+
+    "system_requirements": {
+      "controller_node": {
+        "description": "Machine running agentic-perf (your local machine or CI runner)",
+        "os": ["Linux", "macOS", "Windows (with WSL2 recommended)"],
+        "cpu": "2+ cores recommended",
+        "memory": "4 GB minimum, 8 GB recommended",
+        "disk": "10 GB free space for tools and logs",
+        "network": "Internet connectivity to AWS, Red Hat, and GitHub"
+      }
+    },
+
+    "pre_flight_checklist": {
+      "description": "Run these commands to verify all dependencies before starting deployment",
+      "commands": [
+        "# 1. Verify all CLI tools are installed",
+        "rosa version",
+        "aws --version",
+        "oc version --client",
+        "jq --version",
+        "",
+        "# 2. Verify AWS credentials",
+        "aws sts get-caller-identity",
+        "aws ec2 describe-vpcs --region us-west-2 --max-items 1",
+        "",
+        "# 3. Verify ROSA authentication",
+        "rosa whoami",
+        "rosa list regions",
+        "",
+        "# 4. Check AWS quotas (example for us-west-2)",
+        "aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --region us-west-2 --query 'Quota.Value'",
+        "",
+        "# 5. Verify ROSA prerequisites",
+        "rosa verify quota --region us-west-2",
+        "rosa verify permissions",
+        "",
+        "# 6. List any existing ROSA clusters",
+        "rosa list clusters"
+      ],
+      "expected_success": "All commands should complete without errors. If any fail, review the specific dependency section above."
+    }
+  },
+
+  "configuration": {
+    "defaults": {
+      "region": "us-west-2",
+      "vpc_cidr": "10.0.0.0/16",
+      "availability_zones": 3,
+      "cluster_version": "4.22-latest",
+      "channel_group": "candidate",
+      "worker_replicas": 24,
+      "worker_instance_type": "m6i.xlarge"
+    },
+    "customizable": {
+      "cluster_name": {
+        "description": "Unique name for the ROSA cluster",
+        "type": "string",
+        "required": true,
+        "example": "perftest-cluster"
+      },
+      "region": {
+        "description": "AWS region for deployment",
+        "type": "string",
+        "options": ["us-west-2", "us-east-1", "us-east-2", "eu-west-1"],
+        "default": "us-west-2"
+      },
+      "worker_replicas": {
+        "description": "Number of worker nodes (distributed across AZs)",
+        "type": "integer",
+        "min": 3,
+        "max": 500,
+        "default": 24,
+        "note": "Use multiples of 3 for even distribution across AZs"
+      },
+      "worker_instance_type": {
+        "description": "EC2 instance type for worker nodes",
+        "type": "string",
+        "options": ["m6i.xlarge", "m6i.2xlarge", "m6i.4xlarge", "m5.xlarge"],
+        "default": "m6i.xlarge"
+      },
+      "cluster_version": {
+        "description": "OpenShift version to deploy",
+        "type": "string",
+        "examples": ["4.22-latest", "5.0-latest", "5.0.0-0.nightly-2026-09-04-075242"],
+        "default": "4.22-latest"
+      },
+      "channel_group": {
+        "description": "Release channel",
+        "type": "string",
+        "options": ["stable", "candidate", "nightly"],
+        "default": "candidate"
+      },
+      "install_bastion": {
+        "description": "Create bastion EC2 instance for cluster access and kube-burner execution",
+        "type": "boolean",
+        "default": true,
+        "note": "Recommended for running kube-burner tests"
+      }
+    }
+  },
+
+  "deployment_steps": [
+    {
+      "stage": "network_infrastructure",
+      "name": "Create VPC and Subnets",
+      "description": "Provision AWS VPC with public/private subnets across multiple AZs",
+      "commands": [
+        {
+          "description": "Create VPC with ROSA CLI",
+          "command": "rosa create network --param Region={{region}} --param Name={{cluster_name}}-vpc --param AvailabilityZoneCount={{availability_zones}} --param VpcCidr={{vpc_cidr}}",
+          "output_vars": ["vpc_id"],
+          "note": "ROSA creates 2 subnets per AZ: public and private"
+        },
+        {
+          "description": "Verify VPC creation",
+          "command": "aws ec2 describe-vpcs --region {{region}} --query 'Vpcs[?Tags[?Key==`Name` && Value==`{{cluster_name}}-vpc`]].[VpcId,CidrBlock]' --output table",
+          "validation": "Verify VPC exists with correct CIDR"
+        },
+        {
+          "description": "List created subnets",
+          "command": "aws ec2 describe-subnets --region {{region}} --filters 'Name=vpc-id,Values={{vpc_id}}' --query 'Subnets[*].[SubnetId,AvailabilityZone,CidrBlock,MapPublicIpOnLaunch]' --output table",
+          "output_vars": ["subnet_ids"]
+        }
+      ]
+    },
+    {
+      "stage": "bastion_infrastructure",
+      "name": "Create Bastion Instance",
+      "description": "Provision bastion host for cluster access and kube-burner execution",
+      "skip_if": "install_bastion == false",
+      "commands": [
+        {
+          "description": "Get first public subnet for bastion",
+          "command": "aws ec2 describe-subnets --region {{region}} --filters 'Name=vpc-id,Values={{vpc_id}}' 'Name=map-public-ip-on-launch,Values=true' --query 'Subnets[0].SubnetId' --output text",
+          "output_vars": ["bastion_subnet_id"]
+        },
+        {
+          "description": "Create security group for bastion",
+          "command": "aws ec2 create-security-group --region {{region}} --group-name {{cluster_name}}-bastion-sg --description 'Bastion host for {{cluster_name}}' --vpc-id {{vpc_id}}",
+          "output_vars": ["bastion_security_group_id"]
+        },
+        {
+          "description": "Allow SSH from current IP",
+          "command": "MY_IP=$(curl -s https://checkip.amazonaws.com) && aws ec2 authorize-security-group-ingress --region {{region}} --group-id {{bastion_security_group_id}} --protocol tcp --port 22 --cidr ${MY_IP}/32"
+        },
+        {
+          "description": "Launch bastion EC2 instance",
+          "command": "aws ec2 run-instances --region {{region}} --image-id resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --instance-type t3.medium --subnet-id {{bastion_subnet_id}} --security-group-ids {{bastion_security_group_id}} --associate-public-ip-address --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value={{cluster_name}}-bastion}]'",
+          "output_vars": ["bastion_instance_id"]
+        },
+        {
+          "description": "Wait for bastion instance and get IP addresses",
+          "command": "aws ec2 wait instance-running --region {{region}} --instance-ids {{bastion_instance_id}} && aws ec2 describe-instances --region {{region}} --instance-ids {{bastion_instance_id}} --query 'Reservations[0].Instances[0].[PrivateIpAddress,PublicIpAddress]' --output text",
+          "output_vars": ["bastion_private_ip", "bastion_public_ip"]
+        },
+        {
+          "description": "Wait for SSM agent to be ready",
+          "command": "aws ssm wait instance-information-available --region {{region}} --instance-id {{bastion_instance_id}}",
+          "note": "Enables 'aws ssm start-session' for secure access"
+        }
+      ]
+    },
+    {
+      "stage": "rosa_prerequisites",
+      "name": "Configure ROSA Prerequisites",
+      "description": "Set up OIDC and IAM roles required for ROSA HCP",
+      "commands": [
+        {
+          "description": "List existing OIDC configurations",
+          "command": "rosa list oidc-config --output json",
+          "output_vars": ["oidc_configs"],
+          "note": "Reuse existing OIDC config if available"
+        },
+        {
+          "description": "Create OIDC configuration if needed",
+          "command": "rosa create oidc-config --mode auto --yes --output json",
+          "skip_if": "oidc_configs is not empty",
+          "output_vars": ["oidc_config_id"]
+        },
+        {
+          "description": "Use existing OIDC config",
+          "command": "echo {{oidc_configs}} | jq -r '.[0].id'",
+          "skip_if": "oidc_configs is empty",
+          "output_vars": ["oidc_config_id"]
+        },
+        {
+          "description": "Create account-wide IAM roles (one-time per AWS account)",
+          "command": "rosa create account-roles --mode auto --yes",
+          "note": "Creates Installer, Support, Worker, and ControlPlane roles. Safe to run if already exists."
+        },
+        {
+          "description": "Verify account roles",
+          "command": "rosa list account-roles"
+        }
+      ]
+    },
+    {
+      "stage": "rosa_deployment",
+      "name": "Deploy ROSA HCP Cluster",
+      "description": "Create Red Hat OpenShift Service on AWS Hosted Control Plane cluster",
+      "commands": [
+        {
+          "description": "Get subnet IDs in comma-separated format",
+          "command": "aws ec2 describe-subnets --region {{region}} --filters 'Name=vpc-id,Values={{vpc_id}}' --query 'Subnets[].SubnetId' --output text | tr '\t' ','",
+          "output_vars": ["subnet_ids_csv"]
+        },
+        {
+          "description": "Create ROSA HCP cluster",
+          "command": "rosa create cluster --cluster-name {{cluster_name}} --replicas {{worker_replicas}} --hosted-cp --sts --mode auto -y --oidc-config-id {{oidc_config_id}} --region {{region}} --subnet-ids {{subnet_ids_csv}} --version {{cluster_version}} --channel-group {{channel_group}} --compute-machine-type {{worker_instance_type}}",
+          "timeout": "45m",
+          "note": "Cluster creation takes 30-45 minutes"
+        },
+        {
+          "description": "Wait for cluster to be ready",
+          "command": "rosa describe cluster --cluster={{cluster_name}} --output json | jq -r '.state'",
+          "retry": {
+            "max_attempts": 60,
+            "interval": "60s",
+            "success_condition": "ready"
+          }
+        },
+        {
+          "description": "Get cluster details",
+          "command": "rosa describe cluster --cluster={{cluster_name}} --output json",
+          "output_vars": ["cluster_details"]
+        },
+        {
+          "description": "Extract API URL",
+          "command": "echo {{cluster_details}} | jq -r '.api.url'",
+          "output_vars": ["api_url"]
+        },
+        {
+          "description": "Create cluster-admin user",
+          "command": "rosa create admin --cluster={{cluster_name}}",
+          "output_vars": ["admin_credentials"],
+          "note": "Save credentials - they are shown only once"
+        },
+        {
+          "description": "Extract admin username and password",
+          "command": "echo {{admin_credentials}} | grep -oP 'username \\K[^ ]+' ; echo {{admin_credentials}} | grep -oP 'password \\K[^ ]+'",
+          "output_vars": ["admin_username", "admin_password"]
+        },
+        {
+          "description": "Login to cluster",
+          "command": "oc login {{api_url}} --username {{admin_username}} --password {{admin_password}} --insecure-skip-tls-verify"
+        },
+        {
+          "description": "Verify cluster nodes",
+          "command": "oc get nodes -o wide",
+          "validation": "Confirm {{worker_replicas}} nodes are Ready"
+        },
+        {
+          "description": "Check cluster operators",
+          "command": "oc get clusteroperators",
+          "validation": "All operators should be Available=True"
+        }
+      ]
+    },
+    {
+      "stage": "bastion_configuration",
+      "name": "Configure Bastion for Testing",
+      "description": "Install tools and configure bastion instance for kube-burner execution",
+      "skip_if": "install_bastion == false",
+      "commands": [
+        {
+          "description": "Install required packages on bastion",
+          "command": "aws ssm send-command --region {{region}} --instance-ids {{bastion_instance_id}} --document-name AWS-RunShellScript --parameters commands='sudo yum install -y git wget tar jq'",
+          "note": "Installs basic tools needed for kube-burner"
+        },
+        {
+          "description": "Create kubeconfig on bastion",
+          "command": "oc config view --minify --flatten > /tmp/{{cluster_name}}-kubeconfig && base64 -w0 /tmp/{{cluster_name}}-kubeconfig",
+          "output_vars": ["kubeconfig_b64"],
+          "note": "Base64 encoded kubeconfig for transfer to bastion"
+        },
+        {
+          "description": "Transfer kubeconfig to bastion via SSM",
+          "command": "aws ssm send-command --region {{region}} --instance-ids {{bastion_instance_id}} --document-name AWS-RunShellScript --parameters commands='mkdir -p ~/.kube && echo {{kubeconfig_b64}} | base64 -d > ~/.kube/config && chmod 600 ~/.kube/config'"
+        },
+        {
+          "description": "Verify bastion can access cluster",
+          "command": "aws ssm start-session --region {{region}} --target {{bastion_instance_id}} --document-name AWS-StartNonInteractiveCommand --parameters command='oc whoami && oc get nodes'",
+          "validation": "Should show cluster-admin and list nodes"
+        }
+      ]
+    },
+    {
+      "stage": "kube_burner_setup",
+      "name": "Install kube-burner-ocp",
+      "description": "Deploy kube-burner on bastion instance for performance testing",
+      "skip_if": "install_bastion == false",
+      "commands": [
+        {
+          "description": "Download kube-burner-ocp",
+          "command": "aws ssm send-command --region {{region}} --instance-ids {{bastion_instance_id}} --document-name AWS-RunShellScript --parameters commands='mkdir -p ~/kube-burner-ocp/bin && cd ~/kube-burner-ocp/bin && curl -L https://github.com/kube-burner/kube-burner-ocp/releases/latest/download/kube-burner-ocp-linux-amd64 -o kube-burner-ocp && chmod +x kube-burner-ocp'"
+        },
+        {
+          "description": "Verify kube-burner installation",
+          "command": "aws ssm start-session --region {{region}} --target {{bastion_instance_id}} --document-name AWS-StartNonInteractiveCommand --parameters command='~/kube-burner-ocp/bin/kube-burner-ocp version'"
+        },
+        {
+          "description": "Create kube-burner wrapper script",
+          "command": "aws ssm send-command --region {{region}} --instance-ids {{bastion_instance_id}} --document-name AWS-RunShellScript --parameters commands='cat > ~/run-kube-burner.sh <<EOF\n#!/bin/bash\nexport KUBECONFIG=~/.kube/config\n~/kube-burner-ocp/bin/kube-burner-ocp \\$@\nEOF\nchmod +x ~/run-kube-burner.sh'"
+        }
+      ]
+    },
+    {
+      "stage": "validation",
+      "name": "Validate Deployment",
+      "description": "Run basic validation tests",
+      "commands": [
+        {
+          "description": "Verify all cluster operators are healthy",
+          "command": "oc get clusteroperators -o json | jq -r '.items[] | select(.status.conditions[] | select(.type==\"Available\" and .status!=\"True\")) | .metadata.name'",
+          "validation": "Should return empty (all operators available)"
+        },
+        {
+          "description": "Verify all nodes are Ready",
+          "command": "oc get nodes --no-headers | awk '{print $2}' | grep -v Ready",
+          "validation": "Should return empty (all nodes Ready)"
+        },
+        {
+          "description": "Get cluster version",
+          "command": "oc get clusterversion -o json | jq -r '.items[0].status.desired.version'"
+        },
+        {
+          "description": "List machine pools",
+          "command": "rosa list machinepools --cluster={{cluster_name}}"
+        },
+        {
+          "description": "Get bastion access information",
+          "command": "echo 'Bastion SSH: ssh ec2-user@{{bastion_public_ip}}' && echo 'Bastion SSM: aws ssm start-session --region {{region}} --target {{bastion_instance_id}}'",
+          "skip_if": "install_bastion == false"
+        }
+      ]
+    }
+  ],
+
+  "usage_examples": {
+    "basic_workloads": [
+      {
+        "name": "Node Density Test",
+        "description": "Test node capacity with maximum pod density",
+        "command": "~/run-kube-burner.sh node-density --pods-per-node=245 --uuid=$(uuidgen)",
+        "note": "Tests maximum pod capacity per node"
+      },
+      {
+        "name": "Cluster Density Test",
+        "description": "Test overall cluster capacity",
+        "command": "~/run-kube-burner.sh cluster-density --iterations=100 --churn-duration=5m --uuid=$(uuidgen)",
+        "note": "Creates projects with deployments and services"
+      },
+      {
+        "name": "Network Performance",
+        "description": "Test cluster network throughput and latency",
+        "command": "~/run-kube-burner.sh networkpolicy --iterations=50 --uuid=$(uuidgen)",
+        "note": "Tests network policy performance"
+      }
+    ],
+    "with_elasticsearch": [
+      {
+        "name": "Indexed Performance Test",
+        "description": "Run test with results indexed to Elasticsearch",
+        "command": "~/run-kube-burner.sh cluster-density --iterations=100 --es-server={{es_server}} --es-index=kube-burner-results --uuid=$(uuidgen)",
+        "requires": ["elasticsearch_server"]
+      }
+    ],
+    "custom_workload": {
+      "description": "Run custom workload from configuration file",
+      "steps": [
+        "Create workload config YAML on bastion",
+        "Run: ~/run-kube-burner.sh init --config=my-workload.yaml --uuid=$(uuidgen)"
+      ]
+    }
+  },
+
+  "troubleshooting": {
+    "common_issues": [
+      {
+        "issue": "Cluster creation fails with quota error",
+        "solution": "Check AWS service quotas: aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --region {{region}}",
+        "note": "Request quota increase if needed"
+      },
+      {
+        "issue": "Cannot access cluster from bastion",
+        "checks": [
+          "Verify kubeconfig is correct: cat ~/.kube/config",
+          "Test API connectivity: curl -k {{api_url}}",
+          "Check security groups allow outbound HTTPS"
+        ]
+      },
+      {
+        "issue": "kube-burner fails to start",
+        "checks": [
+          "Verify KUBECONFIG is set: echo $KUBECONFIG",
+          "Test cluster access: oc whoami",
+          "Check kube-burner version: ~/kube-burner-ocp/bin/kube-burner-ocp version"
+        ]
+      },
+      {
+        "issue": "Nodes not ready",
+        "solution": "Check machine pool status: rosa describe machinepool --cluster={{cluster_name}} worker",
+        "note": "May need to wait for autoscaling or check AWS capacity"
+      }
+    ],
+    "debug_commands": {
+      "cluster_health": [
+        "rosa describe cluster --cluster={{cluster_name}}",
+        "oc get clusterversion",
+        "oc get nodes -o wide",
+        "oc get clusteroperators",
+        "oc get events --all-namespaces --sort-by='.lastTimestamp'"
+      ],
+      "bastion_access": [
+        "SSH: ssh ec2-user@{{bastion_public_ip}}",
+        "SSM: aws ssm start-session --region {{region}} --target {{bastion_instance_id}}",
+        "Check SSM agent: aws ssm describe-instance-information --region {{region}}"
+      ],
+      "aws_resources": [
+        "aws ec2 describe-vpcs --region {{region}} --vpc-ids {{vpc_id}}",
+        "aws ec2 describe-subnets --region {{region}} --filters Name=vpc-id,Values={{vpc_id}}",
+        "aws ec2 describe-instances --region {{region}} --filters Name=vpc-id,Values={{vpc_id}}"
+      ]
+    }
+  },
+
+  "lifecycle_management": {
+    "extend_lifetime": {
+      "description": "Extend cluster expiration time",
+      "commands": [
+        "ocm list clusters | grep {{cluster_name}}",
+        "ocm edit cluster --expiration 72h <CLUSTER_ID>",
+        "ocm describe cluster <CLUSTER_ID> | grep -i expiration"
+      ]
+    },
+    "scale_cluster": {
+      "description": "Scale worker nodes up or down",
+      "commands": [
+        "rosa list machinepools --cluster={{cluster_name}}",
+        "rosa edit machinepool --cluster={{cluster_name}} --replicas=<NEW_COUNT> worker"
+      ]
+    },
+    "upgrade_cluster": {
+      "description": "Upgrade cluster to new version",
+      "commands": [
+        "rosa list upgrades --cluster={{cluster_name}}",
+        "rosa upgrade cluster --cluster={{cluster_name}} --version=<VERSION>"
+      ]
+    }
+  },
+
+  "cleanup": {
+    "description": "Remove all resources created during deployment",
+    "commands": [
+      {
+        "description": "Delete ROSA cluster",
+        "command": "rosa delete cluster --cluster={{cluster_name}} --yes",
+        "timeout": "15m",
+        "note": "Also removes operator roles and OIDC providers associated with this cluster"
+      },
+      {
+        "description": "Wait for cluster deletion to complete",
+        "command": "while rosa describe cluster --cluster={{cluster_name}} 2>/dev/null; do echo 'Waiting for cluster deletion...'; sleep 30; done",
+        "timeout": "20m"
+      },
+      {
+        "description": "Terminate bastion instance",
+        "command": "aws ec2 terminate-instances --region {{region}} --instance-ids {{bastion_instance_id}}",
+        "skip_if": "install_bastion == false"
+      },
+      {
+        "description": "Delete bastion security group",
+        "command": "aws ec2 delete-security-group --region {{region}} --group-id {{bastion_security_group_id}}",
+        "skip_if": "install_bastion == false",
+        "note": "Wait for instance termination before deleting security group"
+      },
+      {
+        "description": "Delete VPC and all associated resources",
+        "command": "aws ec2 delete-vpc --region {{region}} --vpc-id {{vpc_id}}",
+        "note": "VPC deletion requires all resources (subnets, NAT gateways, IGW) to be deleted first. ROSA cluster deletion handles this automatically."
+      }
+    ],
+    "manual_cleanup": {
+      "description": "If automated cleanup fails, manually remove resources",
+      "steps": [
+        "1. Delete cluster: rosa delete cluster --cluster={{cluster_name}} --yes",
+        "2. List VPC resources: aws ec2 describe-vpcs --region {{region}}",
+        "3. Terminate instances: aws ec2 terminate-instances --region {{region}} --instance-ids <ID>",
+        "4. Delete NAT gateways: aws ec2 delete-nat-gateway --nat-gateway-id <ID>",
+        "5. Release Elastic IPs: aws ec2 release-address --allocation-id <ID>",
+        "6. Delete subnets: aws ec2 delete-subnet --subnet-id <ID>",
+        "7. Detach and delete Internet Gateway",
+        "8. Delete VPC: aws ec2 delete-vpc --vpc-id {{vpc_id}}"
+      ]
+    }
+  },
+
+  "agentic_perf_integration": {
+    "ticket_lifecycle": {
+      "stages": [
+        "new → triage_pending (agent interprets deployment request)",
+        "triage_pending → awaiting_hardware (agent verifies AWS credentials and quota)",
+        "awaiting_hardware → preparing_platform (agent provisions VPC and networking)",
+        "preparing_platform → awaiting_provision (agent deploys ROSA cluster)",
+        "awaiting_provision → executing_benchmark (agent installs kube-burner)",
+        "executing_benchmark → awaiting_review (agent runs tests and collects metrics)",
+        "awaiting_review → closed (agent analyzes results and reports)"
+      ]
+    },
+    "agent_responsibilities": {
+      "triage_agent": "Parse user request for cluster size, region, version, and test scenarios",
+      "resource_agent": "Verify AWS credentials, check ROSA quota, validate region availability",
+      "provisioning_agent": "Execute deployment steps, handle errors, validate each stage",
+      "benchmark_agent": "Run kube-burner workloads, monitor progress, collect logs",
+      "review_agent": "Parse kube-burner metrics, compare against baselines, generate report"
+    },
+    "natural_language_examples": [
+      "Deploy a ROSA cluster in us-west-2 with 24 workers for performance testing",
+      "Create ROSA 4.22 cluster with kube-burner installed",
+      "Set up ROSA with 48 m6i.2xlarge workers and run cluster-density test",
+      "Deploy ROSA in us-east-1 and execute node-density benchmark"
+    ]
+  },
+
+  "references": {
+    "documentation": [
+      "https://docs.openshift.com/rosa/welcome/index.html",
+      "https://kube-burner.github.io/kube-burner/",
+      "https://github.com/kube-burner/kube-burner-ocp"
+    ],
+    "rosa_guides": [
+      "https://access.redhat.com/documentation/en-us/red_hat_openshift_service_on_aws/4",
+      "https://docs.aws.amazon.com/ROSA/latest/userguide/what-is-rosa.html"
+    ]
+  }
+}
