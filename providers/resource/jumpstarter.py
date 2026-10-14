@@ -656,12 +656,23 @@ class JumpstarterResourceProvider(ResourceProvider):
                     }
                 selector = f"{_board_type_selector_key()}={board_type}"
                 target_exporter = value
-            # Compound selectors with negation terms are passed
-            # through to CreateLease which handles them natively.
-            # Strip negation terms since the SDK's label selector
-            # parser may not support '!' syntax — negation is
-            # enforced client-side in check_available_resources.
+            # Compound selectors with negation terms: the SDK's
+            # label selector parser may not support '!' syntax.
+            # Resolve which exporters pass the full selector
+            # (including negation) and pin to a specific allowed
+            # exporter so the lease can't land on an excluded board.
             elif any(neg for _, _, neg in terms):
+                exporters = await self._service.ListExporters()
+                all_devices = [
+                    {
+                        "name": e.name,
+                        "labels": dict(e.labels),
+                    }
+                    for e in exporters.exporters
+                ]
+                allowed = [d for d in all_devices if _device_matches_selector(d, terms)]
+                if allowed and not target_exporter:
+                    target_exporter = allowed[0]["name"]
                 positive = [f"{k}={v}" for k, v, neg in terms if not neg]
                 selector = ",".join(positive) if positive else selector
 

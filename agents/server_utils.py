@@ -1906,7 +1906,10 @@ def read_artifact_file_impl(
     try:
         resolved = resolved.resolve()
         artifacts_resolved = ARTIFACT_DIR.resolve()
-        if not str(resolved).startswith(str(artifacts_resolved)):
+        # Use is_relative_to for proper path-component containment.
+        # String prefix matching would allow sibling directories
+        # like "artifacts-archive/" to pass.
+        if not resolved.is_relative_to(artifacts_resolved):
             return json.dumps(
                 {"error": "Access denied: path is outside the artifacts directory"}
             )

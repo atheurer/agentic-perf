@@ -4625,12 +4625,24 @@ async def execute_boot_time_test(
         directives = fields.get("directives", {})
         serial_enabled = directives.get("jumpstarter_serial", False)
         is_jumpstarter = lease_id and fields.get("resource_provider") == "jumpstarter"
+        # Resolve reboot method once — used by both branches.
+        requested_reboot = (
+            directives.get("reboot_method", "") or directives.get("boot_type", "")
+        ).lower()
         if is_jumpstarter and serial_enabled:
             cmd.append("--jumpstarter-serial")
             cmd.append(f"--jumpstarter-lease-name={lease_id}")
-            logger.info(
-                f"[boot-time] Using Jumpstarter lease {lease_id} for serial capture"
-            )
+            if requested_reboot == "warm":
+                cmd.append("--no-jumpstarter-power")
+                logger.info(
+                    "[boot-time] Serial capture + warm reboot — power "
+                    "control disabled (lease %s)",
+                    lease_id,
+                )
+            else:
+                logger.info(
+                    f"[boot-time] Using Jumpstarter lease {lease_id} for serial capture"
+                )
         elif is_jumpstarter:
             # Always pass the lease name so the script can use
             # Jumpstarter for diagnostics (exporter status, power
@@ -4638,9 +4650,6 @@ async def execute_boot_time_test(
             # is warm, disable hardware power cycling so the script
             # uses SSH reboot while retaining diagnostic capability.
             cmd.append(f"--jumpstarter-lease-name={lease_id}")
-            requested_reboot = (
-                directives.get("reboot_method", "") or directives.get("boot_type", "")
-            ).lower()
             if requested_reboot == "warm":
                 cmd.append("--no-jumpstarter-power")
                 logger.info(
