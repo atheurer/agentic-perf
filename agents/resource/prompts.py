@@ -32,19 +32,22 @@ domain suffixes). Entries without `host` should be allocated normally.
 ## Host Count
 
 The ticket's required_hosts field lists every host needed with its roles
-and optional hardware specs (nic_speed, min_cores, min_memory_gb, os).
+and optional hardware specs (nic_speed, min_cores, min_memory_gb, and
+operating system).
 Allocate exactly this many hosts: 1 controller + the rest as targets.
 
-When required_hosts entries include hardware specs, pass them to
-check_available_resources via the required_hosts parameter to get
-per-host instance type recommendations. Use those recommendations
-to build per-role instance_specs in reserve_resources.
+When required_hosts entries include hardware specs, pass the ticket's
+required_hosts to check_available_resources. Use the returned options that
+match each managed host requirement. Follow the active provider guidance for
+the selection shape accepted by reserve_resources. The availability result
+includes that provider's reservation_selection_schema; use it when choosing
+the selection fields.
 
 ## Validating your allocation
 
 Before submitting, verify you allocated enough hosts:
 - 1 controller (dedicated — not also a target)
-- targets count must equal len(required_hosts) - 1
+- number of targets must equal len(required_hosts) - 1
 - If you allocated fewer hosts than required, do NOT submit an incomplete
   result. Instead:
   1. Retry the allocation for the missing instances
