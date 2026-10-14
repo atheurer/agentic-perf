@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -24,6 +25,21 @@ def _provider_class(name: str):
     return getattr(importlib.import_module(module_name), class_name)
 
 
+def _schema_property_names(schema):
+    """Collect property names recursively, including nested model definitions."""
+    names = set()
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            names.update(properties)
+        for value in schema.values():
+            names.update(_schema_property_names(value))
+    elif isinstance(schema, list):
+        for value in schema:
+            names.update(_schema_property_names(value))
+    return names
+
+
 def test_every_registered_provider_has_a_validated_selection_contract():
     assert set(RESERVATION_SELECTION_CONTRACTS) == set(PROVIDER_REGISTRY)
 
@@ -32,6 +48,9 @@ def test_every_registered_provider_has_a_validated_selection_contract():
         provider_class = _provider_class(provider)
 
         assert provider_class.reservation_selection_schema() == contract.json_schema()
+        assert set(contract.prompt_fields) == _schema_property_names(
+            contract.json_schema()
+        )
         assert (
             validate_reservation_selection(provider, contract.valid_example)
             == contract.valid_example
@@ -147,27 +166,32 @@ def test_only_matching_provider_selection_guidance_is_assembled(provider):
     # the AWS reservation selection shape.
     unique_other_fields.discard("hostnames")
     for field in unique_other_fields:
-        assert field not in prompt
+        assert not re.search(rf"\b{re.escape(field)}\b", prompt)
 
 
 def test_shared_prompt_and_tool_description_have_no_provider_selection_shape():
-    from agents.resource.server import reserve_resources
+    from agents.resource.server import check_available_resources, reserve_resources
 
     prompts_dir = Path(__file__).resolve().parents[1] / "agents/resource/prompts"
-    provider_fields = {
-        field
-        for contract in RESERVATION_SELECTION_CONTRACTS.values()
-        for field in contract.prompt_fields
-    }
-    tool_description = reserve_resources.__doc__ or ""
+    shared_text = "\n".join(
+        [
+            RESOURCE_BASE_PROMPT,
+            check_available_resources.__doc__ or "",
+            reserve_resources.__doc__ or "",
+        ]
+    )
     for provider in PROVIDER_REGISTRY:
         fragment = AgentBase._load_prompt_fragment(prompts_dir, provider)
         assert fragment
-        assert fragment not in RESOURCE_BASE_PROMPT
-        assert fragment not in tool_description
+        assert fragment not in shared_text
+
+    provider_fields = {
+        field
+        for contract in RESERVATION_SELECTION_CONTRACTS.values()
+        for field in _schema_property_names(contract.json_schema())
+    }
     for field in provider_fields:
-        assert field not in RESOURCE_BASE_PROMPT
-        assert field not in tool_description
+        assert not re.search(rf"\b{re.escape(field)}\b", shared_text)
 
 
 def test_registered_harness_guidance_is_scoped_to_its_assembled_prompt(monkeypatch):
@@ -206,40 +230,47 @@ def test_registered_harness_guidance_is_scoped_to_its_assembled_prompt(monkeypat
                 assert other_fragment not in prompt
 
 
-@pytest.mark.asyncio
-async def test_quads_aws_shaped_selection_is_rejected_before_marker_or_provider_call(
-    monkeypatch,
-):
+def _configure_quads_server(monkeypatch, ticket):
     import agents.resource.server as srv
     from providers.resource.quads import QuadsResourceProvider
 
+    monkeypatch.delenv("TICKET_ID", raising=False)
     provider = QuadsResourceProvider(MagicMock())
     provider.reserve = AsyncMock()
     registry = MagicMock()
     registry.get_provider = AsyncMock(return_value=provider)
     marker = AsyncMock()
 
+    monkeypatch.setattr(srv, "_ensure_init", AsyncMock())
     monkeypatch.setattr(srv, "_initialized", True)
     monkeypatch.setattr(srv, "_registry", registry)
-    monkeypatch.setattr(
-        srv,
-        "_ticket",
-        {
-            "id": "PERF-EAF95C59",
-            "custom_fields": {
-                "resource_provider": "quads",
-                "required_hosts": [
-                    {"roles": ["controller"]},
-                    {"roles": ["client"]},
-                    {"roles": ["server"]},
-                ],
-            },
-        },
-    )
+    monkeypatch.setattr(srv, "_ticket", ticket)
     monkeypatch.setattr(srv, "_resources_allocated", False)
     monkeypatch.setattr(srv, "_reservation_uncertain", False)
     monkeypatch.setattr(srv, "_reservation_failures", 0)
+    monkeypatch.setattr(srv, "_quads_eligible_hostnames_by_requirement", None)
+    monkeypatch.setattr(srv, "_quads_eligibility_context", None)
     monkeypatch.setattr(srv, "_persist_unknown_reservation_marker", marker)
+    monkeypatch.setattr(srv, "_persist_known_reservation_outcome", AsyncMock())
+    return srv, provider, marker
+
+
+@pytest.mark.asyncio
+async def test_quads_aws_shaped_selection_is_rejected_before_marker_or_provider_call(
+    monkeypatch,
+):
+    ticket = {
+        "id": "PERF-EAF95C59",
+        "custom_fields": {
+            "resource_provider": "quads",
+            "required_hosts": [
+                {"roles": ["controller"]},
+                {"roles": ["client"]},
+                {"roles": ["server"]},
+            ],
+        },
+    }
+    srv, provider, marker = _configure_quads_server(monkeypatch, ticket)
 
     raw = await srv.reserve_resources(
         provider="quads",
@@ -265,6 +296,117 @@ async def test_quads_aws_shaped_selection_is_rejected_before_marker_or_provider_
     marker.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_quads_requires_discovery_even_without_ticket_required_hosts(monkeypatch):
+    ticket = {"custom_fields": {"resource_provider": "quads"}}
+    srv, provider, marker = _configure_quads_server(monkeypatch, ticket)
+
+    raw = await srv.reserve_resources(
+        provider="quads",
+        selection={"hostnames": ["invented.example.com"]},
+        description="must be discovered first",
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "invalid_selection"
+    assert result["provider_call_started"] is False
+    assert "eligible host options are unavailable" in result["error"]
+    provider.reserve.assert_not_awaited()
+    marker.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quads_rejects_eligibility_cached_for_a_different_ticket_context(
+    monkeypatch,
+):
+    ticket = {
+        "custom_fields": {
+            "resource_provider": "quads",
+            "required_hosts": [{"roles": ["client"]}],
+        }
+    }
+    srv, provider, marker = _configure_quads_server(monkeypatch, ticket)
+    monkeypatch.setattr(
+        srv, "_quads_eligible_hostnames_by_requirement", [{"host-01.example.com"}]
+    )
+    monkeypatch.setattr(
+        srv, "_quads_eligibility_context", srv._quads_ticket_context_key()
+    )
+    ticket["custom_fields"]["required_hosts"] = [{"roles": ["server"]}]
+
+    raw = await srv.reserve_resources(
+        provider="quads",
+        selection={"hostnames": ["host-01.example.com"]},
+        description="stale discovery must not authorize reserve",
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "invalid_selection"
+    assert result["provider_call_started"] is False
+    assert "eligible host options are unavailable" in result["error"]
+    provider.reserve.assert_not_awaited()
+    marker.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quads_per_host_discovery_exposes_options_for_distinct_selection(
+    monkeypatch,
+):
+    required_hosts = [{"roles": ["target"], "min_cores": 32} for _ in range(3)]
+    ticket = {
+        "custom_fields": {
+            "resource_provider": "quads",
+            "required_hosts": required_hosts,
+        }
+    }
+    srv, provider, marker = _configure_quads_server(monkeypatch, ticket)
+    options = [
+        {"hostname": "host-01.example.com", "cores": 64},
+        {"hostname": "host-02.example.com", "cores": 64},
+        {"hostname": "host-03.example.com", "cores": 64},
+    ]
+    provider.check_available = AsyncMock(
+        return_value={"available_count": 3, "options": options}
+    )
+    provider.reserve.return_value = {
+        "status": "active",
+        "reservation_id": "73",
+        "provider_metadata": {"assignment_id": 73},
+        "hosts": [option["hostname"] for option in options],
+    }
+
+    raw = await srv.check_available_resources(
+        provider="quads", required_hosts=required_hosts
+    )
+    availability = json.loads(raw)
+    recommendations = availability["per_host_recommendations"]
+
+    assert len(recommendations) == 3
+    assert all(item["recommended"] == options[0] for item in recommendations)
+    assert all(item["options"] == options for item in recommendations)
+    selection = {
+        "hostnames": [
+            item["options"][index]["hostname"]
+            for index, item in enumerate(recommendations)
+        ]
+    }
+
+    raw = await srv.reserve_resources(
+        provider="quads",
+        selection=selection,
+        description="three identical requirements",
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "active"
+    assert selection["hostnames"] == [option["hostname"] for option in options]
+    provider.reserve.assert_awaited_once()
+    marker.assert_awaited_once()
+
+
 def test_contract_metadata_covers_all_provider_prompt_fragments():
     prompts_dir = Path("agents/resource/prompts")
     for provider, contract in RESERVATION_SELECTION_CONTRACTS.items():
@@ -283,7 +425,7 @@ def test_contract_metadata_covers_all_provider_prompt_fragments():
     assert "reservation_selection_schema" in auto_select_prompt
     for contract in RESERVATION_SELECTION_CONTRACTS.values():
         for field in contract.prompt_fields:
-            assert field not in auto_select_prompt
+            assert not re.search(rf"\b{re.escape(field)}\b", auto_select_prompt)
 
 
 @pytest.mark.asyncio

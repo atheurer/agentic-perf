@@ -63,6 +63,7 @@ _fleet_next_device: str | None = None
 # QUADS selections must come from options that satisfied this ticket's
 # requirements. A separate set is kept for each managed host requirement.
 _quads_eligible_hostnames_by_requirement: list[set[str]] | None = None
+_quads_eligibility_context: str | None = None
 
 # Guardrail: set after a successful or uncertain reservation outcome.
 # Prevents discovery after allocation and duplicate attempts when the provider
@@ -127,6 +128,21 @@ def _unknown_reservation_response(provider: str | None = None) -> dict[str, Any]
     if provider:
         response["provider"] = provider
     return response
+
+
+def _quads_ticket_context_key() -> str:
+    """Identify the ticket requirements for which QUADS options were checked."""
+    return json.dumps(
+        {
+            "ticket_id": os.environ.get("TICKET_ID", "") or _ticket.get("id", ""),
+            "required_hosts": _ticket.get("custom_fields", {}).get(
+                "required_hosts", []
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _ticket_resource_provider() -> tuple[str | None, bool]:
@@ -595,8 +611,9 @@ async def check_available_resources(
             "reservation_selection_example": prov.reservation_selection_example(),
         }
 
-    global _quads_eligible_hostnames_by_requirement
+    global _quads_eligible_hostnames_by_requirement, _quads_eligibility_context
     _quads_eligible_hostnames_by_requirement = None
+    _quads_eligibility_context = None
 
     ticket_required_hosts = _ticket.get("custom_fields", {}).get("required_hosts")
     if provider == "quads" and isinstance(ticket_required_hosts, list):
@@ -682,6 +699,11 @@ async def check_available_resources(
             rec = dict(host_req)
             if result.get("options"):
                 rec["recommended"] = result["options"][0]
+            if provider == "quads":
+                # Keep every eligible hostname visible so the agent can choose
+                # distinct hosts when several requirements have the same best
+                # recommendation.
+                rec["options"] = result.get("options", [])
             recommendations.append(rec)
         if provider == "quads":
             _quads_eligible_hostnames_by_requirement = [
@@ -692,6 +714,7 @@ async def check_available_resources(
                 }
                 for result in availability_results
             ]
+            _quads_eligibility_context = _quads_ticket_context_key()
         response = {
             "provider": prov.provider_name,
             "per_host_recommendations": recommendations,
@@ -720,6 +743,7 @@ async def check_available_resources(
             if option.get("hostname") or option.get("host")
         }
         _quads_eligible_hostnames_by_requirement = [eligible_hostnames]
+        _quads_eligibility_context = _quads_ticket_context_key()
 
     # Code-enforce: when a specific device was requested by
     # name and is unavailable, escalate to HITL immediately.
@@ -871,13 +895,17 @@ async def reserve_resources(
             required_hosts = _ticket.get("custom_fields", {}).get("required_hosts")
             if not isinstance(required_hosts, list):
                 required_hosts = None
+            quads_eligibility = _quads_eligible_hostnames_by_requirement
+            if (
+                provider == "quads"
+                and _quads_eligibility_context != _quads_ticket_context_key()
+            ):
+                quads_eligibility = None
             selection = prov.validate_reservation_selection(
                 selection,
                 required_hosts=required_hosts,
                 eligible_hostnames_by_requirement=(
-                    _quads_eligible_hostnames_by_requirement
-                    if provider == "quads"
-                    else None
+                    quads_eligibility if provider == "quads" else None
                 ),
                 require_eligible_hostnames=provider == "quads",
             )

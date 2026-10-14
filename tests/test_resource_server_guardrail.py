@@ -117,6 +117,7 @@ def _reset_server_state(monkeypatch):
     srv._ticket = {}
     srv._fleet_next_device = None
     srv._quads_eligible_hostnames_by_requirement = None
+    srv._quads_eligibility_context = None
     srv._last_reservation = {}
     srv._host_inventory = {}
     yield
@@ -124,6 +125,7 @@ def _reset_server_state(monkeypatch):
     srv._reservation_uncertain = False
     srv._reservation_failures = 0
     srv._quads_eligible_hostnames_by_requirement = None
+    srv._quads_eligibility_context = None
 
 
 # ---------------------------------------------------------------------------

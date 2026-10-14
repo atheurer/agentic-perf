@@ -128,7 +128,16 @@ RESERVATION_SELECTION_CONTRACTS: dict[str, ReservationSelectionContract] = {
             {"instance_specs": [{"instance_type": "m5.xlarge", "count": 0}]},
             {"instance_specs": [{"instance_type": "m5.xlarge"}], "count": 2},
         ),
-        prompt_fields=("instance_specs", "instance_type"),
+        prompt_fields=(
+            "instance_specs",
+            "instance_type",
+            "count",
+            "instance_count",
+            "ami",
+            "os",
+            "root_volume_gb",
+            "role",
+        ),
     ),
     "jumpstarter": ReservationSelectionContract(
         model=JumpstarterSelection,
@@ -140,7 +149,12 @@ RESERVATION_SELECTION_CONTRACTS: dict[str, ReservationSelectionContract] = {
             {"hostnames": ["board-01"]},
             {"jumpstarter_selector": "board-type=example", "count": 2},
         ),
-        prompt_fields=("jumpstarter_selector", "lease_duration_seconds"),
+        prompt_fields=(
+            "jumpstarter_selector",
+            "lease_duration_seconds",
+            "count",
+            "exporter_name",
+        ),
     ),
     "psap-cc": ReservationSelectionContract(
         model=PSAPCCSelection,
@@ -235,11 +249,7 @@ def validate_reservation_selection(
                 f"QUADS selection has {len(hostnames)} hostname(s), but the ticket "
                 f"requires {expected_count} managed host(s)"
             )
-        if (
-            require_eligible_hostnames
-            and expected_count
-            and eligible_hostnames_by_requirement is None
-        ):
+        if require_eligible_hostnames and eligible_hostnames_by_requirement is None:
             raise ReservationSelectionError(
                 "QUADS eligible host options are unavailable; call "
                 "check_available_resources with the ticket's requirements first"

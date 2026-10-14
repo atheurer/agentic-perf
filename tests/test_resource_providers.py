@@ -2596,10 +2596,25 @@ class TestProviderCorrectAutoReservation:
             "custom_fields": ticket_fields,
         }
         calls = []
+        mcp_calls = []
 
         async def mcp_call(name, arguments):
+            mcp_calls.append(name)
             if name == "get_accumulated_metadata":
                 return "{}"
+            if name == "check_available_resources" and provider == "quads":
+                options = [
+                    {"hostname": "host-a"},
+                    {"hostname": "host-b"},
+                ]
+                return json.dumps(
+                    {
+                        "per_host_recommendations": [
+                            {"options": options}
+                            for _ in arguments.get("required_hosts", [])
+                        ]
+                    }
+                )
             if name == "reserve_resources":
                 calls.append(arguments)
                 return json.dumps(reserve_result)
@@ -2620,6 +2635,9 @@ class TestProviderCorrectAutoReservation:
         assert fields.get("fresh_host", False) is fresh_host
         assert fields["assigned_hardware_ips"] == expected_hardware
         if provider == "quads":
+            assert mcp_calls.index("check_available_resources") < mcp_calls.index(
+                "reserve_resources"
+            )
             assert (
                 fields["quads_assignment_id"]
                 == reserve_result["provider_metadata"]["assignment_id"]
