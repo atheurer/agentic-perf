@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -366,6 +367,268 @@ class ProvisioningAgent(AgentBase):
             f"Approval {decision} for request {approval_id}. Do not change "
             "kernels or reboot."
         )
+
+    # ------------------------------------------------------------------
+    # Deterministic kernel transition step (no LLM reasoning)
+    # ------------------------------------------------------------------
+
+    _KERNEL_APPROVE_RE = re.compile(
+        r"^\s*(approve[ds]?|yes|ok(ay)?|go( ahead)?|lgtm|proceed|continue)\b", re.I
+    )
+    _KERNEL_INSTALL_OK = frozenset({"installed", "already_installed"})
+    _KERNEL_SELECT_OK = frozenset({"ok", "already_default"})
+
+    @staticmethod
+    def _kernel_step_is_deterministic(cf: dict[str, Any]) -> bool:
+        from agents.provisioning.kernel import current_kernel_step
+
+        if current_kernel_step({"custom_fields": cf}) is None:
+            return False
+        mode = (cf.get("directives") or {}).get("kernel_step_mode", "deterministic")
+        return mode != "llm"
+
+    async def _kernel_tool(
+        self, mcp: Any, name: str, **arguments: Any
+    ) -> dict[str, Any]:
+        """Call one kernel tool through the audited MCP client; always a dict."""
+        raw = await mcp.call_tool(name, arguments)
+        try:
+            decoded = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            decoded = None
+        if not isinstance(decoded, dict):
+            return {
+                "status": "error",
+                "error": f"non-JSON result from {name}",
+                "raw": raw,
+            }
+        return decoded
+
+    async def _kernel_step_stop(
+        self, ticket_id: str, headline: str, detail: Any
+    ) -> None:
+        """Pause for the user unless a tool already paused the ticket."""
+        body = (
+            f"**Kernel transition stopped:** {headline}\n\n"
+            f"```json\n{json.dumps(detail, indent=2)[:3000]}\n```"
+        )
+        await self._add_comment(ticket_id, body)
+        ticket = await self._get_ticket(ticket_id)
+        if ticket.get("status") == "awaiting_customer_guidance":
+            return
+        await self._transition_ticket(
+            ticket_id,
+            "awaiting_customer_guidance",
+            comment=(
+                "Kernel transition needs a decision. Fix the host or the plan "
+                "and reply; a new prepare_kernel_change + approval is needed "
+                "for any new reboot."
+            ),
+        )
+
+    async def _run_kernel_step(
+        self, ticket_id: str, ticket: dict[str, Any], mcp: Any
+    ) -> None:
+        """Drive a kernel transition step with fixed tool calls.
+
+        Order: inventory -> prepare (persisted intent) -> approval pause ->
+        the intent's actions (install, select_default, reboot) -> submit.
+        The human reply to the approval is interpreted by a strict pattern,
+        never by a model; anything that is not a clear yes is a rejection.
+        """
+        from agents.provisioning.kernel import (
+            authorized_kernel_hosts,
+            current_kernel_step,
+        )
+
+        cf = ticket.get("custom_fields", {})
+        step = current_kernel_step(ticket)
+        assert step is not None
+        step_id, spec = step
+        hosts = sorted(authorized_kernel_hosts(ticket).values())
+        harness = self._effective_harness(
+            cf.get("directives", {}), getattr(self, "_skill_provider", None)
+        )
+        reboot_policy = (cf.get("directives") or {}).get(
+            "kernel_reboot_policy", "always"
+        )
+        if not hosts:
+            await self._kernel_step_stop(
+                ticket_id,
+                "no assigned benchmark hosts for the kernel step",
+                cf.get("assigned_hardware_ips"),
+            )
+            return
+
+        await self._add_comment(
+            ticket_id,
+            f"**Kernel transition (deterministic)** — plan step {step_id}: "
+            f"`{spec.nevra}` on {', '.join(hosts)}. No model reasoning is used "
+            "for this step; the only decision is your approval.",
+        )
+
+        inventory = await self._kernel_tool(
+            mcp, "get_kernel_inventory", hosts=hosts, kernel=spec.release
+        )
+        if inventory.get("status") == "rejected":
+            await self._kernel_step_stop(ticket_id, "inventory rejected", inventory)
+            return
+        not_ok = {
+            host: record
+            for host, record in inventory.get("results", {}).items()
+            if not isinstance(record, dict) or record.get("state") != "ok"
+        }
+        if not_ok:
+            await self._kernel_step_stop(
+                ticket_id, "some hosts could not be inventoried", not_ok
+            )
+            return
+        missing = {
+            host: record.get("requested")
+            for host, record in inventory["results"].items()
+            if record.get("requested", {}).get("state") == "not_found"
+        }
+        if missing:
+            await self._kernel_step_stop(
+                ticket_id,
+                f"{spec.nevra} is not installed or available on every host "
+                "(add the repository first)",
+                missing,
+            )
+            return
+
+        prepared = await self._kernel_tool(
+            mcp, "prepare_kernel_change", hosts=hosts, kernel=spec.to_dict()
+        )
+        if prepared.get("status") != "ok":
+            await self._kernel_step_stop(
+                ticket_id, "prepare_kernel_change refused", prepared
+            )
+            return
+        intent_id = prepared["intent_id"]
+        actions = list(prepared.get("actions_required", []))
+
+        summary = (
+            f"Plan step {step_id}: {spec.nevra} on {', '.join(hosts)}; "
+            f"actions: {', '.join(actions)}; reboot policy: {reboot_policy}."
+        )
+        reply = await self._request_kernel_approval(
+            intent_id=intent_id, summary=summary
+        )
+        approval_id = self._active_kernel_approval_id or ""
+        if "already granted" in reply:
+            pass
+        elif reply.startswith("The user replied:"):
+            user_text = reply.split("The user replied:", 1)[1].split("\n", 1)[0]
+            if self._KERNEL_APPROVE_RE.match(user_text):
+                await self._resolve_kernel_approval(decision="approved", reason=None)
+            else:
+                await self._resolve_kernel_approval(
+                    decision="rejected", reason="reply was not a clear approval"
+                )
+                await self._kernel_step_stop(
+                    ticket_id,
+                    "the reply was not a clear approval (say 'approve' to proceed)",
+                    {"reply": user_text.strip()},
+                )
+                return
+        else:
+            await self._kernel_step_stop(
+                ticket_id, "approval not granted", {"reply": reply}
+            )
+            return
+
+        for action in actions:
+            if action == "install":
+                result = await self._kernel_tool(
+                    mcp,
+                    "install_kernel",
+                    hosts=hosts,
+                    kernel=spec.release,
+                    approval_request_id=approval_id,
+                )
+                ok_states = self._KERNEL_INSTALL_OK
+            elif action == "select_default":
+                result = await self._kernel_tool(
+                    mcp,
+                    "select_default_kernel",
+                    hosts=hosts,
+                    kernel=spec.release,
+                    approval_request_id=approval_id,
+                )
+                ok_states = self._KERNEL_SELECT_OK
+            elif action == "reboot":
+                result = await self._kernel_tool(
+                    mcp,
+                    "reboot_hosts_and_verify",
+                    hosts=hosts,
+                    expected_kernel=spec.release,
+                    approval_request_id=approval_id,
+                    reboot_policy=reboot_policy,
+                )
+                if result.get("status") != "verified":
+                    # The reboot tool pauses the ticket itself on failure.
+                    await self._kernel_step_stop(
+                        ticket_id,
+                        f"reboot/verify ended in {result.get('status')}",
+                        result,
+                    )
+                    return
+                continue
+            else:
+                await self._kernel_step_stop(
+                    ticket_id, f"unknown action {action!r}", prepared
+                )
+                return
+            if result.get("status") in ("rejected", "paused", "error"):
+                await self._kernel_step_stop(ticket_id, f"{action} refused", result)
+                return
+            failed = {
+                host: record
+                for host, record in result.get("results", {}).items()
+                if host in hosts
+                and (
+                    not isinstance(record, dict) or record.get("state") not in ok_states
+                )
+            }
+            if failed:
+                await self._kernel_step_stop(
+                    ticket_id, f"{action} failed on some hosts", failed
+                )
+                return
+
+        # Hand the result to the normal completion path: it derives the
+        # verification from the checkpoint and advances the plan.
+        completion = LLMResponse(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="kernel-step",
+                    name="submit_provisioning_result",
+                    input={
+                        "provisioning_complete": True,
+                        "hosts_provisioned": hosts,
+                        "harness_name": harness,
+                        "harness_version": "unchanged by kernel transition",
+                        "configuration_applied": {
+                            "kernel_transition": {
+                                "step_id": step_id,
+                                "kernel": spec.to_dict(),
+                                "actions": actions,
+                                "intent_id": intent_id,
+                                "approval_request_id": approval_id,
+                            }
+                        },
+                        "verification": {
+                            "status": "verified",
+                            "details": "derived from the kernel transition checkpoint",
+                        },
+                        "notes": f"Deterministic kernel transition to {spec.nevra}.",
+                    },
+                )
+            ],
+        )
+        await self._handle_completion(ticket_id, completion)
 
     async def _kernel_step_verification(
         self, ticket_id: str, ticket: dict[str, Any] | None = None
@@ -899,6 +1162,19 @@ class ProvisioningAgent(AgentBase):
         )
         self._harness_self_installing = await self._is_self_installing(harness)
         is_jumpstarter = cf.get("resource_provider") == "jumpstarter"
+
+        # A kernel transition step has no decisions left for a model to make:
+        # the plan names the kernel, the ticket names the hosts, and every
+        # action is a fixed, audited tool call.  Run it in code (the same
+        # pattern as deterministic Jumpstarter provisioning) unless the
+        # ticket explicitly asks for the LLM path.
+        if self._kernel_step_is_deterministic(cf):
+            try:
+                await self._run_kernel_step(ticket_id, ticket, mcp)
+            finally:
+                await mcp.disconnect()
+                self._mcp = None
+            return
 
         if is_jumpstarter and (not harness or self._harness_self_installing):
             # Platform agent already provisioned the

@@ -1,5 +1,14 @@
 # RHEL Kernel Transitions
 
+**By default a kernel step is run without model reasoning.** When the
+current execution-plan step has `params.kernel`, the provisioning agent
+executes the fixed sequence below in code (inventory → prepare →
+approval pause → install → select → reboot/verify → submit) and only the
+human approval is a decision. The ticket directive
+`kernel_step_mode: "llm"` switches to the tool-driven model workflow
+described here; `kernel_reboot_policy: "if_needed"` skips the reboot of
+a host already on the expected kernel (default `"always"`).
+
 When an execution-plan step carries `params.kernel`, your job is the
 kernel transition — not a harness install. Every command, target address
 and state decision is made by the tools; you supply the kernel release

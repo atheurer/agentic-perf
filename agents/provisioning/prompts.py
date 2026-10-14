@@ -114,7 +114,9 @@ install_harness + verify_harness_install into one batched call.
       effect, do NOT report provisioning_complete=true — call
       request_clarification instead.
 
-12. **Kernel transitions.** Only when the current execution-plan step
+12. **Kernel transitions.** (You only see a kernel step when the ticket
+    sets `kernel_step_mode: "llm"`; otherwise the step runs in code
+    without you.) Only when the current execution-plan step
     has `params.kernel` is your job a kernel transition; if it does not,
     do not call any kernel tool and do not ask about kernels, even if
     the ticket text mentions one — the transition is a later plan step.
