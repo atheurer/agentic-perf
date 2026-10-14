@@ -2666,6 +2666,7 @@ async def _poll_loop_after_lease(
     """
     dispatcher: Dispatcher | None = None
     trace_sweep_task: asyncio.Task | None = None
+    jumpstarter_sweep_task: asyncio.Task | None = None
     lease_renew_task: asyncio.Task | None = None
     repo_cache = RepoCache()
 
@@ -2763,6 +2764,25 @@ async def _poll_loop_after_lease(
             secrets = local_secrets
     else:
         secrets = local_secrets
+
+    try:
+        jumpstarter_configured = bool(
+            await secrets.get_secret("jumpstarter/config.json")
+        )
+    except Exception:
+        logger.warning(
+            "Could not check Jumpstarter configuration; lease sweep is disabled",
+            exc_info=True,
+        )
+        jumpstarter_configured = False
+    if jumpstarter_configured:
+        if config.jumpstarter_lease_sweep_interval_seconds > 0:
+            logger.info(
+                "Jumpstarter orphan lease sweep enabled (interval=%ss)",
+                config.jumpstarter_lease_sweep_interval_seconds,
+            )
+        else:
+            logger.info("Jumpstarter orphan lease sweep disabled by configuration")
 
     has_api_key_secret_refs = config.llm_api_key_secret is not None or any(
         isinstance(agent_cfg, dict) and "api_key_secret" in agent_cfg
@@ -2900,6 +2920,7 @@ async def _poll_loop_after_lease(
         status_offset = 0
         was_at_capacity = False
         last_trace_sweep = 0.0
+        last_jumpstarter_sweep = 0.0
         repos_refreshed = False
         normalization_delivery_states: dict[str, dict[str, Any]] = {}
 
@@ -2920,6 +2941,30 @@ async def _poll_loop_after_lease(
                     asyncio.to_thread(_sweep_trace_spools)
                 )
                 last_trace_sweep = time.monotonic()
+            if jumpstarter_sweep_task is not None and jumpstarter_sweep_task.done():
+                try:
+                    jumpstarter_sweep_task.result()
+                except Exception:
+                    logger.exception("Jumpstarter orphan lease sweep failed")
+                jumpstarter_sweep_task = None
+            now = time.monotonic()
+            if (
+                jumpstarter_configured
+                and config.jumpstarter_lease_sweep_interval_seconds > 0
+                and now - last_jumpstarter_sweep
+                >= config.jumpstarter_lease_sweep_interval_seconds
+                and jumpstarter_sweep_task is None
+            ):
+                # Sweep independently of ticket dispatch, but don't let a slow
+                # Jumpstarter control plane hold up polling or agent starts.
+                jumpstarter_sweep_task = asyncio.create_task(
+                    _sweep_orphaned_leases(
+                        config.state_store_url,
+                        auth_headers=_mutation_headers(None),
+                    ),
+                    name="jumpstarter-lease-sweep",
+                )
+                last_jumpstarter_sweep = now
             # Check system-wide budget before dispatching
             if system_budget is not None and events is not None:
                 from providers.budget import (
@@ -3312,13 +3357,6 @@ async def _poll_loop_after_lease(
                 dispatched_tickets=all_fetched,
             )
 
-            # Jumpstarter: release orphaned leases whose
-            # tickets are closed or no longer active.
-            await _sweep_orphaned_leases(
-                config.state_store_url,
-                auth_headers=_mutation_headers(None),
-            )
-
             # Stale-task watchdog: cancel tasks with no events
             # for longer than the configured threshold.
             if config.stale_task_timeout > 0 and events is not None:
@@ -3336,6 +3374,7 @@ async def _poll_loop_after_lease(
             await asyncio.sleep(config.poll_interval)
     finally:
         await _cancel_and_await(trace_sweep_task)
+        await _cancel_and_await(jumpstarter_sweep_task)
         if dispatcher is not None:
             await dispatcher.shutdown()
         await _cancel_and_await(lease_renew_task)

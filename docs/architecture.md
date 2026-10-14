@@ -802,8 +802,11 @@ but not lease management tools (`jmp_create_lease`,
   `awaiting_hardware`, any existing Jumpstarter lease is
   released. This handles the case where a user sends a ticket
   back to resource acquisition after a provisioning failure.
-- **Lease sweep:** Each poll cycle, the orchestrator checks for
-  orphaned leases whose tickets have reached a terminal status.
+- **Lease sweep:** When Jumpstarter is configured, the orchestrator checks
+  for orphaned leases at the configured
+  `jumpstarter_lease_sweep_interval_seconds` interval (60 seconds by
+  default), independently of ticket polling. A value of `0` disables the
+  sweep. It releases leases whose tickets have reached a terminal status.
   This is a failsafe for leases not cleaned up by teardown
   (crashed orchestrators, skipped teardown, manual closure).
   The normal lease release path is the resource agent's
