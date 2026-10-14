@@ -457,3 +457,36 @@ def format_directive_schema_for_prompt(
         "interpret instead."
     )
     return "\n".join(lines)
+
+
+# ── Schema description guidelines ────────────────────────
+#
+# When adding descriptions to _CORE_DESCRIPTIONS or harness
+# descriptions dicts, follow these rules:
+#
+# 1. ONLY describe directives where the LLM needs to MAP
+#    user intent to a canonical key name.  Examples:
+#      "sample_count": "Number of reboot cycles (int)"
+#      "reboot_method": "'warm' or 'cold'"
+#    These help the LLM recognize that "iterations", "cycles",
+#    or "num_reboots" all mean sample_count.
+#
+# 2. Do NOT describe directives where the VALUE must be an
+#    exact match against external data (labels, selectors,
+#    hostnames).  Examples of what to OMIT:
+#      board_selector — must match actual Jumpstarter labels
+#      exclude_hosts — must match real hostnames
+#    Including these encourages the LLM to CONSTRUCT values
+#    from description text instead of preserving user input
+#    or deferring to the agent that owns the lookup.
+#
+# 3. Do NOT describe directives that are purely internal
+#    (set by code, never by users or LLMs):
+#      jumpstarter_serial, endpoint_type, etc.
+#
+# 4. Keep descriptions short and include the type and an
+#    example value:
+#      "power_off_delay": "Seconds between power off and on (int, e.g. 20)"
+#    Not: "The number of seconds to wait after powering off
+#    the board before sending the power on command via the
+#    Jumpstarter SNMP PDU controller."
