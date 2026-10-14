@@ -254,34 +254,36 @@ def test_registered_harness_guidance_is_scoped_to_its_assembled_prompt(monkeypat
 def _provider_name_branches(function) -> set[str]:
     tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
     names = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
-            continue
-        comparison = node.test
-        if not isinstance(comparison.left, ast.Name):
-            continue
-        if comparison.left.id not in {"provider", "rp"}:
+    for comparison in (
+        node for node in ast.walk(tree) if isinstance(node, ast.Compare)
+    ):
+        operands = [comparison.left, *comparison.comparators]
+        if not any(
+            isinstance(child, ast.Name) and child.id in {"provider", "rp"}
+            for operand in operands
+            for child in ast.walk(operand)
+        ):
             continue
         names.update(
-            comparator.value
-            for comparator in comparison.comparators
-            if isinstance(comparator, ast.Constant)
-            and isinstance(comparator.value, str)
+            child.value
+            for operand in operands
+            for child in ast.walk(operand)
+            if isinstance(child, ast.Constant) and isinstance(child.value, str)
         )
     return names
 
 
-def test_shared_resource_selection_flow_has_no_quads_name_branch():
+def test_shared_resource_selection_flow_uses_only_legacy_provider_branches():
     from agents.resource.agent import _prepare_selection_via_resource_tool
     from agents.resource.server import check_available_resources, reserve_resources
 
-    shared_selection_flow = [
-        check_available_resources,
-        reserve_resources,
-        _prepare_selection_via_resource_tool,
-    ]
-    for function in shared_selection_flow:
-        assert "quads" not in _provider_name_branches(function)
+    legacy_provider_branches = {
+        check_available_resources: {"jumpstarter"},
+        reserve_resources: {"aws", "jumpstarter"},
+        _prepare_selection_via_resource_tool: set(),
+    }
+    for function, allowed in legacy_provider_branches.items():
+        assert _provider_name_branches(function) == allowed
 
 
 def _configure_quads_server(monkeypatch, ticket):
@@ -550,6 +552,53 @@ async def test_auto_preparation_dispatches_to_provider_hook_without_reserving(
         "target.example.com",
     ]
     assert provider.check_available.await_count == 2
+    provider.reserve.assert_not_awaited()
+    marker.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_preparation_uses_ticket_hosts_over_weakened_caller_requirements(
+    monkeypatch,
+):
+    ticket_hosts = [
+        {"roles": ["controller"], "min_cores": 64},
+        {"roles": ["target"], "min_cores": 32},
+    ]
+    ticket = {
+        "id": "PERF-TEST",
+        "custom_fields": {
+            "resource_provider": "quads",
+            "required_hosts": ticket_hosts,
+        },
+    }
+    srv, provider, marker = _configure_quads_server(monkeypatch, ticket)
+    provider.check_available = AsyncMock(
+        side_effect=lambda requirements: {
+            "available_count": 1,
+            "options": [
+                {"hostname": f"eligible-{requirements['roles'][0]}.example.com"}
+            ],
+        }
+    )
+
+    raw = await srv.prepare_reservation_selection(
+        provider="quads",
+        selection={
+            "hostnames": [
+                "caller-controller.example.com",
+                "caller-target.example.com",
+            ]
+        },
+        required_hosts=[{}, {}],
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "invalid_selection"
+    assert "eligible options" in result["error"]
+    assert [call.args[0] for call in provider.check_available.await_args_list] == (
+        ticket_hosts
+    )
     provider.reserve.assert_not_awaited()
     marker.assert_not_awaited()
 

@@ -805,16 +805,14 @@ async def prepare_reservation_selection(
                 f"Provider '{provider}' has no reservation selection contract"
             )
         ticket_fields = _ticket.get("custom_fields", {})
+        if not isinstance(ticket_fields, dict):
+            ticket_fields = {}
         ticket_hosts = ticket_fields.get("required_hosts")
-        effective_hosts = (
-            required_hosts
-            if isinstance(required_hosts, list)
-            else ticket_hosts
-            if isinstance(ticket_hosts, list)
-            else None
-        )
-        ticket_context = _reservation_ticket_context(
-            ticket_id, ticket_fields if isinstance(ticket_fields, dict) else {}
+        ticket_context = _reservation_ticket_context(ticket_id, ticket_fields)
+        effective_hosts = prov.required_hosts_for_availability(
+            required_hosts if isinstance(required_hosts, list) else None,
+            ticket_hosts if isinstance(ticket_hosts, list) else None,
+            ticket_context,
         )
         prepared = await prov.prepare_auto_reservation_selection(
             selection,
