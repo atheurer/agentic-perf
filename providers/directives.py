@@ -69,7 +69,6 @@ _CORE_ALIASES: dict[str, str] = {
 }
 
 _CORE_DESCRIPTIONS: dict[str, str] = {
-    "board_selector": "Jumpstarter board label selector (e.g. 'board-type=nxp-s32g-vnp-rdb3')",
     "resource_provider": "Resource provider: 'jumpstarter', 'quads', 'aws', or 'user_provided'",
     "image_version": "OS image version (e.g. 'AutoSD-10', 'RHIVOS-2')",
     "image_name": "Image variant name (e.g. 'qa', 'ps', 'fusa-minimal')",
