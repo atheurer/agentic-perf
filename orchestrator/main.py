@@ -606,6 +606,9 @@ PLAN_AGENT_STATUS = {
     "synthesis": "synthesizing_results",
     "build_image": "building_image",
 }
+# Triage advances the ticket itself instead of using the execution-plan loop,
+# but it needs the same no-progress retry protection as plan-managed stages.
+DISPATCH_RETRY_STATUSES = frozenset({*PLAN_AGENT_STATUS.values(), "triage_pending"})
 
 
 def _capture_step_results(agent_type: str, cf: dict) -> dict:
@@ -2337,11 +2340,11 @@ async def _record_dispatch_retry_outcome(
     *,
     claim_id: str | None,
 ) -> None:
-    """Back off repeated agent failures and stop after the configured cap."""
+    """Back off repeated no-progress dispatches and stop after the cap."""
     if (
         dispatcher.is_deposed()
         or not claim_id
-        or dispatched_status not in PLAN_AGENT_STATUS.values()
+        or dispatched_status not in DISPATCH_RETRY_STATUSES
     ):
         return
 
@@ -2387,11 +2390,11 @@ async def _record_dispatch_retry_outcome(
         if exhausted:
             comment = (
                 f"**Automatic dispatch paused:** {DISPATCH_RETRY_LIMIT} "
-                f"consecutive failures at {dispatched_status}. The "
-                "orchestrator stopped retrying this stage to protect system "
-                "resources. Review the agent failure, then clear "
-                "orchestrator_retry_state or move the ticket to another "
-                "status before resuming."
+                f"consecutive attempts did not advance the ticket from "
+                f"{dispatched_status}. The orchestrator stopped retrying this "
+                "stage to protect system resources. Review the agent result, "
+                "then clear orchestrator_retry_state or move the ticket to "
+                "another status before resuming."
             )
         await _persist_retry_state(
             dispatcher.store_url,
@@ -2403,7 +2406,7 @@ async def _record_dispatch_retry_outcome(
         )
         if exhausted:
             logger.error(
-                "Stopped dispatching %s at %s after %d consecutive failures",
+                "Stopped dispatching %s at %s after %d no-progress attempts",
                 ticket_id,
                 dispatched_status,
                 attempts,
