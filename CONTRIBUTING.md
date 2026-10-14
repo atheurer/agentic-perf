@@ -13,7 +13,8 @@ cd agentic-perf
 
 1. **Create a feature branch** from `main`
 2. **Make changes** — write tests alongside code, update docs
-3. **Commit** — hooks run `scripts/validate.sh` automatically
+3. **Commit** — the pre-commit hook runs scoped lint and tests for staged
+   Python files. It skips Python validation for documentation-only commits.
 4. **Push and open a PR**
 
 ## AI-Assisted Development
@@ -30,24 +31,26 @@ agents, and we encourage contributors to use AI tools effectively.
   project should read it first
 
 **Git hooks enforce quality automatically.** When an AI agent (or human)
-commits, the pre-commit hook runs lint + tests. If anything fails, the
-commit is rejected and the agent sees the error output, fixes the issue,
-and commits again. This creates a self-correcting loop. Do NOT run
-`scripts/validate.sh` manually before committing — the hook does it for
-you, and running it manually just duplicates the work.
+commits, the pre-commit hook runs scoped lint and auto-discovered tests for
+staged Python files. If anything fails, the commit is rejected and the agent
+sees the error output, fixes the issue, and commits again. For a full local
+check, use the commands below. The current CI workflow runs the full suite for
+pull requests targeting `main` or `local-pr-tests`.
 
 ## Scripts
 
 | Script | Purpose | When to use |
 |---|---|---|
 | `scripts/dev-setup.sh` | Install hooks + deps | Once after clone |
-| `scripts/lint.sh` | Run ruff lint + format check | Before commit |
-| `scripts/test.sh` | Run pytest with coverage | Before commit |
+| `scripts/lint.sh` | Run ruff lint + format check across the repository | Full local check |
+| `scripts/test.sh` | Run the full pytest suite serially with coverage | Debugging / serial check |
+| `scripts/test-parallel.sh` | Run the full pytest suite with isolated workers | Full local check; CI |
 | `scripts/audit.sh` | Run audit & trace verification suite | Periodic / before audit gate |
-| `scripts/validate.sh` | Run lint + test | Pre-commit hook calls this |
+| `scripts/validate.sh` | Run lint + the full serial test suite | Manual full validation |
 
-These scripts are the source of truth — CI, hooks, and developers all
-use the same scripts.
+The CI workflow runs `scripts/lint.sh` and `scripts/test-parallel.sh`, plus
+security checks. The pre-commit hook runs scoped validation for staged Python
+files.
 
 ## Code Standards
 
@@ -65,6 +68,22 @@ principles, and key file paths.
 
 See [docs/reviewing.md](docs/reviewing.md) for project-specific guidance on
 reviewing orchestration, configuration, and agent workflow changes.
+
+## Agent Skills
+
+Repository-scoped contributor skills live under `.agents/skills/`. They are
+separate from `skills/`, which contains runtime capabilities loaded by
+agentic-perf agents.
+
+- [PR cycle](.agents/skills/agentic-perf-pr-cycle/SKILL.md) — review, update,
+  validate, and land an existing pull request.
+- [Orchestration development](.agents/skills/agentic-perf-orchestration/SKILL.md)
+  — develop and review changes to agent context, prompts, handoffs, dispatch,
+  and ticket state.
+
+These skills complement this guide and [AGENTS.md](AGENTS.md); the repository
+docs and scripts remain the source of truth for project-specific rules and
+commands.
 
 ## Commit Messages
 

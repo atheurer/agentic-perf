@@ -9,6 +9,17 @@ install tooling, execute benchmarks, and deliver structured analysis.
 **Stack:** Python 3.12+, FastAPI, asyncio, MCP, Pydantic, httpx.
 **License:** Apache 2.0.
 
+## Contributor Agent Skills
+
+Repository-local contributor skills live under `.agents/skills/` and are
+separate from runtime capabilities under `skills/`. Use the
+[PR-cycle skill](.agents/skills/agentic-perf-pr-cycle/SKILL.md) for the
+existing-PR review and landing workflow, and the
+[orchestration-development skill](.agents/skills/agentic-perf-orchestration/SKILL.md)
+for changes to agent context, prompts, handoffs, dispatch, and ticket state.
+These skills complement this file and the project documentation; follow this
+file for the repository's current development rules.
+
 ## Key File Paths
 
 | Path | Purpose |
@@ -76,9 +87,9 @@ Logs are written to `~/.agentic-perf/logs/orchestrator.log` and
 
 1. **Write tests and docs alongside code** — new functionality includes
    tests, docstrings, and relevant doc updates in the same commit.
-2. **Commit and let hooks validate** — the pre-commit hook runs lint +
-   tests automatically. Do NOT run `scripts/validate.sh` manually;
-   that duplicates the hook. Just commit; fix and retry on failure.
+2. **Commit and let hooks validate** — the pre-commit hook runs scoped lint
+   and tests for staged Python files. Use the hook for routine commits; follow
+   the Testing section and CI workflow for full-repository validation.
 3. **Use type hints** on all function signatures.
 4. **Handle errors explicitly** — don't silently swallow exceptions.
 5. **Explain "why" in comments** — not "what."
@@ -163,8 +174,9 @@ Always include `AI-assisted-by: <model>` when AI was used.
 - **Framework:** pytest + pytest-asyncio (asyncio_mode = auto)
 - **Coverage:** pytest-cov, threshold 33% (see `pyproject.toml`)
 - **Mock LLM:** `providers/llm/mock.py` — no API keys needed
-- **Scripts:** `./scripts/test.sh`, `./scripts/lint.sh`,
-  `./scripts/validate.sh` (CI and debugging use only)
+- **Scripts:** `./scripts/test.sh`, `./scripts/test-parallel.sh`,
+  `./scripts/lint.sh`, and `./scripts/validate.sh` (full serial validation
+  for manual checks and debugging)
 
 **Test file naming convention:** Test files are auto-discovered
 by the pre-commit hook using source file/directory name matching.
@@ -190,7 +202,9 @@ counts — other tests in the same session share the sandbox.
 
 The pre-commit hook runs **scoped validation** — lint and tests
 are limited to staged files and their auto-discovered tests.
-CI (`scripts/validate.sh`) runs the full suite.
+The full test suite runs in CI with `scripts/test-parallel.sh`; the CI
+workflow also runs `scripts/lint.sh` and security checks. Use
+`scripts/validate.sh` for a full serial local validation when needed.
 
 **Setup:** `./scripts/dev-setup.sh` (one-time after clone)
 
