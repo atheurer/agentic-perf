@@ -3206,16 +3206,23 @@ async def _kernel_inventory_one(
     package = spec.package if spec else "kernel"
 
     result = await _ssh.run(target, build_inventory_command(package), timeout=30)
-    if result.exit_code != 0:
+    if result.exit_code in (255, -1):
         return {
             "host": host,
             "state": "unreachable",
             "error": result.stderr or result.stdout,
         }
+    # Any other exit code means the host answered; a non-zero status from one
+    # of the probed commands (missing tuned-adm, grubby quirks) is judged by
+    # whether the sections parse, not by the shell's last status.
     try:
         inv = parse_inventory(result.stdout)
     except ValueError as exc:
-        return {"host": host, "state": "not_checked", "error": str(exc)}
+        return {
+            "host": host,
+            "state": "not_checked",
+            "error": f"{exc} (exit {result.exit_code})",
+        }
 
     response: dict[str, Any] = {
         "host": host,

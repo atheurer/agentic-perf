@@ -45,6 +45,9 @@ class FakeRHELHost:
     grubby_behavior: str = "normal"
     # "normal" | "timeout" (the reboot is queued but the SSH session times out)
     reboot_behavior: str = "normal"
+    # The RHEL 9.4 lab hosts have no tuned-adm: the inventory's last command
+    # fails with "command not found" and exit 127 unless the command tolerates it.
+    has_tuned: bool = True
     _cancel_next_probe: bool = field(default=False, init=False)
     boot_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
@@ -148,9 +151,13 @@ class FakeRHELHost:
             f"@@default\n{self.default}\n"
             f"@@default_index\n{default_index}\n"
             f"@@entries\n{entries_text}"
-            f"@@tuned\nCurrent active profile: throughput-performance\n"
         )
-        return SSHResult(stdout=stdout, stderr="", exit_code=0)
+        if self.has_tuned:
+            stdout += "@@tuned\nCurrent active profile: throughput-performance\n"
+            return SSHResult(stdout=stdout, stderr="", exit_code=0)
+        stdout += "@@tuned\nbash: line 1: tuned-adm: command not found\n"
+        exit_code = 0 if "|| true" in command else 127
+        return SSHResult(stdout=stdout, stderr="", exit_code=exit_code)
 
     def _handle_available(self, command: str) -> SSHResult:
         for rel in self.available:

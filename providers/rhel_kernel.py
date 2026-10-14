@@ -111,7 +111,9 @@ def build_inventory_command(package: str = "kernel") -> str:
         " echo @@default; grubby --default-kernel 2>&1;"
         " echo @@default_index; grubby --default-index 2>&1;"
         " echo @@entries; grubby --info=ALL 2>&1;"
-        " echo @@tuned; tuned-adm active 2>&1"
+        # tuned is optional on a lab host; a missing command must not turn
+        # the whole inventory into exit 127 (which reads as "unreachable").
+        " echo @@tuned; tuned-adm active 2>&1 || true"
     )
 
 

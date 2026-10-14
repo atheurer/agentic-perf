@@ -152,6 +152,31 @@ class TestGetKernelInventory:
         assert result["results"]["10.0.0.1"]["requested"]["state"] == "not_found"
 
     @pytest.mark.asyncio
+    async def test_host_without_tuned_is_not_unreachable(self, handlers, two_hosts):
+        """Lab regression (PERF-A9D303F7): RHEL 9.4 hosts without tuned-adm
+        answered the full inventory yet were reported 'unreachable' because
+        the last command's exit 127 tainted the whole probe."""
+        for host in two_hosts.values():
+            host.has_tuned = False
+        result = await handlers["get_kernel_inventory"](
+            hosts=["10.0.0.1", "10.0.0.2"], kernel=KERNEL_B
+        )
+        h1 = result["results"]["10.0.0.1"]
+        assert h1["state"] == "ok", h1
+        assert h1["inventory"]["running"] == KERNEL_A
+        assert h1["requested"]["state"] == "available"
+        assert h1["inventory"].get("tuned_profile") in (None, "", "unknown")
+
+    @pytest.mark.asyncio
+    async def test_prepare_succeeds_on_hosts_without_tuned(self, handlers, two_hosts):
+        for host in two_hosts.values():
+            host.has_tuned = False
+        result = await handlers["prepare_kernel_change"](
+            hosts=["10.0.0.1", "10.0.0.2"], kernel=KERNEL_B
+        )
+        assert result["status"] == "ok", result
+
+    @pytest.mark.asyncio
     async def test_plan_package_is_used_for_queries(self, handlers, fleet_ssh):
         FakeKernelStore.reset(
             kernel_step_ticket(kernel={"release": KERNEL_B, "package": "kernel-rt"})
