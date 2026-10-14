@@ -10,6 +10,7 @@ GPU cluster providers are different from bare-metal and cloud providers:
 When using a GPU cluster provider:
 1. Call check_available_resources to see available clusters and their GPU inventory
 2. Select a cluster based on GPU type/count matching the ticket requirements
-3. Call reserve_resources with the cluster_id from the options
+3. Call reserve_resources with selection `{ "cluster_id": "..." }`, using
+   the `cluster_id` from the selected option.
 4. Call submit_resource_result with assigned_hardware_ips={}, empty ssh_user/ssh_key_path,
    and the cluster info in resource_provider_metadata

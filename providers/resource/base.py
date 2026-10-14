@@ -3,6 +3,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from .selection import (
+    ReservationSelectionContract,
+    validate_reservation_selection,
+)
+
 _RESERVATION_FAILURE_STATUSES = frozenset(
     {
         "failed",
@@ -60,6 +65,44 @@ class ResourceProvider(ABC):
     """
 
     provider_name: str
+
+    @classmethod
+    def reservation_selection_schema(cls) -> dict[str, Any]:
+        """Return the provider's machine-readable reservation selection schema."""
+        return cls._reservation_selection_contract().json_schema()
+
+    @classmethod
+    def _reservation_selection_contract(cls) -> ReservationSelectionContract:
+        from .selection import RESERVATION_SELECTION_CONTRACTS
+
+        contract = RESERVATION_SELECTION_CONTRACTS.get(cls.provider_name)
+        if contract is None:
+            raise ValueError(
+                f"No reservation selection contract is registered for "
+                f"'{cls.provider_name}'"
+            )
+        return contract
+
+    def reservation_selection_example(self) -> dict[str, Any]:
+        """Return a representative selection for dynamic provider guidance."""
+        return self._reservation_selection_contract().valid_example
+
+    def validate_reservation_selection(
+        self,
+        selection: Any,
+        *,
+        required_hosts: list[dict[str, Any]] | None = None,
+        eligible_hostnames_by_requirement: list[set[str]] | None = None,
+        require_eligible_hostnames: bool = False,
+    ) -> dict[str, Any]:
+        """Validate provider-specific selection data before reservation."""
+        return validate_reservation_selection(
+            self.provider_name,
+            selection,
+            required_hosts=required_hosts,
+            eligible_hostnames_by_requirement=eligible_hostnames_by_requirement,
+            require_eligible_hostnames=require_eligible_hostnames,
+        )
 
     @classmethod
     @abstractmethod

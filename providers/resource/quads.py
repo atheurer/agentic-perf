@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from .base import ResourceProvider
@@ -39,12 +40,59 @@ class QuadsResourceProvider(ResourceProvider):
             or requirements.get("disk_type_filter"),
             duration_hours=requirements.get("duration_hours", 36),
         )
+        min_cores = self._numeric_requirement(requirements, "min_cores")
+        min_memory_gb = self._numeric_requirement(
+            requirements,
+            "min_memory_gb",
+            "min_ram_gb",
+        )
+        if min_cores is not None:
+            hosts = [
+                host
+                for host in hosts
+                if self._numeric_value(host.get("cores")) is not None
+                and self._numeric_value(host.get("cores")) >= min_cores
+            ]
+        if min_memory_gb is not None:
+            hosts = [
+                host
+                for host in hosts
+                if self._numeric_value(host.get("memory_gb")) is not None
+                and self._numeric_value(host.get("memory_gb")) >= min_memory_gb
+            ]
         return {
             "provider": self.provider_name,
             "available_count": len(hosts),
             "options": hosts,
             "message": f"{len(hosts)} bare-metal hosts available from Scale Lab QUADS",
         }
+
+    @staticmethod
+    def _numeric_value(value: Any) -> float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if isinstance(value, str):
+            match = re.match(r"\s*(\d+(?:\.\d+)?)", value)
+            if match:
+                return float(match.group(1))
+        return None
+
+    @classmethod
+    def _numeric_requirement(
+        cls,
+        requirements: dict[str, Any],
+        key: str,
+        alias: str | None = None,
+    ) -> float | None:
+        value = requirements.get(key)
+        if value is None and alias:
+            value = requirements.get(alias)
+        if value is None:
+            return None
+        parsed = cls._numeric_value(value)
+        if parsed is None:
+            raise ValueError(f"QUADS {key} requirement must be numeric")
+        return parsed
 
     async def reserve(
         self,
@@ -53,19 +101,8 @@ class QuadsResourceProvider(ResourceProvider):
         duration_hours: int = 36,
         ticket_id: str | None = None,
     ) -> dict[str, Any]:
+        selection = self.validate_reservation_selection(selection)
         hostnames = selection["hostnames"]
-        if len(hostnames) > 10:
-            return {
-                "status": "failed",
-                "reservation_id": "",
-                "hosts": [],
-                "ssh_user": "root",
-                "ssh_key_path": self._client.ssh_key_path,
-                "lease_expiration": None,
-                "provider": self.provider_name,
-                "provider_metadata": {},
-                "message": "Max 10 hosts per QUADS assignment",
-            }
 
         logger.info(f"[quads-provider] Creating assignment: {description}")
         assignment = await self._client.create_assignment(description)

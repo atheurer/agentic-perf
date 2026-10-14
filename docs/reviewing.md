@@ -60,6 +60,25 @@ Tests should verify observable behavior, not only that a helper was called. For
 configuration changes, assert both the effective runtime settings and the
 startup validation settings.
 
+## Optional Codex provider and harness scope review
+
+For a pull request that changes shared prompts, tool descriptions or schemas,
+provider dispatch, orchestration, or harness context, ask Codex to review the
+complete diff with this checklist:
+
+> Enumerate the registered resource providers and benchmark harnesses affected
+> by this change. Check that shared prompts and tool descriptions remain
+> provider-neutral and harness-neutral, and that provider- or harness-specific
+> instructions appear only in the matching scoped context. Trace each changed
+> contract through its producer, validator, consumer, and teardown path. Point
+> to tests that cover valid and invalid inputs for every affected provider or
+> harness, including a mismatched-provider regression. Report any global change
+> that lacks cross-provider or cross-harness coverage.
+
+Treat this as a review aid. CI contract tests remain the automated enforcement
+path and should derive coverage from the provider and harness registries where
+possible.
+
 ## Final review checklist
 
 - [ ] All producers, consumers, schemas, prompts, and tests were considered.

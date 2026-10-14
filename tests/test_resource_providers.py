@@ -181,12 +181,14 @@ class TestQuadsResourceProvider:
         mock_client.ssh_key_path = "/fake/key"
         provider = QuadsResourceProvider(mock_client)
 
-        result = await provider.reserve(
-            selection={"hostnames": [f"host{i}" for i in range(11)]},
-            description="too many",
-        )
-        assert result["status"] == "failed"
-        assert "Max 10" in result["message"]
+        from providers.resource.selection import ReservationSelectionError
+
+        with pytest.raises(ReservationSelectionError, match="at most 10"):
+            await provider.reserve(
+                selection={"hostnames": [f"host{i}" for i in range(11)]},
+                description="too many",
+            )
+        mock_client.create_assignment.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_terminate(self):
@@ -2447,10 +2449,7 @@ class TestProviderCorrectAutoReservation:
             (
                 "jumpstarter",
                 {"board_selector": "board-type=ride4"},
-                {
-                    "board_selector": "board-type=ride4",
-                    "jumpstarter_selector": "board-type=ride4",
-                },
+                {"jumpstarter_selector": "board-type=ride4"},
             ),
         ],
     )
@@ -2458,9 +2457,22 @@ class TestProviderCorrectAutoReservation:
         self, provider, ticket_fields, expected
     ):
         from agents.resource.agent import _auto_reservation_selection
+        from providers.resource.selection import validate_reservation_selection
 
+        selection = _auto_reservation_selection(
+            provider, {"custom_fields": ticket_fields}
+        )
+        assert selection == expected
+        eligibility = None
+        if provider == "quads":
+            eligibility = [{hostname} for hostname in expected["hostnames"]]
         assert (
-            _auto_reservation_selection(provider, {"custom_fields": ticket_fields})
+            validate_reservation_selection(
+                provider,
+                selection,
+                required_hosts=ticket_fields.get("required_hosts"),
+                eligible_hostnames_by_requirement=eligibility,
+            )
             == expected
         )
 
@@ -3049,13 +3061,14 @@ class TestPSAPCCResourceProvider:
     async def test_reserve_no_cluster_id(self):
         provider, client = self._make_provider()
 
-        result = await provider.reserve(
-            selection={},
-            description="missing cluster",
-        )
+        from providers.resource.selection import ReservationSelectionError
 
-        assert result["status"] == "failed"
-        assert "No cluster_id" in result["message"]
+        with pytest.raises(ReservationSelectionError, match="cluster_id"):
+            await provider.reserve(
+                selection={},
+                description="missing cluster",
+            )
+        client.get_cluster.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reserve_cluster_not_found(self):

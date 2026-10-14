@@ -20,6 +20,7 @@ from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.resource.base import has_reservation_metadata, reservation_failed
 from providers.resource.registry import PROVIDER_REGISTRY, ResourceProviderRegistry
+from providers.resource.selection import validate_reservation_selection
 from providers.secrets.base import SecretsProvider
 from providers.ssh import SSHExecutor
 
@@ -187,6 +188,18 @@ def _auto_reservation_selection(
     required_hosts = [host for host in required_hosts if isinstance(host, dict)]
     managed_hosts = [host for host in required_hosts if not host.get("host")]
 
+    def validate_selection(value: dict[str, Any]) -> dict[str, Any]:
+        selection_for_validation = dict(value)
+        duration_hours = selection_for_validation.pop("duration_hours", None)
+        validated = validate_reservation_selection(
+            provider,
+            selection_for_validation,
+            required_hosts=required_hosts or None,
+        )
+        if duration_hours is not None:
+            validated["duration_hours"] = duration_hours
+        return validated
+
     if provider == "jumpstarter":
         selector = selection.get("jumpstarter_selector") or selection.get(
             "board_selector"
@@ -194,6 +207,7 @@ def _auto_reservation_selection(
         if not isinstance(selector, str) or not selector.strip():
             raise ValueError("ticket has no board_selector for Jumpstarter")
         selection["jumpstarter_selector"] = selector
+        selection.pop("board_selector", None)
         if len(managed_hosts) > 1:
             raise ValueError(
                 "Jumpstarter auto-reservation can lease one device per call, "
@@ -202,7 +216,7 @@ def _auto_reservation_selection(
         count = selection.get("count", 1)
         if count != 1:
             raise ValueError("Jumpstarter auto-reservation requires count=1")
-        return selection
+        return validate_selection(selection)
 
     if provider == "aws":
         expected_count = len(managed_hosts) if required_hosts else None
@@ -265,7 +279,7 @@ def _auto_reservation_selection(
             selection.pop("instance_type", None)
             selection.pop("instance_count", None)
             selection.pop("count", None)
-            return selection
+            return validate_selection(selection)
 
         instance_type = selection.get("instance_type")
         count = selection.get("count", selection.get("instance_count"))
@@ -287,7 +301,7 @@ def _auto_reservation_selection(
             )
         selection["count"] = count
         selection.pop("instance_count", None)
-        return selection
+        return validate_selection(selection)
 
     if provider == "quads":
         hostnames = selection.get("hostnames")
@@ -320,13 +334,13 @@ def _auto_reservation_selection(
                 f"but the ticket requires {expected_count} managed host(s)"
             )
         selection["hostnames"] = hostnames
-        return selection
+        return validate_selection(selection)
 
     if provider == "psap-cc":
         cluster_id = selection.get("cluster_id")
         if not cluster_id:
             raise ValueError("PSAP-CC fallback requires an explicit cluster_id")
-        return selection
+        return validate_selection(selection)
 
     raise ValueError(f"No safe auto-reservation selection for provider '{provider}'")
 

@@ -33,7 +33,12 @@ from agents.server_utils import (
     get_board_selector,
 )
 from paths import get_default_ssh_key
-from providers.resource.base import has_reservation_metadata, reservation_failed
+from providers.resource.base import (
+    ResourceProvider,
+    has_reservation_metadata,
+    reservation_failed,
+)
+from providers.resource.selection import ReservationSelectionError
 from providers.tracing import (
     bind_trace_context,
     child_context,
@@ -54,6 +59,10 @@ _registry = None
 # Fleet: first available untested device from check_available.
 # Set by check_available_resources, read by reserve_resources.
 _fleet_next_device: str | None = None
+
+# QUADS selections must come from options that satisfied this ticket's
+# requirements. A separate set is kept for each managed host requirement.
+_quads_eligible_hostnames_by_requirement: list[set[str]] | None = None
 
 # Guardrail: set after a successful or uncertain reservation outcome.
 # Prevents discovery after allocation and duplicate attempts when the provider
@@ -558,7 +567,13 @@ async def check_available_resources(
     requirements: dict | None = None,
     required_hosts: list[dict] | None = None,
 ) -> str:
-    """Check what resources are available from a specific provider. Use required_hosts (preferred) to get per-host recommendations based on the ticket's required_hosts entries with hardware specs, or requirements for a single uniform recommendation."""
+    """Check availability and return the selected provider's selection schema.
+
+    Use required_hosts (preferred) for per-host recommendations based on the
+    ticket's host requirements, or requirements for a uniform recommendation.
+    The result includes reservation_selection_schema and an example that
+    describe the fields accepted by reserve_resources for this provider.
+    """
     if _reservation_uncertain:
         return json.dumps(_unknown_reservation_response(provider))
     if _resources_allocated:
@@ -573,6 +588,27 @@ async def check_available_resources(
     if _reservation_uncertain:
         return json.dumps(_unknown_reservation_response(provider))
     prov = await _registry.get_provider(provider)
+    selection_guidance: dict[str, Any] = {}
+    if isinstance(prov, ResourceProvider):
+        selection_guidance = {
+            "reservation_selection_schema": prov.reservation_selection_schema(),
+            "reservation_selection_example": prov.reservation_selection_example(),
+        }
+
+    global _quads_eligible_hostnames_by_requirement
+    _quads_eligible_hostnames_by_requirement = None
+
+    ticket_required_hosts = _ticket.get("custom_fields", {}).get("required_hosts")
+    if provider == "quads" and isinstance(ticket_required_hosts, list):
+        managed_ticket_hosts = [
+            host
+            for host in ticket_required_hosts
+            if isinstance(host, dict) and not host.get("host")
+        ]
+        if managed_ticket_hosts:
+            # QUADS discovery must apply the ticket's own per-host constraints;
+            # the model cannot replace them with a broader request.
+            required_hosts = managed_ticket_hosts
 
     # Code-enforce the directive's board_selector for
     # Jumpstarter. The LLM may use a wrong selector key.
@@ -647,9 +683,19 @@ async def check_available_resources(
             if result.get("options"):
                 rec["recommended"] = result["options"][0]
             recommendations.append(rec)
+        if provider == "quads":
+            _quads_eligible_hostnames_by_requirement = [
+                {
+                    str(option.get("hostname") or option.get("host") or "").casefold()
+                    for option in result.get("options", [])
+                    if option.get("hostname") or option.get("host")
+                }
+                for result in availability_results
+            ]
         response = {
             "provider": prov.provider_name,
             "per_host_recommendations": recommendations,
+            **selection_guidance,
         }
         if is_fleet_investigation(fresh_cf) and ticket_id:
             fleet_exhausted = bool(availability_results) and all(
@@ -665,6 +711,15 @@ async def check_available_resources(
                 )
         return json.dumps(response)
     result = await prov.check_available(requirements or {})
+    result.update(selection_guidance)
+
+    if provider == "quads":
+        eligible_hostnames = {
+            str(option.get("hostname") or option.get("host") or "").casefold()
+            for option in result.get("options", [])
+            if option.get("hostname") or option.get("host")
+        }
+        _quads_eligible_hostnames_by_requirement = [eligible_hostnames]
 
     # Code-enforce: when a specific device was requested by
     # name and is unavailable, escalate to HITL immediately.
@@ -730,7 +785,13 @@ async def reserve_resources(
     ticket_id: str | None = None,
     duration_hours: int = 36,
 ) -> str:
-    """Reserve resources from a provider. For bare-metal (quads), this creates an assignment, schedules hosts, waits for validation (~30-45 min), and sets up SSH access. For cloud (aws), this launches instances, waits until running, and verifies SSH connectivity. Pass {instance_type, count} for uniform instances or {instance_specs: [{instance_type, count, role}, ...]} for per-role instance types. For GPU cluster (psap-cc), this creates a cluster reservation -- returns cluster access info in provider_metadata (no SSH hosts). Returns a reservation ID for teardown."""
+    """Reserve resources using the active provider's selection contract.
+
+    Choose a selection from the options returned by check_available_resources
+    that conforms to its reservation_selection_schema. Provider selection
+    fields are validated before allocation is attempted. Returns the reservation
+    identity and provider metadata needed for teardown.
+    """
     global _resources_allocated, _reservation_failures, _reservation_uncertain
     if _reservation_uncertain:
         return json.dumps(_unknown_reservation_response(provider))
@@ -755,10 +816,26 @@ async def reserve_resources(
             ),
         }
         return json.dumps(result)
+    if not isinstance(selection, dict):
+        return json.dumps(
+            {
+                "status": "invalid_selection",
+                "provider": provider,
+                "invalid_selection": True,
+                "allocation_unknown": False,
+                "retry_blocked": False,
+                "provider_call_started": False,
+                "error": "Reservation selection must be an object.",
+                "message": (
+                    "No provider allocation was attempted. Correct the provider "
+                    "selection and retry."
+                ),
+            }
+        )
     # Inject OS from ticket required_hosts when the LLM doesn't
     # include it in the selection — ensures AMI resolution fires
     # in the provider regardless of LLM behavior.
-    if not selection.get("ami") and not selection.get("os"):
+    if provider == "aws" and not selection.get("ami") and not selection.get("os"):
         os_name = _infer_os_from_ticket()
         if os_name:
             selection = dict(selection)
@@ -783,12 +860,43 @@ async def reserve_resources(
     # we get an untested board. The name was determined
     # during check_available_resources from the filtered
     # device list.
-    if _fleet_next_device:
+    if provider == "jumpstarter" and _fleet_next_device:
         selection = dict(selection)
         selection["exporter_name"] = _fleet_next_device
         logger.info("Fleet: targeting %s", _fleet_next_device)
 
     prov = await _registry.get_provider(provider)
+    if isinstance(prov, ResourceProvider):
+        try:
+            required_hosts = _ticket.get("custom_fields", {}).get("required_hosts")
+            if not isinstance(required_hosts, list):
+                required_hosts = None
+            selection = prov.validate_reservation_selection(
+                selection,
+                required_hosts=required_hosts,
+                eligible_hostnames_by_requirement=(
+                    _quads_eligible_hostnames_by_requirement
+                    if provider == "quads"
+                    else None
+                ),
+                require_eligible_hostnames=provider == "quads",
+            )
+        except ReservationSelectionError as exc:
+            return json.dumps(
+                {
+                    "status": "invalid_selection",
+                    "provider": provider,
+                    "invalid_selection": True,
+                    "allocation_unknown": False,
+                    "retry_blocked": False,
+                    "provider_call_started": False,
+                    "error": str(exc),
+                    "message": (
+                        "No provider allocation was attempted. Correct the "
+                        "provider selection and retry."
+                    ),
+                }
+            )
     resources_allocated_before = _resources_allocated
     _latch_unknown_reservation()
     try:

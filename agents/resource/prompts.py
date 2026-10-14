@@ -35,10 +35,12 @@ The ticket's required_hosts field lists every host needed with its roles
 and optional hardware specs (nic_speed, min_cores, min_memory_gb, os).
 Allocate exactly this many hosts: 1 controller + the rest as targets.
 
-When required_hosts entries include hardware specs, pass them to
-check_available_resources via the required_hosts parameter to get
-per-host instance type recommendations. Use those recommendations
-to build per-role instance_specs in reserve_resources.
+When required_hosts entries include hardware specs, pass the ticket's
+required_hosts to check_available_resources. Use the returned options that
+match each managed host requirement. Follow the active provider guidance for
+the selection shape accepted by reserve_resources. The availability result
+includes that provider's reservation_selection_schema; use it when choosing
+the selection fields.
 
 ## Validating your allocation
 

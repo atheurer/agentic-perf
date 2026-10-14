@@ -471,6 +471,7 @@ class AWSResourceProvider(ResourceProvider):
         duration_hours: int = 36,
         ticket_id: str | None = None,
     ) -> dict[str, Any]:
+        selection = self.validate_reservation_selection(selection)
         ec2 = self._get_ec2_client()
         ami = selection.get("ami")
         if not ami:
