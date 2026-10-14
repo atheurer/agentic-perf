@@ -446,7 +446,15 @@ def format_directive_schema_for_prompt(
         lines.append(f"- **{key}**: {desc}")
     lines.append("")
     lines.append(
-        "Do NOT invent new directive keys. If a user's intent does "
-        "not match any recognized directive, ask for clarification."
+        "Use ONLY these canonical keys for directives. Every "
+        "directive that affects execution has explicit code handling "
+        "it — unrecognized keys are silently ignored by tools and "
+        "harnesses. If the user's intent clearly matches a recognized "
+        "directive but uses a different name, map it to the canonical "
+        "key (e.g. 'iterations' → 'sample_count', 'os' → "
+        "'image_version'). If the intent is ambiguous or does not "
+        "match any recognized directive, do NOT guess — include the "
+        "instruction in scoped_context for the downstream agent to "
+        "interpret instead."
     )
     return "\n".join(lines)
