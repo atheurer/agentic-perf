@@ -32,6 +32,31 @@ for provider-specific details.
 
 ## Provider Types
 
+### QUADS API TLS trust
+
+The QUADS connection settings live in
+`~/.agentic-perf/secrets/quads/config.json`. QUADS uses HTTPS by default. If
+the optional `ca_bundle` field is omitted, its HTTPS client uses the host's
+default system CA trust store. To trust a specific CA bundle, set `ca_bundle`
+to its file path:
+
+```json
+{
+  "api_host": "quads.example.com",
+  "email": "quads-operator@example.com",
+  "password": "<quads-password>",
+  "owner": "<quads-owner>",
+  "ssh_key_path": "/path/to/ssh/key",
+  "default_root_password": "<default-root-password>",
+  "api_scheme": "https",
+  "ca_bundle": "/etc/pki/tls/certs/ca-bundle.crt"
+}
+```
+
+When set, this bundle is the QUADS client's trust source. Include any public
+roots the endpoint needs in that file. TLS certificate-chain and hostname
+verification stay enabled. This setting only affects QUADS HTTPS connections.
+
 ### Local (file-backed)
 
 The default. Reads files from `~/.agentic-perf/secrets/`. Each

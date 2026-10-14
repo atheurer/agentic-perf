@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ class QuadsClient:
         ssh_key_path: str,
         default_root_password: str,
         api_scheme: str = "https",
+        ca_bundle: str | None = None,
     ) -> None:
         self.api_host = api_host
         self._base_url = f"{api_scheme}://{api_host}"
@@ -41,7 +43,11 @@ class QuadsClient:
         self.owner = owner
         self.ssh_key_path = str(Path(ssh_key_path).expanduser())
         self.default_root_password = default_root_password
-        self._client = AuditedAsyncHTTPClient(timeout=30.0)
+        client_kwargs: dict[str, Any] = {"timeout": 30.0}
+        if api_scheme == "https":
+            ca_file = str(Path(ca_bundle).expanduser()) if ca_bundle else None
+            client_kwargs["verify"] = ssl.create_default_context(cafile=ca_file)
+        self._client = AuditedAsyncHTTPClient(**client_kwargs)
         if api_scheme == "http":
             logger.warning(
                 "QUADS API using plaintext HTTP — credentials are not encrypted in transit"
@@ -72,6 +78,7 @@ class QuadsClient:
             ssh_key_path=config["ssh_key_path"],
             default_root_password=config["default_root_password"],
             api_scheme=config.get("api_scheme", "https"),
+            ca_bundle=config.get("ca_bundle"),
         )
 
     async def close(self) -> None:
