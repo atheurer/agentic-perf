@@ -113,12 +113,53 @@ build team with:
 - The board type and firmware version from serial output
 - The full provisioning serial log as evidence
 
-**Timing signature:** The consistent ~170s kernel timestamp
+**Timing signature:** The consistent ~170-260s kernel timestamp
 on the shutdown (across different boards) is the sysboot
-health check timeout + ukiboot retry exhaustion. If you
-see `Power down` at roughly the same kernel time on
-multiple boards with the same image, it confirms an image
-problem rather than a board-specific hardware issue.
+health check timeout + ukiboot retry exhaustion.
+
+## Cold Reboot Fails on First Cycle (power_off_delay too short)
+
+**Symptom:** Cold reboot test collects 0 samples. The board
+powers off, powers on, but sysboot immediately detects an
+unhealthy state and shuts down. Serial shows `reboot: Power
+down` within the first boot after the power cycle.
+
+**Cause:** The `power_off_delay` (time between power off and
+power on) is too short for the board to fully discharge its
+capacitors and reset its boot ROM. With insufficient delay,
+the board enters a dirty boot state where sysboot's health
+check fails.
+
+**Evidence from testing:**
+- `power_off_delay=2` (script default): 0 samples on every
+  S32G board — fails on first cold reboot
+- `power_off_delay=45`: 18-22 samples before unrelated
+  failure (soft lockup) — cold reboot works reliably
+- Warm SSH reboot (no power cycling): works consistently
+
+**Fix:** Set `power_off_delay` to at least 20 seconds for
+NXP S32G boards. 45 seconds is recommended for reliability.
+The required delay may vary by board type and lab power
+supply configuration (SNMP PDU response time, capacitor
+discharge rate, etc.).
+
+**IMPORTANT for agents:** When setting up a cold reboot
+test on Jumpstarter boards, check that `power_off_delay`
+is set in the ticket directives. If it is not set, the
+boot-time script defaults to 2 seconds which is too short
+for many board types. If `reboot_method` is `cold` (or
+defaulting to cold because a Jumpstarter lease is active)
+and `power_off_delay` is not set, escalate to the user
+via HITL before running the benchmark. Ask them to confirm
+an appropriate `power_off_delay` for their board type, or
+whether they intended warm SSH reboot instead.
+
+**Differentiation from image corruption:** If cold reboot
+works with `power_off_delay=45` but fails with
+`power_off_delay=2`, the image is fine — the board just
+needs more time to reset. If cold reboot fails even with
+a long delay, check for the initramfs corruption pattern
+described above.
 
 ## Lease Cannot Be Satisfied
 
