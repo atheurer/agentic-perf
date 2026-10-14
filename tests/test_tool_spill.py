@@ -102,6 +102,7 @@ async def test_exempt_tools_not_spilled(agent, monkeypatch):
         "search_documents_from_workspace",
         "read_skills",
         "read_harness_doc",
+        "get_skill_context",
         "get_review_config",
         "get_execution_config",
         "get_example_runfile",

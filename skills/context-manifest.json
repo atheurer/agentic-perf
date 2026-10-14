@@ -1,4 +1,86 @@
 {
   "schema_version": 1,
-  "entries": []
+  "entries": [
+    {
+      "id": "general-host-tuning",
+      "path": "skills/general/host-tuning.md",
+      "harness": "general",
+      "phases": ["provisioning", "review"],
+      "agents": ["provisioning-agent", "review-agent"],
+      "subjects": ["host-tuning"],
+      "entrypoint": true
+    },
+    {
+      "id": "crucible-benchmark-discovery",
+      "path": "skills/crucible/benchmark-discovery.md",
+      "harness": "crucible",
+      "phases": ["triage", "benchmark"],
+      "agents": ["triage-agent", "benchmark-agent"],
+      "subjects": ["benchmark-discovery"],
+      "entrypoint": true
+    },
+    {
+      "id": "crucible-cdm-query-guide",
+      "path": "skills/crucible/cdm-query-guide.md",
+      "harness": "crucible",
+      "phase": "review",
+      "agent": "review-agent",
+      "subjects": ["cdm", "results"],
+      "entrypoint": true
+    },
+    {
+      "id": "crucible-kube-endpoints",
+      "path": "skills/crucible/kube-endpoints.md",
+      "harness": "crucible",
+      "phase": "benchmark",
+      "agent": "benchmark-agent",
+      "subjects": ["endpoints", "kube"],
+      "entrypoint": true
+    },
+    {
+      "id": "crucible-result-parsing",
+      "path": "skills/crucible/result-parsing.md",
+      "harness": "crucible",
+      "phase": "review",
+      "agent": "review-agent",
+      "subjects": ["results", "cdm"],
+      "entrypoint": true
+    },
+    {
+      "id": "crucible-review-methodology",
+      "path": "skills/crucible/review-methodology.md",
+      "harness": "crucible",
+      "phase": "review",
+      "agent": "review-agent",
+      "subjects": ["review", "results"],
+      "entrypoint": true
+    },
+    {
+      "id": "crucible-run-file-pitfalls",
+      "path": "skills/crucible/run-file-pitfalls.md",
+      "harness": "crucible",
+      "phase": "benchmark",
+      "agent": "benchmark-agent",
+      "subjects": ["run-file", "endpoints"],
+      "entrypoint": true
+    },
+    {
+      "id": "crucible-tool-params",
+      "path": "skills/crucible/tool-params.md",
+      "harness": "crucible",
+      "phases": ["benchmark", "review"],
+      "agents": ["benchmark-agent", "review-agent"],
+      "subjects": ["tools", "results"],
+      "entrypoint": true
+    },
+    {
+      "id": "crucible-userenv-guide",
+      "path": "skills/crucible/userenv-guide.md",
+      "harness": "crucible",
+      "phase": "benchmark",
+      "agent": "benchmark-agent",
+      "subjects": ["userenv", "environment"],
+      "entrypoint": true
+    }
+  ]
 }

@@ -33,7 +33,7 @@ Bitwarden secrets. After starting the service, `python3 cli.py health` is a
 basic startup check. See the [CLI reference](cli-reference.md) and
 [ticket directives](ticket-directives.md) for command and field details.
 
-Crucible does NOT need to be pre-installed on the controller host. The provisioning agent installs it automatically during the `awaiting_provision` stage using the install contract in `~/.agentic-perf/private-skills/crucible.json`. If you skip provisioning (see "Skipping Early Stages" below), then crucible must already be on the controller.
+Crucible does NOT need to be pre-installed on the controller host. The provisioning agent installs it automatically during the `awaiting_provision` stage using its configured service-side install contract (organization source, or the legacy private JSON when no organization source is configured). If you skip provisioning (see "Skipping Early Stages" below), then crucible must already be on the controller.
 
 ### Config file (`~/.agentic-perf/config.json`)
 

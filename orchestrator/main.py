@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import fcntl
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -16,7 +17,7 @@ from typing import Any
 import httpx
 
 from agents.base import AgentAbortedError, HITLDriftError
-from agents.server_utils import build_skill_provider
+from agents.server_utils import build_skill_provider_async
 from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
 from providers.execution import (
@@ -1142,6 +1143,14 @@ async def run_agent_task(
 
         ticket_secrets = dispatcher._get_secrets_for_ticket(ticket_data)
         agent_type = STATUS_AGENT_MAP.get(status, "")
+        skill_provider_result = dispatcher.get_skill_provider_for_ticket(
+            ticket_id, agent_type
+        )
+        ticket_skill_provider = (
+            await skill_provider_result
+            if inspect.isawaitable(skill_provider_result)
+            else skill_provider_result
+        )
         api_key = (
             await _resolve_api_key_secret(config, agent_type, ticket_secrets)
             if config
@@ -1162,6 +1171,7 @@ async def run_agent_task(
             llm_factory=snapshot_factory,
             iterations_factory=snapshot_iterations,
             secrets_provider=ticket_secrets,
+            skill_provider=ticket_skill_provider,
         )
         if agent is None:
             return
@@ -2700,26 +2710,6 @@ async def _poll_loop_after_lease(
                 arcaflow_mcp = None
             break
 
-    skills = build_skill_provider(
-        crucible_home=config.crucible_home,
-        repo_cache=repo_cache,
-        source_repo=config.raw.get("crucible_source_repo"),
-        source_url=config.harness_repos.get("crucible"),
-        zathras_home=config.zathras_home,
-        resolve_source=False,
-        catalog_only=True,
-        arcaflow_mcp_client=arcaflow_mcp,
-    )
-
-    # Collect harness-contributed directive schemas so the
-    # normalization framework knows about harness-specific keys.
-    # Provider-backed harnesses register via get_directive_schema().
-    # Standalone harnesses register at module import.
-    import providers.skills.boot_time  # noqa: F401
-    from providers.directives import collect_from_providers
-
-    collect_from_providers(skills)
-
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")
 
@@ -2763,6 +2753,61 @@ async def _poll_loop_after_lease(
             secrets = local_secrets
     else:
         secrets = local_secrets
+
+    from providers.secrets.git import GitSecretsProvider
+
+    secrets = GitSecretsProvider(fallback=secrets)
+
+    async def make_skill_provider(
+        ticket_id: str = "",
+        phase: str = "",
+        *,
+        defer_organization_sources: bool = False,
+    ):
+        provider = await build_skill_provider_async(
+            ticket_id=ticket_id,
+            attempt_id="initial",
+            defer_organization_sources=defer_organization_sources,
+            skill_phase=phase or "orchestrator",
+            crucible_home=config.crucible_home,
+            repo_cache=repo_cache,
+            source_repo=config.raw.get("crucible_source_repo"),
+            source_url=config.harness_repos.get("crucible"),
+            zathras_home=config.zathras_home,
+            resolve_source=False,
+            catalog_only=True,
+            arcaflow_mcp_client=arcaflow_mcp,
+            secrets_provider=secrets,
+        )
+        if ticket_id and hasattr(provider, "bind_attempt"):
+            provider.bind_attempt(ticket_id, "initial", phase or "orchestrator")
+        return provider
+
+    skills = await make_skill_provider(defer_organization_sources=True)
+
+    # Collect harness-contributed directive schemas so the normalization
+    # framework knows about harness-specific keys. Standalone harnesses
+    # register their directives at module import.
+    import providers.skills.boot_time  # noqa: F401
+    from providers.directives import collect_from_providers
+
+    collect_from_providers(skills)
+
+    async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
+        if phase not in {
+            "triage",
+            "platform",
+            "provisioning",
+            "benchmark",
+            "review",
+        }:
+            return skills
+        return await make_skill_provider(ticket_id, phase)
+
+    # Each ticket gets a new resolver/provider, including path-only sources.
+    # This binds document and runtime-config snapshots consistently and avoids
+    # sharing mutable in-process state across concurrent tickets.
+    skill_provider_factory = refresh_ticket_skill_provider
 
     has_api_key_secret_refs = config.llm_api_key_secret is not None or any(
         isinstance(agent_cfg, dict) and "api_key_secret" in agent_cfg
@@ -2848,6 +2893,7 @@ async def _poll_loop_after_lease(
             introspection_llm=config.introspection_llm,
             session_id=str(leader_lease.session_id),
             fencing_epoch=leader_lease.epoch,
+            skill_provider_factory=skill_provider_factory,
         )
         lease_loss_gate.bind(dispatcher)
 
