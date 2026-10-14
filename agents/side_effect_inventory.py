@@ -112,6 +112,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/provisioning/server.py", "_install_kernel_one", "ssh"),
     ("agents/provisioning/server.py", "_install_packages_one", "ssh"),
     ("agents/provisioning/server.py", "_capture_environment_one", "ssh"),
+    ("agents/provisioning/agent.py", "_kernel_tool", "mcp"),
     ("agents/provisioning/agent.py", "_request_kernel_approval", "mutating_http_state"),
     ("agents/provisioning/agent.py", "_resolve_kernel_approval", "mutating_http_state"),
     ("agents/provisioning/kernel.py", "_patch_fields", "mutating_http_state"),
@@ -1290,6 +1291,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/provisioning/server.py:_capture_environment_one",
+        "2027-12-31",
+    ),
+    ("agents/provisioning/agent.py", "_kernel_tool", "mcp"): (
+        "audited",
+        "observability-maintainers",
+        "agents/provisioning/agent.py:_kernel_tool",
         "2027-12-31",
     ),
     (
