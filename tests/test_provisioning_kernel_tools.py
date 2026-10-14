@@ -230,6 +230,8 @@ class TestPrepareKernelChange:
         )
         assert result["status"] == "rejected"
         assert result["reason_code"] == "kernel_not_in_plan"
+        # The refusal tells the model what to do so it does not escalate.
+        assert "do not ask the user" in result["instruction"]
 
     @pytest.mark.asyncio
     async def test_rejects_kernel_not_in_plan(self, handlers):

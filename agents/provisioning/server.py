@@ -3116,7 +3116,19 @@ async def _kernel_tool_context(
     ticket = active.get("ticket", active)
     ok, reason = assert_kernel_matches_step(ticket, kernel)
     if not ok:
-        return None, {"status": "rejected", "reason_code": reason}
+        rejection: dict[str, Any] = {"status": "rejected", "reason_code": reason}
+        if reason == "kernel_not_in_plan":
+            # Seen in the lab: the agent called a kernel tool during the
+            # harness-install step and then paused for a human.  Tell it
+            # exactly what to do instead so the refusal costs nothing.
+            rejection["instruction"] = (
+                "The current execution-plan step is not a kernel transition "
+                "(it has no params.kernel). Do not call any kernel tool now and "
+                "do not ask the user about it: finish this step's harness "
+                "provisioning and submit. The kernel transition is its own plan "
+                "step and will be dispatched to you when the plan reaches it."
+            )
+        return None, rejection
     step = current_kernel_step(ticket)
     assert step is not None  # assert_kernel_matches_step guarantees this
     step_id, spec = step

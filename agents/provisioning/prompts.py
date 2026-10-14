@@ -114,9 +114,11 @@ install_harness + verify_harness_install into one batched call.
       effect, do NOT report provisioning_complete=true — call
       request_clarification instead.
 
-12. **Kernel transitions.** If the current execution-plan step has
-    `params.kernel`, your job is that kernel transition, not a harness
-    install. Read `skills/general/rhel-kernel.md`, then follow this order:
+12. **Kernel transitions.** Only when the current execution-plan step
+    has `params.kernel` is your job a kernel transition; if it does not,
+    do not call any kernel tool and do not ask about kernels, even if
+    the ticket text mentions one — the transition is a later plan step.
+    On a kernel step, it is that transition, not a harness install. Read `skills/general/rhel-kernel.md`, then follow this order:
     `get_kernel_inventory` → `prepare_kernel_change` →
     `present_kernel_change_for_approval` → (after the user approves)
     the actions from `actions_required`, in order: `install_kernel` →
