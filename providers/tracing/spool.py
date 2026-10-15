@@ -261,48 +261,70 @@ _PRUNE_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
 _PRUNE_MAX_AGE_SECONDS = 3600  # 1 hour
 
 
+def _is_spool_locked(spool_name: str, spool_dir: Path) -> bool:
+    """Check if a spool's lock file is held by an active producer."""
+    from providers.execution import AuditedFilesystem
+
+    lock_name = spool_name.replace(".spool", ".lock")
+    lock_path = spool_dir / lock_name
+    if not lock_path.exists():
+        return False
+    fs = AuditedFilesystem.system(spool_dir)
+    try:
+        fd = fs.open_descriptor(
+            lock_name,
+            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            mode=0o600,
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False  # lock acquired — not actively owned
+        except BlockingIOError:
+            return True  # actively owned
+        finally:
+            fs.forget_descriptor(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    except OSError:
+        return False  # lock file gone or broken
+
+
 def _try_prune_file(path: Path, spool_dir: Path) -> bool:
-    """Try to remove a spool file, respecting active locks.
+    """Try to remove a spool or ack file, respecting active locks.
 
-    For .spool files, attempt to acquire an exclusive lock on the
-    corresponding .lock file.  If the lock is held (BlockingIOError),
-    the spool is actively owned by a producer — skip it.
-
-    On POSIX, unlink() succeeds even on open/locked files, so we
-    must check the lock BEFORE unlinking to avoid deleting active
-    spool data.
+    For .spool and .ack files, check the corresponding .lock file.
+    If the lock is held (producer active), skip the file.
+    When a .spool file is pruned, also remove its .ack and .lock
+    sidecars.
     """
     from providers.execution import AuditedFilesystem
 
+    name = str(path.name)
     fs = AuditedFilesystem.system(spool_dir)
-    if path.suffix == ".spool" or path.name.endswith(".spool"):
-        lock_name = str(path.name).replace(".spool", ".lock")
-        lock_path = spool_dir / lock_name
-        if lock_path.exists():
-            try:
-                fd = fs.open_descriptor(
-                    lock_path.name,
-                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
-                    mode=0o600,
-                )
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                except BlockingIOError:
-                    fs.forget_descriptor(fd)
-                    os.close(fd)
-                    return False  # actively owned
-                finally:
-                    fs.forget_descriptor(fd)
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-            except OSError:
-                pass  # lock file gone, safe to prune
+
+    # Determine the spool base name for lock checking
+    if name.endswith(".spool"):
+        spool_name = name
+    elif name.endswith(".ack"):
+        spool_name = name.replace(".ack", ".spool")
+    else:
+        spool_name = ""  # .bad files — no lock to check
+
+    # Check if the corresponding spool is actively owned
+    if spool_name and _is_spool_locked(spool_name, spool_dir):
+        return False
+
     try:
         fs.unlink(path.name, missing_ok=True)
         logger.debug("Pruned spool file %s", path.name)
+        # Clean up sidecars when removing a .spool file
+        if name.endswith(".spool"):
+            for suffix in (".ack", ".lock"):
+                sidecar = name.replace(".spool", suffix)
+                fs.unlink(sidecar, missing_ok=True)
         return True
     except OSError:
         return False
