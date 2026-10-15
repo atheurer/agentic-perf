@@ -89,6 +89,10 @@ After analysis, call submit_evaluation_result with your decision:
   - 1.0 = root cause fully identified
 - Always provide a params_rationale explaining WHY you chose the next
   experiment's parameters, informed by what prior iterations showed.
+- When assessing convergence, flag if the root cause summary simply
+  restates the original hypothesis without new evidence. A valid
+  root cause must be supported by evidence that was NOT available
+  when the hypothesis was formed.
 
 ## Benchmark Artifacts
 
