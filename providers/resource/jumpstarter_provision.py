@@ -123,6 +123,66 @@ class ProvisionResult:
 _DEFAULT_PROVISION_LEASE_DURATION_SECONDS = 14_400
 
 
+async def _probe_board_after_flash_failure(
+    client: Any,
+    diag: list[str],
+) -> None:
+    """Best-effort board state probe after flash failure.
+
+    Captures power and serial state so the synthesis agent can
+    distinguish power control, serial/USB, and firmware issues
+    instead of just reporting 'U-Boot prompt timeout'.
+    """
+    from anyio import to_thread
+
+    # Power off/on to see if power control works
+    try:
+        await to_thread.run_sync(client.power.off)
+        diag.append("Post-flash probe: power off OK")
+    except Exception as exc:
+        diag.append(f"Post-flash probe: power off failed: {exc}")
+        return  # No point continuing if we can't control power
+
+    await asyncio.sleep(2)
+
+    try:
+        await to_thread.run_sync(client.power.on)
+        diag.append("Post-flash probe: power on OK")
+    except Exception as exc:
+        diag.append(f"Post-flash probe: power on failed: {exc}")
+        return
+
+    # Brief serial read to see if the board outputs anything
+    console = getattr(client, "console", None)
+    if console is None:
+        diag.append("Post-flash probe: no console driver available")
+        return
+    try:
+        serial_data = await asyncio.wait_for(
+            to_thread.run_sync(lambda: console.read(4096)),
+            timeout=10,
+        )
+        if serial_data:
+            preview = (
+                serial_data[:500]
+                if isinstance(serial_data, bytes)
+                else str(serial_data)[:500]
+            )
+            diag.append(
+                f"Post-flash probe: serial output ({len(serial_data)} bytes): "
+                f"{preview!r}"
+            )
+        else:
+            diag.append("Post-flash probe: no serial output in 10s")
+    except TimeoutError:
+        diag.append(
+            "Post-flash probe: serial read timed out (10s) "
+            "\u2014 board may not be outputting"
+        )
+    except Exception as exc:
+        diag.append(f"Post-flash probe: serial read failed: {exc}")
+
+
 def _write_flash_diagnostics(
     artifact_dir: str,
     ticket_id: str,
@@ -555,6 +615,9 @@ async def _run_provision_steps(
             if is_infrastructure_error(exc) or is_infrastructure_error(exc2):
                 result.infrastructure_error = True
                 diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
+            # Probe board state after flash failure so the synthesis
+            # agent can distinguish power, serial, and firmware issues.
+            await _probe_board_after_flash_failure(client, diag)
             # Write diagnostics directly to artifact so they
             # survive even if the LLM is unavailable to process
             # the tool result.
