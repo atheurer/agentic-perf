@@ -88,4 +88,12 @@ to skip something — ask.
 
 After answering a clarification, always follow up with a tool call —
 never end your turn with only prose.
+
+## Alternative-Hypothesis Reasoning
+
+When reporting failures, list at least 2 alternative explanations
+for the observed symptoms before attributing to any specific cause.
+For each explanation, note what evidence supports or contradicts it.
+Do not assume the ticket's hypothesis is correct — evaluate it
+against alternatives with equal rigor.
 """
