@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,15 @@ from providers.tracing import (
 from .trace_migrations import migrate
 
 logger = logging.getLogger(__name__)
+
+
+def _human_bytes(n: int) -> str:
+    """Format a byte count as a human-readable string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024  # type: ignore[assignment]
+    return f"{n:.1f} TB"
 
 
 class TraceStoreError(RuntimeError):
@@ -79,12 +88,15 @@ class OperationRecord:
 class TraceStore:
     """The authoritative SQLite store, with one connection per store instance."""
 
+    DEFAULT_RETENTION_DAYS = 14
+
     def __init__(
         self,
         db_path: Path,
         *,
         history_db_path: Path | None = None,
         busy_timeout_ms: int = 5_000,
+        trace_retention_days: int | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.history_db_path = (
@@ -127,6 +139,17 @@ class TraceStore:
             raise TraceStoreMigrationError(
                 "could not initialize trace database"
             ) from exc
+
+        self._retention_days = (
+            trace_retention_days
+            if trace_retention_days is not None
+            else self.DEFAULT_RETENTION_DAYS
+        )
+        if self._retention_days > 0:
+            try:
+                self.prune_old_traces(self._retention_days)
+            except Exception:
+                logger.warning("startup trace retention pruning failed", exc_info=True)
 
     def _init_db_connection(
         self, db_path: Path, busy_timeout_ms: int
@@ -225,6 +248,74 @@ class TraceStore:
                         )
                 except Exception:
                     logger.warning("WAL checkpoint failed", exc_info=True)
+
+    def prune_old_traces(self, retention_days: int | None = None) -> int:
+        """Delete trace records older than *retention_days* and reclaim space.
+
+        Returns the number of trace event rows deleted.  Runs ``VACUUM`` only
+        when rows were actually removed so that no-op calls are cheap.
+        """
+        days = retention_days if retention_days is not None else self._retention_days
+        if days <= 0:
+            return 0
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff_iso = cutoff.isoformat()
+
+        total_deleted = 0
+        with self._lock:
+            connection = self._open_connection()
+
+            # --- prune trace_events ---
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "DELETE FROM trace_events WHERE occurred_at < ?",
+                    (cutoff_iso,),
+                )
+                total_deleted += cursor.rowcount
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+            # --- prune terminal operations with no recent history ---
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "DELETE FROM operation_history WHERE occurred_at < ? "
+                    "AND operation_key IN ("
+                    "  SELECT operation_key FROM operations "
+                    "  WHERE state = 'terminal'"
+                    ")",
+                    (cutoff_iso,),
+                )
+                history_deleted = cursor.rowcount
+                total_deleted += history_deleted
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+            if total_deleted > 0:
+                db_size_before = self.db_path.stat().st_size
+                connection.execute("VACUUM")
+                db_size_after = self.db_path.stat().st_size
+                reclaimed = db_size_before - db_size_after
+                logger.info(
+                    "Trace retention: pruned %d record(s) older than %d days, "
+                    "reclaimed %s",
+                    total_deleted,
+                    days,
+                    _human_bytes(reclaimed) if reclaimed > 0 else "0 B",
+                )
+            else:
+                logger.info(
+                    "Trace retention: no records older than %d days to prune",
+                    days,
+                )
+
+        return total_deleted
 
     def close(self) -> None:
         """Close the connections; safe to call after a failed initialization."""
