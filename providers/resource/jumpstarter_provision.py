@@ -159,7 +159,10 @@ async def _probe_board_after_flash_failure(
         return
     try:
         serial_data = await asyncio.wait_for(
-            to_thread.run_sync(lambda: console.read(4096)),
+            to_thread.run_sync(
+                lambda: console.read(4096),
+                abandon_on_cancel=True,
+            ),
             timeout=10,
         )
         if serial_data:

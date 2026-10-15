@@ -476,6 +476,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/resource/jumpstarter_provision.py", "<module>", "cloud_resource"),
     (
         "providers/resource/jumpstarter_provision.py",
+        "_probe_board_after_flash_failure",
+        "cloud_resource",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
         "ProvisionResult",
         "cloud_resource",
     ),
@@ -3030,6 +3035,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/resource/jumpstarter_provision.py:<module>",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_probe_board_after_flash_failure",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter_provision.py:_probe_board_after_flash_failure",
         "2027-12-31",
     ),
     (
