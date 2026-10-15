@@ -483,6 +483,7 @@ class TestBootTimePassiveSerialDefaults:
                 "jmp",
                 "shell",
                 "--lease=lease-123",
+                "--exporter-logs",
                 "--",
                 "j",
                 "serial",
@@ -758,9 +759,9 @@ class TestBootTimeSerialDiagnostics:
         if failure == "cancel":
             benchmark_proc.finish_streamed_output.assert_awaited_once()
             assert benchmark_proc.finish_streamed_output.await_args.kwargs["cancelled"]
-        # open_stream is called for both serial-capture.log
+        # open_stream is called for serial-capture.log, exporter-logs.log,
         # and harness-output.log
-        assert len(opened_streams) == 2
+        assert len(opened_streams) == 3
         assert all(s.closed for s in opened_streams)
 
     async def test_serial_tail_remains_in_artifact_but_not_service_log(
