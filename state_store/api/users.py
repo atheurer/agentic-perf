@@ -100,6 +100,19 @@ def update_user(username: str, body: UpdateUserRequest, request: Request):
 
     from state_store.identity import UNSET
 
+    # These fields only take effect for service accounts.
+    try:
+        existing = store.get_user(username)
+    except UserNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    if not existing.service_account:
+        sa_fields = {"allowed_sources", "max_requests_per_hour"} & body.model_fields_set
+        if sa_fields:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Fields {', '.join(sorted(sa_fields))} apply only to service accounts",
+            )
+
     kwargs: dict = {}
     if "allowed_sources" in body.model_fields_set:
         if body.allowed_sources is None:
