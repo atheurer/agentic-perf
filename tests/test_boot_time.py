@@ -483,6 +483,7 @@ class TestBootTimePassiveSerialDefaults:
                 "jmp",
                 "shell",
                 "--lease=lease-123",
+                "--exporter-logs",
                 "--",
                 "j",
                 "serial",
