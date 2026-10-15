@@ -59,6 +59,10 @@ _CORE_DIRECTIVES: set[str] = {
     "host_cleanup",
     "system_config",
     "update_harness",
+    "user_pre_run_approval",
+    "on_existing_install",
+    "firewall_policy",
+    "test_interfaces",
     # This resource directive must be known to the orchestrator even when the
     # Jumpstarter provider is imported lazily in a separate resource process.
     "jumpstarter_serial",
@@ -86,10 +90,14 @@ _CORE_DESCRIPTIONS: dict[str, str] = {
     "disable_hitl_timeout": "Disable HITL timeout for manual investigation (bool)",
     "review_mode": "Review agent mode",
     "no_host_mounts": "Disable host filesystem mounts in containers (bool)",
-    "host_cleanup": "Host cleanup policy: 'required', 'skip', or 'best-effort'",
+    "host_cleanup": "Host cleanup policy: 'required' or 'skip'",
     "system_config": "Post-provision system configuration operations (list)",
     "update_harness": "Update harness packages on target before benchmark (bool)",
     "jumpstarter_serial": "Enable Jumpstarter serial capture mode (bool)",
+    "user_pre_run_approval": "Require user approval before executing the benchmark (bool, default true)",
+    "on_existing_install": "Policy for pre-existing installations: 'reuse', 'skip', or 'reinstall'",
+    "firewall_policy": "Firewall configuration policy for the benchmark environment",
+    "test_interfaces": "Network interfaces to use for the benchmark test",
 }
 
 # ── Suffix / prefix normalization ─────────────────────────
