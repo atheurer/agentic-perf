@@ -125,9 +125,10 @@ Your job is to analyze a performance test request ticket and:
    name matching for specific devices (e.g., name=device-01).
    Both formats are valid — pass them through as-is.
 
-   The directives object also accepts arbitrary keys for future extensibility. If the
-   user gives an operational instruction that doesn't fit the known fields, include it
-   as a descriptive key-value pair (e.g., "run_count": 3 for "run it three times").
+   Only use recognized directive keys — unrecognized keys are silently
+   ignored by tools and harnesses. If the user gives an operational
+   instruction that doesn't fit a recognized directive, include it in
+   the scoped_context for the appropriate downstream agent instead.
 
 7. Partition the user's request into AGENT-SCOPED CONTEXT. Downstream agents
    (resource, provisioning, benchmark, review) should only see the parts of
