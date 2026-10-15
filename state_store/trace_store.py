@@ -95,7 +95,7 @@ class TraceStore:
         db_path: Path,
         *,
         history_db_path: Path | None = None,
-        busy_timeout_ms: int = 5_000,
+        busy_timeout_ms: int = 120_000,
         trace_retention_days: int | None = None,
     ) -> None:
         self.db_path = Path(db_path)
