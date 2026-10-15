@@ -1460,6 +1460,23 @@ async def run_agent_task(
                             },
                         )
                         response.raise_for_status()
+        except (asyncio.CancelledError, httpx.HTTPStatusError) as exc:
+            # 409 (claim lost) and CancelledError are expected during
+            # shutdown — the agent was interrupted because the claim
+            # expired or the orchestrator lease was lost.
+            if (
+                isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code != 409
+            ):
+                logger.exception(
+                    "Failed to record cancellation guidance for ticket %s",
+                    ticket_id,
+                )
+            else:
+                logger.info(
+                    "Cancellation guidance skipped for %s (claim lost)",
+                    ticket_id,
+                )
         except Exception:
             logger.exception(
                 "Failed to record cancellation guidance for ticket %s", ticket_id
@@ -2517,7 +2534,10 @@ async def _cancel_and_await(task: asyncio.Task | None) -> None:
         task.cancel()
     try:
         await task
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, RuntimeError):
+        # CancelledError is normal during shutdown; RuntimeError
+        # covers "orchestrator leader lease lost" which is the
+        # expected trigger for the shutdown sequence.
         pass
     except Exception:
         logger.exception("Background task failed during shutdown")
@@ -3525,6 +3545,11 @@ def main():
         asyncio.run(poll_loop(config))
     except KeyboardInterrupt:
         logger.info("Orchestrator stopped")
+    except RuntimeError as exc:
+        if "lease lost" in str(exc):
+            logger.info("Orchestrator stopped: leader lease lost")
+        else:
+            raise
     finally:
         clear_orchestrator_status()
         try:
