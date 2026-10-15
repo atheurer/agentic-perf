@@ -3465,8 +3465,8 @@ def _mutation_headers(claim_id: str | None) -> dict[str, str]:
     return headers
 
 
-_last_sweep_warning: float = 0.0
 _SWEEP_WARN_INTERVAL = 300.0  # log sweep failures at most once per 5 min
+_last_sweep_warning: float = -_SWEEP_WARN_INTERVAL
 
 
 def _maybe_log_sweep_failure() -> None:

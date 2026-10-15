@@ -265,7 +265,7 @@ def _is_spool_locked(spool_name: str, spool_dir: Path) -> bool:
     """Check if a spool's lock file is held by an active producer."""
     from providers.execution import AuditedFilesystem
 
-    lock_name = spool_name.replace(".spool", ".lock")
+    lock_name = spool_name.removesuffix(".spool") + ".lock"
     lock_path = spool_dir / lock_name
     if not lock_path.exists():
         return False
@@ -289,7 +289,7 @@ def _is_spool_locked(spool_name: str, spool_dir: Path) -> bool:
             except OSError:
                 pass
     except OSError:
-        return False  # lock file gone or broken
+        return True  # fail closed: assume locked when we cannot check
 
 
 def _try_prune_file(path: Path, spool_dir: Path) -> bool:
@@ -309,7 +309,7 @@ def _try_prune_file(path: Path, spool_dir: Path) -> bool:
     if name.endswith(".spool"):
         spool_name = name
     elif name.endswith(".ack"):
-        spool_name = name.replace(".ack", ".spool")
+        spool_name = name.removesuffix(".ack") + ".spool"
     else:
         spool_name = ""  # .bad files — no lock to check
 
@@ -323,7 +323,7 @@ def _try_prune_file(path: Path, spool_dir: Path) -> bool:
         # Clean up sidecars when removing a .spool file
         if name.endswith(".spool"):
             for suffix in (".ack", ".lock"):
-                sidecar = name.replace(".spool", suffix)
+                sidecar = name.removesuffix(".spool") + suffix
                 fs.unlink(sidecar, missing_ok=True)
         return True
     except OSError:
