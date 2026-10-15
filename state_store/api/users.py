@@ -51,6 +51,10 @@ def create_user(body: CreateUserRequest, request: Request):
     principal = _get_principal(request)
     require_admin(principal)
     store = _get_store(request)
+    if body.max_requests_per_hour is not None and body.max_requests_per_hour < 0:
+        raise HTTPException(
+            status_code=422, detail="max_requests_per_hour must be non-negative"
+        )
     try:
         user, raw_token = store.create_user(
             body.username,
