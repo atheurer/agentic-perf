@@ -20,6 +20,27 @@ def validate_runtime_config(subject: str, config: dict[str, Any]) -> None:
     """Validate registered operation sections; leave other subjects extensible."""
     if not isinstance(config, dict):
         raise ValueError("Runtime configuration must be an object")
+    if subject == "resource/quads":
+        connection = config.get("connection", {})
+        if not isinstance(connection, dict):
+            raise ValueError(
+                "Runtime configuration section connection must be an object"
+            )
+        _fields(
+            connection,
+            {
+                "api_host": (str,),
+                "api_scheme": (str,),
+                "ca_bundle": (str,),
+            },
+        )
+        if "api_host" in connection and not connection["api_host"].strip():
+            raise ValueError("QUADS API host must not be empty")
+        if connection.get("api_scheme", "https") not in {"http", "https"}:
+            raise ValueError("QUADS API scheme must be http or https")
+        if "ca_bundle" in connection and not connection["ca_bundle"].strip():
+            raise ValueError("QUADS CA bundle path must not be empty")
+        return
     if subject != "harness/crucible":
         return
     for name in (

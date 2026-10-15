@@ -205,6 +205,59 @@ async def test_from_secrets_loads_configured_ca_bundle(
     await client.close()
 
 
+@pytest.mark.asyncio
+async def test_from_secrets_uses_organization_connection_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(quads_module, "AuditedAsyncHTTPClient", _CapturingHTTPClient)
+    local_config = _base_config()
+    del local_config["api_host"]
+    local_config["api_scheme"] = None
+    local_config["ca_bundle"] = None
+
+    class Secrets:
+        async def get_secret(self, _name: str) -> str:
+            return json.dumps(local_config)
+
+    client = await QuadsClient.from_secrets(
+        Secrets(),
+        organization_config={
+            "connection": {
+                "api_host": "org-quads.example.test",
+                "api_scheme": "https",
+            }
+        },
+    )
+
+    assert client.api_host == "org-quads.example.test"
+    assert client._base_url == "https://org-quads.example.test"
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_local_connection_settings_override_organization_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(quads_module, "AuditedAsyncHTTPClient", _CapturingHTTPClient)
+
+    class Secrets:
+        async def get_secret(self, _name: str) -> str:
+            return json.dumps(_base_config(api_host="user-quads.example.test"))
+
+    client = await QuadsClient.from_secrets(
+        Secrets(),
+        organization_config={
+            "connection": {
+                "api_host": "org-quads.example.test",
+                "api_scheme": "https",
+            }
+        },
+    )
+
+    assert client.api_host == "user-quads.example.test"
+    await client.close()
+
+
 async def _https_server(
     certificate: Path, key: Path
 ) -> tuple[asyncio.AbstractServer, int]:

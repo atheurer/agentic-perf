@@ -4,13 +4,13 @@ from unittest.mock import patch
 
 import pytest
 
+from agents.provisioning.prompts import PROVISIONING_BASE_PROMPT
 from agents.provisioning.server import (
     _parse_os_release,
     _summarize,
     _verify_harness_install_one,
     validate_platform_contract,
 )
-from agents.provisioning.prompts import PROVISIONING_BASE_PROMPT
 from tests.conftest import (
     MockSecretsProvider,
     MockSkillProvider,
@@ -51,8 +51,11 @@ def test_skip_existing_install_preserves_existing_but_installs_when_missing():
     prompt = " ".join(PROVISIONING_BASE_PROMPT.split())
 
     assert '"skip": preserve and verify an existing installation' in prompt
-    assert "if it is missing, install it from the approved provisioning config" in prompt
+    assert (
+        "if it is missing, install it from the approved provisioning config" in prompt
+    )
     assert "Use ensure_harness_installed for this behavior" in prompt
+
 
 CRUCIBLE_PRIVATE_CONFIG = {
     "platform_contract": {

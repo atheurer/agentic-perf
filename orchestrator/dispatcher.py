@@ -703,6 +703,7 @@ class Dispatcher:
                 secrets_provider=ticket_secrets,
                 event_bus=self.events,
                 instance_name=self._instance_name,
+                skill_provider=selected_skills,
             )
         elif agent_type == "platform":
             from agents.platform import PlatformAgent
@@ -746,6 +747,7 @@ class Dispatcher:
                 secrets_provider=ticket_secrets,
                 event_bus=self.events,
                 instance_name=self._instance_name,
+                skill_provider=selected_skills,
             )
         elif agent_type == "retrospective":
             agent = RetrospectiveAgent(

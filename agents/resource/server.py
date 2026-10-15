@@ -94,7 +94,11 @@ async def _ensure_init():
     from paths import get_instance_name
     from providers.resource.registry import ResourceProviderRegistry
 
-    _registry = ResourceProviderRegistry(secrets, instance_name=get_instance_name())
+    _registry = ResourceProviderRegistry(
+        secrets,
+        instance_name=get_instance_name(),
+        organization_resolver_factory=_get_resource_organization_resolver,
+    )
     _initialized = True
     fields = _ticket.get("custom_fields", {})
     if fields.get("resource_reservation_outcome_unknown") is True:
@@ -115,6 +119,11 @@ async def _get_skill_provider():
         skill_provider.bind_current_attempt("resource")
         _skill_provider = skill_provider
     return _skill_provider
+
+
+async def _get_resource_organization_resolver():
+    skill_provider = await _get_skill_provider()
+    return skill_provider.organization_resolver
 
 
 @mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)

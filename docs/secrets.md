@@ -34,28 +34,36 @@ for provider-specific details.
 
 ### QUADS API TLS trust
 
-The QUADS connection settings live in
-`~/.agentic-perf/secrets/quads/config.json`. QUADS uses HTTPS by default. If
-the optional `ca_bundle` field is omitted, its HTTPS client uses the host's
-default system CA trust store. To trust a specific CA bundle, set `ca_bundle`
-to its file path:
+Shared QUADS connection defaults belong in the organization service
+configuration at `service-config/resource/quads.json`. The endpoint and TLS
+trust are service configuration, not credentials. QUADS uses HTTPS by default;
+if the optional `ca_bundle` field is omitted, its HTTPS client uses the host's
+system CA trust store. A local `quads/config.json` value overrides an
+organization connection default for that installation, which provides a
+migration path for existing local settings.
+
+The local `~/.agentic-perf/secrets/quads/config.json` remains the source for
+QUADS credentials and installation-specific settings, which may be user-specific
+in a single-user deployment. It is not a per-user context source for a shared
+agentic-perf service:
 
 ```json
 {
-  "api_host": "quads.example.com",
   "email": "quads-operator@example.com",
   "password": "<quads-password>",
   "owner": "<quads-owner>",
   "ssh_key_path": "/path/to/ssh/key",
-  "default_root_password": "<default-root-password>",
-  "api_scheme": "https",
-  "ca_bundle": "/etc/pki/tls/certs/ca-bundle.crt"
+  "default_root_password": "<default-root-password>"
 }
 ```
 
-When set, this bundle is the QUADS client's trust source. Include any public
-roots the endpoint needs in that file. TLS certificate-chain and hostname
-verification stay enabled. This setting only affects QUADS HTTPS connections.
+When `ca_bundle` is set in either source, that file is the QUADS client's trust
+source. Include any public roots the endpoint needs in that file. TLS
+certificate-chain and hostname verification stay enabled. This setting only
+affects QUADS HTTPS connections.
+
+For compatibility, `api_host`, `api_scheme`, and `ca_bundle` may remain in the
+local file. Remove a local key to use its organization service-config value.
 
 ### Local (file-backed)
 

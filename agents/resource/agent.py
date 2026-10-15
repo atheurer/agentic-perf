@@ -877,12 +877,19 @@ class ResourceAgent(AgentBase):
         secrets_provider: SecretsProvider | None = None,
         event_bus: EventBus | None = None,
         instance_name: str | None = None,
+        skill_provider: Any | None = None,
     ) -> None:
         self._mode = mode
         self._ticket_id: str | None = None
         self._secrets = secrets_provider
         self._registry = (
-            ResourceProviderRegistry(secrets_provider, instance_name=instance_name)
+            ResourceProviderRegistry(
+                secrets_provider,
+                instance_name=instance_name,
+                organization_resolver=getattr(
+                    skill_provider, "organization_resolver", None
+                ),
+            )
             if secrets_provider
             else None
         )
