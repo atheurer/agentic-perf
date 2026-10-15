@@ -445,11 +445,12 @@ def format_directive_schema_for_prompt(
         lines.append(f"- **{key}**: {desc}")
     lines.append("")
     lines.append(
-        "Use ONLY these canonical keys for directives. Every "
-        "directive that affects execution has explicit code handling "
-        "it — unrecognized keys are silently ignored by tools and "
-        "harnesses. If the user's intent clearly matches a recognized "
-        "directive but uses a different name, map it to the canonical "
+        "These are the most commonly used directive keys with "
+        "descriptions. Other recognized keys (e.g. board_selector, "
+        "exclude_hosts, skip_teardown) are also valid when explicitly "
+        "provided by the user. "
+        "If the user's intent clearly matches a listed directive "
+        "but uses a different name, map it to the canonical "
         "key (e.g. 'iterations' → 'sample_count', 'os' → "
         "'image_version'). If the intent is ambiguous or does not "
         "match any recognized directive, do NOT guess — include the "
