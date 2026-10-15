@@ -69,12 +69,27 @@ _CORE_ALIASES: dict[str, str] = {
 }
 
 _CORE_DESCRIPTIONS: dict[str, str] = {
+    "board_selector": "Jumpstarter board label selector — pass through verbatim from user input",
     "resource_provider": "Resource provider: 'jumpstarter', 'quads', 'aws', or 'user_provided'",
+    "endpoint_type": "Host connection type (default: 'remotehosts')",
+    "exclude_hosts": "Host names to exclude from allocation (list)",
     "image_version": "OS image version (e.g. 'AutoSD-10', 'RHIVOS-2')",
     "image_name": "Image variant name (e.g. 'qa', 'ps', 'fusa-minimal')",
     "image_type": "Image type: 'regular' or 'ostree'",
+    "image_server": "Base URL of the image download server",
     "release": "Release path (e.g. 'monthly/autosd10-202608', 'nightly')",
     "harness": "Benchmark harness to use (e.g. 'boot-time', 'crucible')",
+    "fleet": "Enable fleet investigation mode (bool)",
+    "convergence_strategy": "Fleet convergence strategy",
+    "failure_policy": "Fleet failure handling: 'continue' or 'stop'",
+    "skip_teardown": "Skip resource teardown after completion (bool)",
+    "disable_hitl_timeout": "Disable HITL timeout for manual investigation (bool)",
+    "review_mode": "Review agent mode",
+    "no_host_mounts": "Disable host filesystem mounts in containers (bool)",
+    "host_cleanup": "Host cleanup policy: 'required', 'skip', or 'best-effort'",
+    "system_config": "Post-provision system configuration operations (list)",
+    "update_harness": "Update harness packages on target before benchmark (bool)",
+    "jumpstarter_serial": "Enable Jumpstarter serial capture mode (bool)",
 }
 
 # ── Suffix / prefix normalization ─────────────────────────
@@ -425,14 +440,6 @@ def format_directive_schema_for_prompt(
     all_descriptions = dict(_CORE_DESCRIPTIONS)
     all_descriptions.update(_contributed_descriptions)
 
-    # Only include keys that have descriptions — unnamed keys
-    # without context would confuse rather than guide the LLM.
-    described = {
-        key: all_descriptions[key] for key in sorted(keys) if key in all_descriptions
-    }
-    if not described:
-        return ""
-
     lines = [
         "## Recognized Directives",
         "",
@@ -441,15 +448,19 @@ def format_directive_schema_for_prompt(
         "name for the same concept, map it to the canonical key.",
         "",
     ]
-    for key, desc in described.items():
-        lines.append(f"- **{key}**: {desc}")
+    for key in sorted(keys):
+        desc = all_descriptions.get(key, "")
+        if desc:
+            lines.append(f"- **{key}**: {desc}")
+        else:
+            lines.append(f"- **{key}**")
     lines.append("")
     lines.append(
-        "These are the most commonly used directive keys with "
-        "descriptions. Other recognized keys (e.g. board_selector, "
-        "exclude_hosts, skip_teardown) are also valid when explicitly "
-        "provided by the user. "
-        "If the user's intent clearly matches a listed directive "
+        "Use ONLY these canonical keys for directives. Every "
+        "directive that affects execution has explicit code handling "
+        "it \u2014 unrecognized keys are silently ignored by tools and "
+        "harnesses. If the user's intent clearly matches a recognized "
+        "directive "
         "but uses a different name, map it to the canonical "
         "key (e.g. 'iterations' → 'sample_count', 'os' → "
         "'image_version'). If the intent is ambiguous or does not "
