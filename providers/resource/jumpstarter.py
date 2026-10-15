@@ -671,6 +671,12 @@ class JumpstarterResourceProvider(ResourceProvider):
                     for e in exporters.exporters
                 ]
                 allowed = [d for d in all_devices if _device_matches_selector(d, terms)]
+                if not allowed and any(neg for _, _, neg in terms):
+                    return {
+                        "provider": "jumpstarter",
+                        "error": "No available boards match the selector after applying exclusions",
+                        "status": "rejected",
+                    }
                 if allowed and not target_exporter:
                     target_exporter = allowed[0]["name"]
                 positive = [f"{k}={v}" for k, v, neg in terms if not neg]

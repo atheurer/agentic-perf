@@ -1917,21 +1917,28 @@ def read_artifact_file_impl(
         return json.dumps({"error": f"Cannot resolve path: {path}"})
 
     try:
+        from itertools import islice
+
+        limit = max(0, min(limit, 500))
+        offset = max(0, offset)
         size = resolved.stat().st_size
         with open(resolved, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        total_lines = len(lines)
-        selected = lines[offset : offset + limit]
+            # Skip to offset
+            for _ in range(offset):
+                if f.readline() == "":
+                    break
+            selected = list(islice(f, limit))
+            # Count remaining to determine has_more
+            has_more = f.readline() != ""
         return json.dumps(
             {
                 "file": str(resolved),
-                "total_lines": total_lines,
                 "total_bytes": size,
                 "offset": offset,
                 "limit": limit,
                 "lines_returned": len(selected),
                 "content": "".join(selected),
-                "has_more": offset + limit < total_lines,
+                "has_more": has_more,
             }
         )
     except Exception as exc:
