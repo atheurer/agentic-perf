@@ -593,7 +593,7 @@ def _duration_requirement_changed(
 def _provider_selection_changed(
     provider: str, fields: dict[str, Any], directives: dict[str, Any]
 ) -> bool:
-    """Detect material provider requirements that differ from the saved lease."""
+    """Detect selection changes that can be compared with saved lease metadata."""
     metadata = fields.get("resource_provider_metadata") or {}
     if not isinstance(metadata, dict):
         return True
@@ -677,16 +677,6 @@ def _provider_selection_changed(
         ):
             return True
         requested_hostnames = requested.get("hostnames")
-        if requested_hostnames is None:
-            try:
-                ticket_fields = dict(fields)
-                ticket_fields["directives"] = directives
-                requested_hostnames = _auto_reservation_selection(
-                    "quads", {"custom_fields": ticket_fields}
-                ).get("hostnames")
-            except ValueError:
-                if fields.get("required_hosts"):
-                    return True
         if requested_hostnames is not None:
             if isinstance(requested_hostnames, str):
                 requested_hostnames = [
@@ -712,6 +702,66 @@ def _provider_selection_changed(
                 requested_hostnames
             ):
                 return True
+        else:
+            # Role/OS/NIC descriptors constrain host discovery; they are not a
+            # concrete QUADS selection. Reconstructing a new selection from them
+            # can fail even when this ticket's existing assignment is still in use.
+            required_hosts = fields.get("required_hosts")
+            if (
+                isinstance(required_hosts, list)
+                and required_hosts
+                and all(isinstance(host, dict) for host in required_hosts)
+            ):
+                managed_hosts = [
+                    host for host in required_hosts if not host.get("host")
+                ]
+                managed_host_count = len(managed_hosts)
+                pinned_hostnames: list[str] = []
+                all_managed_hosts_pinned = bool(managed_hosts)
+                for host in managed_hosts:
+                    recommended = host.get("recommended") or {}
+                    hostname = (
+                        host.get("quads_hostname")
+                        or host.get("provider_hostname")
+                        or recommended.get("hostname")
+                    )
+                    if not hostname:
+                        all_managed_hosts_pinned = False
+                        continue
+                    if not isinstance(hostname, str) or not hostname.strip():
+                        return True
+                    pinned_hostnames.append(hostname.strip())
+                records = _saved_selection_records(metadata)
+                saved_hostnames: list[str] = []
+                if records:
+                    for record in records:
+                        hostnames = record.get("hostnames")
+                        if not isinstance(hostnames, list) or any(
+                            not isinstance(hostname, str) or not hostname.strip()
+                            for hostname in hostnames
+                        ):
+                            saved_hostnames = []
+                            break
+                        saved_hostnames.extend(hostnames)
+                elif isinstance(metadata.get("hostnames"), list):
+                    hostnames = metadata["hostnames"]
+                    if all(
+                        isinstance(hostname, str) and hostname.strip()
+                        for hostname in hostnames
+                    ):
+                        saved_hostnames = hostnames
+                if pinned_hostnames:
+                    if not saved_hostnames or len(set(pinned_hostnames)) != len(
+                        pinned_hostnames
+                    ):
+                        return True
+                    if all_managed_hosts_pinned:
+                        if sorted(saved_hostnames) != sorted(pinned_hostnames):
+                            return True
+                    elif not set(pinned_hostnames).issubset(saved_hostnames):
+                        return True
+                if saved_hostnames and len(saved_hostnames) != managed_host_count:
+                    return True
 
     if provider == "psap-cc":
         selection = _explicit_provider_selection(provider, fields, directives)
