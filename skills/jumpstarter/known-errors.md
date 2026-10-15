@@ -271,3 +271,23 @@ errors include:
 **Diagnosis:** Check the full exception chain in the pod
 logs or diagnostics. The sub-exception contains the
 actionable information.
+
+## Capturing Exporter-Side Logs
+
+When diagnosing flash or benchmark failures where the root cause
+may be on the exporter side (process crash, OOM, USB-serial
+disconnect, gRPC endpoint hang), use `--exporter-logs` with
+`jmp shell`:
+
+```
+jmp shell --lease <id> --exporter-logs -- j storage flash <url>
+jmp shell --lease <id> --exporter-logs -- j serial pipe
+```
+
+This streams the exporter process's own logs to stderr alongside
+the command output. Without `--exporter-logs`, only client-side
+evidence is available, making it impossible to distinguish between
+gRPC tunnel failure, exporter crash, and hardware disconnect.
+
+The boot-time test script can also pass `--exporter-logs` via
+the `jumpstarter_exec` wrapper in `boot-timings-test.sh`.
