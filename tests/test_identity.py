@@ -178,7 +178,7 @@ class TestUserStore:
     def test_touch_last_used_save_failure_is_nonfatal(self, store):
         """Persistence failure in touch_last_used must not crash auth."""
         store.create_user("alice")
-        with patch.object(store, "_save", side_effect=OSError("disk full")):
+        with patch.object(store, "_write_locked", side_effect=OSError("disk full")):
             store.touch_last_used("alice")
         user = store.get_user("alice")
         assert user.last_used_at is not None
