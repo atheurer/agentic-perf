@@ -2126,7 +2126,11 @@ function renderRecordLink(recordUrl, recordId, style) {
 
 function renderMarkdown(s) {
   if (typeof marked !== 'undefined' && marked.parse) {
-    try { return marked.parse(s); } catch (e) { /* fall through */ }
+    try {
+      var html = marked.parse(s);
+      if (typeof DOMPurify !== 'undefined') { html = DOMPurify.sanitize(html); }
+      return html;
+    } catch (e) { /* fall through */ }
   }
   return '<pre>' + escHtml(s) + '</pre>';
 }
@@ -2644,7 +2648,7 @@ function renderHypothesisCard(ticket) {
   var html = '<div class="hypothesis-card">';
   html += '<h4>Hypothesis</h4>';
   if (hypothesis) {
-    html += '<div class="hypothesis-text">' + escHtml(String(hypothesis)) + '</div>';
+    html += '<div class="hypothesis-text">' + renderMarkdown(String(hypothesis)) + '</div>';
   }
   if (verdict) {
     var cls = 'inconclusive';
@@ -2662,7 +2666,7 @@ function renderHypothesisCard(ticket) {
           'Results &amp; Analysis</summary>' +
         '<div class="content">';
       if (summary) {
-        html += '<div class="result-summary">' + escHtml(String(summary)) + '</div>';
+        html += '<div class="result-summary">' + renderMarkdown(String(summary)) + '</div>';
       }
       var chartId = 'hypo-chart-' + (ticket.id || '').replace(/[^a-zA-Z0-9]/g, '');
       if (chartData) {
@@ -2754,7 +2758,7 @@ function renderHypothesisCard(ticket) {
       escHtml(sOutcome || 'INVESTIGATION COMPLETE') + '</div>';
     if (synthResult.root_cause_summary) {
       html += '<div class="result-summary">' +
-        escHtml(String(synthResult.root_cause_summary)) + '</div>';
+        renderMarkdown(String(synthResult.root_cause_summary)) + '</div>';
     }
     var om = synthResult.operational_metrics;
     if (om) {
@@ -2782,7 +2786,7 @@ function renderHypothesisCard(ticket) {
       'EVALUATING: ' + escHtml(String(evalResult.decision || '').toUpperCase()) + '</div>';
     if (evalResult.root_cause_summary) {
       html += '<div class="result-summary">' +
-        escHtml(String(evalResult.root_cause_summary)) + '</div>';
+        renderMarkdown(String(evalResult.root_cause_summary)) + '</div>';
     }
   }
   html += '</div>';
