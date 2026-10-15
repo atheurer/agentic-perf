@@ -57,7 +57,7 @@ _MAX_REPLAY_CACHE = 1024
 # Resource availability normally reads provider state; its exceptional named
 # device escalation has its own, narrower operation boundary in
 # ``agents.resource.server``.
-_PROTECTED_TOOLS = frozenset({"execute_benchmark"})
+_PROTECTED_TOOLS = frozenset({"execute_benchmark", "reboot_hosts_and_verify"})
 _OPERATION_LEASE_TTL_SECONDS = 300.0
 _OPERATION_LEASE_RENEW_INTERVAL_SECONDS = 100.0
 _MAX_OPERATION_RESULT_BYTES = 1024 * 1024
