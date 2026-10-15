@@ -166,11 +166,11 @@ class TestUserStore:
 
     def test_touch_last_used_debounce(self, store):
         store.create_user("alice")
-        with patch.object(store, "_save") as mock_save:
+        with patch.object(store, "_write_locked") as mock_write:
             store.touch_last_used("alice")
-            assert mock_save.call_count == 1
+            assert mock_write.call_count == 1
             store.touch_last_used("alice")
-            assert mock_save.call_count == 1
+            assert mock_write.call_count == 1
 
     def test_touch_last_used_nonexistent_user(self, store):
         store.touch_last_used("ghost")
