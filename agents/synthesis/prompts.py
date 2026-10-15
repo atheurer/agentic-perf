@@ -47,6 +47,11 @@ by calling submit_synthesis_result with:
   what was established and what remains unknown.
 - The info_gain_trajectory from the ledger should be preserved — it
   shows how the investigation progressed.
+- In your root_cause_summary, clearly distinguish between:
+  - CONFIRMED: evidence directly proves this cause
+  - CONSISTENT: evidence doesn't contradict but doesn't prove
+  - UNTESTED: evidence needed to confirm/deny was not collected
+  Do not present untested hypotheses as confirmed findings.
 - **Skipped plan steps are normal.** When an investigation concludes
   early (e.g., the review agent refutes a hypothesis before all
   planned steps execute), remaining steps are marked "skipped."
