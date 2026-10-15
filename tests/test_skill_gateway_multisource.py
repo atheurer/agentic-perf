@@ -701,3 +701,43 @@ async def test_docs_only_org_subject_preserves_other_harness_config_defaults(
     assert result["endpoint_type"] == "kube"
     assert result["endpoint_user"] == "benchmark-user"
     assert result["run_file_format"] == "yaml_config"
+
+
+@pytest.mark.asyncio
+async def test_resource_service_config_is_gateway_only_and_not_model_readable(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "organization"
+    config = {
+        "connection": {
+            "api_host": "quads-internal.example.test",
+            "api_scheme": "https",
+        }
+    }
+    _write_package(
+        repository,
+        namespace="resource",
+        name="quads",
+        subject="resource/quads",
+        instruction="Use the QUADS resource provider for managed bare-metal hosts.",
+        runtime_config=config,
+    )
+    resolver = _resolver(("org-operations", repository))
+
+    class Provider:
+        organization_resolver = resolver
+
+    result = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="TEST-QUADS-CONFIG",
+            agent_name="resource-agent",
+            phase="resource",
+            subject="resource/quads",
+        )
+    )
+
+    assert result["found"] is True
+    assert result["context_conflicts"]["runtime_configuration_conflict"] is False
+    assert "quads-internal.example.test" not in json.dumps(result)
+    assert resolver.get_runtime_config("resource/quads") == config

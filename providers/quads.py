@@ -54,11 +54,33 @@ class QuadsClient:
             )
 
     @classmethod
-    async def from_secrets(cls, secrets_provider) -> QuadsClient:
+    async def from_secrets(
+        cls,
+        secrets_provider,
+        *,
+        organization_config: dict[str, Any] | None = None,
+    ) -> QuadsClient:
         raw = await secrets_provider.get_secret("quads/config.json")
         if not raw:
             raise ValueError("QUADS config not found at secrets/quads/config.json")
         config = json.loads(raw)
+        if not isinstance(config, dict):
+            raise ValueError("QUADS secrets configuration must be an object")
+
+        connection = {}
+        if organization_config is not None:
+            connection = organization_config.get("connection", {})
+            if not isinstance(connection, dict):
+                raise ValueError("QUADS organization connection config is invalid")
+            connection = dict(connection)
+        # Keep existing local settings as per-install overrides during the
+        # migration. Null optional values mean "not set" and leave the shared
+        # organization default in place.
+        for key in ("api_host", "api_scheme", "ca_bundle"):
+            value = config.pop(key, None)
+            if value is not None:
+                connection[key] = value
+        config = {**config, **connection}
         required = [
             "api_host",
             "email",
@@ -70,6 +92,12 @@ class QuadsClient:
         missing = [k for k in required if k not in config]
         if missing:
             raise ValueError(f"QUADS secrets missing required fields: {missing}")
+        if not isinstance(config["api_host"], str) or not config["api_host"].strip():
+            raise ValueError("QUADS API host must be a nonempty string")
+        if config.get("api_scheme", "https") not in {"http", "https"}:
+            raise ValueError("QUADS API scheme must be http or https")
+        if "ca_bundle" in config and config["ca_bundle"] == "":
+            raise ValueError("QUADS CA bundle path must not be empty")
         return cls(
             api_host=config["api_host"],
             email=config["email"],
