@@ -1061,4 +1061,8 @@ class ArcaflowPluginSkillProvider(SkillProvider):
                 "workflow_source",
             },
             "aliases": {},
+            "descriptions": {
+                "workflow_name": "Arcaflow workflow name to execute",
+                "workflow_source": "Source repository or path for the workflow",
+            },
         }
