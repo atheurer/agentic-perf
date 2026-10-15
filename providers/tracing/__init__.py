@@ -42,6 +42,7 @@ from .spool import (
     SpoolError,
     TraceSpool,
     drain_abandoned_spools,
+    prune_spool_directory,
 )
 
 __all__ = [
@@ -81,6 +82,7 @@ __all__ = [
     "SpoolBackpressure",
     "SpoolCorruption",
     "drain_abandoned_spools",
+    "prune_spool_directory",
     "operation",
     "AmbiguousOperation",
     "OperationCancelled",

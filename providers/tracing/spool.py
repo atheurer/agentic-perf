@@ -257,6 +257,140 @@ class TraceSpool:
         return offset
 
 
+_PRUNE_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
+_PRUNE_MAX_AGE_SECONDS = 3600  # 1 hour
+
+
+def _is_spool_locked(spool_name: str, spool_dir: Path) -> bool:
+    """Check if a spool's lock file is held by an active producer."""
+    from providers.execution import AuditedFilesystem
+
+    lock_name = spool_name.removesuffix(".spool") + ".lock"
+    lock_path = spool_dir / lock_name
+    if not lock_path.exists():
+        return False
+    fs = AuditedFilesystem.system(spool_dir)
+    try:
+        fd = fs.open_descriptor(
+            lock_name,
+            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            mode=0o600,
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False  # lock acquired — not actively owned
+        except BlockingIOError:
+            return True  # actively owned
+        finally:
+            fs.forget_descriptor(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    except OSError:
+        return True  # fail closed: assume locked when we cannot check
+
+
+def _try_prune_file(path: Path, spool_dir: Path) -> bool:
+    """Try to remove a spool or ack file, respecting active locks.
+
+    For .spool and .ack files, check the corresponding .lock file.
+    If the lock is held (producer active), skip the file.
+    When a .spool file is pruned, also remove its .ack and .lock
+    sidecars.
+    """
+    from providers.execution import AuditedFilesystem
+
+    name = str(path.name)
+    fs = AuditedFilesystem.system(spool_dir)
+
+    # Determine the spool base name for lock checking
+    if name.endswith(".spool"):
+        spool_name = name
+    elif name.endswith(".ack"):
+        spool_name = name.removesuffix(".ack") + ".spool"
+    else:
+        spool_name = ""  # .bad files — no lock to check
+
+    # Check if the corresponding spool is actively owned
+    if spool_name and _is_spool_locked(spool_name, spool_dir):
+        return False
+
+    try:
+        fs.unlink(path.name, missing_ok=True)
+        logger.debug("Pruned spool file %s", path.name)
+        # Clean up sidecars when removing a .spool file
+        if name.endswith(".spool"):
+            for suffix in (".ack", ".lock"):
+                sidecar = name.removesuffix(".spool") + suffix
+                fs.unlink(sidecar, missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def prune_spool_directory(
+    directory: Path,
+    *,
+    max_total_bytes: int = _PRUNE_MAX_BYTES,
+    max_age_seconds: float = _PRUNE_MAX_AGE_SECONDS,
+) -> int:
+    """Remove oldest spool files until total size is under *max_total_bytes*.
+
+    Files older than *max_age_seconds* are removed unconditionally.  Locked
+    (actively-owned) spool files are skipped.
+
+    Returns the number of files removed.
+    """
+    root = Path(directory)
+    if not root.exists():
+        return 0
+    if root.is_symlink() or not root.is_dir():
+        return 0
+
+    now = time.time()
+    entries: list[tuple[Path, float, int]] = []  # (path, mtime, size)
+    # .lock files are NOT pruned independently — they are only
+    # removed alongside their .spool file in _try_prune_file.
+    suffixes = (".spool", ".ack", ".bad")
+    for path in root.iterdir():
+        if path.is_symlink() or not path.is_file():
+            continue
+        if not any(path.name.endswith(s) or s in path.name for s in suffixes):
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        entries.append((path, st.st_mtime, st.st_size))
+
+    removed = 0
+
+    # Phase 1: remove files older than max_age_seconds
+    remaining: list[tuple[Path, float, int]] = []
+    for path, mtime, size in entries:
+        if now - mtime > max_age_seconds:
+            if _try_prune_file(path, root):
+                removed += 1
+            else:
+                remaining.append((path, mtime, size))
+        else:
+            remaining.append((path, mtime, size))
+
+    # Phase 2: prune oldest first until under budget
+    remaining.sort(key=lambda e: e[1])  # oldest first
+    total = sum(s for _, _, s in remaining)
+    for path, _mtime, size in remaining:
+        if total <= max_total_bytes:
+            break
+        if _try_prune_file(path, root):
+            removed += 1
+            total -= size
+
+    return removed
+
+
 def drain_abandoned_spools(
     directory: Path,
     deliver: Callable[[TraceEventV1], None],
