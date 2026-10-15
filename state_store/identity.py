@@ -459,7 +459,16 @@ class UserStore:
         filesystem.touch(lock_path.name, mode=0o600)
         lock_fd = filesystem.open_descriptor(lock_path.name, os.O_RDWR, mode=0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        self._reload_if_stale()
+        try:
+            self._reload_if_stale()
+        except Exception:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                filesystem.forget_descriptor(lock_fd)
+                os.close(lock_fd)
+            except OSError:
+                pass
+            raise
         return filesystem, lock_fd
 
     def _release_file_lock(self, filesystem, lock_fd: int) -> None:
@@ -493,16 +502,22 @@ class UserStore:
         Must be called while ``self._lock`` is held.
         """
         try:
-            current_mtime = self._path.stat().st_mtime
-        except OSError:
+            pre_mtime = self._path.stat().st_mtime
+        except FileNotFoundError:
             return
-        if current_mtime != self._file_mtime:
-            logger.debug(
-                "users.json changed on disk (mtime %.3f -> %.3f), reloading",
-                self._file_mtime,
-                current_mtime,
-            )
+        if pre_mtime == self._file_mtime:
+            return
+        logger.debug(
+            "users.json changed on disk (mtime %.3f -> %.3f), reloading",
+            self._file_mtime,
+            pre_mtime,
+        )
+        self._load()
+        post_mtime = self._path.stat().st_mtime
+        if post_mtime != pre_mtime:
+            # File changed during read — re-read once more
             self._load()
+        self._file_mtime = self._path.stat().st_mtime
 
     def _load(self) -> None:
         if not self._path.exists():
