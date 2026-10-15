@@ -2965,6 +2965,12 @@ async def _poll_loop_after_lease(
 
             try:
                 all_fetched = await fetch_all_tickets(config.state_store_url)
+            except (httpx.ReadTimeout, httpx.ConnectError, ConnectionError) as exc:
+                # Transient during startup while the state store is
+                # still loading tickets.  No traceback needed.
+                logger.warning("Failed to fetch tickets: %s", exc)
+                await asyncio.sleep(config.poll_interval)
+                continue
             except Exception:
                 logger.exception("Failed to fetch tickets")
                 await asyncio.sleep(config.poll_interval)
