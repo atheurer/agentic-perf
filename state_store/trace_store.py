@@ -251,6 +251,69 @@ class TraceStore:
                 except Exception:
                     logger.warning("WAL checkpoint failed", exc_info=True)
 
+    _PRUNE_BATCH_SIZE = 1000
+
+    def _prune_trace_events_batched(
+        self, connection: sqlite3.Connection, cutoff_iso: str
+    ) -> int:
+        """Delete old trace_events in batches, releasing the lock between each."""
+        total = 0
+        while True:
+            with self._lock:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor = connection.execute(
+                        "DELETE FROM trace_events WHERE rowid IN "
+                        "(SELECT rowid FROM trace_events "
+                        "WHERE occurred_at < ? LIMIT ?)",
+                        (cutoff_iso, self._PRUNE_BATCH_SIZE),
+                    )
+                    batch = cursor.rowcount
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+            total += batch
+            if batch < self._PRUNE_BATCH_SIZE:
+                break
+        return total
+
+    def _prune_operation_history_batched(
+        self, connection: sqlite3.Connection, cutoff_iso: str
+    ) -> int:
+        """Delete old terminal operation_history rows in batches."""
+        # Ensure occurred_at is indexed for the retention query.
+        with self._lock:
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "operation_history_occurred_at_idx "
+                "ON operation_history(occurred_at)"
+            )
+        total = 0
+        while True:
+            with self._lock:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor = connection.execute(
+                        "DELETE FROM operation_history WHERE rowid IN "
+                        "(SELECT operation_history.rowid "
+                        "FROM operation_history "
+                        "JOIN operations USING (operation_key) "
+                        "WHERE operation_history.occurred_at < ? "
+                        "AND operations.state = 'terminal' "
+                        "LIMIT ?)",
+                        (cutoff_iso, self._PRUNE_BATCH_SIZE),
+                    )
+                    batch = cursor.rowcount
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+            total += batch
+            if batch < self._PRUNE_BATCH_SIZE:
+                break
+        return total
+
     def prune_old_traces(self, retention_days: int | None = None) -> int:
         """Delete trace records older than *retention_days* and reclaim space.
 
@@ -258,6 +321,13 @@ class TraceStore:
         are reused by SQLite for new inserts; no VACUUM is performed
         because it requires an exclusive lock that would block event
         loop trace writes and stall lease renewal.
+
+        Deletes are performed in batches of ~1000 rows with the lock
+        released between batches so that ``insert_event()`` calls on
+        the event loop thread are not starved.
+
+        Both the active trace DB and the history DB (if present) are
+        pruned.
         """
         days = retention_days if retention_days is not None else self._retention_days
         if days <= 0:
@@ -267,57 +337,28 @@ class TraceStore:
         cutoff_iso = cutoff.isoformat()
 
         total_deleted = 0
-        with self._lock:
-            connection = self._open_connection()
 
-            # --- prune trace_events ---
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = connection.execute(
-                    "DELETE FROM trace_events WHERE occurred_at < ?",
-                    (cutoff_iso,),
-                )
-                total_deleted += cursor.rowcount
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
+        # --- prune active trace DB ---
+        connection = self._open_connection()
+        total_deleted += self._prune_trace_events_batched(connection, cutoff_iso)
+        total_deleted += self._prune_operation_history_batched(connection, cutoff_iso)
 
-            # --- prune terminal operations with no recent history ---
-            # Ensure occurred_at is indexed for the retention query.
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS "
-                "operation_history_occurred_at_idx "
-                "ON operation_history(occurred_at)"
+        # --- prune history DB ---
+        history_conn = self._open_history_connection()
+        if history_conn is not None:
+            total_deleted += self._prune_trace_events_batched(history_conn, cutoff_iso)
+
+        if total_deleted > 0:
+            logger.info(
+                "Trace retention: pruned %d record(s) older than %d days",
+                total_deleted,
+                days,
             )
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = connection.execute(
-                    "DELETE FROM operation_history WHERE occurred_at < ? "
-                    "AND operation_key IN ("
-                    "  SELECT operation_key FROM operations "
-                    "  WHERE state = 'terminal'"
-                    ")",
-                    (cutoff_iso,),
-                )
-                history_deleted = cursor.rowcount
-                total_deleted += history_deleted
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-
-            if total_deleted > 0:
-                logger.info(
-                    "Trace retention: pruned %d record(s) older than %d days",
-                    total_deleted,
-                    days,
-                )
-            else:
-                logger.info(
-                    "Trace retention: no records older than %d days to prune",
-                    days,
-                )
+        else:
+            logger.info(
+                "Trace retention: no records older than %d days to prune",
+                days,
+            )
 
         # No VACUUM — SQLite reuses freed pages for new inserts, so
         # the steady-state DB size is bounded by the retention window.
