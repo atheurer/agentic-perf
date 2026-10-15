@@ -31,15 +31,6 @@ from .trace_migrations import migrate
 logger = logging.getLogger(__name__)
 
 
-def _human_bytes(n: int) -> str:
-    """Format a byte count as a human-readable string."""
-    for unit in ("B", "KB", "MB", "GB"):
-        if abs(n) < 1024:
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
-        n /= 1024  # type: ignore[assignment]
-    return f"{n:.1f} TB"
-
-
 class TraceStoreError(RuntimeError):
     """Base class for trace persistence failures."""
 
@@ -146,8 +137,8 @@ class TraceStore:
             else self.DEFAULT_RETENTION_DAYS
         )
         if self._retention_days > 0:
-            # Run retention in a background thread to avoid blocking
-            # startup.  VACUUM on a multi-GB database can take minutes.
+            # Run retention in a background thread so DELETE batches
+            # don't block startup.
 
             def _deferred_prune() -> None:
                 try:
@@ -263,8 +254,10 @@ class TraceStore:
     def prune_old_traces(self, retention_days: int | None = None) -> int:
         """Delete trace records older than *retention_days* and reclaim space.
 
-        Returns the number of trace event rows deleted.  Runs ``VACUUM`` only
-        when rows were actually removed so that no-op calls are cheap.
+        Returns the number of trace event rows deleted.  Freed pages
+        are reused by SQLite for new inserts; no VACUUM is performed
+        because it requires an exclusive lock that would block event
+        loop trace writes and stall lease renewal.
         """
         days = retention_days if retention_days is not None else self._retention_days
         if days <= 0:
@@ -316,8 +309,7 @@ class TraceStore:
 
             if total_deleted > 0:
                 logger.info(
-                    "Trace retention: deleted %d record(s) older than "
-                    "%d days, running VACUUM outside lock...",
+                    "Trace retention: pruned %d record(s) older than %d days",
                     total_deleted,
                     days,
                 )
@@ -327,30 +319,13 @@ class TraceStore:
                     days,
                 )
 
-        # Release self._lock BEFORE VACUUM so trace writes from the
-        # event loop aren't blocked for the duration.  VACUUM can
-        # take minutes on a multi-GB database and must not hold
-        # self._lock or it will stall the asyncio event loop
-        # (which blocks lease renewal, causing pod restarts).
-        if total_deleted > 0:
-            try:
-                db_size_before = self.db_path.stat().st_size
-                vacuum_conn = sqlite3.connect(self.db_path, timeout=300)
-                try:
-                    vacuum_conn.execute("VACUUM")
-                finally:
-                    vacuum_conn.close()
-                db_size_after = self.db_path.stat().st_size
-                reclaimed = db_size_before - db_size_after
-                logger.info(
-                    "Trace retention: VACUUM complete, reclaimed %s",
-                    _human_bytes(reclaimed) if reclaimed > 0 else "0 B",
-                )
-            except Exception:
-                logger.warning(
-                    "Trace retention: VACUUM failed (non-fatal)",
-                    exc_info=True,
-                )
+        # No VACUUM — SQLite reuses freed pages for new inserts, so
+        # the steady-state DB size is bounded by the retention window.
+        # VACUUM rebuilds the entire file and requires an exclusive
+        # lock that blocks ALL writers (even on separate connections
+        # in WAL mode).  Since trace writes happen on the asyncio
+        # event loop thread, a blocked write stalls lease renewal
+        # and crashes the pod.
 
         return total_deleted
 
