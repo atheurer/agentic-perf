@@ -189,6 +189,35 @@ class TestDeterministicKernelStep:
         assert "validation error" in agent._add_comment.await_args.args[1]
 
     @pytest.mark.asyncio
+    async def test_approval_runs_under_a_fence_context_with_tool_call_id(self):
+        """Lab regression (PERF-29157B06): the approval endpoint returned 422
+        because the runner created the approval outside any tool call, so
+        the fence context carried no tool-call id."""
+        from providers.tracing import current_trace_context, new_trace_context
+
+        ticket = kernel_step_ticket()
+        agent = _agent(ticket)
+        agent.trace_context = new_trace_context(
+            ticket_id=ticket["id"], agent_id="provisioning-agent"
+        )
+        seen: dict[str, object] = {}
+
+        async def _approval(*, intent_id, summary):
+            ctx = current_trace_context()
+            seen["invocation_id"] = ctx.invocation_id if ctx else None
+            seen["tool_call_id"] = ctx.tool_call_id if ctx else None
+            agent._active_kernel_approval_id = "apr-" + "a" * 32
+            return "The user replied: approve\n\nInterpret this."
+
+        agent._request_kernel_approval = AsyncMock(side_effect=_approval)
+        mcp = ScriptedMCP(full_script(actions=("reboot",)))
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+        assert seen["invocation_id"] == agent.trace_context.invocation_id
+        assert seen["tool_call_id"] == "kernel-step-2"
+        assert current_trace_context() is None, "context must be unbound afterwards"
+        agent._handle_completion.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_actions_follow_the_intent(self):
         ticket = kernel_step_ticket()
         agent = _agent(ticket)

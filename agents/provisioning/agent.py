@@ -524,31 +524,54 @@ class ProvisioningAgent(AgentBase):
             f"Plan step {step_id}: {spec.nevra} on {', '.join(hosts)}; "
             f"actions: {', '.join(actions)}; reboot policy: {reboot_policy}."
         )
-        reply = await self._request_kernel_approval(
-            intent_id=intent_id, summary=summary
+        # The approval endpoint requires a trusted fence context with an
+        # invocation id AND a tool-call id.  The model loop derives one per
+        # tool call; this runner has no tool call, so it binds a child
+        # context of the dispatcher's invocation with a synthetic id.
+        from providers.tracing import (
+            bind_trace_context,
+            child_context,
+            current_trace_context,
+            new_trace_context,
+            reset_trace_context,
         )
-        approval_id = self._active_kernel_approval_id or ""
-        if "already granted" in reply:
-            pass
-        elif reply.startswith("The user replied:"):
-            user_text = reply.split("The user replied:", 1)[1].split("\n", 1)[0]
-            if self._KERNEL_APPROVE_RE.match(user_text):
-                await self._resolve_kernel_approval(decision="approved", reason=None)
+
+        parent = current_trace_context() or getattr(self, "trace_context", None)
+        if parent is None:
+            parent = new_trace_context(ticket_id=ticket_id, agent_id=self.agent_name)
+            self.trace_context = parent
+        approval_context = child_context(parent, tool_call_id=f"kernel-step-{step_id}")
+        token = bind_trace_context(approval_context)
+        try:
+            reply = await self._request_kernel_approval(
+                intent_id=intent_id, summary=summary
+            )
+            approval_id = self._active_kernel_approval_id or ""
+            if "already granted" in reply:
+                pass
+            elif reply.startswith("The user replied:"):
+                user_text = reply.split("The user replied:", 1)[1].split("\n", 1)[0]
+                if self._KERNEL_APPROVE_RE.match(user_text):
+                    await self._resolve_kernel_approval(
+                        decision="approved", reason=None
+                    )
+                else:
+                    await self._resolve_kernel_approval(
+                        decision="rejected", reason="reply was not a clear approval"
+                    )
+                    await self._kernel_step_stop(
+                        ticket_id,
+                        "the reply was not a clear approval (say 'approve' to proceed)",
+                        {"reply": user_text.strip()},
+                    )
+                    return
             else:
-                await self._resolve_kernel_approval(
-                    decision="rejected", reason="reply was not a clear approval"
-                )
                 await self._kernel_step_stop(
-                    ticket_id,
-                    "the reply was not a clear approval (say 'approve' to proceed)",
-                    {"reply": user_text.strip()},
+                    ticket_id, "approval not granted", {"reply": reply}
                 )
                 return
-        else:
-            await self._kernel_step_stop(
-                ticket_id, "approval not granted", {"reply": reply}
-            )
-            return
+        finally:
+            reset_trace_context(token)
 
         for action in actions:
             if action == "install":
