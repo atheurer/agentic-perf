@@ -315,21 +315,41 @@ class TraceStore:
                 raise
 
             if total_deleted > 0:
-                db_size_before = self.db_path.stat().st_size
-                connection.execute("VACUUM")
-                db_size_after = self.db_path.stat().st_size
-                reclaimed = db_size_before - db_size_after
                 logger.info(
-                    "Trace retention: pruned %d record(s) older than %d days, "
-                    "reclaimed %s",
+                    "Trace retention: deleted %d record(s) older than "
+                    "%d days, running VACUUM outside lock...",
                     total_deleted,
                     days,
-                    _human_bytes(reclaimed) if reclaimed > 0 else "0 B",
                 )
             else:
                 logger.info(
                     "Trace retention: no records older than %d days to prune",
                     days,
+                )
+
+        # Release self._lock BEFORE VACUUM so trace writes from the
+        # event loop aren't blocked for the duration.  VACUUM can
+        # take minutes on a multi-GB database and must not hold
+        # self._lock or it will stall the asyncio event loop
+        # (which blocks lease renewal, causing pod restarts).
+        if total_deleted > 0:
+            try:
+                db_size_before = self.db_path.stat().st_size
+                vacuum_conn = sqlite3.connect(self.db_path, timeout=300)
+                try:
+                    vacuum_conn.execute("VACUUM")
+                finally:
+                    vacuum_conn.close()
+                db_size_after = self.db_path.stat().st_size
+                reclaimed = db_size_before - db_size_after
+                logger.info(
+                    "Trace retention: VACUUM complete, reclaimed %s",
+                    _human_bytes(reclaimed) if reclaimed > 0 else "0 B",
+                )
+            except Exception:
+                logger.warning(
+                    "Trace retention: VACUUM failed (non-fatal)",
+                    exc_info=True,
                 )
 
         return total_deleted
