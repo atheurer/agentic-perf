@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import socket
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -4626,9 +4627,18 @@ async def execute_boot_time_test(
                     serial_log_fh = artifact_filesystem.open_stream(
                         "serial-capture.log", mode=artifact_file_mode
                     )
-                    exporter_log_fh = artifact_filesystem.open_stream(
-                        "exporter-logs.log", mode=artifact_file_mode
-                    )
+                    # Exporter logs are best-effort — failure to open
+                    # must not prevent serial capture from starting.
+                    try:
+                        exporter_log_fh = artifact_filesystem.open_stream(
+                            "exporter-logs.log", mode=artifact_file_mode
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[boot-time] Could not open exporter-logs.log, "
+                            "using DEVNULL for exporter stderr"
+                        )
+                        exporter_log_fh = subprocess.DEVNULL
                     serial_proc = await AuditedSubprocessRunner().start(
                         [
                             "jmp",
