@@ -127,7 +127,7 @@ class TestDeterministicKernelStep:
         ]
         for name, args in mcp.calls:
             assert args["hosts"] == HOSTS
-        assert mcp.calls[1][1]["kernel"] == {"release": KERNEL_B, "package": "kernel"}
+        assert mcp.calls[1][1]["kernel"] == KERNEL_B
         approval_id = "apr-" + "a" * 32
         for name, args in mcp.calls[2:]:
             assert args["approval_request_id"] == approval_id
@@ -143,6 +143,50 @@ class TestDeterministicKernelStep:
         assert submitted["hosts_provisioned"] == HOSTS
         assert submitted["configuration_applied"]["kernel_transition"]["intent_id"]
         agent._transition_ticket.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_arguments_match_the_real_tool_schemas(self):
+        """Lab regression (PERF-29157B06): prepare_kernel_change was called
+        with a dict for its string parameter and the MCP layer rejected it.
+        Validate every call against the registered tool's input schema."""
+        from agents.provisioning.server import get_registered_tools
+
+        schemas = {t.name: t.input_schema for t in await get_registered_tools()}
+        ticket = kernel_step_ticket()
+        agent = _agent(ticket)
+        mcp = ScriptedMCP(full_script())
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+        type_map = {"string": str, "array": list, "integer": int, "boolean": bool}
+        for name, args in mcp.calls:
+            props = schemas[name]["properties"]
+            for key, value in args.items():
+                assert key in props, f"{name}: unknown argument {key}"
+                expected = type_map.get(props[key].get("type"))
+                if expected is not None:
+                    assert isinstance(value, expected), (
+                        f"{name}.{key} should be {props[key].get('type')}, got "
+                        f"{type(value).__name__}"
+                    )
+            for required in schemas[name].get("required", []):
+                assert required in args, f"{name}: missing required {required}"
+
+    @pytest.mark.asyncio
+    async def test_tool_call_error_pauses_instead_of_crashing(self):
+        from agents.mcp_client import MCPToolCallError
+
+        ticket = kernel_step_ticket()
+        agent = _agent(ticket)
+
+        class ExplodingMCP(ScriptedMCP):
+            async def call_tool(self, name, arguments, **_kw):
+                self.calls.append((name, dict(arguments)))
+                raise MCPToolCallError("1 validation error for call[...]", "validation")
+
+        mcp = ExplodingMCP(full_script())
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+        agent._handle_completion.assert_not_called()
+        agent._transition_ticket.assert_awaited_once()
+        assert "validation error" in agent._add_comment.await_args.args[1]
 
     @pytest.mark.asyncio
     async def test_actions_follow_the_intent(self):

@@ -390,8 +390,18 @@ class ProvisioningAgent(AgentBase):
     async def _kernel_tool(
         self, mcp: Any, name: str, **arguments: Any
     ) -> dict[str, Any]:
-        """Call one kernel tool through the audited MCP client; always a dict."""
-        raw = await mcp.call_tool(name, arguments)
+        """Call one kernel tool through the audited MCP client; always a dict.
+
+        Tool arguments must match the tool's schema exactly (the MCP layer
+        validates them); a transport or validation error becomes an error
+        dict so the step pauses with the detail instead of crashing.
+        """
+        from agents.mcp_client import MCPToolCallError
+
+        try:
+            raw = await mcp.call_tool(name, arguments)
+        except MCPToolCallError as exc:
+            return {"status": "error", "error": f"{name}: {exc}"}
         try:
             decoded = json.loads(raw) if isinstance(raw, str) else raw
         except json.JSONDecodeError:
@@ -470,7 +480,7 @@ class ProvisioningAgent(AgentBase):
         inventory = await self._kernel_tool(
             mcp, "get_kernel_inventory", hosts=hosts, kernel=spec.release
         )
-        if inventory.get("status") == "rejected":
+        if inventory.get("status") in ("rejected", "error"):
             await self._kernel_step_stop(ticket_id, "inventory rejected", inventory)
             return
         not_ok = {
@@ -497,8 +507,10 @@ class ProvisioningAgent(AgentBase):
             )
             return
 
+        # The tools take the release string; the plan step supplies the
+        # package, and each tool re-derives the full spec from the step.
         prepared = await self._kernel_tool(
-            mcp, "prepare_kernel_change", hosts=hosts, kernel=spec.to_dict()
+            mcp, "prepare_kernel_change", hosts=hosts, kernel=spec.release
         )
         if prepared.get("status") != "ok":
             await self._kernel_step_stop(
