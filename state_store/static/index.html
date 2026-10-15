@@ -2126,7 +2126,11 @@ function renderRecordLink(recordUrl, recordId, style) {
 
 function renderMarkdown(s) {
   if (typeof marked !== 'undefined' && marked.parse) {
-    try { return marked.parse(s); } catch (e) { /* fall through */ }
+    try {
+      var html = marked.parse(s);
+      if (typeof DOMPurify !== 'undefined') { html = DOMPurify.sanitize(html); }
+      return html;
+    } catch (e) { /* fall through */ }
   }
   return '<pre>' + escHtml(s) + '</pre>';
 }
