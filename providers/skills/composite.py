@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
+from .gateway import OrganizationSkillResolver
 from .private import PrivateSkillProvider
 
 
@@ -22,6 +23,13 @@ class CompositeSkillProvider(SkillProvider):
     ) -> None:
         self._public = public
         self._private = private or PrivateSkillProvider()
+
+    def bind_attempt(self, ticket_id: str, attempt_id: str, phase: str) -> None:
+        self._private.bind_attempt(ticket_id, attempt_id, phase)
+
+    @property
+    def organization_resolver(self) -> OrganizationSkillResolver:
+        return self._private.organization_resolver
 
     async def list_benchmarks(self) -> list[BenchmarkSuite]:
         benchmarks = await self._public.list_benchmarks()

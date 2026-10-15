@@ -108,6 +108,82 @@ class TestResourceProviderRegistry:
         with pytest.raises(ValueError, match="not configured"):
             await reg.get_provider("aws")
 
+    @pytest.mark.asyncio
+    async def test_quads_provider_receives_organization_service_config(
+        self, quads_secrets, monkeypatch
+    ):
+        from providers.resource.quads import QuadsResourceProvider
+
+        organization_config = {
+            "connection": {
+                "api_host": "org-quads.example.test",
+                "api_scheme": "https",
+            }
+        }
+        resolver = MagicMock()
+        resolver.has_runtime_config.return_value = True
+        resolver.get_runtime_config.return_value = organization_config
+        resolver.bootstrap.return_value = {
+            "revision": "gateway-revision",
+            "runtime_config_sources": ["org-operations"],
+        }
+        resolver_factory = AsyncMock(return_value=resolver)
+        provider = MagicMock()
+        from_secrets = AsyncMock(return_value=provider)
+        monkeypatch.setattr(QuadsResourceProvider, "from_secrets", from_secrets)
+
+        registry = ResourceProviderRegistry(
+            quads_secrets,
+            organization_resolver_factory=resolver_factory,
+        )
+        result = await registry.get_provider("quads")
+
+        assert result is provider
+        resolver_factory.assert_awaited_once()
+        from_secrets.assert_awaited_once_with(
+            quads_secrets,
+            organization_config=organization_config,
+        )
+        resolver.get_runtime_config.assert_called_once_with("resource/quads")
+        resolver.bootstrap.assert_called_once_with("resource/quads")
+
+    @pytest.mark.asyncio
+    async def test_other_resource_providers_do_not_load_gateway_config(
+        self, aws_secrets, monkeypatch
+    ):
+        from providers.resource.aws import AWSResourceProvider
+
+        provider = MagicMock()
+        from_secrets = AsyncMock(return_value=provider)
+        monkeypatch.setattr(AWSResourceProvider, "from_secrets", from_secrets)
+        resolver_factory = AsyncMock()
+        registry = ResourceProviderRegistry(
+            aws_secrets,
+            organization_resolver_factory=resolver_factory,
+        )
+
+        result = await registry.get_provider("aws")
+
+        assert result is provider
+        resolver_factory.assert_not_awaited()
+
+    def test_resource_agent_uses_ticket_skill_resolver_for_teardown(
+        self, quads_secrets
+    ):
+        from agents.resource.agent import ResourceAgent
+
+        resolver = MagicMock()
+        skills = MagicMock()
+        skills.organization_resolver = resolver
+        agent = ResourceAgent(
+            llm_provider=MagicMock(),
+            state_store_url="http://state-store.invalid",
+            secrets_provider=quads_secrets,
+            skill_provider=skills,
+        )
+
+        assert agent._registry._organization_resolver is resolver
+
 
 # ---------------------------------------------------------------------------
 # QUADS adapter tests

@@ -126,8 +126,9 @@ class TestResourceAgentPromptFragments:
         assert "Cloud Provider" in prompt
         assert "GPU Cluster" not in prompt
 
-    def test_quads_fragment_loaded(self):
+    def test_quads_guidance_is_retrieved_from_gateway(self):
         from agents.resource.agent import ResourceAgent
+        from agents.resource.prompts import RESOURCE_BASE_PROMPT
 
         ticket = {
             "id": "PERF-TEST",
@@ -140,8 +141,10 @@ class TestResourceAgentPromptFragments:
         }
         agent = ResourceAgent.__new__(ResourceAgent)
         prompt = agent._system_prompt(ticket)
-        assert "QUADS" in prompt
-        assert "Cloud Provider" not in prompt
+        assert 'get_skill_context(subject="resource/<provider>"' in prompt
+        assert "five days" not in prompt
+        assert prompt.startswith(RESOURCE_BASE_PROMPT)
+        assert "Max 5-day lifetime" not in prompt
 
     def test_psap_fragment_loaded(self):
         from agents.resource.agent import ResourceAgent

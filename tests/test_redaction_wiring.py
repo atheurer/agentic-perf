@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from providers.events import EventBus
 from providers.redaction import Redactor
+from providers.secrets.git_reference import GitSecretReferenceProvider
 from providers.secrets.recording import RecordingSecretsProvider
 from state_store.audit import AuditLog
 
@@ -250,24 +251,27 @@ class TestDispatcherRedactorWiring:
 
         assert isinstance(result, RecordingSecretsProvider)
 
-    def test_no_redactor_returns_raw_provider(self) -> None:
+    def test_no_redactor_keeps_git_reference_resolver(self) -> None:
         secrets = StubSecretsProvider({"ssh/key": SECRET_VALUE})
         dispatcher = self._make_dispatcher(redactor=None, secrets=secrets)
 
         ticket_data = {"id": TICKET_ID}
         result = dispatcher._get_secrets_for_ticket(ticket_data)
 
-        assert result is secrets
+        assert isinstance(result, GitSecretReferenceProvider)
+        assert result._inner is secrets
         assert not isinstance(result, RecordingSecretsProvider)
 
-    def test_no_ticket_id_returns_raw_provider(self) -> None:
+    def test_no_ticket_id_keeps_git_reference_resolver(self) -> None:
         redactor = Redactor()
         secrets = StubSecretsProvider({"ssh/key": SECRET_VALUE})
         dispatcher = self._make_dispatcher(redactor=redactor, secrets=secrets)
 
         # ticket_data with no id field
         result = dispatcher._get_secrets_for_ticket({})
-        assert result is secrets
+        assert isinstance(result, GitSecretReferenceProvider)
+        assert result._inner is secrets
+        assert not isinstance(result, RecordingSecretsProvider)
 
     async def test_deregisters_on_mark_done(self) -> None:
         redactor = Redactor()

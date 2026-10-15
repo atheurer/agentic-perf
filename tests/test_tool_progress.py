@@ -346,3 +346,44 @@ class TestRunWithProgress:
             result = await ssh.run_with_progress("10.0.0.1", "cmd", poll_interval=1)
 
         assert result.exit_code == 0
+
+    async def test_real_executor_cleanup_receives_mutating_once(self, ssh):
+        """The production child executor accepts one audit mutation flag."""
+        from providers.ssh import SSHExecutor, SSHResult
+
+        cleanup_mutation_flags = []
+
+        async def mock_run(
+            _executor,
+            host,
+            command,
+            timeout=300,
+            key_path=None,
+            mutating=None,
+        ):
+            if "mktemp -d" in command:
+                return SSHResult(stdout="/tmp/run-abcd1234\n", stderr="", exit_code=0)
+            if "nohup" in command:
+                return SSHResult(stdout="__PID:42\n", stderr="", exit_code=0)
+            if "test -f" in command:
+                return SSHResult(stdout="", stderr="", exit_code=0)
+            if "cat" in command and "/out" in command:
+                return SSHResult(stdout="done\n", stderr="", exit_code=0)
+            if "cat" in command and "/rc" in command:
+                return SSHResult(stdout="0\n", stderr="", exit_code=0)
+            if "rm -rf" in command:
+                cleanup_mutation_flags.append(mutating)
+                return SSHResult(stdout="", stderr="", exit_code=0)
+            return SSHResult(stdout="", stderr="", exit_code=0)
+
+        async def noop_sleep(_):
+            pass
+
+        with (
+            patch.object(SSHExecutor, "run", mock_run),
+            patch("asyncio.sleep", noop_sleep),
+        ):
+            result = await ssh.run_with_progress("10.0.0.1", "cmd", poll_interval=1)
+
+        assert result.exit_code == 0
+        assert cleanup_mutation_flags == [True]

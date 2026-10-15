@@ -154,6 +154,12 @@ def test_only_matching_provider_selection_guidance_is_assembled(provider):
         "comments": [],
     }
     prompt = ResourceAgent.__new__(ResourceAgent)._system_prompt(ticket)
+    if provider == "quads":
+        assert 'get_skill_context(subject="resource/<provider>"' in prompt
+        assert "reservation_selection_schema" in prompt
+        assert "hostnames" not in prompt
+        return
+
     own_fields = RESERVATION_SELECTION_CONTRACTS[provider].prompt_fields
     for field in own_fields:
         assert field in prompt
@@ -185,6 +191,9 @@ def test_shared_prompt_and_tool_description_have_no_provider_selection_shape():
     )
     for provider in PROVIDER_REGISTRY:
         fragment = AgentBase._load_prompt_fragment(prompts_dir, provider)
+        if provider == "quads":
+            assert not fragment
+            continue
         assert fragment
         assert fragment not in shared_text
 
@@ -626,6 +635,9 @@ def test_contract_metadata_covers_all_provider_prompt_fragments():
         fragments = AgentBase._load_prompt_fragments(
             prompts_dir.parent, resource_provider=provider
         )
+        if provider == "quads":
+            assert not fragments
+            continue
         assert fragments
         for field in contract.prompt_fields:
             assert field in fragments

@@ -27,7 +27,7 @@
         "git_url": "https://github.com/redhat-performance/zathras.git",
         "install_script": "bin/install.sh",
         "install_target_path": "/opt/zathras",
-        "verify_command": "/opt/zathras/bin/burden --usage",
+        "verify_command": "/opt/zathras/bin/burden -h",
         "update_command": "cd /opt/zathras && git pull && bin/install.sh",
         "on_existing_install": "skip",
         "run_install_as_root": "yes | bin/install.sh",

@@ -9,6 +9,7 @@ from typing import Any
 
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
+from agents.skill_context import skill_context_prompt
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 
@@ -69,6 +70,32 @@ def _description_harness_intent(
                     "end": match.end(),
                     "clause_start": clause_start,
                     "canonical": canonical,
+                }
+            )
+
+    # In ordinary prose, "Arcaflow workflow" names the workflow harness;
+    # the bare alias "arcaflow" names the direct plugin harness. Treat the
+    # two-word form as the longer, canonical workflow name so a negation of
+    # workflows does not accidentally exclude arcaflow-plugins as well.
+    if "arcaflow-workflows" in harness_names:
+        for match in re.finditer(
+            r"(?<![\w-])arcaflow\s+workflows?(?![\w-])",
+            description,
+            re.IGNORECASE,
+        ):
+            clause_start = (
+                max(
+                    description.rfind(separator, 0, match.start())
+                    for separator in ".!?;\n"
+                )
+                + 1
+            )
+            occurrences.append(
+                {
+                    "start": match.start(),
+                    "end": match.end(),
+                    "clause_start": clause_start,
+                    "canonical": "arcaflow-workflows",
                 }
             )
 
@@ -938,7 +965,7 @@ class TriageAgent(AgentBase):
             self._mcp = None
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
-        return TRIAGE_SYSTEM_PROMPT
+        return TRIAGE_SYSTEM_PROMPT + "\n\n" + skill_context_prompt()
 
     def _has_external_data_tools(self) -> bool:
         """Check if external MCP data tools are configured."""

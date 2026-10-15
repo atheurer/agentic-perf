@@ -1,140 +1,77 @@
-## Crucible Benchmark Execution
+## Benchmark Tool Contracts
 
-This benchmark uses the Crucible harness with a **dedicated controller
-host** that runs the Crucible framework. The orchestrator relays
-commands to the controller, which SSHes to target hosts to execute
-workloads.
+Retrieve the subject's phase guidance and software documentation through the
+skill gateway before constructing the run-file. Follow the returned pointers
+for the selected benchmark, endpoint, tools, and execution environment. Use
+`get_execution_config` for the approved execution settings view; verify runtime
+capabilities with the available controller discovery tools. Crucible gateway
+responses also include the provider-owned `runfile_contract`; satisfy its
+required top-level fields, including `tags` as `{}` when no tags apply.
 
-### Controller Context
+### Benchmark-specific parameter guidance
 
-First call the benchmark-independent bootstrap operation
-`get_crucible_benchmark_context(operation="bootstrap")`. Read the
-returned `AGENTS.md` document, then follow its documentation pointers
-iteratively. Pass controller-relative paths exactly as documented to
-`get_crucible_benchmark_context(operation="read", path=<path>)`. Do
-not ask the gateway to interpret Crucible repository metadata or
-invent a namespace. Use `operation="search"` with a literal or regex
-`query` to discover candidate controller-relative paths when AGENTS.md
-does not identify the needed file; search returns paths, snippets, and
-`size_bytes`, so read selected files separately. Search queries are
-interpreted as regular expressions; whitespace is literal, not an
-AND/OR separator. For independent alternatives, use `|`, such as
-`ethtool|multiplex\\.json|flow steering`.
+Before selecting benchmark arguments, follow the controller `AGENTS.md`
+documentation pointers to that benchmark's installed subproject. Read its
+`AGENTS.md`, `README.md`, `multiplex.json`, and `rickshaw.json` when present,
+using `get_skill_context` with subject `harness/crucible` and the returned
+software-document ref as `from_ref`. For example, the uperf documents are under
+`subprojects/benchmarks/uperf/`.
 
-Reads return `document.content` with at most 16384 bytes by default;
-use `max_bytes` to choose a smaller page, then repeat the same read
-with `offset_bytes` set to `next_offset_bytes` until it is null.
+Keep the software sources distinct. The Crucible benchmark subproject (for
+uperf, `bench-uperf`) defines how that benchmark is integrated with Crucible,
+including Crucible `mv-params`, engine roles, and run-file behavior. The native
+benchmark's own documentation (for uperf, upstream uperf) explains the native
+program and its concepts. Consult native documentation when that behavior needs
+explanation, but never derive Crucible run-file arguments from native command
+line options or workload syntax.
 
-Never construct or pass a `workspace://` path and never select a
-source explicitly. The context gateway applies the phase-appropriate
-authority dynamically. The controller remains authoritative for
-installed-runtime facts such as userenv availability and actual
-installed behavior.
+`get_skill_context` subjects identify applicable organization or user guidance;
+they are not software repository names. A bootstrap such as
+`subject="benchmark/uperf"` reporting no configured guidance does not mean the
+Crucible uperf integration documentation is absent. When using Crucible, always
+retrieve the Crucible-side benchmark subproject documentation above. If native
+benchmark documentation is needed but no software source for it is available,
+report that gap rather than treating the missing guidance package as a software
+source lookup.
 
-### SSH and Network Model
+The benchmark's own documentation and metadata define argument meaning and
+requirements. Crucible's general run-file guide explains structure and may use
+one benchmark's argument in an example; that does not make the argument
+necessary or applicable to every benchmark. A successful generic run-file
+validation confirms schema and parameter validation, not that every supplied
+argument is semantically needed. If the benchmark-specific documentation is
+unavailable or unclear, request clarification rather than infer arguments from
+a generic example.
 
-For Crucible `remotehosts`, `remotes[].config.host` is the
-controller-to-remote control-plane SSH address. It is independent from
-benchmark data-plane addressing: select the benchmark interface with
-`ifname` and its discovered test address according to benchmark
-guidance; never infer one address from the other.
+### Verified SSH Access
 
-**SSH Key Setup** — Call `setup_passwordless_ssh` with:
-- source: the controller's SSH-reachable IP (`ssh_hardware_ips.controller`)
-- targets: the endpoint identities from the resource assignment
-- target_ssh_hosts: the endpoint addresses verified for
-  controller-to-host SSH
-
-This generates a key on the controller and injects it through the
-verified access path. Do not substitute benchmark dataplane addresses
-for the SSH addresses.
-
-### Run-File Construction
-
-a. **MANDATORY — Bootstrap and discover context FIRST.** Call
-   `get_crucible_benchmark_context(operation="bootstrap")`. Read the
-   returned `AGENTS.md`, then follow its documentation pointers
-   iteratively with `operation="read"`. When it identifies the
-   `subprojects/benchmarks/` layout, use the known benchmark name
-   to request `subprojects/benchmarks/<benchmark>/AGENTS.md`, then
-   metadata files — including `multiplex.json` and `rickshaw.json`
-   when present — through the context gateway. Use
-   `operation="search"` to discover candidate paths.
-
-b. Read the controller-sourced run-file schema and relevant tool
-   metadata through `get_crucible_benchmark_context`. This includes
-   the schema itself, tool definitions, and benchmark metadata. Do
-   not use legacy schema, parameter, or example-runfile lookup tools.
-
-c. Read the harness's run-file documentation for format details.
-
-f. **Choose remote hosts from verified SSH reachability.** For
-   `remotehosts`, each `remotes[].config.host` is the address the
-   Crucible controller uses for SSH, file transfer, and container
-   orchestration. Use the hostname or IP address that
-   `verify_ssh_path` confirms from the controller. Do not infer
-   this address from the benchmark interface or dataplane IP.
+For `setup_passwordless_ssh`, use the controller's verified SSH address from
+`ssh_hardware_ips.controller` as `source`, the assigned endpoint identities as
+`targets`, and their verified controller-to-host SSH addresses as
+`target_ssh_hosts`. Benchmark traffic addresses are separate observations;
+do not substitute them for a verified SSH access path.
 
 ### Validation and Execution
 
 - **Validate:** `validate_benchmark(controller, run_file, harness)`.
-  This performs the controller-side `crucible validate` checks
-  without deploying or running anything. Save `validation_id`.
+  Save the returned `validation_id`.
 
 - **Execute:** `execute_benchmark(controller, validation_id, harness,
-  run_command)`. Do not pass the run-file: Crucible execution accepts
-  only the exact run-file saved by the successful validation.
+  run_command)`. Do not pass a run-file: this tool accepts only the exact
+  run-file saved by successful validation.
 
-- **Verify results:** If status is "completed" AND `result_summary`
-  is present, submit with status "completed". Include the
-  `validation_id` returned by `execute_benchmark` when submitting.
+- **Verify results:** If status is "completed" and `result_summary` is
+  present, submit with status "completed". Include the `validation_id`
+  returned by `execute_benchmark` when submitting.
 
-  If `result-summary.json` is missing, the run did not produce
-  usable results even though crucible exited cleanly. Read the
-  `run_log` to understand why. Based on the log:
-  - If the failure is transient (network timeout, container pull
-    error), retry once.
-  - If the failure indicates a configuration problem (bad
-    parameters, missing endpoints, schema errors), call
-    `request_clarification` to escalate.
-  - If you cannot determine the cause, call
-    `request_clarification` with the relevant log excerpt.
+  If the tool reports missing results despite a clean exit, read the `run_log`
+  to determine why. If the failure is transient (network timeout or container
+  pull error), retry once. If it indicates a configuration problem, call
+  `request_clarification`. If the cause is unknown, request clarification with
+  the relevant log excerpt.
 
-  If exit_code is non-zero, submit as "failed" immediately. Do
-  NOT call `get_run_logs`, do NOT attempt to read files from the
-  run directory, do NOT query OpenSearch. There are no results to
-  extract from a failed run.
-  Exception: if exit_code is non-zero but `run_id` is present and
-  the message indicates only the indexing step failed (not the
-  benchmark itself), call `request_clarification` to let the user
-  decide.
-
-### Common Pitfalls
-
-- For `remotehosts`, use the controller-verified SSH address in each
-  remote's `config.host`; do not use a dataplane address unless it
-  has independently been verified as the controller's SSH access path.
-- `tags` must be an object `{"key": "val"}`, NOT an array
-- `ids` values must be strings: `"1"` not `1`
-- Do NOT set `controller-ip-address` unless crucible cannot resolve
-  it itself. Setting the wrong IP breaks the run.
-- `userenv` must be a real userenv name — `"default"` is NOT valid.
-  Call `list_controller_userenvs(controller)` and use the controller's
-  installed benchmark metadata discovery to determine which userenv.
-- `osruntime: podman` needs `host-mounts` for DPDK workloads
-- Every benchmark object MUST include `mv-params`
-- Tools in `tool-params` use `tool` plus optional
-  `params: [{"arg": ..., "val": ...}]`
-- `num-samples` belongs in `run-params` (top level), NOT inside a
-  benchmark object
-
-### Important Notes
-
-- The controller host runs the benchmark framework. For remotehosts,
-  it is NOT an endpoint unless the benchmark has only a "client" role.
-  For kube endpoints, workloads run as pods on the controller's K8s
-  cluster.
-- Endpoints are the target hosts where the actual workload runs.
-- If the benchmark needs only 1 host (client role only), use the
-  first target host as the endpoint. If no targets exist, the
-  controller itself can be the endpoint.
+  If `exit_code` is non-zero, submit as "failed" immediately. Do not call
+  `get_run_logs`, read the run directory, or query indexing services to extract
+  results from a failed run. Exception: if `run_id` is present and the tool
+  reports only an indexing failure after benchmark completion, call
+  `request_clarification` to let the user decide.

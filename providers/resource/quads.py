@@ -133,10 +133,18 @@ class QuadsResourceProvider(ResourceProvider):
         )
 
     @classmethod
-    async def from_secrets(cls, secrets_provider) -> QuadsResourceProvider:
+    async def from_secrets(
+        cls,
+        secrets_provider,
+        *,
+        organization_config: dict[str, Any] | None = None,
+    ) -> QuadsResourceProvider:
         from providers.quads import QuadsClient
 
-        client = await QuadsClient.from_secrets(secrets_provider)
+        client = await QuadsClient.from_secrets(
+            secrets_provider,
+            organization_config=organization_config,
+        )
         return cls(client)
 
     async def check_available(self, requirements: dict[str, Any]) -> dict[str, Any]:
