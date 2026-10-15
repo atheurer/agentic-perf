@@ -146,10 +146,21 @@ class TraceStore:
             else self.DEFAULT_RETENTION_DAYS
         )
         if self._retention_days > 0:
-            try:
-                self.prune_old_traces(self._retention_days)
-            except Exception:
-                logger.warning("startup trace retention pruning failed", exc_info=True)
+            # Run retention in a background thread to avoid blocking
+            # startup.  VACUUM on a multi-GB database can take minutes.
+
+            def _deferred_prune() -> None:
+                try:
+                    self.prune_old_traces(self._retention_days)
+                except Exception:
+                    logger.warning(
+                        "deferred trace retention pruning failed",
+                        exc_info=True,
+                    )
+
+            threading.Thread(
+                target=_deferred_prune, daemon=True, name="trace-retention"
+            ).start()
 
     def _init_db_connection(
         self, db_path: Path, busy_timeout_ms: int
@@ -280,6 +291,12 @@ class TraceStore:
                 raise
 
             # --- prune terminal operations with no recent history ---
+            # Ensure occurred_at is indexed for the retention query.
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "operation_history_occurred_at_idx "
+                "ON operation_history(occurred_at)"
+            )
             connection.execute("BEGIN IMMEDIATE")
             try:
                 cursor = connection.execute(
