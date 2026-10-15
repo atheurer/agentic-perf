@@ -183,47 +183,61 @@ class UserStore:
     def disable_user(self, username: str) -> User:
         normalized = username.lower()
         with self._lock:
-            self._reload_if_stale()
-            user = self._users.get(normalized)
-            if user is None:
-                raise UserNotFound(f"User '{username}' not found")
-            user.disabled = True
-            self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                user = self._users.get(normalized)
+                if user is None:
+                    raise UserNotFound(f"User '{username}' not found")
+                user.disabled = True
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
             return user.model_copy()
 
     def enable_user(self, username: str) -> User:
         normalized = username.lower()
         with self._lock:
-            self._reload_if_stale()
-            user = self._users.get(normalized)
-            if user is None:
-                raise UserNotFound(f"User '{username}' not found")
-            user.disabled = False
-            self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                user = self._users.get(normalized)
+                if user is None:
+                    raise UserNotFound(f"User '{username}' not found")
+                user.disabled = False
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
             return user.model_copy()
 
     def set_admin(self, username: str) -> User:
         normalized = username.lower()
         with self._lock:
-            self._reload_if_stale()
-            user = self._users.get(normalized)
-            if user is None:
-                raise UserNotFound(f"User '{username}' not found")
-            if user.service_account:
-                raise ValueError("Service accounts cannot be granted admin privileges")
-            user.is_admin = True
-            self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                user = self._users.get(normalized)
+                if user is None:
+                    raise UserNotFound(f"User '{username}' not found")
+                if user.service_account:
+                    raise ValueError(
+                        "Service accounts cannot be granted admin privileges"
+                    )
+                user.is_admin = True
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
             return user.model_copy()
 
     def remove_admin(self, username: str) -> User:
         normalized = username.lower()
         with self._lock:
-            self._reload_if_stale()
-            user = self._users.get(normalized)
-            if user is None:
-                raise UserNotFound(f"User '{username}' not found")
-            user.is_admin = False
-            self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                user = self._users.get(normalized)
+                if user is None:
+                    raise UserNotFound(f"User '{username}' not found")
+                user.is_admin = False
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
             return user.model_copy()
 
     def rotate_token(self, username: str) -> str:
@@ -232,13 +246,16 @@ class UserStore:
         raw_token = secrets.token_hex(32)
         token_h = hash_token(raw_token)
         with self._lock:
-            self._reload_if_stale()
-            user = self._users.get(normalized)
-            if user is None:
-                raise UserNotFound(f"User '{username}' not found")
-            user.token_hash = token_h
-            user.token_issued_at = datetime.now(timezone.utc)
-            self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                user = self._users.get(normalized)
+                if user is None:
+                    raise UserNotFound(f"User '{username}' not found")
+                user.token_hash = token_h
+                user.token_issued_at = datetime.now(timezone.utc)
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
         return raw_token
 
     def lookup_by_token_hash(self, token_h: str) -> User | None:
@@ -257,22 +274,25 @@ class UserStore:
         """Update last_used_at in-memory; persist at most once per debounce interval."""
         now = datetime.now(timezone.utc)
         with self._lock:
-            self._reload_if_stale()
-            user = self._users.get(username)
-            if user is None:
-                return
-            user.last_used_at = now
-            last = self._last_persisted.get(username)
-            if last is None or (time.monotonic() - last) >= self._DEBOUNCE_SECONDS:
-                try:
-                    self._save()
-                    self._last_persisted[username] = time.monotonic()
-                except Exception:
-                    logger.warning(
-                        "Failed to persist last_used_at for %s",
-                        username,
-                        exc_info=True,
-                    )
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                user = self._users.get(username)
+                if user is None:
+                    return
+                user.last_used_at = now
+                last = self._last_persisted.get(username)
+                if last is None or (time.monotonic() - last) >= self._DEBOUNCE_SECONDS:
+                    try:
+                        self._write_locked(filesystem)
+                        self._last_persisted[username] = time.monotonic()
+                    except Exception:
+                        logger.warning(
+                            "Failed to persist last_used_at for %s",
+                            username,
+                            exc_info=True,
+                        )
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
 
     def set_user_quota(
         self,
@@ -282,12 +302,15 @@ class UserStore:
         """Set or clear a user's LLM quota."""
         normalized = username.lower()
         with self._lock:
-            self._reload_if_stale()
-            user = self._users.get(normalized)
-            if user is None:
-                raise UserNotFound(f"User '{username}' not found")
-            user.llm_quota = quota
-            self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                user = self._users.get(normalized)
+                if user is None:
+                    raise UserNotFound(f"User '{username}' not found")
+                user.llm_quota = quota
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
             return user.model_copy()
 
     # ------------------------------------------------------------------
@@ -302,12 +325,15 @@ class UserStore:
         """Set or clear a group's LLM quota."""
         normalized = group_name.lower()
         with self._lock:
-            self._reload_if_stale()
-            group = self._groups.get(normalized)
-            if group is None:
-                raise GroupNotFound(f"Group '{group_name}' not found")
-            group.llm_quota = quota
-            self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                group = self._groups.get(normalized)
+                if group is None:
+                    raise GroupNotFound(f"Group '{group_name}' not found")
+                group.llm_quota = quota
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
             return group.model_copy()
 
     def create_group(self, name: str, description: str = "") -> Group:
@@ -317,25 +343,31 @@ class UserStore:
                 f"Invalid group name '{name}': must match [a-z0-9_-]{{1,32}}"
             )
         with self._lock:
-            self._reload_if_stale()
-            if normalized in self._groups:
-                raise DuplicateGroup(f"Group '{normalized}' already exists")
-            group = Group(name=normalized, description=description)
-            self._groups[normalized] = group
-            self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                if normalized in self._groups:
+                    raise DuplicateGroup(f"Group '{normalized}' already exists")
+                group = Group(name=normalized, description=description)
+                self._groups[normalized] = group
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
         return group
 
     def delete_group(self, name: str) -> None:
         normalized = name.lower()
         with self._lock:
-            self._reload_if_stale()
-            if normalized not in self._groups:
-                raise GroupNotFound(f"Group '{name}' not found")
-            del self._groups[normalized]
-            for user in self._users.values():
-                if normalized in user.groups:
-                    user.groups.remove(normalized)
-            self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                if normalized not in self._groups:
+                    raise GroupNotFound(f"Group '{name}' not found")
+                del self._groups[normalized]
+                for user in self._users.values():
+                    if normalized in user.groups:
+                        user.groups.remove(normalized)
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
 
     def get_group(self, name: str) -> Group:
         normalized = name.lower()
@@ -355,29 +387,35 @@ class UserStore:
         g_norm = group_name.lower()
         u_norm = username.lower()
         with self._lock:
-            self._reload_if_stale()
-            if g_norm not in self._groups:
-                raise GroupNotFound(f"Group '{group_name}' not found")
-            user = self._users.get(u_norm)
-            if user is None:
-                raise UserNotFound(f"User '{username}' not found")
-            if g_norm not in user.groups:
-                user.groups.append(g_norm)
-                self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                if g_norm not in self._groups:
+                    raise GroupNotFound(f"Group '{group_name}' not found")
+                user = self._users.get(u_norm)
+                if user is None:
+                    raise UserNotFound(f"User '{username}' not found")
+                if g_norm not in user.groups:
+                    user.groups.append(g_norm)
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
 
     def remove_member(self, group_name: str, username: str) -> None:
         g_norm = group_name.lower()
         u_norm = username.lower()
         with self._lock:
-            self._reload_if_stale()
-            if g_norm not in self._groups:
-                raise GroupNotFound(f"Group '{group_name}' not found")
-            user = self._users.get(u_norm)
-            if user is None:
-                raise UserNotFound(f"User '{username}' not found")
-            if g_norm in user.groups:
-                user.groups.remove(g_norm)
-                self._save()
+            filesystem, lock_fd = self._acquire_file_lock()
+            try:
+                if g_norm not in self._groups:
+                    raise GroupNotFound(f"Group '{group_name}' not found")
+                user = self._users.get(u_norm)
+                if user is None:
+                    raise UserNotFound(f"User '{username}' not found")
+                if g_norm in user.groups:
+                    user.groups.remove(g_norm)
+                self._write_locked(filesystem)
+            finally:
+                self._release_file_lock(filesystem, lock_fd)
 
     def get_group_members(self, group_name: str) -> list[str]:
         g_norm = group_name.lower()
@@ -444,18 +482,6 @@ class UserStore:
             },
         }
         filesystem.write(self._path.name, json.dumps(data, indent=2), mode=0o600)
-        try:
-            self._file_mtime = self._path.stat().st_mtime
-        except OSError:
-            pass
-
-    def _save(self) -> None:
-        """Acquire lock, reload, and write.  For simple mutations."""
-        filesystem, lock_fd = self._acquire_file_lock()
-        try:
-            self._write_locked(filesystem)
-        finally:
-            self._release_file_lock(filesystem, lock_fd)
         try:
             self._file_mtime = self._path.stat().st_mtime
         except OSError:
