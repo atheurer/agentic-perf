@@ -512,10 +512,8 @@ class EventBus:
                 trace_to_legacy(event)
                 for event in self._trace_store.list_events(ticket_id)
             ]
-        # Cursor values follow each source's immutable sequence: JSONL line
-        # order first, then the trace store's per-ticket insertion order. New
-        # backdated traces therefore cannot renumber events already delivered.
-        traces.sort(key=lambda item: item["seq"])
+        # TraceStore preserves insertion order across active and history rows.
+        # Cursor assignment below keeps that order stable when late events arrive.
         merged = legacy + traces
         for cursor, item in enumerate(merged, start=1):
             item["seq"] = cursor
