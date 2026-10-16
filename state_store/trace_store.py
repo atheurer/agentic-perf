@@ -369,25 +369,45 @@ class TraceStore:
         """
         with self._lock:
             try:
-                row = (
-                    self._open_connection()
-                    .execute(
-                        "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                active_conn = self._open_connection()
+                active_count = active_conn.execute(
+                    "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                    (ticket_id,),
+                ).fetchone()[0]
+
+                history_conn = self._open_history_connection()
+                if history_conn is None:
+                    return active_count
+
+                history_count = history_conn.execute(
+                    "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                    (ticket_id,),
+                ).fetchone()[0]
+                if not active_count:
+                    return history_count
+                if not history_count:
+                    return active_count
+
+                smaller_conn, larger_conn = (
+                    (active_conn, history_conn)
+                    if active_count <= history_count
+                    else (history_conn, active_conn)
+                )
+                smaller_event_ids = {
+                    row[0]
+                    for row in smaller_conn.execute(
+                        "SELECT event_id FROM trace_events WHERE ticket_id = ?",
                         (ticket_id,),
                     )
-                    .fetchone()
-                )
-                active_count = row[0] if row else 0
-                if active_count > 0:
-                    return active_count
-                history_conn = self._open_history_connection()
-                if history_conn is not None:
-                    hist_row = history_conn.execute(
-                        "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                }
+                duplicate_count = sum(
+                    row[0] in smaller_event_ids
+                    for row in larger_conn.execute(
+                        "SELECT event_id FROM trace_events WHERE ticket_id = ?",
                         (ticket_id,),
-                    ).fetchone()
-                    return hist_row[0] if hist_row else 0
-                return 0
+                    )
+                )
+                return active_count + history_count - duplicate_count
             except (sqlite3.Error, OSError):
                 return 0
 
@@ -426,62 +446,33 @@ class TraceStore:
                 if predicates:
                     where_clause = " WHERE " + " AND ".join(predicates)
 
-                query = f"SELECT global_seq, event_json FROM trace_events{where_clause} ORDER BY global_seq"
-                raw_rows: list[tuple[int, str]] = [
-                    (row["global_seq"], row["event_json"])
-                    for row in self._open_connection().execute(query, tuple(values))
-                ]
+                query = f"SELECT event_json FROM trace_events{where_clause}"
+                events_by_id: dict[str, TraceEventV1] = {}
+                for connection in (
+                    self._open_connection(),
+                    self._open_history_connection(),
+                ):
+                    if connection is None:
+                        continue
+                    for row in connection.execute(query, tuple(values)):
+                        event = TraceEventV1.model_validate_json(row["event_json"])
+                        events_by_id.setdefault(str(event.event_id), event)
 
-                # Check history connection if configured
-                history_conn = self._open_history_connection()
-                if history_conn is not None:
-                    hist_rows: list[tuple[int, str]] = []
-                    if ticket_id is not None:
-                        # For a single ticket, if not in active, query history
-                        if not raw_rows:
-                            hist_rows = [
-                                (row["global_seq"], row["event_json"])
-                                for row in history_conn.execute(query, tuple(values))
-                            ]
-                    elif ticket_ids is not None:
-                        # Find which tickets had rows in active DB
-                        found_tickets = {
-                            json.loads(r[1]).get("ticket_id") for r in raw_rows
-                        }
-                        missing_ticket_ids = [
-                            tid for tid in ticket_ids if tid not in found_tickets
-                        ]
-                        if missing_ticket_ids:
-                            placeholders = ", ".join("?" for _ in missing_ticket_ids)
-                            # Reconstruct predicates for missing tickets
-                            h_preds: list[str] = []
-                            h_vals: list[str] = []
-                            h_preds.append(f"ticket_id IN ({placeholders})")
-                            h_vals.extend(missing_ticket_ids)
-                            if action_type is not None:
-                                h_preds.append("action_type = ?")
-                                h_vals.append(action_type)
-                            if legacy_event_type is not None:
-                                h_preds.append(
-                                    "json_extract(event_json, "
-                                    "'$.attributes.legacy_event.event_type') = ?"
-                                )
-                                h_vals.append(legacy_event_type)
-                            h_query = f"SELECT global_seq, event_json FROM trace_events WHERE {' AND '.join(h_preds)} ORDER BY global_seq"
-                            hist_rows = [
-                                (row["global_seq"], row["event_json"])
-                                for row in history_conn.execute(h_query, tuple(h_vals))
-                            ]
-                    if hist_rows:
-                        raw_rows.extend(hist_rows)
-                        raw_rows.sort(key=lambda item: item[0])
-
-                return [
-                    TraceEventV1.model_validate_json(event_json)
-                    for _, event_json in raw_rows
-                ]
+                return sorted(
+                    events_by_id.values(),
+                    key=self._insertion_order,
+                )
             except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
                 raise TraceStoreWriteError("could not read trace events") from exc
+
+    @staticmethod
+    def _insertion_order(event: TraceEventV1) -> tuple[datetime, int, str]:
+        """Order events consistently when active and history rows overlap."""
+        return (
+            event.recorded_at or event.occurred_at,
+            event.global_seq or 0,
+            str(event.event_id),
+        )
 
     def migrate_ticket_traces(self, ticket_id: str) -> int:
         """Migrate all trace events for ticket_id from active store to history store.
@@ -495,20 +486,21 @@ class TraceStore:
         with self._lock:
             with self._write_lock:
                 active_conn = self._open_connection()
-                cursor = active_conn.execute(
-                    "SELECT event_id, content_hash, global_seq, ticket_id, ticket_seq, "
-                    "trace_id, invocation_id, action_id, parent_action_id, action_type, "
-                    "lifecycle_state, outcome, producer_component, occurred_at, event_json "
-                    "FROM trace_events WHERE ticket_id = ?",
-                    (ticket_id,),
-                )
-                rows = cursor.fetchall()
-                if not rows:
-                    return 0
-
-                history_conn.execute("BEGIN IMMEDIATE")
                 active_conn.execute("BEGIN IMMEDIATE")
                 try:
+                    rows = active_conn.execute(
+                        "SELECT event_id, content_hash, global_seq, ticket_id, "
+                        "ticket_seq, trace_id, invocation_id, action_id, "
+                        "parent_action_id, action_type, lifecycle_state, outcome, "
+                        "producer_component, occurred_at, event_json "
+                        "FROM trace_events WHERE ticket_id = ?",
+                        (ticket_id,),
+                    ).fetchall()
+                    if not rows:
+                        active_conn.rollback()
+                        return 0
+
+                    history_conn.execute("BEGIN IMMEDIATE")
                     history_conn.executemany(
                         "INSERT OR IGNORE INTO trace_events ("
                         "event_id, content_hash, global_seq, ticket_id, ticket_seq, "
@@ -524,8 +516,10 @@ class TraceStore:
                     history_conn.commit()
                     active_conn.commit()
                 except Exception:
-                    history_conn.rollback()
-                    active_conn.rollback()
+                    if history_conn.in_transaction:
+                        history_conn.rollback()
+                    if active_conn.in_transaction:
+                        active_conn.rollback()
                     raise
                 return len(rows)
 

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from providers.events import EventBus
 from providers.tracing import (
@@ -13,6 +16,7 @@ from providers.tracing import (
     LifecycleState,
     TraceEventV1,
 )
+from state_store.api.events import get_usage
 from state_store.audit import AuditLog
 from state_store.models import CreateTicketRequest, TicketStatus, TransitionRequest
 from state_store.store import TicketStore
@@ -92,6 +96,97 @@ def test_migrate_ticket_traces_moves_events(tmp_path: Path) -> None:
             e2.global_seq,
             e3.global_seq,
         ]
+
+
+def test_history_readers_deduplicate_interrupted_migration(tmp_path: Path) -> None:
+    db_path = tmp_path / "trace.db"
+    history_db_path = tmp_path / "trace-history.db"
+
+    with TraceStore(db_path, history_db_path=history_db_path) as store:
+        event = store.insert_event(make_event("PERF-3"))
+        assert store.migrate_ticket_traces("PERF-3") == 1
+
+        history_row = (
+            store._open_history_connection()
+            .execute(
+                "SELECT * FROM trace_events WHERE event_id = ?",
+                (str(event.event_id),),
+            )
+            .fetchone()
+        )
+        store._open_connection().execute(
+            "INSERT INTO trace_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            tuple(history_row),
+        )
+
+        assert store.count_events("PERF-3") == 1
+        assert [item.event_id for item in store.list_events("PERF-3")] == [
+            event.event_id
+        ]
+
+
+def test_migration_snapshot_does_not_drop_concurrent_insert(tmp_path: Path) -> None:
+    db_path = tmp_path / "trace.db"
+    history_db_path = tmp_path / "trace-history.db"
+    store = TraceStore(db_path, history_db_path=history_db_path)
+    writer = TraceStore(db_path, history_db_path=history_db_path)
+    ticket_id = "PERF-4"
+    initial_event = store.insert_event(make_event(ticket_id))
+    concurrent_event = make_event(ticket_id)
+
+    snapshot_started = threading.Event()
+    continue_migration = threading.Event()
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+    active_connection = store._open_connection()
+
+    class PausingConnection:
+        def execute(self, sql: str, parameters: tuple[str, ...] = ()):
+            cursor = active_connection.execute(sql, parameters)
+            if sql.startswith("SELECT event_id, content_hash"):
+                snapshot_started.set()
+                if not continue_migration.wait(timeout=5):
+                    raise TimeoutError("migration snapshot was not released")
+            return cursor
+
+        def __getattr__(self, name: str):
+            return getattr(active_connection, name)
+
+    def insert_concurrent_event() -> None:
+        writer_started.set()
+        try:
+            writer.insert_event(concurrent_event)
+        finally:
+            writer_finished.set()
+
+    try:
+        with patch.object(
+            store,
+            "_open_connection",
+            return_value=PausingConnection(),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                migration = executor.submit(store.migrate_ticket_traces, ticket_id)
+                assert snapshot_started.wait(timeout=5)
+                insert = executor.submit(insert_concurrent_event)
+                assert writer_started.wait(timeout=5)
+                try:
+                    assert not writer_finished.wait(timeout=1)
+                finally:
+                    continue_migration.set()
+
+                assert migration.result(timeout=5) == 1
+                insert.result(timeout=5)
+
+        assert store.count_events(ticket_id) == 2
+        assert {event.event_id for event in store.list_events(ticket_id)} == {
+            initial_event.event_id,
+            concurrent_event.event_id,
+        }
+    finally:
+        continue_migration.set()
+        writer.close()
+        store.close()
 
 
 def test_transition_ticket_to_closed_triggers_migration(tmp_path: Path) -> None:
@@ -243,6 +338,59 @@ def test_force_close_triggers_migration(tmp_path: Path) -> None:
         assert len(trace_store.list_events(tid)) == history_count
 
     finally:
+        trace_store.close()
+
+
+def test_ticket_usage_includes_late_events_after_trace_migration(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "trace.db"
+    history_db_path = tmp_path / "trace-history.db"
+    trace_store = TraceStore(db_path, history_db_path=history_db_path)
+    event_bus = EventBus(log_dir=tmp_path / "logs", trace_store=trace_store)
+    store = TicketStore(
+        persist_dir=tmp_path / "tickets",
+        event_bus=event_bus,
+        trace_store=trace_store,
+    )
+
+    try:
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="pipeline usage", description="d")
+        )
+        event_bus.emit(
+            ticket.id,
+            "triage-agent",
+            "llm_usage",
+            {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "model": "claude-sonnet-4-6",
+            },
+        )
+        store.force_close(ticket.id)
+
+        event_bus.emit(
+            ticket.id,
+            "introspection-agent",
+            "llm_usage",
+            {
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "model": "claude-haiku-4-5",
+            },
+        )
+
+        request = MagicMock()
+        request.app.state.event_bus = event_bus
+        result = get_usage(ticket.id, request)
+
+        assert result["usage"]["total_tokens"] == 165
+        assert set(result["by_agent"]) == {"triage-agent", "introspection-agent"}
+        assert result["by_agent"]["triage-agent"]["total_tokens"] == 150
+        assert result["by_agent"]["introspection-agent"]["total_tokens"] == 15
+    finally:
+        event_bus.close()
         trace_store.close()
 
 
