@@ -17,6 +17,7 @@ register_directives(
         "power_off_delay",
         "serial_capture",
         "kpi_pattern",
+        "warm_boot_fallback_to_cold",
     },
     aliases={
         # Sample count variants

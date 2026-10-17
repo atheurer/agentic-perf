@@ -4629,14 +4629,26 @@ async def execute_boot_time_test(
         requested_reboot = (
             directives.get("reboot_method", "") or directives.get("boot_type", "")
         ).lower()
+        # When reboot_method=warm with fallback enabled, keep power
+        # control available so the script can fall back to a cold
+        # power cycle when SSH reboot fails.
+        warm_fallback = requested_reboot == "warm" and directives.get(
+            "warm_boot_fallback_to_cold", False
+        )
         if is_jumpstarter and serial_enabled:
             cmd.append("--jumpstarter-serial")
             cmd.append(f"--jumpstarter-lease-name={lease_id}")
-            if requested_reboot == "warm":
+            if requested_reboot == "warm" and not warm_fallback:
                 cmd.append("--no-jumpstarter-power")
                 logger.info(
                     "[boot-time] Serial capture + warm reboot — power "
                     "control disabled (lease %s)",
+                    lease_id,
+                )
+            elif requested_reboot == "warm":
+                logger.info(
+                    "[boot-time] Serial capture + warm reboot with cold "
+                    "fallback — power control retained (lease %s)",
                     lease_id,
                 )
             else:
@@ -4647,15 +4659,21 @@ async def execute_boot_time_test(
             # Always pass the lease name so the script can use
             # Jumpstarter for diagnostics (exporter status, power
             # status, serial probe on failure).  When reboot_method
-            # is warm, disable hardware power cycling so the script
-            # uses SSH reboot while retaining diagnostic capability.
+            # is warm without fallback, disable hardware power cycling
+            # so the script uses SSH reboot only.
             cmd.append(f"--jumpstarter-lease-name={lease_id}")
-            if requested_reboot == "warm":
+            if requested_reboot == "warm" and not warm_fallback:
                 cmd.append("--no-jumpstarter-power")
                 logger.info(
                     "[boot-time] reboot_method=warm — Jumpstarter power "
                     "control disabled, using SSH reboot (lease %s "
                     "retained for diagnostics)",
+                    lease_id,
+                )
+            elif requested_reboot == "warm":
+                logger.info(
+                    "[boot-time] reboot_method=warm with cold fallback "
+                    "— power control retained (lease %s)",
                     lease_id,
                 )
             else:
