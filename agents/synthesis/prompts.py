@@ -55,3 +55,30 @@ by calling submit_synthesis_result with:
   or stalling. Base your outcome on the substantive findings from
   the agents that DID run, especially the review verdict.
 """
+
+FLEET_SYNTHESIS_ADDENDUM = """\
+
+## Fleet Investigation Report
+
+This is a fleet health survey, not a single-hypothesis investigation.
+The tested_hosts data below contains per-board results. Your synthesis
+must include a **structured per-board report** in addition to the
+overall summary.
+
+For each board in tested_hosts, include in your root_cause_summary:
+
+| Board | Status | Samples | Avg Boot (s) | Failure Category | Notes |
+|-------|--------|---------|-------------|------------------|-------|
+
+Categories: healthy, flash_failure, power_control, benchmark_timeout,
+infrastructure_error, claim_race
+
+After the table, include:
+- Total boards tested / completed / partial
+- Common failure patterns across boards
+- Recommended actions for each failure category
+- Which boards are safe for production testing
+
+Do NOT claim "comprehensive per-board documentation generated" without
+actually generating the table. The table IS the documentation.
+"""

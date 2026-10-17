@@ -421,6 +421,43 @@ SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 # Module-level globals — lazily initialized by _ensure_init()
 _initialized = False
 _boot_time_executed = False
+
+
+def _truncated_output_guidance(
+    stdout: str,
+    stderr: str,
+    *,
+    controller: str = "",
+    run_id: str = "",
+    artifact_files: list[str] | None = None,
+) -> dict[str, str]:
+    """Build truncated output + guidance for where to find full data.
+
+    Returns a dict with 'output', 'error', and 'full_output_hint' keys
+    suitable for merging into a tool response.
+    """
+    result: dict[str, str] = {
+        "output": stdout[-3000:] if stdout else "",
+        "error": stderr[-1000:] if stderr else "",
+    }
+    hints: list[str] = []
+    if len(stdout) > 3000:
+        hints.append(f"Output truncated to last 3000 of {len(stdout)} bytes.")
+    if controller and run_id:
+        hints.append(
+            f"Full logs available via get_run_logs("
+            f"controller='{controller}', run_id='{run_id}')."
+        )
+    if artifact_files:
+        hints.append(
+            "Local artifact files available via read_artifact_file(): "
+            + ", ".join(artifact_files)
+        )
+    if hints:
+        result["full_output_hint"] = " ".join(hints)
+    return result
+
+
 _ssh = None
 _skill_provider = None
 _crucible_context = None
@@ -2880,8 +2917,13 @@ async def execute_benchmark(
                 except json.JSONDecodeError:
                     response["result_summary"] = metrics_result.stdout[:3000]
         if result.exit_code != 0:
-            response["output"] = result.stdout[-3000:] if result.stdout else ""
-            response["error"] = result.stderr[-1000:] if result.stderr else ""
+            response.update(
+                _truncated_output_guidance(
+                    result.stdout or "",
+                    result.stderr or "",
+                    controller=controller,
+                )
+            )
         return json.dumps(response)
 
     if harness_name == "benchmark-runner":
@@ -2999,8 +3041,13 @@ async def execute_benchmark(
             if ls_result.exit_code == 0 and ls_result.stdout:
                 response["result_summary"] = ls_result.stdout.strip()
         if result.exit_code != 0:
-            response["output"] = result.stdout[-3000:] if result.stdout else ""
-            response["error"] = result.stderr[-1000:] if result.stderr else ""
+            response.update(
+                _truncated_output_guidance(
+                    result.stdout or "",
+                    result.stderr or "",
+                    controller=controller,
+                )
+            )
         return json.dumps(response)
 
     if harness_name == "zathras":
@@ -3138,8 +3185,13 @@ async def execute_benchmark(
             if ls_result.exit_code == 0 and ls_result.stdout:
                 response["result_summary"] = ls_result.stdout.strip()
         if result.exit_code != 0:
-            response["output"] = result.stdout[-3000:] if result.stdout else ""
-            response["error"] = result.stderr[-1000:] if result.stderr else ""
+            response.update(
+                _truncated_output_guidance(
+                    result.stdout or "",
+                    result.stderr or "",
+                    controller=controller,
+                )
+            )
         return json.dumps(response)
 
     if harness_name == "ioscale":
@@ -3349,8 +3401,13 @@ async def execute_benchmark(
             except json.JSONDecodeError:
                 response["result_summary"] = result.stdout[:3000]
         if result.exit_code != 0:
-            response["output"] = result.stdout[-3000:] if result.stdout else ""
-            response["error"] = result.stderr[-1000:] if result.stderr else ""
+            response.update(
+                _truncated_output_guidance(
+                    result.stdout or "",
+                    result.stderr or "",
+                    controller=controller,
+                )
+            )
         return json.dumps(response)
 
     if harness_name == "vstorm":
@@ -3395,8 +3452,13 @@ async def execute_benchmark(
             except json.JSONDecodeError:
                 response["result_summary"] = result.stdout[:3000]
         if result.exit_code != 0:
-            response["output"] = result.stdout[-3000:] if result.stdout else ""
-            response["error"] = result.stderr[-1000:] if result.stderr else ""
+            response.update(
+                _truncated_output_guidance(
+                    result.stdout or "",
+                    result.stderr or "",
+                    controller=controller,
+                )
+            )
         return json.dumps(response)
 
     if harness_name == "forge":
@@ -3475,8 +3537,13 @@ async def execute_benchmark(
             ),
         }
         if result.exit_code != 0:
-            response["output"] = result.stdout[-3000:] if result.stdout else ""
-            response["error"] = result.stderr[-1000:] if result.stderr else ""
+            response.update(
+                _truncated_output_guidance(
+                    result.stdout or "",
+                    result.stderr or "",
+                    controller=controller,
+                )
+            )
         return json.dumps(response)
 
     if harness_name == "clusterbuster":
@@ -3530,8 +3597,13 @@ async def execute_benchmark(
             except json.JSONDecodeError:
                 response["result_summary"] = result.stdout[:3000]
         if result.exit_code != 0:
-            response["output"] = result.stdout[-3000:] if result.stdout else ""
-            response["error"] = result.stderr[-1000:] if result.stderr else ""
+            response.update(
+                _truncated_output_guidance(
+                    result.stdout or "",
+                    result.stderr or "",
+                    controller=controller,
+                )
+            )
         return json.dumps(response)
 
     if harness_name == "k8s-netperf":
@@ -3606,8 +3678,13 @@ async def execute_benchmark(
             except json.JSONDecodeError:
                 response["result_summary"] = result.stdout[:3000]
         if result.exit_code != 0:
-            response["output"] = result.stdout[-3000:] if result.stdout else ""
-            response["error"] = result.stderr[-1000:] if result.stderr else ""
+            response.update(
+                _truncated_output_guidance(
+                    result.stdout or "",
+                    result.stderr or "",
+                    controller=controller,
+                )
+            )
         return json.dumps(response)
 
     # Default: crucible (and any unknown harness that uses JSON run-files)
@@ -3963,8 +4040,13 @@ async def execute_benchmark(
             if log_result.exit_code == 0 and log_result.stdout:
                 response["run_log"] = log_result.stdout
     if result.exit_code != 0:
-        response["output"] = result.stdout[-3000:] if result.stdout else ""
-        response["error"] = result.stderr[-1000:] if result.stderr else ""
+        response.update(
+            _truncated_output_guidance(
+                result.stdout or "",
+                result.stderr or "",
+                controller=controller,
+            )
+        )
     if operation_guard and operation_owned:
         terminal_ok = await operation_guard.terminalize(
             operation_record,
@@ -4543,20 +4625,61 @@ async def execute_boot_time_test(
         directives = fields.get("directives", {})
         serial_enabled = directives.get("jumpstarter_serial", False)
         is_jumpstarter = lease_id and fields.get("resource_provider") == "jumpstarter"
+        # Resolve reboot method once — used by both branches.
+        requested_reboot = (
+            directives.get("reboot_method", "") or directives.get("boot_type", "")
+        ).lower()
+        # When reboot_method=warm with fallback enabled, keep power
+        # control available so the script can fall back to a cold
+        # power cycle when SSH reboot fails.
+        warm_fallback = requested_reboot == "warm" and directives.get(
+            "warm_boot_fallback_to_cold", False
+        )
         if is_jumpstarter and serial_enabled:
             cmd.append("--jumpstarter-serial")
             cmd.append(f"--jumpstarter-lease-name={lease_id}")
-            logger.info(
-                f"[boot-time] Using Jumpstarter lease {lease_id} for serial capture"
-            )
+            if requested_reboot == "warm" and not warm_fallback:
+                cmd.append("--no-jumpstarter-power")
+                logger.info(
+                    "[boot-time] Serial capture + warm reboot — power "
+                    "control disabled (lease %s)",
+                    lease_id,
+                )
+            elif requested_reboot == "warm":
+                logger.info(
+                    "[boot-time] Serial capture + warm reboot with cold "
+                    "fallback — power control retained (lease %s)",
+                    lease_id,
+                )
+            else:
+                logger.info(
+                    f"[boot-time] Using Jumpstarter lease {lease_id} for serial capture"
+                )
         elif is_jumpstarter:
-            # Enable Jumpstarter power control even without
-            # serial capture so cold boots use hardware
-            # power cycling instead of SSH reboots.
+            # Always pass the lease name so the script can use
+            # Jumpstarter for diagnostics (exporter status, power
+            # status, serial probe on failure).  When reboot_method
+            # is warm without fallback, disable hardware power cycling
+            # so the script uses SSH reboot only.
             cmd.append(f"--jumpstarter-lease-name={lease_id}")
-            logger.info(
-                f"[boot-time] Using Jumpstarter lease {lease_id} for power control"
-            )
+            if requested_reboot == "warm" and not warm_fallback:
+                cmd.append("--no-jumpstarter-power")
+                logger.info(
+                    "[boot-time] reboot_method=warm — Jumpstarter power "
+                    "control disabled, using SSH reboot (lease %s "
+                    "retained for diagnostics)",
+                    lease_id,
+                )
+            elif requested_reboot == "warm":
+                logger.info(
+                    "[boot-time] reboot_method=warm with cold fallback "
+                    "— power control retained (lease %s)",
+                    lease_id,
+                )
+            else:
+                logger.info(
+                    f"[boot-time] Using Jumpstarter lease {lease_id} for power control"
+                )
 
         # Pass power-off delay from directives
         power_off_delay = directives.get("power_off_delay") or directives.get(
@@ -4683,7 +4806,12 @@ async def execute_boot_time_test(
             mutating=True,
         )
         _STALL_CHECK_INTERVAL = 60
-        _STALL_TIMEOUT = 300
+        # Allow 360s so the boot-time script's failure diagnostics
+        # (exporter status, power status, serial probe) have time to
+        # run after wait_for_sut_up times out at 300s.  The diagnostics
+        # take ~30s and produce DIAGNOSTIC: lines that are critical for
+        # differentiating power control, gRPC, and boot failures.
+        _STALL_TIMEOUT = 360
 
         # Drain bounded chunks so an unterminated line cannot exceed the
         # StreamReader line limit and strand the benchmark subprocess.
@@ -5178,6 +5306,17 @@ async def execute_boot_time_test(
     if exit_code not in (0, 2):
         response["output"] = stdout_str[-3000:]
         response["error"] = stderr_str[-1000:]
+        # Point the agent to the full artifact files for deeper analysis
+        artifact_files = []
+        if (output_dir / "harness-output.log").exists():
+            artifact_files.append(str(output_dir / "harness-output.log"))
+        if (output_dir / "serial-capture.log").exists():
+            artifact_files.append(str(output_dir / "serial-capture.log"))
+        if artifact_files:
+            response["full_output_hint"] = (
+                f"Output truncated. Full logs available via "
+                f"read_artifact_file(): {', '.join(artifact_files)}"
+            )
     else:
         # On success, include a compact summary so the
         # evaluate agent can see serial capture status
@@ -5275,6 +5414,28 @@ async def execute_boot_time_test(
 def _count_boot_time_samples(output_dir: Path) -> int:
     """Return the number of boot-time sample artifacts in an output directory."""
     return sum(1 for _ in output_dir.glob("**/*boot_time_logs.json"))
+
+
+@mcp.tool()
+async def read_artifact_file(
+    path: str,
+    offset: int = 0,
+    limit: int = 200,
+) -> str:
+    """Read lines from a local artifact file (harness output, serial
+    capture, diagnostics).  Use this to inspect the full output when
+    the tool result was truncated.
+
+    Args:
+        path: Absolute path to the artifact file, or a path relative
+            to the current run's output_dir.
+        offset: 0-based line number to start reading from.
+        limit: Maximum number of lines to return (max 500).
+    """
+    from agents.server_utils import read_artifact_file_impl
+
+    tid = _ticket.get("id", "") if _ticket else ""
+    return read_artifact_file_impl(path, offset, limit, ticket_id=tid)
 
 
 async def get_registered_tools():

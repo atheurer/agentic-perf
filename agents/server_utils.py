@@ -1864,3 +1864,82 @@ def extract_ticket_references(text: str) -> list[str]:
             seen.add(tid)
             ids.append(tid)
     return ids
+
+
+def read_artifact_file_impl(
+    path: str,
+    offset: int = 0,
+    limit: int = 200,
+    ticket_id: str = "",
+) -> str:
+    """Read lines from a local artifact file with bounds checking.
+
+    Shared implementation for the read_artifact_file MCP tool
+    exposed by benchmark and platform servers.
+
+    Args:
+        path: Absolute path or path relative to the ticket's
+            artifact directory.
+        offset: 0-based line number to start reading from.
+        limit: Maximum number of lines to return (max 500).
+        ticket_id: Ticket ID for resolving relative paths.
+
+    Returns:
+        JSON string with file content, metadata, and pagination info.
+    """
+    import json
+    from pathlib import Path
+
+    from paths import ARTIFACT_DIR
+
+    limit = min(limit, 500)
+
+    resolved = Path(path)
+    if not resolved.is_absolute() and ticket_id:
+        candidate = ARTIFACT_DIR / ticket_id / path
+        if candidate.exists():
+            resolved = candidate
+
+    if not resolved.exists():
+        return json.dumps({"error": f"File not found: {path}"})
+
+    try:
+        resolved = resolved.resolve()
+        artifacts_resolved = ARTIFACT_DIR.resolve()
+        # Use is_relative_to for proper path-component containment.
+        # String prefix matching would allow sibling directories
+        # like "artifacts-archive/" to pass.
+        if not resolved.is_relative_to(artifacts_resolved):
+            return json.dumps(
+                {"error": "Access denied: path is outside the artifacts directory"}
+            )
+    except (OSError, ValueError):
+        return json.dumps({"error": f"Cannot resolve path: {path}"})
+
+    try:
+        from itertools import islice
+
+        limit = max(0, min(limit, 500))
+        offset = max(0, offset)
+        size = resolved.stat().st_size
+        with open(resolved, encoding="utf-8", errors="replace") as f:
+            # Skip to offset
+            for _ in range(offset):
+                if f.readline() == "":
+                    break
+            selected = list(islice(f, limit))
+            # Count remaining to determine has_more
+            has_more = f.readline() != ""
+        return json.dumps(
+            {
+                "file": str(resolved),
+                "total_bytes": size,
+                "offset": offset,
+                "limit": limit,
+                "lines_returned": len(selected),
+                "content": "".join(selected),
+                "has_more": has_more,
+            }
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to read file: {exc}"})
