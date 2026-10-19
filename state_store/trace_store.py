@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Collection
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -79,12 +79,15 @@ class OperationRecord:
 class TraceStore:
     """The authoritative SQLite store, with one connection per store instance."""
 
+    DEFAULT_RETENTION_DAYS = 14
+
     def __init__(
         self,
         db_path: Path,
         *,
         history_db_path: Path | None = None,
-        busy_timeout_ms: int = 5_000,
+        busy_timeout_ms: int = 120_000,
+        trace_retention_days: int | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.history_db_path = (
@@ -127,6 +130,28 @@ class TraceStore:
             raise TraceStoreMigrationError(
                 "could not initialize trace database"
             ) from exc
+
+        self._retention_days = (
+            trace_retention_days
+            if trace_retention_days is not None
+            else self.DEFAULT_RETENTION_DAYS
+        )
+        if self._retention_days > 0:
+            # Run retention in a background thread so DELETE batches
+            # don't block startup.
+
+            def _deferred_prune() -> None:
+                try:
+                    self.prune_old_traces(self._retention_days)
+                except Exception:
+                    logger.warning(
+                        "deferred trace retention pruning failed",
+                        exc_info=True,
+                    )
+
+            threading.Thread(
+                target=_deferred_prune, daemon=True, name="trace-retention"
+            ).start()
 
     def _init_db_connection(
         self, db_path: Path, busy_timeout_ms: int
@@ -225,6 +250,125 @@ class TraceStore:
                         )
                 except Exception:
                     logger.warning("WAL checkpoint failed", exc_info=True)
+
+    _PRUNE_BATCH_SIZE = 1000
+
+    def _prune_trace_events_batched(
+        self, connection: sqlite3.Connection, cutoff_iso: str
+    ) -> int:
+        """Delete old trace_events in batches, releasing the lock between each."""
+        total = 0
+        while True:
+            with self._lock:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor = connection.execute(
+                        "DELETE FROM trace_events WHERE rowid IN "
+                        "(SELECT rowid FROM trace_events "
+                        "WHERE occurred_at < ? LIMIT ?)",
+                        (cutoff_iso, self._PRUNE_BATCH_SIZE),
+                    )
+                    batch = cursor.rowcount
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+            total += batch
+            if batch < self._PRUNE_BATCH_SIZE:
+                break
+        return total
+
+    def _prune_operation_history_batched(
+        self, connection: sqlite3.Connection, cutoff_iso: str
+    ) -> int:
+        """Delete old terminal operation_history rows in batches."""
+        # Ensure occurred_at is indexed for the retention query.
+        with self._lock:
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "operation_history_occurred_at_idx "
+                "ON operation_history(occurred_at)"
+            )
+        total = 0
+        while True:
+            with self._lock:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor = connection.execute(
+                        "DELETE FROM operation_history WHERE rowid IN "
+                        "(SELECT operation_history.rowid "
+                        "FROM operation_history "
+                        "JOIN operations USING (operation_key) "
+                        "WHERE operation_history.occurred_at < ? "
+                        "AND operations.state = 'terminal' "
+                        "LIMIT ?)",
+                        (cutoff_iso, self._PRUNE_BATCH_SIZE),
+                    )
+                    batch = cursor.rowcount
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+            total += batch
+            if batch < self._PRUNE_BATCH_SIZE:
+                break
+        return total
+
+    def prune_old_traces(self, retention_days: int | None = None) -> int:
+        """Delete trace records older than *retention_days* and reclaim space.
+
+        Returns the number of trace event rows deleted.  Freed pages
+        are reused by SQLite for new inserts; no VACUUM is performed
+        because it requires an exclusive lock that would block event
+        loop trace writes and stall lease renewal.
+
+        Deletes are performed in batches of ~1000 rows with the lock
+        released between batches so that ``insert_event()`` calls on
+        the event loop thread are not starved.
+
+        Both the active trace DB and the history DB (if present) are
+        pruned.
+        """
+        days = retention_days if retention_days is not None else self._retention_days
+        if days <= 0:
+            return 0
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff_iso = cutoff.isoformat()
+
+        total_deleted = 0
+
+        # --- prune active trace DB ---
+        connection = self._open_connection()
+        total_deleted += self._prune_trace_events_batched(connection, cutoff_iso)
+        total_deleted += self._prune_operation_history_batched(connection, cutoff_iso)
+
+        # --- prune history DB ---
+        history_conn = self._open_history_connection()
+        if history_conn is not None:
+            total_deleted += self._prune_trace_events_batched(history_conn, cutoff_iso)
+
+        if total_deleted > 0:
+            logger.info(
+                "Trace retention: pruned %d record(s) older than %d days",
+                total_deleted,
+                days,
+            )
+        else:
+            logger.info(
+                "Trace retention: no records older than %d days to prune",
+                days,
+            )
+
+        # No VACUUM — SQLite reuses freed pages for new inserts, so
+        # the steady-state DB size is bounded by the retention window.
+        # VACUUM rebuilds the entire file and requires an exclusive
+        # lock that blocks ALL writers (even on separate connections
+        # in WAL mode).  Since trace writes happen on the asyncio
+        # event loop thread, a blocked write stalls lease renewal
+        # and crashes the pod.
+
+        return total_deleted
 
     def close(self) -> None:
         """Close the connections; safe to call after a failed initialization."""
