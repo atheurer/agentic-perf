@@ -2913,7 +2913,7 @@ async def _poll_loop_after_lease(
                     try:
                         trace_sweep_task.result()
                     except Exception:
-                        logger.exception("Trace spool sweep failed")
+                        _maybe_log_sweep_failure()
                 # Network delivery may wait through an outage; never block ticket
                 # dispatch on orphan recovery.
                 trace_sweep_task = asyncio.create_task(
@@ -3465,12 +3465,30 @@ def _mutation_headers(claim_id: str | None) -> dict[str, str]:
     return headers
 
 
+_SWEEP_WARN_INTERVAL = 300.0  # log sweep failures at most once per 5 min
+_last_sweep_warning: float = -_SWEEP_WARN_INTERVAL
+
+
+def _maybe_log_sweep_failure() -> None:
+    """Log a sweep failure at most once per *_SWEEP_WARN_INTERVAL*."""
+    global _last_sweep_warning
+    now = time.monotonic()
+    if now - _last_sweep_warning >= _SWEEP_WARN_INTERVAL:
+        logger.exception("Trace spool sweep failed")
+        _last_sweep_warning = now
+
+
 def _sweep_trace_spools() -> None:
     """Best-effort restart recovery for orphaned MCP producer spools."""
+    global _last_sweep_warning
     from providers.tracing import TraceClient, TraceDeliveryError
+    from providers.tracing.spool import prune_spool_directory
 
     token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
     if not token:
+        # No token means we can't deliver to the state store,
+        # but we should still prune old/oversized spool files.
+        prune_spool_directory(TRACE_SPOOL_DIR)
         return
     url, _ = resolve_state_store()
     client = TraceClient(url, token, spool_dir=TRACE_SPOOL_DIR)
@@ -3479,12 +3497,18 @@ def _sweep_trace_spools() -> None:
         if count:
             logger.info("Drained %d abandoned trace spool event(s)", count)
     except TraceDeliveryError:
-        logger.warning("Trace spool sweep deferred: state store unavailable")
+        now = time.monotonic()
+        if now - _last_sweep_warning >= _SWEEP_WARN_INTERVAL:
+            logger.warning("Trace spool sweep deferred: state store unavailable")
+            _last_sweep_warning = now
+        prune_spool_directory(TRACE_SPOOL_DIR)
     finally:
         try:
             client.close()
         except TraceDeliveryError:
             pass
+    # Always prune expired / oversized spool files, even on success.
+    prune_spool_directory(TRACE_SPOOL_DIR)
 
 
 def _handle_shutdown_signal(_signum: int, _frame: Any) -> None:

@@ -665,6 +665,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/tracing/spool.py", "close", "filesystem"),
     ("providers/tracing/spool.py", "compact", "filesystem"),
     ("providers/tracing/spool.py", "pending", "filesystem"),
+    ("providers/tracing/spool.py", "_is_spool_locked", "filesystem"),
+    ("providers/tracing/spool.py", "_try_prune_file", "filesystem"),
     ("providers/webhook_enrichment.py", "_call_get_run_info", "mutating_http_state"),
     ("providers/webhook_enrichment.py", "enrich_webhook_ticket", "mutating_http_state"),
     ("providers/workspace/charts/cdm.py", "_format_metric_title", "filesystem"),
@@ -3655,6 +3657,18 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/tracing/spool.py:pending",
+        "2027-12-31",
+    ),
+    ("providers/tracing/spool.py", "_is_spool_locked", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "providers/tracing/spool.py:_is_spool_locked",
+        "2027-12-31",
+    ),
+    ("providers/tracing/spool.py", "_try_prune_file", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "providers/tracing/spool.py:_try_prune_file",
         "2027-12-31",
     ),
     ("providers/webhook_enrichment.py", "_call_get_run_info", "mutating_http_state"): (
