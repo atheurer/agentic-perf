@@ -731,7 +731,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/auth.py", "load_or_generate_token", "filesystem"),
     ("state_store/auth.py", "load_or_generate_validator_token", "filesystem"),
     ("state_store/auth.py", "verify_token", "filesystem"),
-    ("state_store/identity.py", "_save", "filesystem"),
+    ("state_store/identity.py", "_acquire_file_lock", "filesystem"),
+    ("state_store/identity.py", "_release_file_lock", "filesystem"),
     ("state_store/identity.py", "delete_group", "filesystem"),
     ("state_store/identity.py", "remove_member", "filesystem"),
     ("state_store/main.py", "_token_age_days", "filesystem"),
@@ -4059,10 +4060,16 @@ INVENTORY_DISPOSITIONS = {
         "state_store/auth.py:verify_token",
         "2027-12-31",
     ),
-    ("state_store/identity.py", "_save", "filesystem"): (
-        "system_only",
+    ("state_store/identity.py", "_acquire_file_lock", "filesystem"): (
+        "audited",
         "state-store-maintainers",
-        "state_store/identity.py:_save",
+        "state_store/identity.py:_acquire_file_lock",
+        "2027-12-31",
+    ),
+    ("state_store/identity.py", "_release_file_lock", "filesystem"): (
+        "audited",
+        "state-store-maintainers",
+        "state_store/identity.py:_release_file_lock",
         "2027-12-31",
     ),
     ("state_store/identity.py", "delete_group", "filesystem"): (
