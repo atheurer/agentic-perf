@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import socket
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -4590,8 +4591,10 @@ async def execute_boot_time_test(
 
     serial_proc = None
     serial_log_fh = None
+    exporter_log_fh = None
     harness_log_fh = None
     serial_log_path = output_dir / "serial-capture.log"
+    exporter_log_path = output_dir / "exporter-logs.log"
     try:
         if _ticket:
             _fields = _ticket.get("custom_fields", {})
@@ -4624,18 +4627,31 @@ async def execute_boot_time_test(
                     serial_log_fh = artifact_filesystem.open_stream(
                         "serial-capture.log", mode=artifact_file_mode
                     )
+                    # Exporter logs are best-effort — failure to open
+                    # must not prevent serial capture from starting.
+                    try:
+                        exporter_log_fh = artifact_filesystem.open_stream(
+                            "exporter-logs.log", mode=artifact_file_mode
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[boot-time] Could not open exporter-logs.log, "
+                            "using DEVNULL for exporter stderr"
+                        )
+                        exporter_log_fh = subprocess.DEVNULL
                     serial_proc = await AuditedSubprocessRunner().start(
                         [
                             "jmp",
                             "shell",
                             f"--lease={_lease_id}",
+                            "--exporter-logs",
                             "--",
                             "j",
                             "serial",
                             "pipe",
                         ],
                         stdout=serial_log_fh,
-                        stderr=_asyncio.subprocess.DEVNULL,
+                        stderr=exporter_log_fh,
                         mutating=True,
                     )
                     logger.info(
@@ -4651,6 +4667,9 @@ async def execute_boot_time_test(
                     if serial_log_fh:
                         serial_log_fh.close()
                         serial_log_fh = None
+                    if exporter_log_fh:
+                        exporter_log_fh.close()
+                        exporter_log_fh = None
 
         # ── Execute ───────────────────────────────────────────
         # Run from output_dir so boot-timings-test.sh creates
@@ -4965,6 +4984,8 @@ async def execute_boot_time_test(
         finally:
             if serial_log_fh is not None:
                 serial_log_fh.close()
+            if exporter_log_fh is not None:
+                exporter_log_fh.close()
             if harness_log_fh is not None:
                 try:
                     harness_log_fh.close()
@@ -4981,6 +5002,14 @@ async def execute_boot_time_test(
         else:
             # Remove empty log file
             artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
+    if exporter_log_path.exists():
+        size = exporter_log_path.stat().st_size
+        if size > 0:
+            logger.info(
+                f"[boot-time] Exporter logs: {exporter_log_path} ({size} bytes)"
+            )
+        else:
+            artifact_filesystem.unlink("exporter-logs.log", missing_ok=True)
 
     # ── Parse results ─────────────────────────────────────────
     # Find the results folder created by boot-timings-test.sh
