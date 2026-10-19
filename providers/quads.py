@@ -13,6 +13,8 @@ from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
 
 logger = logging.getLogger(__name__)
 
+QUADS_ASSIGNMENT_DESCRIPTION_MAX_LENGTH = 32
+
 
 class QuadsAPIError(Exception):
     def __init__(self, status_code: int, message: str, path: str) -> None:
@@ -240,6 +242,14 @@ class QuadsClient:
     async def create_assignment(
         self, description: str, owner: str | None = None
     ) -> dict[str, Any]:
+        description = " ".join(description.split())
+        # QUADS uses this field as a Jira title; bound arbitrary caller text.
+        if len(description) > QUADS_ASSIGNMENT_DESCRIPTION_MAX_LENGTH:
+            description = description[: QUADS_ASSIGNMENT_DESCRIPTION_MAX_LENGTH - 1]
+            word_boundary = description.rfind(" ")
+            if word_boundary > QUADS_ASSIGNMENT_DESCRIPTION_MAX_LENGTH // 2:
+                description = description[:word_boundary]
+            description = f"{description.rstrip()}…"
         r = await self._authed_request(
             "POST",
             "/api/v3/assignments/self",

@@ -222,8 +222,11 @@ class QuadsResourceProvider(ResourceProvider):
         selection = self.validate_reservation_selection(selection)
         hostnames = selection["hostnames"]
 
-        logger.info(f"[quads-provider] Creating assignment: {description}")
-        assignment = await self._client.create_assignment(description)
+        ticket_key = ticket_id.strip() if isinstance(ticket_id, str) else ""
+        if not ticket_key:
+            raise ValueError("QUADS reservation requires an Agentic Perf ticket key")
+        logger.info("[quads-provider] Creating assignment for ticket: %s", ticket_key)
+        assignment = await self._client.create_assignment(ticket_key)
         logger.info(
             f"[quads-provider] Assignment created: id={assignment['id']} "
             f"cloud={assignment['cloud_name']}"

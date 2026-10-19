@@ -201,6 +201,24 @@ def _reservation_ticket_context(
     }
 
 
+def _resolve_quads_ticket_key(ticket_id: str | None) -> str | None:
+    """Resolve the canonical ticket key from active context, then the environment."""
+    ticket_key = None
+    for candidate in (_ticket.get("id"), os.environ.get("TICKET_ID")):
+        if isinstance(candidate, str) and (ticket_key := candidate.strip()):
+            break
+    else:
+        return None
+
+    supplied_ticket_id = ticket_id.strip() if isinstance(ticket_id, str) else ""
+    if supplied_ticket_id and supplied_ticket_id != ticket_key:
+        logger.warning(
+            "Ignoring reserve_resources ticket_id that conflicts with the "
+            "canonical QUADS ticket key."
+        )
+    return ticket_key
+
+
 def _ticket_resource_provider() -> tuple[str | None, bool]:
     """Return the authoritative managed provider and user-provided-only flag."""
     custom_fields = _ticket.get("custom_fields", {})
@@ -958,6 +976,23 @@ async def reserve_resources(
             ),
         }
         return json.dumps(result)
+    if provider == "quads":
+        ticket_id = _resolve_quads_ticket_key(ticket_id)
+        if ticket_id is None:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "provider": provider,
+                    "allocation_unknown": False,
+                    "retry_blocked": False,
+                    "provider_call_started": False,
+                    "error": (
+                        "No Agentic Perf ticket key is available from the active "
+                        "ticket or TICKET_ID."
+                    ),
+                    "message": "No provider allocation was attempted.",
+                }
+            )
     if not isinstance(selection, dict):
         return json.dumps(
             {
