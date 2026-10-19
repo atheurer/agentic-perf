@@ -1100,6 +1100,56 @@ def _resource_reconciliation_required_before_resume(status: str, ticket: dict) -
         return True
 
 
+async def _cleanup_closed_ticket_skill_context(
+    dispatcher: Dispatcher, ticket_id: str
+) -> None:
+    """Drop ticket-owned gateway snapshots only after the ticket is closed."""
+    if getattr(dispatcher, "_skill_provider_factory", None) is None:
+        return
+    resolver = getattr(dispatcher.skills, "organization_resolver", None)
+    if resolver is None:
+        return
+    try:
+        async with AuditedAsyncHTTPClient(
+            timeout=10.0, headers=_auth_headers()
+        ) as client:
+            response = await client.get(
+                f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+            )
+            if response.status_code != 200:
+                return
+            if response.json().get("status") != "closed":
+                return
+        removed = await asyncio.to_thread(resolver.cleanup_ticket, ticket_id)
+        if removed:
+            logger.info(
+                "Removed %s ticket-owned skill gateway snapshots for %s",
+                removed,
+                ticket_id,
+            )
+    except Exception:
+        logger.exception(
+            "Could not clean ticket-owned skill gateway snapshots for %s", ticket_id
+        )
+
+
+def _cleanup_skill_context_for_closed_tickets(
+    dispatcher: Dispatcher, open_ticket_ids: set[str]
+) -> list[tuple[str, int]]:
+    """Sweep ticket snapshots for closed tickets, including tickets idle at close."""
+    if getattr(dispatcher, "_skill_provider_factory", None) is None:
+        return []
+    resolver = getattr(dispatcher.skills, "organization_resolver", None)
+    if resolver is None:
+        return []
+    removed = []
+    for ticket_id in resolver.ticket_ids_with_source_pins() - open_ticket_ids:
+        count = resolver.cleanup_ticket(ticket_id)
+        if count:
+            removed.append((ticket_id, count))
+    return removed
+
+
 async def run_agent_task(
     dispatcher: Dispatcher,
     status: str,
@@ -1605,13 +1655,14 @@ async def run_agent_task(
             )
 
         dispatcher.clear_agent(ticket_id)
-        await dispatcher.mark_done(ticket_id)
-        logger.info(f"mark_done completed for {ticket_id}")
         if agent is not None:
             try:
                 await agent.close()
             except Exception:
                 pass
+        await _cleanup_closed_ticket_skill_context(dispatcher, ticket_id)
+        await dispatcher.mark_done(ticket_id)
+        logger.info(f"mark_done completed for {ticket_id}")
 
 
 def _cancellation_guidance_reason(cancel_reason: str) -> str:
@@ -2791,6 +2842,7 @@ async def _poll_loop_after_lease(
             catalog_only=True,
             arcaflow_mcp_client=arcaflow_mcp,
             secrets_provider=secrets,
+            ticket_id=ticket_id or None,
         )
         if ticket_id and hasattr(provider, "bind_attempt"):
             provider.bind_attempt(ticket_id, "initial", phase or "orchestrator")
@@ -2820,17 +2872,9 @@ async def _poll_loop_after_lease(
     except (TypeError, ValueError):
         organization_sources = []
     skill_provider_factory = None
-    if any(item["source"].get("kind") == "git" for item in organization_sources):
+    if organization_sources or organization_config:
 
         async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
-            if phase not in {
-                "triage",
-                "platform",
-                "provisioning",
-                "benchmark",
-                "review",
-            }:
-                return skills
             return await make_skill_provider(ticket_id, phase)
 
         skill_provider_factory = refresh_ticket_skill_provider
@@ -2992,6 +3036,7 @@ async def _poll_loop_after_lease(
         was_at_capacity = False
         last_trace_sweep = 0.0
         last_jumpstarter_sweep = 0.0
+        last_skill_snapshot_sweep = 0.0
         repos_refreshed = False
         normalization_delivery_states: dict[str, dict[str, Any]] = {}
 
@@ -3071,6 +3116,28 @@ async def _poll_loop_after_lease(
                 logger.exception("Failed to fetch tickets")
                 await asyncio.sleep(config.poll_interval)
                 continue
+
+            if time.monotonic() - last_skill_snapshot_sweep >= 60.0:
+                try:
+                    open_ticket_ids = {
+                        ticket["id"]
+                        for ticket in all_fetched
+                        if isinstance(ticket.get("id"), str)
+                    }
+                    removed_snapshots = await asyncio.to_thread(
+                        _cleanup_skill_context_for_closed_tickets,
+                        dispatcher,
+                        open_ticket_ids,
+                    )
+                    for ticket_id, count in removed_snapshots:
+                        logger.info(
+                            "Removed %s ticket-owned skill gateway snapshots for %s",
+                            count,
+                            ticket_id,
+                        )
+                except Exception:
+                    logger.exception("Skill gateway snapshot sweep failed")
+                last_skill_snapshot_sweep = time.monotonic()
 
             # Clear retry limits as soon as any ticket leaves the status
             # where its failures occurred. Guidance and terminal statuses

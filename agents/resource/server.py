@@ -114,7 +114,9 @@ async def _get_skill_provider():
     """
     global _skill_provider
     if _skill_provider is None:
-        resolver = await build_organization_skill_resolver_async()
+        resolver = await build_organization_skill_resolver_async(
+            ticket_id=os.environ.get("TICKET_ID") or None
+        )
         skill_provider = PrivateSkillProvider(resolver=resolver)
         skill_provider.bind_current_attempt("resource")
         _skill_provider = skill_provider

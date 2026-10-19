@@ -109,9 +109,15 @@ GitLab URL-prefix installations are unsupported. See
 [HTTPS Git file references](secrets.md#https-git-file-references) for limits
 and error handling.
 
-Each named source refreshes its configured branch during provider initialization
-and reads from an immutable commit checkout. Existing ticket snapshots keep
-their source revisions. `config show` reports each configured host, ref, and auth method, but
+Each named Git source refreshes its configured branch when a ticket first
+requests a provider, before its agent starts. A service-only, ticket-specific
+pin stores a digest of the organization source configuration and the resolved
+Git commits. All later phases and MCP servers for that ticket reuse the same
+immutable commit checkout, even while another ticket refreshes the shared
+mirror. Git authentication is not needed again to use an already-pinned
+checkout. A changed source configuration during an active ticket fails closed;
+new tickets can load the updated configuration and branch revision.
+`config show` reports each configured host, ref, and auth method, but
 does not connect or expose the full URL or secret reference; discovery is marked
 `not_checked` until a worker initializes the source. Git content is cached under
 service storage, outside ticket workspaces, with restricted directory
@@ -156,13 +162,16 @@ runtime settings are not pinned together with documents. There is no implicit
 merge of settings values from different configuration sources.
 
 A missing, unreadable, invalid, empty, or unauthenticated configured repository
-is an explicit discovery error. A required unavailable subject prevents affected actions.
-Organization documents
-and configuration are pinned together under the service-only `skill-snapshots/`
-directory on first use for the ticket lifetime. New tickets see source content
-updates; existing tickets keep their revision. Adding a document/configuration
-counterpart under the same source does not change an existing pin. Changing an
-explicit binding path, Git URL, or ref causes an error for an existing pin.
+is an explicit discovery error. A required unavailable subject prevents affected
+actions.
+Organization documents and configuration are copied into ticket-owned snapshots
+under the service-only `skill-snapshots/` directory on first subject use. Git
+content comes from the ticket's pinned commit. Local path sources are captured
+on first subject use, so administrators should not edit those paths during an
+active ticket. The orchestrator removes ticket-owned pins and content snapshots
+after observing closure, including tickets closed while idle. Shared immutable
+Git checkouts remain available for concurrent tickets and reuse. New tickets
+see source updates.
 
 ### Multiple-source overlap and HITL
 

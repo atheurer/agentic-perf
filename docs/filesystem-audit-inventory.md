@@ -73,3 +73,11 @@ configuration; only manifest-listed document projections leave the resolver.
 The sensitive snapshot filename suppresses content digests in filesystem trace
 attributes. A durable pin is written after the snapshot and verified on reads;
 an audited descriptor plus a process-shared file lock serializes initial pins.
+
+The same directory contains a ticket-specific organization source pin. It
+records a digest of the organization binding configuration and Git commit
+revisions before the first agent starts. Later agent and MCP processes for that
+ticket reuse those revisions. Ticket source-pin records and captured subject
+snapshots are removed after the orchestrator observes the ticket closed, either
+during task finalization or its periodic closed-ticket sweep. Immutable Git
+checkouts are shared cache entries and are retained for concurrent tickets.

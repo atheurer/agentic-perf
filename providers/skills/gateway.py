@@ -8,6 +8,7 @@ without backreferences. The transport is the existing audited process runner.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import fcntl
 import hashlib
@@ -523,8 +524,9 @@ class OrganizationSkillResolver:
         snapshot_root: str | Path | None = None,
         audit_emit: Any | None = None,
         secrets_provider: SecretsProvider | None = None,
+        ticket_id: str | None = None,
     ) -> OrganizationSkillResolver:
-        """Resolve Git sources before using the synchronous local resolver."""
+        """Resolve sources, pinning Git revisions once for each ticket."""
         if raw_config is None:
             try:
                 raw_config = (
@@ -537,26 +539,35 @@ class OrganizationSkillResolver:
         try:
             organization = raw_config.get("skill_gateway", {}).get("organization", {})
             descriptors = organization_source_descriptors(organization)
-            if not any(item["source"].get("kind") == "git" for item in descriptors):
+            organization_digest = _digest(organization)
+            git_descriptors = [
+                item for item in descriptors if item["source"].get("kind") == "git"
+            ]
+            if not git_descriptors and ticket_id is None:
                 return cls.from_instance_config(
                     raw_config,
                     snapshot_root=snapshot_root,
                     audit_emit=audit_emit,
                 )
-            from providers.skills.git_source import GitSourceError, prepare_git_source
-
-            prepared_sources = {}
+            prepared_sources = await cls._prepare_git_sources(
+                descriptors,
+                organization_digest=organization_digest,
+                ticket_id=ticket_id,
+                snapshot_root=snapshot_root,
+                audit_emit=audit_emit,
+                secrets_provider=secrets_provider,
+            )
+            if not descriptors:
+                return cls.from_instance_config(
+                    raw_config,
+                    snapshot_root=snapshot_root,
+                    audit_emit=audit_emit,
+                )
             resolved_sources = []
             for item in descriptors:
                 source_id, source = item["id"], item["source"]
                 if source.get("kind") == "git":
-                    try:
-                        prepared = await prepare_git_source(
-                            source, secrets_provider=secrets_provider
-                        )
-                    except GitSourceError as exc:
-                        raise SkillGatewayError(exc.code, str(exc)) from None
-                    prepared_sources[source_id] = prepared
+                    prepared = prepared_sources[source_id]
                     resolved_sources.append(
                         {
                             "id": source_id,
@@ -604,6 +615,164 @@ class OrganizationSkillResolver:
             raise SkillGatewayError(
                 "invalid_config", "Invalid organization skill source binding"
             ) from None
+
+    @classmethod
+    async def _prepare_git_sources(
+        cls,
+        descriptors: list[dict[str, Any]],
+        *,
+        organization_digest: str,
+        ticket_id: str | None,
+        snapshot_root: str | Path | None,
+        audit_emit: Any | None,
+        secrets_provider: SecretsProvider | None,
+    ) -> dict[str, Any]:
+        """Prepare one immutable Git revision set for a ticket's lifetime."""
+        from providers.skills.git_source import (
+            GitSourceError,
+            parse_git_source,
+            prepare_git_source,
+        )
+
+        git_descriptors = [
+            item for item in descriptors if item["source"].get("kind") == "git"
+        ]
+        ticket_key = _digest([ticket_id]) if ticket_id else ""
+        descriptor_digest = _digest(
+            [
+                organization_digest,
+                [{"id": item["id"], "source": item["source"]} for item in descriptors],
+            ]
+        )
+        filesystem = None
+        lock_fd = None
+        pin_relative = f"source-pins/{ticket_key}.json" if ticket_id else ""
+        pins: dict[str, Any] | None = None
+
+        try:
+            if ticket_id:
+                root = Path(snapshot_root or AGENTIC_PERF_HOME / "skill-snapshots")
+                filesystem = AuditedFilesystem(
+                    RootedPath(root, "skill-service"),
+                    ticket_id=ticket_id,
+                    emit=audit_emit or durable_filesystem_emitter(),
+                    critical=True,
+                )
+                filesystem.mkdir("source-pins", mode=0o700)
+                lock_fd = filesystem.open_descriptor(
+                    f"source-pins/{ticket_key}.lock",
+                    os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                    mode=0o600,
+                )
+                while True:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(0.05)
+                pin_path = root / pin_relative
+                if pin_path.exists():
+                    try:
+                        if pin_path.is_symlink():
+                            raise ValueError("source pin cannot be a symlink")
+                        pin_bytes = cls._read_bytes(pin_path, 1024 * 1024)
+                        pins = json.loads(pin_bytes)
+                    except (OSError, ValueError, TypeError, RecursionError):
+                        raise SkillGatewayError(
+                            "invalid_snapshot",
+                            "Ticket organization source pin is unavailable",
+                        ) from None
+                    if (
+                        not isinstance(pins, dict)
+                        or pins.get("schema_version") != 1
+                        or pins.get("ticket_key") != ticket_key
+                        or pins.get("ticket_id") not in (None, ticket_id)
+                        or pins.get("descriptor_digest") != descriptor_digest
+                        or not isinstance(pins.get("sources"), dict)
+                        or set(pins.get("sources", {}))
+                        != {item["id"] for item in git_descriptors}
+                    ):
+                        raise SkillGatewayError(
+                            "invalid_snapshot",
+                            "Ticket organization source pin is unavailable",
+                        )
+                    if pins.get("ticket_id") is None:
+                        pins["ticket_id"] = ticket_id
+                        filesystem.write(
+                            pin_relative,
+                            json.dumps(pins, sort_keys=True),
+                            mode=0o600,
+                        )
+            prepared_sources: dict[str, Any] = {}
+            for item in git_descriptors:
+                source_id, source = item["id"], item["source"]
+                pinned = pins.get("sources", {}).get(source_id) if pins else None
+                if pins is not None and not isinstance(pinned, dict):
+                    raise SkillGatewayError(
+                        "invalid_snapshot",
+                        "Ticket organization source pin is unavailable",
+                    )
+                expected_identity = (
+                    parse_git_source(source).identity if pinned is not None else None
+                )
+                if pinned is not None and pinned.get("identity") != expected_identity:
+                    raise SkillGatewayError(
+                        "organization_binding_changed",
+                        "Organization Git source changed during this ticket",
+                    )
+                if pinned is not None and not isinstance(pinned.get("commit"), str):
+                    raise SkillGatewayError(
+                        "invalid_snapshot",
+                        "Ticket organization source pin is unavailable",
+                    )
+                try:
+                    prepared = await prepare_git_source(
+                        source,
+                        secrets_provider=secrets_provider,
+                        pinned_commit=(pinned.get("commit") if pinned else None),
+                    )
+                except GitSourceError as exc:
+                    raise SkillGatewayError(exc.code, str(exc)) from None
+                prepared_sources[source_id] = prepared
+
+            if ticket_id and pins is None:
+                assert filesystem is not None
+                filesystem.write(
+                    pin_relative,
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "ticket_key": ticket_key,
+                            "ticket_id": ticket_id,
+                            "descriptor_digest": descriptor_digest,
+                            "sources": {
+                                source_id: {
+                                    "identity": prepared.identity,
+                                    "commit": prepared.commit,
+                                }
+                                for source_id, prepared in prepared_sources.items()
+                            },
+                        },
+                        sort_keys=True,
+                    ),
+                    mode=0o600,
+                )
+            return prepared_sources
+        except SkillGatewayError:
+            raise
+        except Exception:
+            raise SkillGatewayError(
+                "snapshot_unavailable",
+                "Cannot access ticket organization source pins",
+            ) from None
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    if filesystem is not None:
+                        filesystem.forget_descriptor(lock_fd)
+                    os.close(lock_fd)
 
     def for_attempt(
         self, ticket_id: str, attempt_id: str, phase: str
@@ -656,6 +825,124 @@ class OrganizationSkillResolver:
     def _pin_path(self, subject: str) -> Path:
         key = _digest([self.ticket_id, self.attempt_id, _subject(subject)])
         return self.snapshot_root / key / "pin.json"
+
+    def cleanup_ticket(self, ticket_id: str) -> int:
+        """Remove ticket-owned source pins and captured content snapshots."""
+        if not ticket_id or not self.snapshot_root.is_dir():
+            return 0
+
+        ticket_key = _digest([ticket_id])
+        filesystem = AuditedFilesystem(
+            RootedPath(self.snapshot_root, "skill-service"),
+            ticket_id=ticket_id,
+            emit=self.audit_emit or durable_filesystem_emitter(),
+            critical=True,
+        )
+        removed = 0
+
+        source_pin = self.snapshot_root / "source-pins" / f"{ticket_key}.json"
+        source_lock = self.snapshot_root / "source-pins" / f"{ticket_key}.lock"
+        if source_pin.is_file() and not source_pin.is_symlink():
+            filesystem.unlink(
+                source_pin.relative_to(self.snapshot_root), missing_ok=True
+            )
+            removed += 1
+        if source_lock.is_file() and not source_lock.is_symlink():
+            filesystem.unlink(
+                source_lock.relative_to(self.snapshot_root), missing_ok=True
+            )
+        source_pin_dir = self.snapshot_root / "source-pins"
+        if source_pin_dir.is_dir() and not source_pin_dir.is_symlink():
+            try:
+                if not any(source_pin_dir.iterdir()):
+                    filesystem.rmdir("source-pins")
+            except OSError:
+                pass
+
+        for candidate in self.snapshot_root.iterdir():
+            if (
+                candidate.name == "source-pins"
+                or candidate.is_symlink()
+                or not candidate.is_dir()
+                or not re.fullmatch(r"[a-f0-9]{64}", candidate.name)
+            ):
+                continue
+            if not candidate.exists():
+                continue
+            owns_snapshot = False
+            pin_path = candidate / "pin.json"
+            snapshot_path = candidate / "private-snapshot.json"
+            try:
+                if pin_path.is_file() and not pin_path.is_symlink():
+                    pin = json.loads(self._read_bytes(pin_path, 64 * 1024))
+                    owns_snapshot = pin.get("ticket_key") == ticket_key
+                # Pre-upgrade snapshots did not record their owner. All current
+                # callers bind the initial attempt, so recover those safely.
+                if not owns_snapshot and snapshot_path.is_file():
+                    snapshot = json.loads(
+                        self._read_bytes(snapshot_path, 8 * MAX_PACKAGE_BYTES)
+                    )
+                    subject = snapshot.get("subject")
+                    owns_snapshot = (
+                        isinstance(subject, str)
+                        and candidate.name == _digest([ticket_id, "initial", subject])
+                    )
+            except (OSError, ValueError, TypeError, RecursionError):
+                continue
+            if not owns_snapshot:
+                continue
+
+            for current, directories, files in os.walk(
+                candidate, topdown=False, followlinks=False
+            ):
+                current_path = Path(current)
+                for name in files:
+                    filesystem.unlink(
+                        (current_path / name).relative_to(self.snapshot_root),
+                        missing_ok=True,
+                    )
+                for name in directories:
+                    child = current_path / name
+                    relative = child.relative_to(self.snapshot_root)
+                    if child.is_symlink():
+                        filesystem.unlink(relative, missing_ok=True)
+                    else:
+                        try:
+                            filesystem.rmdir(relative)
+                        except FileNotFoundError:
+                            pass
+            try:
+                filesystem.rmdir(candidate.relative_to(self.snapshot_root))
+                removed += 1
+            except FileNotFoundError:
+                pass
+        return removed
+
+    def ticket_ids_with_source_pins(self) -> set[str]:
+        """Return validated ticket ids whose gateway snapshots need lifecycle cleanup."""
+        pin_dir = self.snapshot_root / "source-pins"
+        if not pin_dir.is_dir() or pin_dir.is_symlink():
+            return set()
+        ticket_ids = set()
+        for path in pin_dir.iterdir():
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or not re.fullmatch(r"[a-f0-9]{64}\.json", path.name)
+            ):
+                continue
+            try:
+                pin = json.loads(self._read_bytes(path, 1024 * 1024))
+                ticket_id = pin.get("ticket_id")
+                if (
+                    isinstance(ticket_id, str)
+                    and pin.get("ticket_key") == _digest([ticket_id])
+                    and path.stem == pin.get("ticket_key")
+                ):
+                    ticket_ids.add(ticket_id)
+            except (OSError, ValueError, TypeError, RecursionError):
+                continue
+        return ticket_ids
 
     def has_subject(self, subject: str) -> bool:
         """Include removed pinned subjects so they never fall through to legacy."""
@@ -1002,6 +1289,8 @@ class OrganizationSkillResolver:
                     snapshot = json.loads(snapshot_bytes)
                     if snapshot["binding"] != binding_identity:
                         raise ValueError("administrator source binding changed")
+                    if pin.get("ticket_key") not in (None, _digest([self.ticket_id])):
+                        raise ValueError("snapshot ticket identity changed")
                     return snapshot
                 except (OSError, ValueError, KeyError, TypeError, RecursionError):
                     raise SkillGatewayError(
@@ -1012,7 +1301,13 @@ class OrganizationSkillResolver:
             filesystem.write(f"{key}/private-snapshot.json", content)
             filesystem.write(
                 f"{key}/pin.json",
-                json.dumps({"digest": hashlib.sha256(content).hexdigest()}),
+                json.dumps(
+                    {
+                        "digest": hashlib.sha256(content).hexdigest(),
+                        "ticket_key": _digest([self.ticket_id]),
+                        "attempt_key": _digest([self.attempt_id]),
+                    }
+                ),
             )
             return snapshot
         except SkillGatewayError:

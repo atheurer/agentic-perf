@@ -211,6 +211,8 @@ def _valid_secret_ref(value: object) -> bool:
 async def _git_environment(
     config: _GitSourceConfig,
     secrets_provider: SecretsProvider | None,
+    *,
+    include_auth: bool = True,
 ) -> AsyncIterator[dict[str, str]]:
     """Build a child-only Git environment, materializing secrets just in time."""
     env = {
@@ -236,6 +238,10 @@ async def _git_environment(
             "GIT_OPTIONAL_LOCKS": "0",
         }
     )
+
+    if not include_auth:
+        yield env
+        return
 
     if config.auth_kind == "default":
         if config.url.startswith("ssh:"):
@@ -412,9 +418,17 @@ async def prepare_git_source(
     *,
     secrets_provider: SecretsProvider | None = None,
     cache_root: str | Path | None = None,
+    pinned_commit: str | None = None,
 ) -> PreparedGitSource:
-    """Fetch a configured branch and return a private immutable commit tree."""
+    """Fetch a branch or reuse its ticket-pinned immutable commit tree."""
     config = parse_git_source(source)
+    if pinned_commit is not None and not re.fullmatch(
+        r"[a-f0-9]{40,64}", pinned_commit
+    ):
+        raise GitSourceError(
+            "organization_source_unavailable",
+            "Pinned organization repository revision is invalid",
+        )
     root = Path(cache_root or (AGENTIC_PERF_HOME / "organization-git")).resolve()
     home = AGENTIC_PERF_HOME.resolve()
     if not root.is_absolute() or not root.is_relative_to(home):
@@ -444,7 +458,9 @@ async def prepare_git_source(
     mirror_rel = relative_root / "mirrors" / f"{config.cache_key}.git"
     mirror = home / mirror_rel
     try:
-        async with _git_environment(config, secrets_provider) as env:
+        async with _git_environment(
+            config, secrets_provider, include_auth=pinned_commit is None
+        ) as env:
             await _acquire_lock(lock_fd)
             runner = AuditedSubprocessRunner(output_limit=4096)
             if mirror.is_symlink():
@@ -467,65 +483,72 @@ async def prepare_git_source(
                     env,
                 )
 
-            initialize = not mirror.exists()
-            if not initialize:
-                try:
-                    existing_url = await _run_git(
-                        runner,
-                        _git_argv(
-                            "--git-dir", str(mirror), "remote", "get-url", "origin"
-                        ),
-                        env,
-                    )
-                    initialize = existing_url != config.url
-                except GitSourceError:
-                    initialize = True
+            if pinned_commit is None:
+                initialize = not mirror.exists()
+                if not initialize:
+                    try:
+                        existing_url = await _run_git(
+                            runner,
+                            _git_argv(
+                                "--git-dir",
+                                str(mirror),
+                                "remote",
+                                "get-url",
+                                "origin",
+                            ),
+                            env,
+                        )
+                        initialize = existing_url != config.url
+                    except GitSourceError:
+                        initialize = True
+                    if initialize:
+                        _remove_tree(mirror_rel, home)
                 if initialize:
-                    _remove_tree(mirror_rel, home)
-            if initialize:
-                await initialize_mirror()
+                    await initialize_mirror()
 
-            await _run_git(
-                runner,
-                _git_argv(
-                    "--git-dir",
-                    str(mirror),
-                    "fetch",
-                    "--quiet",
-                    "--depth=1",
-                    "--no-tags",
-                    "origin",
-                    f"+refs/heads/{config.ref}:refs/heads/agentic-perf-current",
-                ),
-                env,
-            )
-            commit = await _run_git(
-                runner,
-                _git_argv(
-                    "--git-dir",
-                    str(mirror),
-                    "rev-parse",
-                    "--verify",
-                    "refs/heads/agentic-perf-current^{commit}",
-                ),
-                env,
-            )
-            if not re.fullmatch(r"[a-f0-9]{40,64}", commit):
-                raise GitSourceError(
-                    "organization_source_unavailable",
-                    "Configured organization repository returned an invalid revision",
+                await _run_git(
+                    runner,
+                    _git_argv(
+                        "--git-dir",
+                        str(mirror),
+                        "fetch",
+                        "--quiet",
+                        "--depth=1",
+                        "--no-tags",
+                        "origin",
+                        f"+refs/heads/{config.ref}:refs/heads/agentic-perf-current",
+                    ),
+                    env,
                 )
-            await _run_git(
-                runner,
-                _git_argv(
-                    "--git-dir",
-                    str(mirror),
-                    "symbolic-ref",
-                    "HEAD",
-                    "refs/heads/agentic-perf-current",
-                ),
-                env,
-            )
+                commit = await _run_git(
+                    runner,
+                    _git_argv(
+                        "--git-dir",
+                        str(mirror),
+                        "rev-parse",
+                        "--verify",
+                        "refs/heads/agentic-perf-current^{commit}",
+                    ),
+                    env,
+                )
+                if not re.fullmatch(r"[a-f0-9]{40,64}", commit):
+                    raise GitSourceError(
+                        "organization_source_unavailable",
+                        "Configured organization repository returned an invalid revision",
+                    )
+                await _run_git(
+                    runner,
+                    _git_argv(
+                        "--git-dir",
+                        str(mirror),
+                        "symbolic-ref",
+                        "HEAD",
+                        "refs/heads/agentic-perf-current",
+                    ),
+                    env,
+                )
+            else:
+                commit = pinned_commit
 
             checkout_rel = relative_root / "checkouts" / f"{config.cache_key}-{commit}"
             checkout = home / checkout_rel
@@ -563,8 +586,18 @@ async def prepare_git_source(
                 except GitSourceError:
                     checkout_valid = False
                 if not checkout_valid:
+                    if pinned_commit is not None:
+                        raise GitSourceError(
+                            "organization_source_unavailable",
+                            "Pinned organization repository checkout is unavailable",
+                        )
                     _remove_tree(checkout_rel, home)
             if not checkout_valid:
+                if pinned_commit is not None:
+                    raise GitSourceError(
+                        "organization_source_unavailable",
+                        "Pinned organization repository checkout is unavailable",
+                    )
                 temp_rel = filesystem.temporary_directory(
                     relative_root / "checkouts", prefix="checkout-"
                 ).relative_to(home)

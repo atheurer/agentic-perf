@@ -42,9 +42,11 @@ received different instructions. A gateway helps by:
   select a winner, and material conflicts that agents cannot resolve should be
   raised through HITL. Conflicting runtime configurations stop affected
   consumers rather than being silently merged.
-- **Supporting repeatable tickets.** Organization documents and configuration
-  are pinned for a ticket so later phases can use the same captured revision;
-  newly submitted tickets can see updated source content.
+- **Supporting repeatable tickets.** A ticket pins its configured organization
+  source set and Git commits before its first agent starts. Later phases reuse
+  those immutable revisions while new tickets can see updates. Subject content
+  is copied into ticket-owned snapshots on first use and removed after closure;
+  shared immutable Git checkouts remain safe for concurrent tickets.
 - **Loading context when it is needed.** Agents retrieve bounded entrypoints,
   follow relevant document pointers, and search the subject's material instead
   of putting every subject's documents into every prompt. This helps keep

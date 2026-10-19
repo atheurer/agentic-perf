@@ -154,7 +154,7 @@ def build_skill_provider(
 
 
 async def build_organization_skill_resolver_async(
-    *, secrets_provider: Any | None = None
+    *, secrets_provider: Any | None = None, ticket_id: str | None = None
 ):
     """Resolve only organization skill sources, loading Git auth if required.
 
@@ -169,6 +169,7 @@ async def build_organization_skill_resolver_async(
         organization_source_descriptors,
     )
 
+    ticket_id = ticket_id or os.environ.get("TICKET_ID") or None
     raw_config = None
     try:
         if CONFIG_PATH.exists():
@@ -193,16 +194,21 @@ async def build_organization_skill_resolver_async(
     resolver = await OrganizationSkillResolver.from_instance_config_async(
         raw_config=raw_config,
         secrets_provider=secrets_provider,
+        ticket_id=ticket_id,
     )
     return resolver
 
 
 async def build_skill_provider_async(
-    *, secrets_provider: Any | None = None, **kwargs: Any
+    *,
+    secrets_provider: Any | None = None,
+    ticket_id: str | None = None,
+    **kwargs: Any,
 ):
     """Build skills after resolving authenticated organization Git sources."""
     resolver = await build_organization_skill_resolver_async(
-        secrets_provider=secrets_provider
+        secrets_provider=secrets_provider,
+        ticket_id=ticket_id,
     )
     return build_skill_provider(organization_resolver=resolver, **kwargs)
 
