@@ -17,6 +17,12 @@ from typing import Any
 KERNEL_RELEASE_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9._+~]+$")
 _PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 _MAX_RELEASE_LEN = 96
+# A repo URL is interpolated into a single-quoted printf argument on a
+# remote shell, so it must not contain a single quote, whitespace, or any
+# character that survives single-quoting (backslash). Everything else
+# common in URLs (?, &, =, %, $) is safe inside single quotes.
+_REPO_URL_RE = re.compile(r"^https?://[^'\s\\]+$")
+_REPO_FILE = "/etc/yum.repos.d/agentic-perf-kernel.repo"
 
 
 @dataclass(frozen=True)
@@ -26,6 +32,7 @@ class KernelSpec:
     release: str
     package: str = "kernel"
     companion_packages: tuple[str, ...] = ()
+    repo_url: str = ""
 
     def __post_init__(self) -> None:
         if not self.release:
@@ -44,6 +51,13 @@ class KernelSpec:
         for cp in self.companion_packages:
             if not KERNEL_RELEASE_RE.match(cp):
                 raise ValueError(f"companion package {cp!r} is not a valid release")
+        if self.repo_url:
+            if len(self.repo_url) > 512:
+                raise ValueError("repo_url exceeds 512 chars")
+            if not _REPO_URL_RE.match(self.repo_url):
+                raise ValueError(
+                    f"repo_url {self.repo_url!r} is not a plain http(s) URL"
+                )
 
     @classmethod
     def parse(cls, raw: dict | str) -> KernelSpec:
@@ -60,6 +74,7 @@ class KernelSpec:
             release=release,
             package=package,
             companion_packages=companions,
+            repo_url=str(raw.get("repo_url") or ""),
         )
 
     @property
@@ -81,6 +96,8 @@ class KernelSpec:
         }
         if self.companion_packages:
             d["companion_packages"] = list(self.companion_packages)
+        if self.repo_url:
+            d["repo_url"] = self.repo_url
         return d
 
 
@@ -119,6 +136,28 @@ def build_inventory_command(package: str = "kernel") -> str:
 
 def build_available_command(spec: KernelSpec) -> str:
     return f"dnf -q list --available {spec.nevra} 2>&1"
+
+
+def build_repo_setup_command(spec: KernelSpec) -> str:
+    """Idempotent dnf repo file for spec.repo_url (call before install).
+
+    The URL goes through a single-quoted printf, which the KernelSpec
+    validation guarantees to be injection-safe. sslverify=0 because lab
+    compose servers commonly present private CA chains; gpgcheck=0 for
+    the same reason. `dnf clean metadata` makes a previously-failed
+    metadata download retry cleanly.
+    """
+    if not spec.repo_url:
+        raise ValueError("kernel spec has no repo_url")
+    return (
+        f"printf '%s\\n' '[agentic-perf-kernel]'"
+        f" 'name=agentic-perf kernel repository'"
+        f" 'baseurl={spec.repo_url}'"
+        f" 'enabled=1' 'gpgcheck=0' 'sslverify=0'"
+        f" > {_REPO_FILE}"
+        f" && dnf clean metadata >/dev/null 2>&1;"
+        f" dnf -q list --available {spec.nevra} >/dev/null 2>&1"
+    )
 
 
 def build_install_command(spec: KernelSpec) -> str:

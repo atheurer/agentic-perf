@@ -578,6 +578,42 @@ _LOCAL_TOOLS = [
                                 "workflows. Example: 'workflow-fio'"
                             ),
                         },
+                        "kernel_comparison": {
+                            "type": "object",
+                            "description": (
+                                "Kernel A/B comparison. Set only when the "
+                                "user asks to compare benchmark results "
+                                "between two kernel versions. baseline and "
+                                "candidate are EXACT uname -r release "
+                                "strings; order is AB (default), ABBA, or "
+                                "BAAB; package defaults to kernel; repo_url "
+                                "is an optional dnf repo URL serving the "
+                                "packages."
+                            ),
+                            "properties": {
+                                "baseline": {
+                                    "type": "string",
+                                    "description": (
+                                        "Exact uname -r release of kernel A "
+                                        "(e.g. 5.14.0-427.13.1.el9_4.x86_64)"
+                                    ),
+                                },
+                                "candidate": {
+                                    "type": "string",
+                                    "description": (
+                                        "Exact uname -r release of kernel B "
+                                        "(e.g. 5.14.0-742.el9.x86_64)"
+                                    ),
+                                },
+                                "order": {
+                                    "type": "string",
+                                    "enum": ["AB", "ABBA", "BAAB"],
+                                },
+                                "package": {"type": "string"},
+                                "repo_url": {"type": "string"},
+                            },
+                            "required": ["baseline", "candidate"],
+                        },
                     },
                     "additionalProperties": True,
                 },
@@ -1333,6 +1369,34 @@ class TriageAgent(AgentBase):
             "run_ids": [],
             "steps": steps,
         }
+
+        # Kernel comparison (epic #995): a kernel_comparison directive
+        # deterministically reshapes the plan into the canonical A/B
+        # form. Code owns the topology; the LLM only supplied the intent
+        # and the releases. An invalid directive pauses for guidance
+        # instead of silently running a single-kernel ticket.
+        kernel_comparison = directives.get("kernel_comparison")
+        if kernel_comparison:
+            from providers.kernel_plan import build_kernel_comparison_plan
+
+            new_plan, plan_err = build_kernel_comparison_plan(
+                fields["execution_plan"], kernel_comparison
+            )
+            if plan_err:
+                await self._add_comment(
+                    ticket_id,
+                    f"**Triage validation failed:** {plan_err}\n\n"
+                    "Fix the kernel_comparison directive and resubmit.",
+                )
+                await self._transition_ticket(
+                    ticket_id,
+                    "awaiting_customer_guidance",
+                    comment=(
+                        "Triage validation failed; invalid kernel_comparison directive."
+                    ),
+                )
+                return
+            fields["execution_plan"] = new_plan
 
         # Apply step 0's overrides directly — _apply_step_overrides
         # handles this for subsequent steps, but step 0 runs before
