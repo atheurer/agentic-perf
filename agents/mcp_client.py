@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.shared.exceptions import McpError
@@ -1274,7 +1275,12 @@ class AgentMCPClient:
                 type(exc).__name__,
             )
             raise _MCPRegistrationRefreshError(
-                name, timed_out=isinstance(exc, TimeoutError)
+                name,
+                timed_out=isinstance(exc, TimeoutError)
+                or (
+                    isinstance(exc, McpError)
+                    and exc.error.code == httpx.codes.REQUEST_TIMEOUT
+                ),
             ) from None
 
         if (
