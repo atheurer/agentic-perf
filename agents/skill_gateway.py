@@ -227,7 +227,19 @@ def _source_path_excluded(path: str) -> bool:
     )
 
 
-def _source_path_type(root: Path, relative: str) -> tuple[Path, str]:
+def _is_exposed_upstream_path(relative: str) -> bool:
+    normalized = posixpath.normpath(relative)
+    return any(
+        normalized == directory or normalized.startswith(f"{directory}/")
+        for directory in ("docs", "config")
+    )
+
+
+def _source_path_type(root: Path, relative: str, *, kind: str) -> tuple[Path, str]:
+    if kind == "upstream" and not _is_exposed_upstream_path(relative):
+        raise SkillGatewayError(
+            "invalid_document", "Upstream refs must stay inside exposed docs or config"
+        )
     if _source_path_excluded(relative):
         raise SkillGatewayError("invalid_document", "Source path is excluded")
     try:
@@ -251,6 +263,13 @@ def _source_path_type(root: Path, relative: str) -> tuple[Path, str]:
     if _source_path_excluded(target.relative_to(root).as_posix()):
         raise SkillGatewayError(
             "invalid_document", "The resolved source path is excluded"
+        )
+    if kind == "upstream" and not _is_exposed_upstream_path(
+        target.relative_to(root).as_posix()
+    ):
+        raise SkillGatewayError(
+            "invalid_document",
+            "Resolved upstream refs must stay inside exposed docs or config",
         )
     if target.is_dir():
         return target, "directory"
@@ -344,7 +363,7 @@ def _list_source_directory(
     max_entries: int = 4096,
 ) -> dict[str, Any]:
     """List registered document types and immediate directories only."""
-    target, target_type = _source_path_type(root, relative)
+    target, target_type = _source_path_type(root, relative, kind=kind)
     if target_type != "directory":
         raise SkillGatewayError(
             "source_path_not_directory",
@@ -364,7 +383,7 @@ def _list_source_directory(
         if _source_path_excluded(child_relative):
             continue
         try:
-            child, child_type = _source_path_type(root, child_relative)
+            child, child_type = _source_path_type(root, child_relative, kind=kind)
         except SkillGatewayError as exc:
             if exc.code in {"source_path_outside_root", "invalid_document"}:
                 continue
@@ -488,13 +507,25 @@ def _list_upstream_documents(repo_cache: Any, subject: str) -> list[dict[str, An
     repo_name = _UPSTREAM_REPOS.get(subject)
     if not repo_name or repo_cache is None:
         return []
-    if repo_cache.get_path(repo_name) is None:
+    source_path = repo_cache.get_path(repo_name)
+    if source_path is None:
         return []
+    root = Path(source_path).resolve()
     source, provenance_status = _upstream_provenance(repo_cache, subject)
     results = []
     for item in repo_cache.list_docs(repo_name, subdirs=["docs", "config"]):
         path = item.get("path")
         if not isinstance(path, str):
+            continue
+        try:
+            target, path_type = _source_path_type(root, path, kind="upstream")
+        except SkillGatewayError:
+            continue
+        if path_type != "file" or target.suffix.lower() not in {
+            ".md",
+            ".yml",
+            ".yaml",
+        }:
             continue
         ref = _source_ref("upstream", subject, path)
         results.append(
@@ -527,32 +558,9 @@ def _read_upstream_document(
     root = repo_cache.get_path(repo_name)
     if root is None:
         raise SkillGatewayError("source_unavailable", "Upstream cache is unavailable")
-    if not any(relative.startswith(f"{subdir}/") for subdir in ("docs", "config")):
-        raise SkillGatewayError("invalid_document", "Invalid upstream document")
-    if _source_path_excluded(relative):
-        raise SkillGatewayError("invalid_document", "Invalid upstream document")
     root = Path(root).resolve()
-    candidate = root / relative
-    try:
-        target = candidate.resolve(strict=True)
-    except PermissionError:
-        raise SkillGatewayError(
-            "source_path_inaccessible", "The upstream document cannot be read"
-        ) from None
-    except FileNotFoundError:
-        raise SkillGatewayError(
-            "source_path_not_found", "The upstream document does not exist"
-        ) from None
-    except (OSError, RuntimeError):
-        raise SkillGatewayError(
-            "source_path_inaccessible", "The upstream document cannot be resolved"
-        ) from None
-    if (
-        not target.is_relative_to(root)
-        or _source_path_excluded(target.relative_to(root).as_posix())
-        or not target.is_file()
-        or target.suffix.lower() not in {".md", ".yml", ".yaml"}
-    ):
+    target, path_type = _source_path_type(root, relative, kind="upstream")
+    if path_type != "file" or target.suffix.lower() not in {".md", ".yml", ".yaml"}:
         raise SkillGatewayError("invalid_document", "Invalid upstream document")
     if target.stat().st_size > _MAX_SOURCE_DOCUMENT_BYTES:
         raise SkillGatewayError(
@@ -691,19 +699,16 @@ def _resolve_source_pointer(
 ) -> tuple[str, str]:
     if pointer.startswith(("/", "\\")) or "://" in pointer or "\\" in pointer:
         raise SkillGatewayError("invalid_document", "Invalid relative pointer")
-    _target, origin_type = _source_path_type(root, relative)
+    _target, origin_type = _source_path_type(root, relative, kind=kind)
     base = relative if origin_type == "directory" else posixpath.dirname(relative)
     resolved = posixpath.normpath(posixpath.join(base, pointer))
     if resolved in {"", ".", ".."} or resolved.startswith("../"):
         raise SkillGatewayError("invalid_document", "Pointer leaves its source")
-    if kind == "upstream" and not any(
-        resolved == allowed or resolved.startswith(f"{allowed}/")
-        for allowed in ("docs", "config")
-    ):
+    if kind == "upstream" and not _is_exposed_upstream_path(resolved):
         raise SkillGatewayError(
             "invalid_document", "Pointer leaves exposed upstream docs"
         )
-    _target, target_type = _source_path_type(root, resolved)
+    _target, target_type = _source_path_type(root, resolved, kind=kind)
     return resolved, target_type
 
 
@@ -725,12 +730,7 @@ def _search_source_documents(
     )
     complete = len(documents) < 128 if kind == "local" else True
     if scope_path:
-        _scope, scope_type = _source_path_type(root, scope_path)
-        if kind == "upstream" and not any(
-            scope_path == allowed or scope_path.startswith(f"{allowed}/")
-            for allowed in ("docs", "config")
-        ):
-            raise SkillGatewayError("invalid_origin", "Origin is outside exposed docs")
+        _scope, scope_type = _source_path_type(root, scope_path, kind=kind)
         if scope_type == "file":
             allowed_ref = _source_ref(kind, subject, scope_path)
             if not any(item["ref"] == allowed_ref for item in documents):
@@ -738,11 +738,9 @@ def _search_source_documents(
                     "invalid_origin", "The file is not an exposed source document"
                 )
             scope_path = posixpath.dirname(scope_path)
-        documents = [
-            item
-            for item in documents
-            if item["path"].startswith(f"{scope_path.rstrip('/')}/")
-        ]
+        if scope_path not in {"", "."}:
+            prefix = f"{scope_path.rstrip('/')}/"
+            documents = [item for item in documents if item["path"].startswith(prefix)]
     alternatives = [
         term.casefold().strip() for term in query.split("|") if term.strip()
     ]
@@ -1189,7 +1187,9 @@ async def _skill_context_list_search(
                         kind, root, origin_path, path
                     )
                 else:
-                    _target, origin_type = _source_path_type(root, origin_path)
+                    _target, origin_type = _source_path_type(
+                        root, origin_path, kind=kind
+                    )
                     relative = (
                         origin_path
                         if origin_type == "directory"

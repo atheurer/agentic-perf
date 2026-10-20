@@ -2280,6 +2280,56 @@ async def test_controller_gateway_distinguishes_invalid_and_missing_origins(
     assert pointer_ssh.calls == 1
 
 
+@pytest.mark.parametrize("exit_code", [-1, 255])
+@pytest.mark.parametrize("operation", ["read", "list", "search"])
+@pytest.mark.asyncio
+async def test_controller_origin_inspection_transport_failures_are_retryable_and_safe(
+    tmp_path, monkeypatch, exit_code, operation
+):
+    import agents.server_utils as server_utils
+    import paths
+    from providers.ssh import SSHResult
+
+    events = []
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    monkeypatch.setattr(
+        server_utils,
+        "emit_private_tool_audit_event",
+        lambda *args, **kwargs: events.append(kwargs["data"]),
+    )
+
+    class FailedInspectionSSH:
+        calls = 0
+
+        async def run(self, host, command, **kwargs):
+            self.calls += 1
+            return SSHResult("", "credential-bearing transport detail", exit_code)
+
+    ssh = FailedInspectionSSH()
+    result = json.loads(
+        await server_utils.controller_context_gateway(
+            ssh=ssh,
+            controller_host="controller.example.test",
+            ticket_id=f"PERF-CONTROLLER-ORIGIN-TRANSPORT-{operation}-{exit_code}",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation=operation,
+            from_ref="repos/safe",
+            path="README.md" if operation == "read" else "",
+            query="README" if operation == "search" else "",
+        )
+    )
+
+    assert result["reason"] == "controller_transport_error"
+    assert result["requested_ref"] == "repos/safe"
+    assert "Retry" in result["next_action"]
+    assert "credential-bearing" not in json.dumps(result)
+    assert ssh.calls == 1
+    assert events[-1]["outcome"] == "rejected"
+    assert events[-1]["reason"] == "controller_transport_error"
+    assert "credential-bearing" not in json.dumps(events)
+
+
 @pytest.mark.asyncio
 async def test_controller_listing_returns_typed_reusable_children(
     tmp_path, monkeypatch

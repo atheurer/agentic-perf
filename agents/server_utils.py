@@ -1167,15 +1167,26 @@ async def controller_context_gateway(
                 requested_ref=origin,
                 next_action="Retry the context request after controller connectivity is restored.",
             )
+        if origin_result.exit_code not in {0, 20, 21, 22, 24, 25, 27}:
+            return failure(
+                "controller_transport_error",
+                "The controller could not confirm the origin's path type.",
+                requested_ref=origin,
+                next_action=(
+                    "Retry the context request after controller connectivity is "
+                    "restored."
+                ),
+            )
         if origin_result.exit_code != 0:
             return failure(
                 {
                     20: "controller_root_unavailable",
                     21: "controller_origin_not_found",
                     22: "controller_path_outside_root",
+                    24: "controller_origin_invalid",
                     25: "controller_path_inaccessible",
                     27: "controller_path_excluded",
-                }.get(origin_result.exit_code, "controller_origin_invalid"),
+                }[origin_result.exit_code],
                 "The origin could not be resolved safely on the controller.",
                 requested_ref=origin,
                 path_type={

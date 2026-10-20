@@ -348,6 +348,131 @@ async def test_local_directory_listing_and_directory_origin_reads_are_typed(
 
 
 @pytest.mark.asyncio
+async def test_root_level_local_document_origin_searches_source_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    skills = tmp_path / "skills"
+    local = skills / "kube-burner"
+    local.mkdir(parents=True)
+    (local / "SKILL.md").write_text("root needle guidance")
+    (local / "notes.md").write_text("sibling needle reference")
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    result = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-ROOT-ORIGIN-SEARCH",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="search",
+            query="needle",
+            from_ref=("skill://local/harness/kube-burner/SKILL.md"),
+            local_skills_dir=skills,
+        )
+    )
+
+    source = result["sources"][0]
+    assert source["scan_scope"] == "."
+    assert {item["path"] for item in source["results"]} == {"SKILL.md", "notes.md"}
+
+
+@pytest.mark.asyncio
+async def test_upstream_symlinks_cannot_escape_exposed_docs_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    repo_root = tmp_path / "cache" / "kube-burner"
+    docs = repo_root / "docs"
+    source = repo_root / "src"
+    docs.mkdir(parents=True)
+    source.mkdir()
+    (docs / "visible.md").write_text("public docs guidance")
+    (source / "secret.md").write_text("secretphrase out of scope")
+    (docs / "safe-link.md").symlink_to(docs / "visible.md")
+    (docs / "internal").symlink_to(source, target_is_directory=True)
+
+    from providers.skills.repo_cache import RepoCache
+
+    cache = RepoCache(cache_dir=repo_root.parent)
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    unsafe_directory_ref = "skill://upstream/harness/kube-burner/docs/internal"
+    unsafe_document_ref = "skill://upstream/harness/kube-burner/docs/internal/secret.md"
+    safe_directory_ref = "skill://upstream/harness/kube-burner/docs"
+
+    async def invoke(**kwargs: Any) -> dict[str, Any]:
+        return json.loads(
+            await skill_context_gateway(
+                Provider(),
+                ticket_id="PERF-UPSTREAM-SYMLINK-BOUNDARY",
+                agent_name="benchmark-agent",
+                phase="benchmark",
+                subject="harness/kube-burner",
+                repo_cache=cache,
+                **kwargs,
+            )
+        )
+
+    direct_read = await invoke(operation="read", ref=unsafe_document_ref)
+    assert direct_read["reason"] == "invalid_document"
+
+    relative_read = await invoke(
+        operation="read", from_ref=unsafe_directory_ref, path="secret.md"
+    )
+    assert relative_read["reason"] == "invalid_document"
+
+    pointer_read = await invoke(
+        operation="read", from_ref=safe_directory_ref, path="internal/secret.md"
+    )
+    assert pointer_read["reason"] == "invalid_document"
+
+    directory_list = await invoke(operation="list", ref=unsafe_directory_ref)
+    assert directory_list["reason"] == "invalid_document"
+
+    pointer_list = await invoke(
+        operation="list", from_ref=safe_directory_ref, path="internal"
+    )
+    assert pointer_list["reason"] == "invalid_document"
+
+    scoped_search = await invoke(
+        operation="search", query="secretphrase", from_ref=unsafe_directory_ref
+    )
+    assert scoped_search["reason"] == "invalid_document"
+
+    pointer_search = await invoke(
+        operation="search",
+        query="secretphrase",
+        from_ref=safe_directory_ref,
+        path="internal",
+    )
+    assert pointer_search["reason"] == "invalid_document"
+
+    bootstrap = await invoke(operation="bootstrap")
+    upstream_paths = {
+        item["path"] for item in bootstrap["documents"] if item["scope"] == "upstream"
+    }
+    assert "docs/internal/secret.md" not in upstream_paths
+    assert "docs/safe-link.md" in upstream_paths
+
+    safe_read = await invoke(
+        operation="read",
+        ref="skill://upstream/harness/kube-burner/docs/safe-link.md",
+    )
+    assert safe_read["found"] is True
+    assert safe_read["document"]["content"] == "public docs guidance"
+
+
+@pytest.mark.asyncio
 async def test_search_and_list_cursors_are_bounded_scoped_and_do_not_drop_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
