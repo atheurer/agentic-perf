@@ -1120,14 +1120,18 @@ async def _skill_context_list_search(
     if any(not source for source in selected_sources):
         raise SkillGatewayError("invalid_origin", "Use a returned source ref.")
 
+    effective_from_ref = saved_binding.get("origin", "") if saved_binding else from_ref
+    effective_ref = saved_binding.get("ref", "") if saved_binding else ref
+    effective_path = saved_binding.get("path", "") if saved_binding else path
+
     sources: list[dict[str, Any]] = []
     pages: list[dict[str, Any]] = []
     # Let each source use the remaining result budget; the final envelope pass
     # removes any excess and keeps continuation cursors for trimmed results.
     per_source_budget = max(64, budget - 256)
     for source_kind in selected_sources:
-        origin_ref = saved_binding.get("origin", "") if saved_binding else from_ref
-        bound_ref = saved_binding.get("ref", "") if saved_binding else ref
+        origin_ref = effective_from_ref
+        bound_ref = effective_ref
         source_scope = saved_binding.get("scope", "") if saved_binding else ""
         binding = {
             "ticket_id": ticket_id,
@@ -1140,7 +1144,7 @@ async def _skill_context_list_search(
             "scope": source_scope,
             "origin": origin_ref,
             "ref": bound_ref,
-            "path": path,
+            "path": effective_path,
         }
         if saved_binding:
             binding.update(saved_binding)
@@ -1349,7 +1353,7 @@ async def _skill_context_list_search(
                     None,
                     query,
                     from_ref=origin_ref or None,
-                    path=path or None,
+                    path=effective_path or None,
                     offset=org_offset,
                     max_bytes=max(128, per_source_budget - 128),
                 )
@@ -1382,7 +1386,7 @@ async def _skill_context_list_search(
                 "source": "organization",
                 "scope": "organization",
                 "scope_ref": origin_ref or None,
-                "relative_path": path or None,
+                "relative_path": effective_path or None,
                 "scan_scope": org.get(
                     "scan_scope", "all applicable organization documents"
                 ),

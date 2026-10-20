@@ -1413,7 +1413,9 @@ async def get_skill_context(
     response_overhead_bytes = (
         len(
             json.dumps(
-                {"runfile_contract": runfile_contract}, separators=(",", ":")
+                {"runfile_contract": runfile_contract},
+                ensure_ascii=False,
+                separators=(",", ":"),
             ).encode()
         )
         if runfile_contract is not None and operation in {"list", "search"}
@@ -1453,9 +1455,13 @@ async def get_skill_context(
                     "max_bytes cannot fit the run-file contract and complete result envelope."
                 ),
             }
-            error_response = json.dumps(too_small, separators=(",", ":"))
+            error_response = json.dumps(
+                too_small, ensure_ascii=False, separators=(",", ":")
+            )
             if len(error_response.encode("utf-8")) > max_bytes:
-                error_response = json.dumps({"reason": "page_too_small"})
+                error_response = json.dumps(
+                    {"reason": "page_too_small"}, ensure_ascii=False
+                )
             if len(error_response.encode("utf-8")) > max_bytes:
                 return "{}"
             return error_response
@@ -1743,7 +1749,7 @@ def _with_crucible_runfile_contract(
         if runfile_contract is not None
         else _crucible_context.get_runfile_contract()
     )
-    return json.dumps(result, separators=(",", ":"))
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 async def _legacy_get_crucible_benchmark_context(
