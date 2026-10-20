@@ -15,7 +15,8 @@ dependencies = [
     # The MCP audit boundary relies on ClientSession.call_tool(meta=...) and
     # FastMCP's middleware request/session context. Keep this tested pair
     # constrained instead of accepting an incompatible future SDK release.
-    "mcp~=1.28.0",
+    # mcp 1.30.0 is the first patched release for CVE-2026-59951.
+    "mcp~=1.30.0",
     "fastmcp~=3.4.2",
 ]
 
