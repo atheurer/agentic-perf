@@ -176,6 +176,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/resource/server.py", "_ensure_init", "cloud_resource"),
     ("agents/resource/server.py", "_get_skill_provider", "cloud_resource"),
     ("agents/resource/server.py", "_get_board_selector", "cloud_resource"),
+    (
+        "agents/resource/server.py",
+        "_get_resource_organization_resolver",
+        "cloud_resource",
+    ),
     ("agents/resource/server.py", "_infer_os_from_ticket", "cloud_resource"),
     ("agents/resource/server.py", "get_skill_context", "cloud_resource"),
     (
@@ -214,6 +219,7 @@ INVENTORIED_SIDE_EFFECTS = (
         "_reservation_ticket_context",
         "cloud_resource",
     ),
+    ("agents/resource/server.py", "_resolve_quads_ticket_key", "cloud_resource"),
     (
         "agents/resource/server.py",
         "_split_reservation_ids",
@@ -624,6 +630,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/resource/registry.py", "<module>", "cloud_resource"),
     ("providers/resource/registry.py", "close_all", "cloud_resource"),
     ("providers/resource/registry.py", "get_provider", "cloud_resource"),
+    (
+        "providers/resource/registry.py",
+        "_organization_service_config",
+        "cloud_resource",
+    ),
     ("providers/resource/registry.py", "list_configured_providers", "cloud_resource"),
     ("providers/secrets/bitwarden.py", "secret_file", "filesystem"),
     ("providers/secrets/git_reference.py", "secret_file", "filesystem"),
@@ -643,10 +654,12 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/skills/crucible.py", "get_benchmark_context", "filesystem"),
     ("providers/skills/crucible.py", "get_crucible_context", "github"),
     ("providers/skills/gateway.py", "_read_bytes", "filesystem"),
+    ("providers/skills/gateway.py", "_prepare_git_sources", "filesystem"),
     ("providers/skills/gateway.py", "from_instance_config", "filesystem"),
     ("providers/skills/gateway.py", "from_instance_config_async", "filesystem"),
     ("providers/skills/gateway.py", "_snapshot", "filesystem"),
     ("providers/skills/gateway.py", "search", "filesystem"),
+    ("providers/skills/gateway.py", "cleanup_ticket", "filesystem"),
     ("providers/skills/git_source.py", "_acquire_lock", "filesystem"),
     ("providers/skills/git_source.py", "_make_tree_read_only", "filesystem"),
     ("providers/skills/git_source.py", "_remove_tree", "filesystem"),
@@ -1797,6 +1810,16 @@ INVENTORY_DISPOSITIONS = {
         "agents/resource/server.py:_get_board_selector",
         "2027-12-31",
     ),
+    (
+        "agents/resource/server.py",
+        "_get_resource_organization_resolver",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_get_resource_organization_resolver",
+        "2027-12-31",
+    ),
     ("agents/resource/server.py", "_infer_os_from_ticket", "cloud_resource"): (
         "audited",
         "observability-maintainers",
@@ -1887,6 +1910,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/server.py:_reservation_ticket_context",
+        "2027-12-31",
+    ),
+    ("agents/resource/server.py", "_resolve_quads_ticket_key", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_resolve_quads_ticket_key",
         "2027-12-31",
     ),
     (
@@ -3439,6 +3468,16 @@ INVENTORY_DISPOSITIONS = {
         "providers/resource/registry.py:get_provider",
         "2027-12-31",
     ),
+    (
+        "providers/resource/registry.py",
+        "_organization_service_config",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/registry.py:_organization_service_config",
+        "2027-12-31",
+    ),
     ("providers/resource/registry.py", "list_configured_providers", "cloud_resource"): (
         "audited",
         "observability-maintainers",
@@ -3545,6 +3584,12 @@ INVENTORY_DISPOSITIONS = {
         "providers/skills/gateway.py:_read_bytes",
         "2027-12-31",
     ),
+    ("providers/skills/gateway.py", "_prepare_git_sources", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "providers/skills/gateway.py:_prepare_git_sources",
+        "2027-12-31",
+    ),
     ("providers/skills/gateway.py", "from_instance_config", "filesystem"): (
         "audited",
         "observability-maintainers",
@@ -3567,6 +3612,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/skills/gateway.py:search",
+        "2027-12-31",
+    ),
+    ("providers/skills/gateway.py", "cleanup_ticket", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "providers/skills/gateway.py:cleanup_ticket",
         "2027-12-31",
     ),
     ("providers/skills/git_source.py", "_acquire_lock", "filesystem"): (
