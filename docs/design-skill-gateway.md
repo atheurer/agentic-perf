@@ -331,8 +331,9 @@ Use one shared tool definition, provisionally `get_skill_context`, for example:
 
 ```json
 {"subject":"harness/crucible","operation":"bootstrap"}
-{"subject":"harness/crucible","operation":"read","ref":"<returned-ref>"}
-{"subject":"harness/crucible","operation":"search","query":"ethtool|multiplex"}
+{"subject":"harness/crucible","operation":"read","ref":"<returned-file-ref>"}
+{"subject":"harness/crucible","operation":"list","ref":"<returned-directory-ref>"}
+{"subject":"harness/crucible","operation":"search","query":"ethtool|multiplex","from_ref":"<returned-origin-ref>"}
 ```
 
 Bootstrap returns the applicable organization entrypoints and, when available
@@ -344,10 +345,30 @@ that depend on it; missing controller context does not become an inferred schema
 
 Returned references are stable logical identities and round-trip directly into
 reads. Organization and software documents cannot collide even if both are
-named `AGENTS.md`. To follow a relative pointer inside a document, allow a
-relative path together with the originating document reference. The gateway
-resolves it mechanically inside that document's source root. The agent retains
-responsibility for interpreting the documents and choosing follow-up reads.
+named `AGENTS.md`. To follow a relative pointer inside a document, supply
+`from_ref` plus `path`. The gateway checks the origin's actual type: a file
+origin resolves relative to its parent, and a directory origin resolves inside
+that directory. Directory refs returned by `list` can be reused directly.
+Listing returns only sorted immediate children, with file/directory types and
+exact refs. It never fetches child contents recursively. Organization package
+and service-config directories are not exposed; that backend reports listing as
+unsupported while preserving its registered document and phase rules.
+
+Search without `from_ref` searches every applicable source. A file origin
+searches its parent directory, while a directory origin searches that subtree
+recursively. Software searches honor that scope, including encoded-colon
+repository refs. Every source returns a bounded page of structured results and
+its own opaque `next_cursor` when more results are available. Pass the same
+operation and query with that cursor to continue; the cursor retains the original
+source, origin, and relative path. Cursors live in the ticket's audited workspace
+snapshot and bind to ticket, agent, phase, subject, source, scope, and query;
+another ticket or scope cannot reuse them. `max_bytes` bounds the complete
+serialized list/search response, including its envelope and all source pages.
+The benchmark Crucible wrapper counts its run-file contract toward that budget;
+if the contract and result envelope cannot fit, it returns `page_too_small`
+without the contract.
+`offset_bytes` remains document-read pagination. Search and listing report
+whether scanning completed, so an incomplete scan cannot confirm absence.
 
 Bootstrap can also identify approved configuration views for the current phase,
 such as execution defaults or review settings. Existing config-display tools can
@@ -355,10 +376,12 @@ delegate to the same resolver during migration; Crucible prompts eventually use
 the generic gateway views. Installation/execution services consume the full
 validated runtime configuration directly through the resolver.
 
-Read responses use the existing bounded byte paging. Search covers only the
-current subject's applicable document inventory and returns references, snippets,
-and sizes. Results identify the scope and role needed to interpret guidance;
-physical paths, credential references, and transport details stay server-side.
+Read responses use the existing bounded byte paging. Organization search uses
+POSIX extended regular expressions without backreferences. Controller search
+uses Python regular expressions and treats an invalid expression literally;
+local and upstream search use literal alternatives separated by `|`. Results
+identify source, scope, match counts, and completeness; physical paths,
+credential references, and transport details stay server-side.
 
 Use a shared gateway implementation and MCP tool registration for every consuming
 agent. A ticket-scoped MCP server is a suitable initial host, using the existing
@@ -643,15 +666,14 @@ installation check.
 
 The implementation uses the existing audited FastMCP tool surface:
 `get_skill_context(subject, operation, ref, path, from_ref, query, max_bytes,
-offset_bytes)`. It does not claim conformance to the Final MCP Skills extension.
+offset_bytes, cursor)`. It does not claim conformance to the Final MCP Skills extension.
 An adapter can expose the same resolver through that protocol later.
 
 Organization search requires GNU grep and accepts POSIX extended regular
 expressions without backreferences. It has a two-second deadline and bounded
-input, matches, snippets, and pages. Controller search retains its existing
-software adapter semantics. Scope a paged organization search with `from_ref`
-and use that source's returned cursor; controller search is bounded discovery
-without a continuation cursor.
+input, matches, snippets, and pages. Controller search uses bounded discovery
+and now supports ticket-scoped continuation cursors. Local/upstream listing and
+search remain confined to their exposed subject document roots.
 
 Local administrator paths and organization Git sources are implemented in this
 draft. Authenticated user packages, project packages, and user-specific

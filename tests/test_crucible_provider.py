@@ -1813,9 +1813,18 @@ class TestEndpointUserEnforcement:
 @pytest.mark.asyncio
 async def test_skill_context_mcp_schema_exposes_generic_request_fields():
     import agents.benchmark.server as benchmark_server
+    import agents.provisioning.server as provisioning_server
+    import agents.resource.server as resource_server
     import agents.review.server as review_server
+    import agents.triage.server as triage_server
 
-    for server in (benchmark_server, review_server):
+    for server in (
+        benchmark_server,
+        provisioning_server,
+        resource_server,
+        review_server,
+        triage_server,
+    ):
         tools = await server.mcp.list_tools()
         tool = next(item for item in tools if item.name == "get_skill_context")
         assert set(tool.parameters["properties"]) == {
@@ -1827,6 +1836,7 @@ async def test_skill_context_mcp_schema_exposes_generic_request_fields():
             "query",
             "max_bytes",
             "offset_bytes",
+            "cursor",
         }
         assert tool.parameters["additionalProperties"] is False
 
@@ -1883,6 +1893,45 @@ async def test_registered_skill_context_tool_includes_provider_runfile_contract(
     assert "Use {} when no tags apply" in response["runfile_contract"]["guidance"]
     assert calls[0]["operation"] == "bootstrap"
     assert calls[0]["subject"] == "harness/crucible"
+
+
+@pytest.mark.asyncio
+async def test_benchmark_search_budget_includes_runfile_contract(tmp_path, monkeypatch):
+    import agents.benchmark.server as benchmark_server
+
+    class LargeContractProvider:
+        def get_runfile_contract(self):
+            return {"guidance": "run-file contract " * 100}
+
+    monkeypatch.setattr(benchmark_server, "_initialized", True)
+    monkeypatch.setattr(benchmark_server, "_crucible_context", LargeContractProvider())
+    calls = []
+
+    async def too_small(*_args, **kwargs):
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "found": False,
+                "operation": "search",
+                "reason": "page_too_small",
+                "message": "max_bytes must leave room for one result page.",
+            },
+            separators=(",", ":"),
+        )
+
+    monkeypatch.setattr(benchmark_server, "skill_context_gateway", too_small)
+    response = await benchmark_server.get_skill_context(
+        subject="harness/crucible",
+        operation="search",
+        query="README",
+        max_bytes=512,
+    )
+
+    payload = json.loads(response)
+    assert len(response.encode("utf-8")) <= 512
+    assert payload["reason"] == "page_too_small"
+    assert "runfile_contract" not in payload
+    assert calls[0]["response_overhead_bytes"] > 512
 
 
 @pytest.mark.asyncio
@@ -2008,7 +2057,7 @@ async def test_controller_context_gateway_rejects_symlink_escape(tmp_path, monke
     class EscapingSSH:
         async def run(self, host, command, **kwargs):
             if "realpath -e" in command:
-                return SSHResult("", "path escapes controller root", 2)
+                return SSHResult("", "path escapes controller root", 22)
             return SSHResult("", "unexpected command", 1)
 
     monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
@@ -2025,4 +2074,413 @@ async def test_controller_context_gateway_rejects_symlink_escape(tmp_path, monke
     )
 
     assert result["found"] is False
-    assert result["reason"] == "controller_document_not_found"
+    assert result["reason"] == "controller_path_outside_root"
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "reason", "path_type"),
+    [
+        (20, "controller_root_unavailable", "unknown"),
+        (21, "controller_document_not_found", "missing"),
+        (22, "controller_path_outside_root", "outside_root"),
+        (23, "controller_path_is_directory", "directory"),
+        (24, "controller_path_not_file", "unsupported"),
+        (25, "controller_path_inaccessible", "inaccessible"),
+        (26, "controller_read_failed", "file"),
+        (27, "controller_path_excluded", "excluded"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_controller_read_errors_are_structured_and_audited(
+    tmp_path, monkeypatch, exit_code, reason, path_type
+):
+    import agents.server_utils as server_utils
+    import paths
+    from providers.ssh import SSHResult
+
+    events = []
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    monkeypatch.setattr(
+        server_utils,
+        "emit_private_tool_audit_event",
+        lambda *args, **kwargs: events.append(kwargs["data"]),
+    )
+
+    class ErrorSSH:
+        async def run(self, host, command, **kwargs):
+            return SSHResult("", "secret diagnostic must not escape", exit_code)
+
+    result = json.loads(
+        await server_utils.controller_context_gateway(
+            ssh=ErrorSSH(),
+            controller_host="controller.example.test",
+            ticket_id=f"PERF-CONTROLLER-ERROR-{exit_code}",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="read",
+            path="repos/example/README.md",
+        )
+    )
+
+    assert result["reason"] == reason
+    assert result["requested_ref"] == "repos/example/README.md"
+    assert result["path_type"] == path_type
+    assert result["next_action"]
+    assert "secret diagnostic" not in json.dumps(result)
+    assert events[-1]["outcome"] == "rejected"
+    assert events[-1]["reason"] == reason
+    assert "secret diagnostic" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_controller_transport_error_is_safe_and_audited(tmp_path, monkeypatch):
+    import agents.server_utils as server_utils
+    import paths
+
+    events = []
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    monkeypatch.setattr(
+        server_utils,
+        "emit_private_tool_audit_event",
+        lambda *args, **kwargs: events.append(kwargs["data"]),
+    )
+
+    class FailedSSH:
+        async def run(self, host, command, **kwargs):
+            raise RuntimeError("credential-bearing ssh failure")
+
+    result = json.loads(
+        await server_utils.controller_context_gateway(
+            ssh=FailedSSH(),
+            controller_host="controller.example.test",
+            ticket_id="PERF-CONTROLLER-TRANSPORT-ERROR",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="read",
+            path="README.md",
+        )
+    )
+
+    assert result["reason"] == "controller_transport_error"
+    assert result["requested_ref"] == "README.md"
+    assert "credential-bearing" not in json.dumps(result)
+    assert events[-1]["outcome"] == "rejected"
+    assert "credential-bearing" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_controller_read_reports_only_validated_resolved_ref(
+    tmp_path, monkeypatch
+):
+    import agents.server_utils as server_utils
+    import paths
+    from providers.ssh import SSHResult
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+
+    class ResolvedSSH:
+        async def run(self, host, command, **kwargs):
+            return SSHResult(
+                "safe controller guidance",
+                "resolved_ref=canonical/README.md\nprivate transport detail",
+                0,
+            )
+
+    result = json.loads(
+        await server_utils.controller_context_gateway(
+            ssh=ResolvedSSH(),
+            controller_host="controller.example.test",
+            ticket_id="PERF-CONTROLLER-RESOLVED-REF",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="read",
+            path="alias/README.md",
+        )
+    )
+
+    assert result["requested_ref"] == "alias/README.md"
+    assert result["resolved_ref"] == "canonical/README.md"
+    assert result["path_type"] == "file"
+    assert "private transport detail" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_controller_gateway_distinguishes_invalid_and_missing_origins(
+    tmp_path, monkeypatch
+):
+    import agents.server_utils as server_utils
+    import paths
+    from providers.ssh import SSHResult
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+
+    class MissingOriginSSH:
+        calls = 0
+
+        async def run(self, host, command, **kwargs):
+            self.calls += 1
+            return SSHResult("", "not-found detail", 21)
+
+    ssh = MissingOriginSSH()
+    invalid = json.loads(
+        await server_utils.controller_context_gateway(
+            ssh=ssh,
+            controller_host="controller.example.test",
+            ticket_id="PERF-CONTROLLER-INVALID-ORIGIN",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="read",
+            from_ref="../outside",
+            path="README.md",
+        )
+    )
+    missing = json.loads(
+        await server_utils.controller_context_gateway(
+            ssh=ssh,
+            controller_host="controller.example.test",
+            ticket_id="PERF-CONTROLLER-MISSING-ORIGIN",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="read",
+            from_ref="repos/missing",
+            path="README.md",
+        )
+    )
+
+    assert invalid["reason"] == "invalid_origin"
+    assert missing["reason"] == "controller_origin_not_found"
+    assert missing["path_type"] == "missing"
+    assert ssh.calls == 1
+    assert "not-found detail" not in json.dumps(missing)
+
+    class PointerSSH:
+        calls = 0
+
+        async def run(self, host, command, **kwargs):
+            self.calls += 1
+            assert "realpath -e" in command
+            return SSHResult("directory", "", 0)
+
+    pointer_ssh = PointerSSH()
+    invalid_pointer = json.loads(
+        await server_utils.controller_context_gateway(
+            ssh=pointer_ssh,
+            controller_host="controller.example.test",
+            ticket_id="PERF-CONTROLLER-INVALID-POINTER",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="search",
+            query="README",
+            from_ref="repos/safe",
+            path="../../outside",
+        )
+    )
+    assert invalid_pointer["reason"] == "invalid_origin"
+    assert invalid_pointer["path_type"] == "invalid_pointer"
+    assert pointer_ssh.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_controller_listing_returns_typed_reusable_children(
+    tmp_path, monkeypatch
+):
+    import agents.server_utils as server_utils
+    import paths
+    from providers.ssh import SSHResult
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    directory = "repos/https:github.com:perftool-incubator/bench-uperf"
+
+    class ListingSSH:
+        async def run(self, host, command, **kwargs):
+            assert "os.path.realpath" in command
+            return SSHResult(
+                json.dumps(
+                    {
+                        "entries": [
+                            {
+                                "path": f"{directory}/README.md",
+                                "type": "file",
+                                "size_bytes": 18,
+                            },
+                            {
+                                "path": f"{directory}/docs",
+                                "type": "directory",
+                                "size_bytes": None,
+                            },
+                        ],
+                        "complete": True,
+                        "resolved_path": directory,
+                    }
+                ),
+                "",
+                0,
+            )
+
+    result = json.loads(
+        await server_utils.controller_context_gateway(
+            ssh=ListingSSH(),
+            controller_host="controller.example.test",
+            ticket_id="PERF-CONTROLLER-LIST",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="list",
+            path=directory,
+        )
+    )
+
+    assert result["resolved_ref"] == directory
+    assert result["path_type"] == "directory"
+    assert [(item["path"], item["type"]) for item in result["results"]] == [
+        (f"{directory}/README.md", "file"),
+        (f"{directory}/docs", "directory"),
+    ]
+    assert all(item["uri"] == f"crucible://{item['ref']}" for item in result["results"])
+    assert result["recursive"] is False
+
+
+@pytest.mark.asyncio
+async def test_software_listing_refs_are_reusable_and_directory_reads_explain_list(
+    tmp_path, monkeypatch
+):
+    import agents.skill_gateway as skill_gateway
+    import paths
+    from providers.skills.gateway import OrganizationSkillResolver
+    from providers.ssh import SSHResult
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    directory = "repos/https:github.com:perftool-incubator/bench-uperf"
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    class ListingSSH:
+        async def run(self, host, command, **kwargs):
+            if command.startswith("python3 -c "):
+                return SSHResult(
+                    json.dumps(
+                        {
+                            "entries": [
+                                {
+                                    "path": f"{directory}/README.md",
+                                    "type": "file",
+                                    "size_bytes": 18,
+                                },
+                                {
+                                    "path": f"{directory}/docs",
+                                    "type": "directory",
+                                    "size_bytes": None,
+                                },
+                            ],
+                            "complete": True,
+                            "resolved_path": directory,
+                        }
+                    ),
+                    "",
+                    0,
+                )
+            if "cat --" in command:
+                return SSHResult("", "secret controller error", 23)
+            raise AssertionError(f"unexpected controller command: {command}")
+
+    listing = json.loads(
+        await skill_gateway.skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-SOFTWARE-LIST-REFS",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="list",
+            ref=skill_gateway._software_ref(directory),
+            ssh=ListingSSH(),
+            controller_host="controller.example.test",
+        )
+    )
+    source = next(item for item in listing["sources"] if item["scope"] == "software")
+    assert [(item["path"], item["type"]) for item in source["results"]] == [
+        (f"{directory}/README.md", "file"),
+        (f"{directory}/docs", "directory"),
+    ]
+    assert all(
+        item["ref"] == skill_gateway._software_ref(item["path"])
+        for item in source["results"]
+    )
+    directory_ref = next(
+        item["ref"] for item in source["results"] if item["type"] == "directory"
+    )
+    read = json.loads(
+        await skill_gateway.skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-SOFTWARE-LIST-REFS",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            operation="read",
+            ref=directory_ref,
+            ssh=ListingSSH(),
+            controller_host="controller.example.test",
+        )
+    )
+    assert read["reason"] == "controller_path_is_directory"
+    assert read["path_type"] == "directory"
+    assert "operation='list'" in read["next_action"]
+    assert "secret controller error" not in json.dumps(read)
+
+
+@pytest.mark.asyncio
+async def test_controller_search_uses_encoded_colon_directory_or_file_scope(
+    tmp_path, monkeypatch
+):
+    import agents.skill_gateway as skill_gateway
+    import paths
+    from agents.skill_gateway import skill_context_gateway
+    from providers.skills.gateway import OrganizationSkillResolver
+    from providers.ssh import SSHResult
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    relative_directory = "repos/https:github.com:perftool-incubator/bench-uperf"
+    expected_file = f"{relative_directory}/README.md"
+    expected_ref = skill_gateway._software_ref(expected_file)
+    calls = []
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    class ScopedSSH:
+        async def run(self, host, command, **kwargs):
+            calls.append(command)
+            if "realpath -e" in command:
+                kind = "file" if "README.md" in command else "directory"
+                return SSHResult(kind, "", 0)
+            assert "MAX_DIRECTORIES" in command
+            return SSHResult(
+                f"NAME\tf\t18\t/opt/crucible/{expected_file}\n",
+                "",
+                0,
+            )
+
+    for is_directory in (True, False):
+        origin = relative_directory if is_directory else expected_file
+        origin_ref = skill_gateway._software_ref(origin)
+        calls.clear()
+        result = json.loads(
+            await skill_context_gateway(
+                Provider(),
+                ticket_id=f"PERF-SCOPED-SEARCH-{is_directory}",
+                agent_name="benchmark-agent",
+                phase="benchmark",
+                operation="search",
+                query="README",
+                from_ref=origin_ref,
+                ssh=ScopedSSH(),
+                controller_host="controller.example.test",
+            )
+        )
+        search_command = next(
+            command for command in calls if "MAX_DIRECTORIES" in command
+        )
+        assert relative_directory in search_command
+        source = next(
+            source for source in result["sources"] if source["scope"] == "software"
+        )
+        assert source["results"][0]["ref"] == expected_ref
+        assert source["scope_ref"] == skill_gateway._software_ref(relative_directory)
+        assert source["complete"] is True

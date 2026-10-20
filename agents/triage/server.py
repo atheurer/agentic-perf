@@ -55,6 +55,7 @@ async def get_skill_context(
     query: str = "",
     max_bytes: int = 16384,
     offset_bytes: int = 0,
+    cursor: str = "",
 ) -> str:
     """Retrieve guidance through server-owned subject and source bindings."""
     return await skill_context_gateway(
@@ -70,6 +71,7 @@ async def get_skill_context(
         query=query,
         max_bytes=max_bytes,
         offset_bytes=offset_bytes,
+        cursor=cursor,
     )
 
 

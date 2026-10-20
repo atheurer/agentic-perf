@@ -84,6 +84,7 @@ async def get_skill_context(
     query: str = "",
     max_bytes: int = 16384,
     offset_bytes: int = 0,
+    cursor: str = "",
 ) -> str:
     """Retrieve guidance through server-owned subject and source bindings."""
     await _ensure_init()
@@ -102,6 +103,7 @@ async def get_skill_context(
         query=query,
         max_bytes=max_bytes,
         offset_bytes=offset_bytes,
+        cursor=cursor,
         local_skills_dir=SKILLS_DIR,
         repo_cache=_repo_cache,
     )
@@ -180,6 +182,7 @@ async def _legacy_get_crucible_benchmark_context(
     """Compatibility implementation for pre-gateway internal callers."""
     await _ensure_init()
     if operation in {"bootstrap", "list", "read", "search"}:
+        gateway_operation = "manifest" if operation == "list" else operation
         return await controller_context_gateway(
             ssh=_ssh,
             controller_host=ticket_controller_host(_ticket),
@@ -187,7 +190,7 @@ async def _legacy_get_crucible_benchmark_context(
             agent_name="review-agent",
             phase="review",
             benchmark=benchmark,
-            operation=operation,
+            operation=gateway_operation,
             path=path,
             query=query,
             include_alternates=include_alternates,

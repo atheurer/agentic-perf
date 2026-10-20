@@ -1369,9 +1369,24 @@ async def get_skill_context(
     query: str = "",
     max_bytes: int = 16384,
     offset_bytes: int = 0,
+    cursor: str = "",
 ) -> str:
     """Retrieve guidance through server-owned subject and source bindings."""
     await _ensure_init()
+    runfile_contract = (
+        _crucible_context.get_runfile_contract()
+        if subject == "harness/crucible" and _crucible_context is not None
+        else None
+    )
+    response_overhead_bytes = (
+        len(
+            json.dumps(
+                {"runfile_contract": runfile_contract}, separators=(",", ":")
+            ).encode()
+        )
+        if runfile_contract is not None and operation in {"list", "search"}
+        else 0
+    )
     response = await skill_context_gateway(
         _skill_provider,
         ticket_id=os.environ.get("TICKET_ID", ""),
@@ -1387,11 +1402,32 @@ async def get_skill_context(
         query=query,
         max_bytes=max_bytes,
         offset_bytes=offset_bytes,
+        cursor=cursor,
+        response_overhead_bytes=response_overhead_bytes,
         local_skills_dir=SKILLS_DIR,
         repo_cache=_repo_cache,
     )
     if subject == "harness/crucible":
-        return _with_crucible_runfile_contract(response)
+        if (
+            operation in {"list", "search"}
+            and type(max_bytes) is int
+            and len(response.encode("utf-8")) + response_overhead_bytes - 1 > max_bytes
+        ):
+            too_small = {
+                "found": False,
+                "operation": operation,
+                "reason": "page_too_small",
+                "message": (
+                    "max_bytes cannot fit the run-file contract and complete result envelope."
+                ),
+            }
+            error_response = json.dumps(too_small, separators=(",", ":"))
+            if len(error_response.encode("utf-8")) > max_bytes:
+                error_response = json.dumps({"reason": "page_too_small"})
+            if len(error_response.encode("utf-8")) > max_bytes:
+                return "{}"
+            return error_response
+        return _with_crucible_runfile_contract(response, runfile_contract)
     return response
 
 
@@ -1661,15 +1697,21 @@ async def _get_crucible_benchmark_context_tool(
     )
 
 
-def _with_crucible_runfile_contract(response: str) -> str:
+def _with_crucible_runfile_contract(
+    response: str, runfile_contract: dict[str, Any] | None = None
+) -> str:
     """Attach provider-owned run-file requirements to model-facing context."""
     if _crucible_context is None:
         raise RuntimeError("Crucible context provider was not initialized")
     result = json.loads(response)
     if not isinstance(result, dict):
         raise ValueError("Crucible context response must be a JSON object")
-    result["runfile_contract"] = _crucible_context.get_runfile_contract()
-    return json.dumps(result)
+    result["runfile_contract"] = (
+        runfile_contract
+        if runfile_contract is not None
+        else _crucible_context.get_runfile_contract()
+    )
+    return json.dumps(result, separators=(",", ":"))
 
 
 async def _legacy_get_crucible_benchmark_context(
@@ -1691,6 +1733,7 @@ async def _legacy_get_crucible_benchmark_context(
         and _ssh is not None
         and _controller_host()
     ):
+        gateway_operation = "manifest" if operation == "list" else operation
         return await controller_context_gateway(
             ssh=_ssh,
             controller_host=_controller_host(),
@@ -1698,7 +1741,7 @@ async def _legacy_get_crucible_benchmark_context(
             agent_name="benchmark-agent",
             phase=phase,
             benchmark=benchmark,
-            operation=operation,
+            operation=gateway_operation,
             path=path,
             query=query,
             include_alternates=include_alternates,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -259,6 +260,276 @@ def test_resource_aws_guidance_is_retrieved_through_local_gateway(
     assert document["scope"] == "local"
     assert document["source"] == "agentic-perf"
     assert "AWS resource allocation guidance" in document["content"]
+
+
+@pytest.mark.asyncio
+async def test_local_directory_listing_and_directory_origin_reads_are_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agents.skill_gateway as gateway
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    skills = tmp_path / "skills"
+    docs = skills / "kube-burner" / "docs"
+    nested = docs / "nested"
+    nested.mkdir(parents=True)
+    (docs / "alpha.md").write_text("alpha guidance")
+    (nested / "nested.md").write_text("special nested guidance")
+    (docs / "token-notes.md").write_text("credential-shaped name")
+    private_docs = docs / "credentials"
+    private_docs.mkdir()
+    (private_docs / "key.md").write_text("must not be listed")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside source")
+    (docs / "safe-link.md").symlink_to(docs / "alpha.md")
+    (docs / "escape.md").symlink_to(outside)
+    (docs / "credential-link").symlink_to(private_docs, target_is_directory=True)
+    (docs / ".git").mkdir()
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    directory_ref = gateway._source_ref("local", "harness/kube-burner", "docs")
+    listing = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-LOCAL-LIST",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="list",
+            ref=directory_ref,
+            local_skills_dir=skills,
+        )
+    )
+
+    entries = listing["sources"][0]["results"]
+    assert [(item["path"], item["type"]) for item in entries] == [
+        ("docs/alpha.md", "file"),
+        ("docs/nested", "directory"),
+        ("docs/safe-link.md", "file"),
+    ]
+    assert all(item["ref"].startswith("skill://local/") for item in entries)
+    assert listing["sources"][0]["recursive"] is False
+
+    nested_ref = next(item["ref"] for item in entries if item["type"] == "directory")
+    read = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-LOCAL-LIST",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="read",
+            from_ref=nested_ref,
+            path="nested.md",
+            local_skills_dir=skills,
+        )
+    )
+    assert read["document"]["content"] == "special nested guidance"
+
+    search = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-LOCAL-LIST",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="search",
+            query="special",
+            from_ref=nested_ref,
+            local_skills_dir=skills,
+        )
+    )
+    assert [item["path"] for item in search["sources"][0]["results"]] == [
+        "docs/nested/nested.md"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_and_list_cursors_are_bounded_scoped_and_do_not_drop_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agents.skill_gateway as gateway
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    skills = tmp_path / "skills"
+    docs = skills / "kube-burner" / "docs"
+    docs.mkdir(parents=True)
+    for index in range(35):
+        (docs / f"doc-{index:02}.md").write_text(f"needle {index}\n")
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    directory_ref = gateway._source_ref("local", "harness/kube-burner", "docs")
+
+    async def invoke(**kwargs: Any) -> tuple[str, dict[str, Any]]:
+        raw = await skill_context_gateway(
+            Provider(),
+            ticket_id=kwargs.pop("ticket_id", "PERF-CURSOR"),
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            local_skills_dir=skills,
+            max_bytes=1024,
+            **kwargs,
+        )
+        return raw, json.loads(raw)
+
+    listed_refs = []
+    raw, result = await invoke(operation="list", ref=directory_ref)
+    while True:
+        assert len(raw.encode("utf-8")) <= 1024
+        listed_refs.extend(item["ref"] for item in result["sources"][0]["results"])
+        cursor = result["sources"][0].get("next_cursor")
+        if not cursor:
+            break
+        raw, result = await invoke(operation="list", ref=directory_ref, cursor=cursor)
+    assert len(listed_refs) == 35
+    assert len(set(listed_refs)) == 35
+
+    found_refs = []
+    raw, result = await invoke(
+        operation="search", query="needle", from_ref=directory_ref, path="."
+    )
+    first_cursor = result["sources"][0]["next_cursor"]
+    while True:
+        assert len(raw.encode("utf-8")) <= 1024
+        found_refs.extend(item["ref"] for item in result["sources"][0]["results"])
+        cursor = result["sources"][0].get("next_cursor")
+        if not cursor:
+            break
+        raw, result = await invoke(operation="search", query="needle", cursor=cursor)
+    assert len(found_refs) == 35
+    assert len(set(found_refs)) == 35
+
+    _raw, changed_query = await invoke(
+        operation="search",
+        query="different",
+        from_ref=directory_ref,
+        cursor=first_cursor,
+    )
+    assert changed_query["reason"] == "cursor_scope_mismatch"
+    _raw, changed_scope = await invoke(
+        operation="search",
+        query="needle",
+        from_ref=directory_ref,
+        path="nested",
+        cursor=first_cursor,
+    )
+    assert changed_scope["reason"] == "cursor_scope_mismatch"
+    _raw, changed_ticket = await invoke(
+        ticket_id="PERF-OTHER-TICKET",
+        operation="search",
+        query="needle",
+        from_ref=directory_ref,
+        cursor=first_cursor,
+    )
+    assert changed_ticket["reason"] == "invalid_cursor"
+    _raw, tampered = await invoke(
+        operation="search",
+        query="needle",
+        cursor=f"{first_cursor[:-1]}!",
+    )
+    assert tampered["reason"] == "invalid_cursor"
+
+
+@pytest.mark.asyncio
+async def test_incomplete_local_scan_does_not_confirm_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agents.skill_gateway as gateway
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    skills = tmp_path / "skills"
+    docs = skills / "kube-burner" / "docs"
+    docs.mkdir(parents=True)
+    (docs / "large.md").write_text("content without the query")
+    monkeypatch.setattr(gateway, "_MAX_SOURCE_SEARCH_BYTES", 1)
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    result = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-INCOMPLETE-SEARCH",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="search",
+            query="absent",
+            from_ref=gateway._source_ref(
+                "local", "harness/kube-burner", "docs/large.md"
+            ),
+            local_skills_dir=skills,
+        )
+    )
+    source = result["sources"][0]
+    assert source["found"] is False
+    assert source["complete"] is False
+    assert source["absence_confirmed"] is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_reports_unsupported_organization_directory_listing(
+    tmp_path: Path,
+):
+    _write_package(
+        tmp_path / "organization",
+        namespace="harness",
+        name="crucible",
+        subject="harness/crucible",
+        instruction="Crucible guidance.",
+    )
+    resolver = _resolver(("team", tmp_path / "organization"))
+
+    class Provider:
+        organization_resolver = resolver
+
+    result = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-ORG-LIST",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/crucible",
+            operation="list",
+            from_ref=resolver.bootstrap("harness/crucible")["documents"][0]["ref"],
+        )
+    )
+    assert result["sources"][0]["capability"] == "unsupported"
+    assert result["sources"][0]["reason"] == "directory_listing_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_controller_listing_keeps_existing_phase_restrictions() -> None:
+    import agents.skill_gateway as gateway
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    class ForbiddenSSH:
+        async def run(self, host, command, **kwargs):
+            raise AssertionError("controller access is forbidden in triage")
+
+    result = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-CONTROLLER-LIST-PHASE",
+            agent_name="triage-agent",
+            phase="triage",
+            operation="list",
+            ref=gateway._software_ref("repos/example"),
+            ssh=ForbiddenSSH(),
+            controller_host="controller.example.test",
+        )
+    )
+    assert result["reason"] == "source_unavailable"
 
 
 @pytest.mark.asyncio

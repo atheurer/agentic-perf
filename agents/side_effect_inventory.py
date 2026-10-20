@@ -258,6 +258,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/review/server.py", "get_run_summary", "ssh"),
     ("agents/review/server.py", "read_run_results", "ssh"),
     ("agents/server_utils.py", "_read_controller_document", "ssh"),
+    ("agents/server_utils.py", "_inspect_controller_path", "ssh"),
+    ("agents/server_utils.py", "_list_controller_directory", "ssh"),
     ("agents/server_utils.py", "_search_controller_source", "ssh"),
     ("agents/server_utils.py", "assert_ticket_active", "filesystem"),
     ("agents/server_utils.py", "tool_progress", "mutating_http_state"),
@@ -2053,6 +2055,18 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/server_utils.py:_read_controller_document",
+        "2027-12-31",
+    ),
+    ("agents/server_utils.py", "_inspect_controller_path", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/server_utils.py:_inspect_controller_path",
+        "2027-12-31",
+    ),
+    ("agents/server_utils.py", "_list_controller_directory", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/server_utils.py:_list_controller_directory",
         "2027-12-31",
     ),
     ("agents/server_utils.py", "_search_controller_source", "ssh"): (

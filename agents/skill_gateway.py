@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import posixpath
+import re
+import secrets
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
@@ -32,18 +34,31 @@ _MAX_SOURCE_SEARCH_BYTES = 4 * 1024 * 1024
 SKILL_GATEWAY_TOOL_DESCRIPTION = """Retrieve subject guidance and software references.
 
 Bootstrap returns applicable organization entrypoints, phase-compatible software
-entrypoints, and approved configuration-view refs. Read a returned ref; follow a
-relative documentation pointer with from_ref plus path. Organization search uses a POSIX extended regular
-expression (no backreferences); from_ref optionally restricts the source. Reads are bounded to
-16384 bytes; continue with next_offset_bytes. Subject, source availability and
-provenance remain visible, while source paths, credentials, identity and phase
-are server-owned. Organization practices cannot alter installed software facts
-or code-enforced requirements. Service-only configuration is never a document.
+entrypoints, and approved configuration-view refs. Read a returned file ref; use
+operation='list' with a directory ref to see its immediate children. List results
+include typed, reusable refs and do not read directory contents. Organization
+directories are not exposed; listing that source reports an unsupported
+capability. Relative reads and lists use from_ref plus path. The server checks
+whether from_ref is a file or directory: file origins use their parent directory,
+and directory origins use that directory.
 
-Search without from_ref searches every applicable source, including project-local
-and upstream documents. For local and upstream searches, from_ref scopes the
-search to that source and subject; it does not limit the search to the referenced
-document. Organization and software references retain their own source semantics.
+Search without from_ref searches every applicable source. A file origin searches
+its parent directory; a directory origin searches recursively inside that
+directory. Organization search uses POSIX extended regular expressions without
+backreferences; controller search uses Python regular expressions and falls back
+to a literal query when the expression is invalid. Local and upstream search use
+literal alternatives separated by '|'. For list and search, max_bytes bounds the
+complete serialized result page.
+Continue each source with its next_cursor and the same operation and query; the
+cursor retains its original source, origin, and relative path.
+The opaque cursor is ticket-, agent-, phase-, subject-, source-, scope-, and
+query-bound. Search/list pages report scan completeness; an incomplete scan does
+not confirm that no matches exist. Read pages remain bounded to max_bytes of
+document content and continue with next_offset_bytes. Subject, source availability
+and provenance remain visible, while source paths, credentials, identity and
+phase are server-owned. Organization practices cannot alter installed software
+facts or code-enforced requirements. Service-only configuration is never a
+document.
 
 The organization entry may include several named sources. Read and compare
 applicable entrypoints across sources, including same-path variants; exact
@@ -155,20 +170,10 @@ def _software_ref(path: str) -> str:
     return _SOFTWARE_PREFIX + quote(path, safe="/")
 
 
-def _software_path(ref: str, *, from_ref: str = "", path: str = "") -> str:
-    if path:
-        if not from_ref.startswith(_SOFTWARE_PREFIX) or ref:
-            raise SkillGatewayError(
-                "origin_required", "Pointer requires software origin"
-            )
-        if path.startswith(("/", "\\")) or "://" in path or "\\" in path:
-            raise SkillGatewayError("invalid_document", "Invalid relative pointer")
-        origin = unquote(from_ref.removeprefix(_SOFTWARE_PREFIX))
-        relative = posixpath.normpath(posixpath.join(posixpath.dirname(origin), path))
-    elif ref.startswith(_SOFTWARE_PREFIX):
-        relative = unquote(ref.removeprefix(_SOFTWARE_PREFIX))
-    else:
+def _software_path(ref: str) -> str:
+    if not ref.startswith(_SOFTWARE_PREFIX):
         raise SkillGatewayError("invalid_ref", "Use a returned software document ref")
+    relative = unquote(ref.removeprefix(_SOFTWARE_PREFIX))
     from agents.server_utils import _controller_relative_path
 
     checked = _controller_relative_path(relative)
@@ -198,6 +203,62 @@ def _config_ref(revision: str, subject: str, view: str) -> str:
 def _source_ref(kind: str, subject: str, path: str) -> str:
     prefix = _LOCAL_PREFIX if kind == "local" else _UPSTREAM_PREFIX
     return prefix + quote(subject, safe="/") + "/" + quote(path, safe="/")
+
+
+def _source_path_excluded(path: str) -> bool:
+    return any(
+        part.lower()
+        in {
+            ".ssh",
+            ".env",
+            "secrets",
+            "credential",
+            "credentials",
+            "authorized_keys",
+            "id_rsa",
+            "id_ed25519",
+            "known_hosts",
+            "private_key",
+        }
+        or part.lower().startswith(".git")
+        or part.lower().endswith((".pem", ".key"))
+        or "token" in part.lower()
+        for part in Path(path).parts
+    )
+
+
+def _source_path_type(root: Path, relative: str) -> tuple[Path, str]:
+    if _source_path_excluded(relative):
+        raise SkillGatewayError("invalid_document", "Source path is excluded")
+    try:
+        target = (root / relative).resolve(strict=True)
+    except PermissionError:
+        raise SkillGatewayError(
+            "source_path_inaccessible", "The requested source path cannot be read"
+        ) from None
+    except FileNotFoundError:
+        raise SkillGatewayError(
+            "source_path_not_found", "The requested source path does not exist"
+        ) from None
+    except (OSError, RuntimeError):
+        raise SkillGatewayError(
+            "source_path_inaccessible", "The requested source path cannot be resolved"
+        ) from None
+    if not target.is_relative_to(root):
+        raise SkillGatewayError(
+            "source_path_outside_root", "The resolved source path leaves its source"
+        )
+    if _source_path_excluded(target.relative_to(root).as_posix()):
+        raise SkillGatewayError(
+            "invalid_document", "The resolved source path is excluded"
+        )
+    if target.is_dir():
+        return target, "directory"
+    if target.is_file():
+        return target, "file"
+    raise SkillGatewayError(
+        "invalid_document", "The source path is not a file or directory"
+    )
 
 
 def _parse_source_ref(ref: str, kind: str) -> tuple[str, str]:
@@ -246,11 +307,15 @@ def _list_local_documents(
     for target in sorted(base.rglob("*.md")):
         try:
             resolved = target.resolve(strict=True)
-            if target.is_symlink() or not resolved.is_relative_to(base):
+            relative = target.relative_to(base).as_posix()
+            if (
+                _source_path_excluded(relative)
+                or not resolved.is_relative_to(base)
+                or _source_path_excluded(resolved.relative_to(base).as_posix())
+            ):
                 continue
             if not resolved.is_file():
                 continue
-            relative = resolved.relative_to(base).as_posix()
             results.append(
                 {
                     "ref": _source_ref("local", subject, relative),
@@ -269,6 +334,72 @@ def _list_local_documents(
     return results
 
 
+def _list_source_directory(
+    kind: str,
+    root: Path,
+    subject: str,
+    relative: str,
+    *,
+    provenance: tuple[str, str] | None = None,
+    max_entries: int = 4096,
+) -> dict[str, Any]:
+    """List registered document types and immediate directories only."""
+    target, target_type = _source_path_type(root, relative)
+    if target_type != "directory":
+        raise SkillGatewayError(
+            "source_path_not_directory",
+            "The requested source ref is a file; list its containing directory.",
+        )
+    allowed_suffixes = {".md"} if kind == "local" else {".md", ".yml", ".yaml"}
+    results = []
+    complete = True
+    try:
+        entries = sorted(target.iterdir(), key=lambda item: item.name)
+    except PermissionError:
+        raise SkillGatewayError(
+            "source_path_inaccessible", "The source directory cannot be read"
+        ) from None
+    for entry in entries:
+        child_relative = posixpath.join(relative, entry.name)
+        if _source_path_excluded(child_relative):
+            continue
+        try:
+            child, child_type = _source_path_type(root, child_relative)
+        except SkillGatewayError as exc:
+            if exc.code in {"source_path_outside_root", "invalid_document"}:
+                continue
+            complete = False
+            continue
+        if child_type == "file" and child.suffix.lower() not in allowed_suffixes:
+            continue
+        if child_type not in {"directory", "file"}:
+            continue
+        ref = _source_ref(kind, subject, child_relative)
+        source = (
+            "agentic-perf"
+            if kind == "local"
+            else (provenance or ("upstream", "unverified"))[0]
+        )
+        result = {
+            "ref": ref,
+            "uri": ref,
+            "path": child_relative,
+            "source": source,
+            "scope": kind,
+            "type": child_type,
+            "size_bytes": child.stat().st_size if child_type == "file" else None,
+        }
+        if kind == "upstream":
+            _source, provenance_status = provenance or ("upstream", "unverified")
+            result["provenance_status"] = provenance_status
+        results.append(result)
+        if len(results) >= max_entries:
+            complete = False
+            break
+    results.sort(key=lambda item: item["path"])
+    return {"results": results, "complete": complete}
+
+
 def _read_local_document(
     local_skills_dir: Path | None,
     subject: str,
@@ -282,18 +413,47 @@ def _read_local_document(
     if base is None:
         raise SkillGatewayError("source_unavailable", "Local subject is unavailable")
     candidate = base / relative
-    if any(
-        part.is_symlink() for part in [candidate, *candidate.parents] if part != base
+    if _source_path_excluded(relative):
+        raise SkillGatewayError("invalid_document", "Invalid local document")
+    try:
+        target = candidate.resolve(strict=True)
+    except PermissionError:
+        raise SkillGatewayError(
+            "source_path_inaccessible", "The local document cannot be read"
+        ) from None
+    except FileNotFoundError:
+        raise SkillGatewayError(
+            "source_path_not_found", "The local document does not exist"
+        ) from None
+    except (OSError, RuntimeError):
+        raise SkillGatewayError(
+            "source_path_inaccessible", "The local document cannot be resolved"
+        ) from None
+    if not target.is_relative_to(base) or _source_path_excluded(
+        target.relative_to(base).as_posix()
     ):
         raise SkillGatewayError("invalid_document", "Invalid local document")
-    target = candidate.resolve(strict=True)
-    if not target.is_relative_to(base) or not target.is_file():
+    if not target.is_file():
+        if target.is_dir():
+            raise SkillGatewayError(
+                "source_path_is_directory",
+                "The reference is a directory; use operation='list'.",
+            )
         raise SkillGatewayError("invalid_document", "Invalid local document")
     if target.suffix.lower() != ".md":
         raise SkillGatewayError("invalid_document", "Only Markdown guidance is exposed")
     if target.stat().st_size > _MAX_SOURCE_DOCUMENT_BYTES:
         raise SkillGatewayError("source_too_large", "Local document exceeds the limit")
-    content = target.read_text(encoding="utf-8")
+    try:
+        content = target.read_text(encoding="utf-8")
+    except PermissionError:
+        raise SkillGatewayError(
+            "source_path_inaccessible", "The local document cannot be read"
+        ) from None
+    except OSError:
+        raise SkillGatewayError(
+            "source_read_failed", "The local document could not be read"
+        ) from None
     page = (
         {"content": content, "offset": offset_bytes, "next_offset": None}
         if full_content
@@ -369,16 +529,27 @@ def _read_upstream_document(
         raise SkillGatewayError("source_unavailable", "Upstream cache is unavailable")
     if not any(relative.startswith(f"{subdir}/") for subdir in ("docs", "config")):
         raise SkillGatewayError("invalid_document", "Invalid upstream document")
+    if _source_path_excluded(relative):
+        raise SkillGatewayError("invalid_document", "Invalid upstream document")
     root = Path(root).resolve()
     candidate = root / relative
-    if any(
-        part.is_symlink() for part in [candidate, *candidate.parents] if part != root
-    ):
-        raise SkillGatewayError("invalid_document", "Invalid upstream document")
-    target = candidate.resolve(strict=True)
+    try:
+        target = candidate.resolve(strict=True)
+    except PermissionError:
+        raise SkillGatewayError(
+            "source_path_inaccessible", "The upstream document cannot be read"
+        ) from None
+    except FileNotFoundError:
+        raise SkillGatewayError(
+            "source_path_not_found", "The upstream document does not exist"
+        ) from None
+    except (OSError, RuntimeError):
+        raise SkillGatewayError(
+            "source_path_inaccessible", "The upstream document cannot be resolved"
+        ) from None
     if (
         not target.is_relative_to(root)
-        or target.is_symlink()
+        or _source_path_excluded(target.relative_to(root).as_posix())
         or not target.is_file()
         or target.suffix.lower() not in {".md", ".yml", ".yaml"}
     ):
@@ -387,7 +558,16 @@ def _read_upstream_document(
         raise SkillGatewayError(
             "source_too_large", "Upstream document exceeds the limit"
         )
-    content = target.read_text(encoding="utf-8")
+    try:
+        content = target.read_text(encoding="utf-8")
+    except PermissionError:
+        raise SkillGatewayError(
+            "source_path_inaccessible", "The upstream document cannot be read"
+        ) from None
+    except OSError:
+        raise SkillGatewayError(
+            "source_read_failed", "The upstream document could not be read"
+        ) from None
     page = (
         {"content": content, "offset": offset_bytes, "next_offset": None}
         if full_content
@@ -409,6 +589,866 @@ def _read_upstream_document(
     }
 
 
+def _gateway_cursor_path(cursor: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32}", cursor):
+        raise SkillGatewayError("invalid_cursor", "The continuation cursor is invalid")
+    return f"context/gateway-cursors/{cursor}.json"
+
+
+def _load_gateway_cursor(
+    manager: Any,
+    cursor: str,
+    *,
+    ticket_id: str,
+    agent_name: str,
+    phase: str,
+    subject: str,
+    operation: str,
+    query: str,
+    from_ref: str,
+    ref: str,
+    path: str,
+) -> dict[str, Any]:
+    cursor_path = _gateway_cursor_path(cursor)
+    try:
+        value = json.loads(
+            manager.resolve_path(cursor_path).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
+        raise SkillGatewayError(
+            "invalid_cursor", "The cursor is unknown for this ticket"
+        ) from None
+    if not isinstance(value, dict) or not isinstance(value.get("binding"), dict):
+        raise SkillGatewayError("invalid_cursor", "The cursor state is invalid")
+    binding = value["binding"]
+    expected = {
+        "ticket_id": ticket_id,
+        "agent_name": agent_name,
+        "phase": phase,
+        "subject": subject,
+        "operation": operation,
+        "query": query,
+    }
+    if any(
+        binding.get(key) != expected_value for key, expected_value in expected.items()
+    ):
+        raise SkillGatewayError(
+            "cursor_scope_mismatch",
+            "The cursor belongs to another ticket, phase, subject, operation, or query.",
+        )
+    if from_ref and from_ref != binding.get("origin"):
+        raise SkillGatewayError(
+            "cursor_scope_mismatch", "The cursor belongs to a different source origin."
+        )
+    if ref and ref != binding.get("ref"):
+        raise SkillGatewayError(
+            "cursor_scope_mismatch", "The cursor belongs to a different source ref."
+        )
+    if path and path != binding.get("path", ""):
+        raise SkillGatewayError(
+            "cursor_scope_mismatch", "The cursor belongs to a different relative scope."
+        )
+    return value
+
+
+def _save_gateway_cursor(
+    manager: Any, binding: dict[str, Any], state: dict[str, Any]
+) -> str:
+    cursor = secrets.token_urlsafe(24)
+    relative_path = _gateway_cursor_path(cursor)
+    manager.save_file(
+        relative_path,
+        json.dumps({"binding": binding, "state": state}, separators=(",", ":")),
+    )
+    manager._stamp(relative_path, source="workspace", authority="alternate")
+    return cursor
+
+
+def _source_root(
+    kind: str,
+    subject: str,
+    local_skills_dir: Path | None,
+    repo_cache: Any,
+) -> tuple[Path, tuple[str, str]] | None:
+    if kind == "local":
+        root = _local_base(local_skills_dir, subject)
+        return (root, ("agentic-perf", "checked-in-project-context")) if root else None
+    repo_name = _UPSTREAM_REPOS.get(subject)
+    if not repo_name or repo_cache is None:
+        return None
+    source_path = repo_cache.get_path(repo_name)
+    if source_path is None:
+        return None
+    root = Path(source_path).resolve()
+    return root, _upstream_provenance(repo_cache, subject)
+
+
+def _resolve_source_pointer(
+    kind: str,
+    root: Path,
+    relative: str,
+    pointer: str,
+) -> tuple[str, str]:
+    if pointer.startswith(("/", "\\")) or "://" in pointer or "\\" in pointer:
+        raise SkillGatewayError("invalid_document", "Invalid relative pointer")
+    _target, origin_type = _source_path_type(root, relative)
+    base = relative if origin_type == "directory" else posixpath.dirname(relative)
+    resolved = posixpath.normpath(posixpath.join(base, pointer))
+    if resolved in {"", ".", ".."} or resolved.startswith("../"):
+        raise SkillGatewayError("invalid_document", "Pointer leaves its source")
+    if kind == "upstream" and not any(
+        resolved == allowed or resolved.startswith(f"{allowed}/")
+        for allowed in ("docs", "config")
+    ):
+        raise SkillGatewayError(
+            "invalid_document", "Pointer leaves exposed upstream docs"
+        )
+    _target, target_type = _source_path_type(root, resolved)
+    return resolved, target_type
+
+
+def _search_source_documents(
+    kind: str,
+    subject: str,
+    root: Path,
+    provenance: tuple[str, str],
+    query: str,
+    *,
+    scope_path: str = "",
+    local_skills_dir: Path | None = None,
+    repo_cache: Any = None,
+) -> dict[str, Any]:
+    documents = (
+        _list_local_documents(local_skills_dir, subject)
+        if kind == "local"
+        else _list_upstream_documents(repo_cache, subject)
+    )
+    complete = len(documents) < 128 if kind == "local" else True
+    if scope_path:
+        _scope, scope_type = _source_path_type(root, scope_path)
+        if kind == "upstream" and not any(
+            scope_path == allowed or scope_path.startswith(f"{allowed}/")
+            for allowed in ("docs", "config")
+        ):
+            raise SkillGatewayError("invalid_origin", "Origin is outside exposed docs")
+        if scope_type == "file":
+            allowed_ref = _source_ref(kind, subject, scope_path)
+            if not any(item["ref"] == allowed_ref for item in documents):
+                raise SkillGatewayError(
+                    "invalid_origin", "The file is not an exposed source document"
+                )
+            scope_path = posixpath.dirname(scope_path)
+        documents = [
+            item
+            for item in documents
+            if item["path"].startswith(f"{scope_path.rstrip('/')}/")
+        ]
+    alternatives = [
+        term.casefold().strip() for term in query.split("|") if term.strip()
+    ]
+    results = []
+    scanned_bytes = 0
+    for item in documents:
+        size = item.get("size_bytes", 0)
+        if not isinstance(size, int) or size < 0:
+            complete = False
+            continue
+        if scanned_bytes + size > _MAX_SOURCE_SEARCH_BYTES:
+            complete = False
+            break
+        scanned_bytes += size
+        try:
+            document = (
+                _read_local_document(
+                    local_skills_dir,
+                    subject,
+                    item["path"],
+                    offset_bytes=0,
+                    max_bytes=16384,
+                    full_content=True,
+                )
+                if kind == "local"
+                else _read_upstream_document(
+                    repo_cache,
+                    subject,
+                    item["path"],
+                    offset_bytes=0,
+                    max_bytes=16384,
+                    full_content=True,
+                )
+            )
+        except (OSError, ValueError, TypeError, SkillGatewayError):
+            complete = False
+            continue
+        content = document.get("content", "").casefold()
+        if not alternatives or any(term in content for term in alternatives):
+            results.append(
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"uri", "role"}
+                }
+            )
+            if len(results) >= 500:
+                complete = False
+                break
+    return {
+        "results": results,
+        "complete": complete,
+        "scanned_bytes": scanned_bytes,
+        "query_mode": "literal-alternatives",
+        "scope_path": scope_path or ".",
+        "scope_semantics": "recursive subtree; file origins use their parent directory",
+        "source": provenance[0],
+        "provenance_status": provenance[1],
+    }
+
+
+def _source_page(
+    items: list[dict[str, Any]],
+    start: int,
+    budget: int,
+) -> list[dict[str, Any]]:
+    page = []
+    used = 0
+    for item in items[start:]:
+        size = len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode())
+        if page and used + size > budget:
+            break
+        if not page and size > budget:
+            raise SkillGatewayError(
+                "page_too_small", "max_bytes cannot fit one complete result object"
+            )
+        page.append(item)
+        used += size
+        if len(page) >= 20:
+            break
+    return page
+
+
+def _append_source_page(
+    sources: list[dict[str, Any]],
+    pages: list[dict[str, Any]],
+    *,
+    items: list[dict[str, Any]],
+    key: str,
+    start: int,
+    budget: int,
+    binding: dict[str, Any],
+    metadata: dict[str, Any],
+    complete: bool,
+    total: int,
+    mode: str = "items",
+    backend_more: bool = False,
+    organization_offset: int = 0,
+) -> None:
+    page = _source_page(items, start, budget)
+    source = {
+        **metadata,
+        key: page,
+        "found": total > 0,
+        "matches_count": total,
+        "complete": complete,
+        "absence_confirmed": total == 0 and complete,
+        "has_more": start + len(page) < len(items) or backend_more,
+        "next_cursor": "c" * 32,
+    }
+    sources.append(source)
+    pages.append(
+        {
+            "source": source,
+            "items": items,
+            "key": key,
+            "start": start,
+            "binding": binding,
+            "mode": mode,
+            "backend_more": backend_more,
+            "organization_offset": organization_offset,
+            "forced_more": False,
+        }
+    )
+
+
+def _compact_json_bytes(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
+
+
+def _finalize_search_list_result(
+    result: dict[str, Any],
+    pages: list[dict[str, Any]],
+    *,
+    manager: Any,
+    budget: int,
+) -> str:
+    while _compact_json_bytes(result) > budget:
+        candidates = [page for page in pages if page["source"][page["key"]]]
+        if not candidates:
+            return json.dumps(
+                {
+                    "found": False,
+                    "operation": result["operation"],
+                    "reason": "page_too_small",
+                    "message": "max_bytes cannot fit the complete result envelope.",
+                },
+                separators=(",", ":"),
+            )
+        page = max(
+            candidates,
+            key=lambda item: _compact_json_bytes(item["source"][item["key"]][-1]),
+        )
+        page["source"][page["key"]].pop()
+        page["forced_more"] = True
+        page["source"]["has_more"] = True
+    for page in pages:
+        source = page["source"]
+        if page["mode"] == "organization_offset":
+            shown_bytes = sum(
+                len((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
+                for item in source[page["key"]]
+            )
+            next_offset = page["organization_offset"] + shown_bytes
+            more = page["backend_more"] or page["forced_more"]
+            state = {"mode": "organization_offset", "offset": next_offset}
+        else:
+            next_index = page["start"] + len(source[page["key"]])
+            more = next_index < len(page["items"]) or page["forced_more"]
+            state = {
+                "mode": "items",
+                "items": page["items"],
+                "index": next_index,
+                "metadata": {
+                    key: value
+                    for key, value in source.items()
+                    if key not in {page["key"], "next_cursor", "has_more"}
+                },
+                "key": page["key"],
+            }
+        source["has_more"] = more
+        if more:
+            source["next_cursor"] = _save_gateway_cursor(
+                manager, page["binding"], state
+            )
+        else:
+            source.pop("next_cursor", None)
+    result["found"] = any(source.get("found") for source in result["sources"])
+    result["complete"] = all(
+        source.get("complete") is True for source in result["sources"]
+    )
+    result["absence_confirmed"] = not result["found"] and result["complete"]
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+async def _skill_context_list_search(
+    provider: Any,
+    *,
+    resolver: OrganizationSkillResolver,
+    organization: dict[str, Any],
+    ticket_id: str,
+    agent_name: str,
+    phase: str,
+    subject: str,
+    operation: str,
+    ref: str,
+    path: str,
+    from_ref: str,
+    query: str,
+    max_bytes: int,
+    response_overhead_bytes: int,
+    cursor: str,
+    ssh: Any,
+    controller_host: str | None,
+    local_skills_dir: Path | None,
+    repo_cache: Any,
+) -> str:
+    from agents.server_utils import controller_context_gateway
+    from providers.workspace.manager import WorkspaceManager
+
+    manager = WorkspaceManager(ticket_id=ticket_id, agent_name=agent_name, phase=phase)
+    budget = max_bytes - max(0, response_overhead_bytes)
+    if budget < 512:
+        raise SkillGatewayError(
+            "page_too_small", "max_bytes must leave 512 bytes for the complete result."
+        )
+    if operation == "list" and not cursor and (not ref and not from_ref):
+        raise SkillGatewayError(
+            "origin_required",
+            "List a returned directory ref or a directory relative to from_ref.",
+        )
+    if operation == "search" and ref:
+        raise SkillGatewayError("invalid_search", "Use from_ref to scope a search.")
+    if operation == "search" and (not query.strip() or len(query) > 256):
+        raise SkillGatewayError(
+            "invalid_query", "Search query must contain 1 through 256 characters."
+        )
+    if cursor:
+        saved = _load_gateway_cursor(
+            manager,
+            cursor,
+            ticket_id=ticket_id,
+            agent_name=agent_name,
+            phase=phase,
+            subject=subject,
+            operation=operation,
+            query=query,
+            from_ref=from_ref,
+            ref=ref,
+            path=path,
+        )
+        saved_binding = saved["binding"]
+        saved_state = saved.get("state", {})
+        if not isinstance(saved_state, dict):
+            raise SkillGatewayError("invalid_cursor", "The cursor state is invalid")
+        selected_sources = [saved_binding.get("source")]
+    else:
+        saved_binding = saved_state = None
+        if operation == "list":
+            selected_sources = [
+                "controller"
+                if (ref or from_ref).startswith(_SOFTWARE_PREFIX)
+                else "local"
+                if (ref or from_ref).startswith(_LOCAL_PREFIX)
+                else "upstream"
+                if (ref or from_ref).startswith(_UPSTREAM_PREFIX)
+                else "organization"
+                if is_organization_ref(ref or from_ref)
+                else ""
+            ]
+        elif from_ref:
+            selected_sources = [
+                "organization"
+                if is_organization_ref(from_ref)
+                else "controller"
+                if from_ref.startswith(_SOFTWARE_PREFIX)
+                else "local"
+                if from_ref.startswith(_LOCAL_PREFIX)
+                else "upstream"
+                if from_ref.startswith(_UPSTREAM_PREFIX)
+                else ""
+            ]
+        else:
+            selected_sources = []
+            if organization.get("status") == "available":
+                selected_sources.append("organization")
+            if subject == "harness/crucible" and phase in {"benchmark", "review"}:
+                selected_sources.append("controller")
+            if subject in _LOCAL_SUBJECT_DIRS:
+                selected_sources.extend(["local", "upstream"])
+    if any(not source for source in selected_sources):
+        raise SkillGatewayError("invalid_origin", "Use a returned source ref.")
+
+    sources: list[dict[str, Any]] = []
+    pages: list[dict[str, Any]] = []
+    per_source_budget = max(64, (budget - 256) // max(len(selected_sources), 1))
+    for source_kind in selected_sources:
+        origin_ref = saved_binding.get("origin", "") if saved_binding else from_ref
+        bound_ref = saved_binding.get("ref", "") if saved_binding else ref
+        source_scope = saved_binding.get("scope", "") if saved_binding else ""
+        binding = {
+            "ticket_id": ticket_id,
+            "agent_name": agent_name,
+            "phase": phase,
+            "subject": subject,
+            "operation": operation,
+            "query": query,
+            "source": source_kind,
+            "scope": source_scope,
+            "origin": origin_ref,
+            "ref": bound_ref,
+            "path": path,
+        }
+        if saved_binding:
+            binding.update(saved_binding)
+        if cursor and saved_state.get("mode") == "items":
+            items = saved_state.get("items")
+            start = saved_state.get("index")
+            metadata = saved_state.get("metadata")
+            key = saved_state.get("key")
+            if (
+                not isinstance(items, list)
+                or type(start) is not int
+                or start < 0
+                or start > len(items)
+                or not isinstance(metadata, dict)
+                or key not in {"results", "matches"}
+            ):
+                raise SkillGatewayError("invalid_cursor", "The saved page is invalid")
+            _append_source_page(
+                sources,
+                pages,
+                items=items,
+                key=key,
+                start=start,
+                budget=per_source_budget,
+                binding=binding,
+                metadata=metadata,
+                complete=metadata.get("complete") is True,
+                total=metadata.get(
+                    "matches_count", metadata.get("total_entries", len(items))
+                ),
+            )
+            continue
+
+        if operation == "list" and source_kind == "organization":
+            sources.append(
+                {
+                    "source": "organization",
+                    "scope": "organization",
+                    "found": False,
+                    "complete": False,
+                    "absence_confirmed": False,
+                    "capability": "unsupported",
+                    "reason": "directory_listing_unsupported",
+                    "message": "Organization directories are not exposed; use returned document refs.",
+                }
+            )
+            continue
+        if operation == "list" and source_kind == "controller":
+            if subject != "harness/crucible" or phase not in {"benchmark", "review"}:
+                raise SkillGatewayError(
+                    "source_unavailable", "Software source is unavailable in this phase"
+                )
+            if from_ref:
+                controller_origin = _software_path(from_ref)
+                software = json.loads(
+                    await controller_context_gateway(
+                        ssh=ssh,
+                        controller_host=controller_host,
+                        ticket_id=ticket_id,
+                        agent_name=agent_name,
+                        phase=phase,
+                        operation="list",
+                        from_ref=controller_origin,
+                        path=path,
+                    )
+                )
+            else:
+                controller_path = _software_path(ref)
+                software = json.loads(
+                    await controller_context_gateway(
+                        ssh=ssh,
+                        controller_host=controller_host,
+                        ticket_id=ticket_id,
+                        agent_name=agent_name,
+                        phase=phase,
+                        operation="list",
+                        path=controller_path,
+                    )
+                )
+            if not software.get("found") and software.get("reason"):
+                sources.append(
+                    {
+                        "source": "controller",
+                        "scope": "software",
+                        "found": False,
+                        "complete": False,
+                        "absence_confirmed": False,
+                        "reason": software["reason"],
+                        "message": software.get("message"),
+                        "next_action": software.get("next_action"),
+                    }
+                )
+                continue
+            items = [_software_document(item) for item in software.get("results", [])]
+            source_scope = software.get("resolved_ref", "")
+            binding.update({"scope": source_scope})
+            _append_source_page(
+                sources,
+                pages,
+                items=items,
+                key="results",
+                start=0,
+                budget=per_source_budget,
+                binding=binding,
+                metadata={
+                    "source": "controller",
+                    "scope": "software",
+                    "scope_ref": _software_ref(source_scope) if source_scope else "",
+                    "scope_kind": "immediate_children",
+                    "recursive": False,
+                    "total_entries": software.get("total_entries", len(items)),
+                    "complete": software.get("complete") is True,
+                },
+                complete=software.get("complete") is True,
+                total=software.get("total_entries", len(items)),
+            )
+            continue
+        if operation == "list":
+            kind = source_kind
+            source_root = _source_root(kind, subject, local_skills_dir, repo_cache)
+            if source_root is None:
+                raise SkillGatewayError("source_unavailable", "Source is not available")
+            root, provenance = source_root
+            if from_ref:
+                origin_subject, origin_path = _parse_source_ref(from_ref, kind)
+                if origin_subject != subject:
+                    raise SkillGatewayError(
+                        "invalid_origin", "Subject does not match source ref"
+                    )
+                if path:
+                    relative, _kind = _resolve_source_pointer(
+                        kind, root, origin_path, path
+                    )
+                else:
+                    _target, origin_type = _source_path_type(root, origin_path)
+                    relative = (
+                        origin_path
+                        if origin_type == "directory"
+                        else posixpath.dirname(origin_path)
+                    )
+            else:
+                origin_subject, relative = _parse_source_ref(ref, kind)
+                if origin_subject != subject:
+                    raise SkillGatewayError("invalid_ref", "Subject does not match ref")
+            listed = _list_source_directory(
+                kind,
+                root,
+                subject,
+                relative,
+                provenance=provenance,
+            )
+            binding.update({"scope": relative})
+            _append_source_page(
+                sources,
+                pages,
+                items=listed["results"],
+                key="results",
+                start=0,
+                budget=per_source_budget,
+                binding=binding,
+                metadata={
+                    "source": provenance[0],
+                    "scope": kind,
+                    "scope_ref": _source_ref(kind, subject, relative),
+                    "scope_kind": "immediate_children",
+                    "recursive": False,
+                    "total_entries": len(listed["results"]),
+                    "complete": listed["complete"],
+                },
+                complete=listed["complete"],
+                total=len(listed["results"]),
+            )
+            continue
+
+        if source_kind == "organization":
+            if not organization.get("status") == "available":
+                sources.append(
+                    {
+                        "source": "organization",
+                        "scope": "organization",
+                        "found": False,
+                        "complete": False,
+                        "absence_confirmed": False,
+                        "reason": organization.get("error", "source_unavailable"),
+                    }
+                )
+                continue
+            if origin_ref and not is_organization_ref(origin_ref):
+                raise SkillGatewayError(
+                    "invalid_origin", "Origin source does not match cursor"
+                )
+            org_offset = (
+                saved_state.get("offset", 0)
+                if cursor and saved_state.get("mode") == "organization_offset"
+                else 0
+            )
+            if origin_ref:
+                resolver.read(subject, origin_ref, max_bytes=16384)
+            org = resolver.search(
+                subject,
+                None,
+                query,
+                from_ref=origin_ref or None,
+                offset=org_offset,
+                max_bytes=max(128, per_source_budget - 128),
+            )
+            org_matches = org.get("matches", [])
+            complete = not org.get("search_limited", False)
+            more = org.get("next_offset") is not None
+            binding.update({"scope": origin_ref or "all-organization-documents"})
+            metadata = {
+                "source": "organization",
+                "scope": "organization",
+                "scope_ref": origin_ref or None,
+                "revision": org.get("revision"),
+                "search_limited": org.get("search_limited", False),
+                "query_mode": "posix-extended-regex",
+                "scan_scope": origin_ref or "all applicable organization documents",
+            }
+            _append_source_page(
+                sources,
+                pages,
+                items=org_matches,
+                key="matches",
+                start=0,
+                budget=per_source_budget,
+                binding=binding,
+                metadata=metadata,
+                complete=complete,
+                total=org.get("matches_count", 0),
+                mode="organization_offset",
+                backend_more=more,
+                organization_offset=org_offset,
+            )
+            continue
+        if source_kind == "controller":
+            if subject != "harness/crucible" or phase not in {"benchmark", "review"}:
+                raise SkillGatewayError(
+                    "source_unavailable", "Software source is unavailable in this phase"
+                )
+            if from_ref:
+                controller_origin = _software_path(from_ref)
+                software = json.loads(
+                    await controller_context_gateway(
+                        ssh=ssh,
+                        controller_host=controller_host,
+                        ticket_id=ticket_id,
+                        agent_name=agent_name,
+                        phase=phase,
+                        operation="search",
+                        from_ref=controller_origin,
+                        path=path,
+                        query=query,
+                    )
+                )
+            else:
+                software = json.loads(
+                    await controller_context_gateway(
+                        ssh=ssh,
+                        controller_host=controller_host,
+                        ticket_id=ticket_id,
+                        agent_name=agent_name,
+                        phase=phase,
+                        operation="search",
+                        query=query,
+                    )
+                )
+            if software.get("reason"):
+                sources.append(
+                    {
+                        "source": "controller",
+                        "scope": "software",
+                        "found": False,
+                        "complete": False,
+                        "absence_confirmed": False,
+                        "reason": software["reason"],
+                        "message": software.get("message"),
+                        "next_action": software.get("next_action"),
+                    }
+                )
+                continue
+            items = [_software_document(item) for item in software.get("results", [])]
+            source_scope = software.get("scan_scope", ".")
+            binding.update({"scope": source_scope})
+            total = software.get("total_files", len(items))
+            _append_source_page(
+                sources,
+                pages,
+                items=items,
+                key="results",
+                start=0,
+                budget=per_source_budget,
+                binding=binding,
+                metadata={
+                    "source": "controller",
+                    "scope": "software",
+                    "scope_ref": _software_ref(source_scope)
+                    if source_scope != "."
+                    else None,
+                    "total_files": total,
+                    "total_matches": software.get("total_matches", total),
+                    "truncated": software.get("truncated", False),
+                    "scan_scope": software.get("scan_scope", "."),
+                    "scope_semantics": software.get("scope_semantics"),
+                },
+                complete=software.get("complete") is True,
+                total=total,
+            )
+            continue
+
+        root_data = _source_root(source_kind, subject, local_skills_dir, repo_cache)
+        if root_data is None:
+            sources.append(
+                {
+                    "source": "agentic-perf" if source_kind == "local" else "upstream",
+                    "scope": source_kind,
+                    "found": False,
+                    "complete": False,
+                    "absence_confirmed": False,
+                    "reason": "source_unavailable",
+                }
+            )
+            continue
+        root, provenance = root_data
+        scope_path = ""
+        if from_ref:
+            origin_subject, origin_path = _parse_source_ref(from_ref, source_kind)
+            if origin_subject != subject:
+                raise SkillGatewayError(
+                    "invalid_origin", "Subject does not match source ref"
+                )
+            if path:
+                scope_path, _scope_type = _resolve_source_pointer(
+                    source_kind, root, origin_path, path
+                )
+            else:
+                scope_path = origin_path
+        if cursor and saved_state.get("mode") == "items":
+            continue
+        scanned = _search_source_documents(
+            source_kind,
+            subject,
+            root,
+            provenance,
+            query,
+            scope_path=scope_path,
+            local_skills_dir=local_skills_dir,
+            repo_cache=repo_cache,
+        )
+        items = scanned["results"]
+        binding.update({"scope": scanned["scope_path"]})
+        _append_source_page(
+            sources,
+            pages,
+            items=items,
+            key="results",
+            start=0,
+            budget=per_source_budget,
+            binding=binding,
+            metadata={
+                "source": scanned["source"],
+                "scope": source_kind,
+                "scope_ref": from_ref or None,
+                "provenance_status": scanned["provenance_status"],
+                "query_mode": scanned["query_mode"],
+                "scanned_bytes": scanned["scanned_bytes"],
+                "scan_scope": scanned["scope_path"],
+                "scope_semantics": scanned["scope_semantics"],
+            },
+            complete=scanned["complete"],
+            total=len(items),
+        )
+
+    result = {
+        "found": False,
+        "complete": False,
+        "absence_confirmed": False,
+        "subject": subject,
+        "operation": operation,
+        "query": query if operation == "search" else None,
+        "sources": sources,
+        "pagination": "ticket-scoped cursor",
+    }
+    result = {key: value for key, value in result.items() if value is not None}
+    # Include the maximum cursor length while fitting so cursor emission itself
+    # cannot push the final JSON over the caller's byte budget.
+    return _finalize_search_list_result(
+        result,
+        pages,
+        manager=manager,
+        budget=budget,
+    )
+
+
 async def skill_context_gateway(
     provider: Any,
     *,
@@ -425,6 +1465,8 @@ async def skill_context_gateway(
     query: str = "",
     max_bytes: int = 16384,
     offset_bytes: int = 0,
+    cursor: str = "",
+    response_overhead_bytes: int = 0,
     local_skills_dir: Path | None = None,
     repo_cache: Any = None,
 ) -> str:
@@ -437,14 +1479,34 @@ async def skill_context_gateway(
     if not ticket_id:
         return json.dumps({"found": False, "reason": "ticket_required"})
     try:
-        if operation not in {"bootstrap", "read", "search"}:
+        if operation not in {"bootstrap", "read", "list", "search"}:
             raise SkillGatewayError(
-                "unsupported_operation", "Use bootstrap, read or search"
+                "unsupported_operation", "Use bootstrap, read, list, or search"
             )
         if type(max_bytes) is not int or not 4 <= max_bytes <= 16384:
             raise SkillGatewayError("invalid_page", "max_bytes must be 4 through 16384")
         if type(offset_bytes) is not int or offset_bytes < 0:
             raise SkillGatewayError("invalid_page", "offset_bytes must be nonnegative")
+        if operation in {"list", "search"}:
+            if offset_bytes:
+                raise SkillGatewayError(
+                    "invalid_page", "Use cursor for list/search result pagination"
+                )
+            if cursor and not isinstance(cursor, str):
+                raise SkillGatewayError("invalid_cursor", "Cursor must be a string")
+            if path and not from_ref:
+                raise SkillGatewayError(
+                    "invalid_origin", "Use from_ref with a relative list or search path"
+                )
+            response_budget = max_bytes - max(0, response_overhead_bytes)
+            if response_budget < 512:
+                raise SkillGatewayError(
+                    "page_too_small", "max_bytes must leave 512 bytes for a result page"
+                )
+        elif cursor:
+            raise SkillGatewayError(
+                "invalid_cursor", "Cursor is supported only for list and search"
+            )
         resolver = provider.organization_resolver
         organization = resolver.bootstrap(subject)
         organization.setdefault("scope", "organization")
@@ -459,7 +1521,6 @@ async def skill_context_gateway(
                 }
             )
         revision = organization.get("revision", "legacy")
-        org_available = organization.get("status") == "available"
         software_allowed = subject == "harness/crucible" and phase in {
             "benchmark",
             "review",
@@ -642,13 +1703,14 @@ async def skill_context_gateway(
                 if source_subject != subject:
                     raise SkillGatewayError("invalid_ref", "Subject does not match ref")
                 if path:
-                    if path.startswith(("/", "\\")) or "\\" in path:
-                        raise SkillGatewayError("invalid_document", "Invalid pointer")
-                    relative = posixpath.normpath(
-                        posixpath.join(posixpath.dirname(relative), path)
+                    base = _local_base(local_skills_dir, subject)
+                    if base is None:
+                        raise SkillGatewayError(
+                            "source_unavailable", "Local subject is unavailable"
+                        )
+                    relative, _target_type = _resolve_source_pointer(
+                        "local", base, relative, path
                     )
-                    if relative == ".." or relative.startswith("../"):
-                        raise SkillGatewayError("invalid_document", "Invalid pointer")
                 document = _read_local_document(
                     local_skills_dir,
                     subject,
@@ -670,13 +1732,16 @@ async def skill_context_gateway(
                 if source_subject != subject:
                     raise SkillGatewayError("invalid_ref", "Subject does not match ref")
                 if path:
-                    if path.startswith(("/", "\\")) or "\\" in path:
-                        raise SkillGatewayError("invalid_document", "Invalid pointer")
-                    relative = posixpath.normpath(
-                        posixpath.join(posixpath.dirname(relative), path)
+                    source = _source_root(
+                        "upstream", subject, local_skills_dir, repo_cache
                     )
-                    if relative == ".." or relative.startswith("../"):
-                        raise SkillGatewayError("invalid_document", "Invalid pointer")
+                    if source is None:
+                        raise SkillGatewayError(
+                            "source_unavailable", "Upstream cache is unavailable"
+                        )
+                    relative, _target_type = _resolve_source_pointer(
+                        "upstream", source[0], relative, path
+                    )
                 document = _read_upstream_document(
                     repo_cache,
                     subject,
@@ -687,7 +1752,16 @@ async def skill_context_gateway(
                 return json.dumps({"found": True, "document": document})
             if not software_allowed:
                 raise SkillGatewayError("invalid_ref", "Source unavailable in phase")
-            relative = _software_path(ref, from_ref=from_ref, path=path)
+            if path:
+                if ref or not from_ref:
+                    raise SkillGatewayError(
+                        "invalid_document", "Use a software origin and relative pointer"
+                    )
+                origin = _software_path(from_ref)
+                relative = ""
+            else:
+                origin = ""
+                relative = _software_path(ref)
             result = json.loads(
                 await controller_context_gateway(
                     ssh=ssh,
@@ -696,7 +1770,8 @@ async def skill_context_gateway(
                     agent_name=agent_name,
                     phase=phase,
                     operation="read",
-                    path=relative,
+                    from_ref=origin,
+                    path=path if origin else relative,
                     max_bytes=max_bytes,
                     offset_bytes=offset_bytes,
                 )
@@ -705,176 +1780,42 @@ async def skill_context_gateway(
                 result["document"] = _software_document(result["document"])
                 result["documents"] = [result["document"]]
             return json.dumps(result)
-        if ref or path:
-            raise SkillGatewayError("invalid_search", "Scope search with from_ref")
-        if offset_bytes and (not from_ref or not is_organization_ref(from_ref)):
-            raise SkillGatewayError(
-                "invalid_page", "Search cursor requires organization origin"
+        if operation in {"list", "search"}:
+            return await _skill_context_list_search(
+                provider,
+                resolver=resolver,
+                organization=organization,
+                ticket_id=ticket_id,
+                agent_name=agent_name,
+                phase=phase,
+                subject=subject,
+                operation=operation,
+                ref=ref,
+                path=path,
+                from_ref=from_ref,
+                query=query,
+                max_bytes=max_bytes,
+                response_overhead_bytes=response_overhead_bytes,
+                cursor=cursor,
+                ssh=ssh,
+                controller_host=controller_host,
+                local_skills_dir=local_skills_dir,
+                repo_cache=repo_cache,
             )
-        if from_ref and not (
-            is_organization_ref(from_ref)
-            or from_ref.startswith(_SOFTWARE_PREFIX)
-            or from_ref.startswith(_LOCAL_PREFIX)
-            or from_ref.startswith(_UPSTREAM_PREFIX)
-        ):
-            raise SkillGatewayError("invalid_origin", "Use a returned source origin")
-        result = {
+        raise SkillGatewayError(
+            "unsupported_operation", "Unsupported context operation"
+        )
+    except SkillGatewayError as exc:
+        payload = {
             "found": False,
             "subject": subject,
-            "operation": "search",
-            "sources": [],
+            "operation": operation,
+            "reason": exc.code,
+            "message": str(exc),
         }
-        if org_available and (not from_ref or is_organization_ref(from_ref)):
-            if from_ref:
-                resolver.read(subject, from_ref, max_bytes=16384)
-            org_result = resolver.search(
-                subject,
-                None,
-                query,
-                from_ref=from_ref or None,
-                offset=offset_bytes,
-                max_bytes=max_bytes,
-            )
-            org_result["next_offset_bytes"] = org_result.get(
-                "next_offset_bytes", org_result.get("next_offset")
-            )
-            result["sources"].append(org_result)
-            result["found"] = bool(org_result.get("matches_count"))
-        if software_allowed and (not from_ref or from_ref.startswith(_SOFTWARE_PREFIX)):
-            if from_ref:
-                _software_path(from_ref)
-            software = json.loads(
-                await controller_context_gateway(
-                    ssh=ssh,
-                    controller_host=controller_host,
-                    ticket_id=ticket_id,
-                    agent_name=agent_name,
-                    phase=phase,
-                    operation="search",
-                    query=query,
-                    max_bytes=max_bytes,
-                )
-            )
-            software.update(
-                {
-                    "source": "controller",
-                    "scope": "software",
-                    "pagination": "unsupported",
-                }
-            )
-            software["results"] = [
-                _software_document(item) for item in software.get("results", [])
-            ]
-            result["sources"].append(software)
-            result["found"] = result["found"] or software.get("found", False)
-        if subject in _LOCAL_SUBJECT_DIRS and (
-            not from_ref
-            or from_ref.startswith(_LOCAL_PREFIX)
-            or from_ref.startswith(_UPSTREAM_PREFIX)
-        ):
-            source_kinds = (
-                ["local", "upstream"]
-                if not from_ref
-                else ["local"]
-                if from_ref.startswith(_LOCAL_PREFIX)
-                else ["upstream"]
-            )
-            alternatives = [
-                term.casefold().strip() for term in query.split("|") if term.strip()
-            ]
-            for source_kind in source_kinds:
-                source_documents = (
-                    _list_local_documents(local_skills_dir, subject)
-                    if source_kind == "local"
-                    else _list_upstream_documents(repo_cache, subject)
-                )
-                if from_ref:
-                    origin_subject, _origin_path = _parse_source_ref(
-                        from_ref, source_kind
-                    )
-                    if origin_subject != subject:
-                        raise SkillGatewayError(
-                            "invalid_origin", "Subject does not match source ref"
-                        )
-                    if not any(item["ref"] == from_ref for item in source_documents):
-                        raise SkillGatewayError(
-                            "invalid_origin", "Source reference is not available"
-                        )
-                matches = []
-                scanned_bytes = 0
-                for item in source_documents:
-                    size_bytes = item.get("size_bytes", 0)
-                    if not isinstance(size_bytes, int) or size_bytes < 0:
-                        continue
-                    if scanned_bytes + size_bytes > _MAX_SOURCE_SEARCH_BYTES:
-                        break
-                    scanned_bytes += size_bytes
-                    try:
-                        document_result = (
-                            _read_local_document(
-                                local_skills_dir,
-                                subject,
-                                item["path"],
-                                offset_bytes=0,
-                                max_bytes=16384,
-                                full_content=True,
-                            )
-                            if source_kind == "local"
-                            else _read_upstream_document(
-                                repo_cache,
-                                subject,
-                                item["path"],
-                                offset_bytes=0,
-                                max_bytes=16384,
-                                full_content=True,
-                            )
-                        )
-                        content = document_result.get("content", "")
-                        if not alternatives or any(
-                            alternative in content.casefold()
-                            for alternative in alternatives
-                        ):
-                            matches.append(
-                                {
-                                    key: value
-                                    for key, value in item.items()
-                                    if key != "uri"
-                                }
-                            )
-                    except (OSError, ValueError, TypeError):
-                        continue
-                    if len(matches) >= 100:
-                        break
-                source = "agentic-perf"
-                provenance_status = "checked-in-project-context"
-                if source_kind == "upstream":
-                    source, provenance_status = _upstream_provenance(
-                        repo_cache, subject
-                    )
-                result["sources"].append(
-                    {
-                        "source": source,
-                        "scope": source_kind,
-                        "provenance_status": provenance_status,
-                        "found": bool(matches),
-                        "matches_count": len(matches),
-                        "results": matches,
-                        "pagination": "bounded",
-                        "query_mode": "literal-alternatives",
-                        "scanned_bytes": scanned_bytes,
-                    }
-                )
-                result["found"] = result["found"] or bool(matches)
-        return json.dumps(result)
-    except SkillGatewayError as exc:
-        return json.dumps(
-            {
-                "found": False,
-                "subject": subject,
-                "operation": operation,
-                "reason": exc.code,
-            }
-        )
+        if operation in {"list", "search"}:
+            return json.dumps(payload, separators=(",", ":"))
+        return json.dumps(payload)
     except (OSError, ValueError, TypeError):
         return json.dumps(
             {

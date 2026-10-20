@@ -138,6 +138,7 @@ async def get_skill_context(
     query: str = "",
     max_bytes: int = 16384,
     offset_bytes: int = 0,
+    cursor: str = "",
 ) -> str:
     """Retrieve resource guidance through the subject-scoped context gateway."""
     return await skill_context_gateway(
@@ -153,6 +154,7 @@ async def get_skill_context(
         query=query,
         max_bytes=max_bytes,
         offset_bytes=offset_bytes,
+        cursor=cursor,
         local_skills_dir=SKILLS_DIR,
     )
 
