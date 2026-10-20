@@ -560,7 +560,12 @@ def _read_upstream_document(
         raise SkillGatewayError("source_unavailable", "Upstream cache is unavailable")
     root = Path(root).resolve()
     target, path_type = _source_path_type(root, relative, kind="upstream")
-    if path_type != "file" or target.suffix.lower() not in {".md", ".yml", ".yaml"}:
+    if path_type == "directory":
+        raise SkillGatewayError(
+            "source_path_is_directory",
+            "This upstream ref is a directory; use operation='list' to inspect its immediate children.",
+        )
+    if target.suffix.lower() not in {".md", ".yml", ".yaml"}:
         raise SkillGatewayError("invalid_document", "Invalid upstream document")
     if target.stat().st_size > _MAX_SOURCE_DOCUMENT_BYTES:
         raise SkillGatewayError(
@@ -730,7 +735,12 @@ def _search_source_documents(
     )
     complete = len(documents) < 128 if kind == "local" else True
     if scope_path:
-        _scope, scope_type = _source_path_type(root, scope_path, kind=kind)
+        scope, scope_type = _source_path_type(root, scope_path, kind=kind)
+        if scope_type == "directory":
+            # Search inventories use repository-relative paths; normalize a
+            # safe directory alias before filtering so its target's documents
+            # remain discoverable with reusable canonical refs.
+            scope_path = scope.relative_to(root).as_posix()
         if scope_type == "file":
             allowed_ref = _source_ref(kind, subject, scope_path)
             if not any(item["ref"] == allowed_ref for item in documents):
@@ -905,7 +915,11 @@ def _finalize_search_list_result(
                 for item in source[page["key"]]
             )
             next_offset = page["organization_offset"] + shown_bytes
-            more = page["backend_more"] or page["forced_more"]
+            more = (
+                page["backend_more"]
+                or page["forced_more"]
+                or len(source[page["key"]]) < len(page["items"])
+            )
             state = {"mode": "organization_offset", "offset": next_offset}
         else:
             next_index = page["start"] + len(source[page["key"]])
@@ -929,7 +943,7 @@ def _finalize_search_list_result(
         else:
             source.pop("next_cursor", None)
     result["found"] = any(source.get("found") for source in result["sources"])
-    result["complete"] = all(
+    result["complete"] = bool(result["sources"]) and all(
         source.get("complete") is True for source in result["sources"]
     )
     result["absence_confirmed"] = not result["found"] and result["complete"]
@@ -1036,7 +1050,9 @@ async def _skill_context_list_search(
 
     sources: list[dict[str, Any]] = []
     pages: list[dict[str, Any]] = []
-    per_source_budget = max(64, (budget - 256) // max(len(selected_sources), 1))
+    # Let each source use the remaining result budget; the final envelope pass
+    # removes any excess and keeps continuation cursors for trimmed results.
+    per_source_budget = max(64, budget - 256)
     for source_kind in selected_sources:
         origin_ref = saved_binding.get("origin", "") if saved_binding else from_ref
         bound_ref = saved_binding.get("ref", "") if saved_binding else ref

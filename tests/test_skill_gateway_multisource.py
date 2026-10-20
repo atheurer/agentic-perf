@@ -383,6 +383,43 @@ async def test_root_level_local_document_origin_searches_source_root(
 
 
 @pytest.mark.asyncio
+async def test_local_directory_alias_searches_its_resolved_subtree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    skills = tmp_path / "skills"
+    docs = skills / "kube-burner" / "docs"
+    real = docs / "real"
+    real.mkdir(parents=True)
+    (real / "needle.md").write_text("needle through a safe directory alias")
+    (docs / "alias").symlink_to(real, target_is_directory=True)
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    result = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-LOCAL-ALIAS-SEARCH",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="search",
+            query="needle",
+            from_ref="skill://local/harness/kube-burner/docs/alias",
+            local_skills_dir=skills,
+        )
+    )
+
+    source = result["sources"][0]
+    assert source["found"] is True
+    assert source["complete"] is True
+    assert [item["path"] for item in source["results"]] == ["docs/real/needle.md"]
+
+
+@pytest.mark.asyncio
 async def test_upstream_symlinks_cannot_escape_exposed_docs_trees(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -394,9 +431,13 @@ async def test_upstream_symlinks_cannot_escape_exposed_docs_trees(
     source = repo_root / "src"
     docs.mkdir(parents=True)
     source.mkdir()
+    real_docs = docs / "real"
+    real_docs.mkdir()
+    (real_docs / "needle.md").write_text("needle through a safe directory alias")
     (docs / "visible.md").write_text("public docs guidance")
     (source / "secret.md").write_text("secretphrase out of scope")
     (docs / "safe-link.md").symlink_to(docs / "visible.md")
+    (docs / "alias").symlink_to(real_docs, target_is_directory=True)
     (docs / "internal").symlink_to(source, target_is_directory=True)
 
     from providers.skills.repo_cache import RepoCache
@@ -439,6 +480,10 @@ async def test_upstream_symlinks_cannot_escape_exposed_docs_trees(
     directory_list = await invoke(operation="list", ref=unsafe_directory_ref)
     assert directory_list["reason"] == "invalid_document"
 
+    directory_read = await invoke(operation="read", ref=safe_directory_ref)
+    assert directory_read["reason"] == "source_path_is_directory"
+    assert "operation='list'" in directory_read["message"]
+
     pointer_list = await invoke(
         operation="list", from_ref=safe_directory_ref, path="internal"
     )
@@ -470,6 +515,16 @@ async def test_upstream_symlinks_cannot_escape_exposed_docs_trees(
     )
     assert safe_read["found"] is True
     assert safe_read["document"]["content"] == "public docs guidance"
+
+    safe_alias_search = await invoke(
+        operation="search",
+        query="needle",
+        from_ref="skill://upstream/harness/kube-burner/docs/alias",
+    )
+    alias_source = safe_alias_search["sources"][0]
+    assert alias_source["found"] is True
+    assert alias_source["complete"] is True
+    assert [item["path"] for item in alias_source["results"]] == ["docs/real/needle.md"]
 
 
 @pytest.mark.asyncio
@@ -560,6 +615,229 @@ async def test_search_and_list_cursors_are_bounded_scoped_and_do_not_drop_entrie
         cursor=f"{first_cursor[:-1]}!",
     )
     assert tampered["reason"] == "invalid_cursor"
+
+
+@pytest.mark.asyncio
+async def test_search_page_uses_spare_global_budget_across_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    organization = tmp_path / "organization"
+    _write_package(
+        organization,
+        namespace="harness",
+        name="kube-burner",
+        subject="harness/kube-burner",
+        instruction="General organization guidance.",
+    )
+    resolver = _resolver(("team", organization))
+    skills = tmp_path / "skills"
+    deep_parent = skills / "kube-burner" / "docs"
+    deep_parent = deep_parent.joinpath(*(["nested-directory-name"] * 56))
+    deep_parent.mkdir(parents=True)
+    long_path = deep_parent / "needle.md"
+    long_path.write_text("needle in one long source path")
+    upstream = tmp_path / "cache" / "kube-burner" / "docs"
+    upstream.mkdir(parents=True)
+    (upstream / "reference.md").write_text("unrelated upstream reference")
+
+    from providers.skills.repo_cache import RepoCache
+
+    cache = RepoCache(cache_dir=upstream.parents[1])
+
+    class Provider:
+        organization_resolver = resolver
+
+    raw = await skill_context_gateway(
+        Provider(),
+        ticket_id="PERF-GLOBAL-SPARE-BUDGET",
+        agent_name="benchmark-agent",
+        phase="benchmark",
+        subject="harness/kube-burner",
+        operation="search",
+        query="needle",
+        max_bytes=6000,
+        local_skills_dir=skills,
+        repo_cache=cache,
+    )
+    result = json.loads(raw)
+
+    assert len(raw.encode("utf-8")) <= 6000
+    assert result["found"] is True
+    local_source = next(item for item in result["sources"] if item["scope"] == "local")
+    assert [item["path"] for item in local_source["results"]] == [
+        long_path.relative_to(skills / "kube-burner").as_posix()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_with_no_available_sources_is_incomplete_not_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    result = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-NO-SEARCH-SOURCES",
+            agent_name="triage-agent",
+            phase="triage",
+            subject="harness/crucible",
+            operation="search",
+            query="missing",
+        )
+    )
+
+    assert result["sources"] == []
+    assert result["found"] is False
+    assert result["complete"] is False
+    assert result["absence_confirmed"] is False
+
+
+@pytest.mark.asyncio
+async def test_organization_search_cursor_continues_without_dropping_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    organization = tmp_path / "organization"
+    _write_package(
+        organization,
+        namespace="harness",
+        name="crucible",
+        subject="harness/crucible",
+        instruction="General Crucible organization guidance.",
+    )
+    package = organization / "skills" / "harness" / "crucible"
+    manifest_path = package / "skill.json"
+    manifest = json.loads(manifest_path.read_text())
+    documents = package / "references"
+    documents.mkdir()
+    for index in range(21):
+        relative = f"references/reference-{index:02}.md"
+        (package / relative).write_text(f"needle in reference {index:02}\n")
+        manifest["documents"].append({"path": relative, "entrypoint": False})
+    manifest_path.write_text(json.dumps(manifest))
+    resolver = _resolver(("team", organization))
+
+    class Provider:
+        organization_resolver = resolver
+
+    origin = resolver.bootstrap("harness/crucible")["documents"][0]["ref"]
+
+    async def invoke(cursor: str = "") -> tuple[str, dict[str, Any]]:
+        raw = await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-ORGANIZATION-CURSOR",
+            agent_name="triage-agent",
+            phase="triage",
+            subject="harness/crucible",
+            operation="search",
+            query="needle",
+            from_ref=origin,
+            max_bytes=8192,
+            cursor=cursor,
+        )
+        return raw, json.loads(raw)
+
+    refs: list[str] = []
+    raw, result = await invoke()
+    while True:
+        assert len(raw.encode("utf-8")) <= 8192
+        source = result["sources"][0]
+        refs.extend(item["ref"] for item in source["matches"])
+        cursor = source.get("next_cursor")
+        if not cursor:
+            break
+        raw, result = await invoke(cursor)
+
+    assert len(refs) == 21
+    assert len(set(refs)) == 21
+
+
+@pytest.mark.asyncio
+async def test_controller_search_cursor_continues_gateway_result_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agents.server_utils as server_utils
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    calls = []
+    search_results = [
+        {
+            "path": f"repos/bench/docs/reference-{index:02}.md",
+            "type": "file",
+            "size_bytes": 32,
+            "match_kinds": ["content"],
+            "matches": [{"kind": "content", "line_number": 1, "content": "needle"}],
+            "match_count": 1,
+            "matches_truncated": False,
+        }
+        for index in range(12)
+    ]
+
+    async def fake_controller_context_gateway(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "found": True,
+                "operation": "search",
+                "results": search_results,
+                "total_files": len(search_results),
+                "total_matches": len(search_results),
+                "complete": True,
+                "scan_scope": "repos/bench",
+                "scope_semantics": "recursive subtree",
+            }
+        )
+
+    monkeypatch.setattr(
+        server_utils, "controller_context_gateway", fake_controller_context_gateway
+    )
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    origin = "skill://software/controller/harness/crucible/repos/bench"
+
+    async def invoke(cursor: str = "") -> tuple[str, dict[str, Any]]:
+        raw = await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-CONTROLLER-CURSOR",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/crucible",
+            operation="search",
+            query="needle",
+            from_ref=origin,
+            max_bytes=1200,
+            cursor=cursor,
+        )
+        return raw, json.loads(raw)
+
+    refs: list[str] = []
+    raw, result = await invoke()
+    while True:
+        assert len(raw.encode("utf-8")) <= 1200
+        source = result["sources"][0]
+        refs.extend(item["ref"] for item in source["results"])
+        cursor = source.get("next_cursor")
+        if not cursor:
+            break
+        raw, result = await invoke(cursor)
+
+    assert len(refs) == 12
+    assert len(set(refs)) == 12
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
