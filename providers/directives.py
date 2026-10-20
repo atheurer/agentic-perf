@@ -59,6 +59,9 @@ _CORE_DIRECTIVES: set[str] = {
     "on_existing_install",
     "firewall_policy",
     "test_interfaces",
+    # Kernel comparison (epic #995): a mapping directive consumed by the
+    # deterministic plan builder in providers/kernel_plan.py.
+    "kernel_comparison",
     # This resource directive must be known to the orchestrator even when the
     # Jumpstarter provider is imported lazily in a separate resource process.
     "jumpstarter_serial",
@@ -66,6 +69,7 @@ _CORE_DIRECTIVES: set[str] = {
 
 _CORE_ALIASES: dict[str, str] = {
     "exclude_host": "exclude_hosts",
+    "kernel-comparison": "kernel_comparison",
 }
 
 _CORE_DESCRIPTIONS: dict[str, str] = {
@@ -89,6 +93,7 @@ _CORE_DESCRIPTIONS: dict[str, str] = {
     "on_existing_install": "Policy for pre-existing installations: 'reinstall', 'update', 'skip', or 'ask_user'",
     "firewall_policy": "Firewall configuration policy for the benchmark environment",
     "test_interfaces": "Network interfaces to use for the benchmark test",
+    "kernel_comparison": "Kernel comparison plan with baseline, candidate, and order",
 }
 
 # ── Suffix / prefix normalization ─────────────────────────

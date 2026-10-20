@@ -3521,6 +3521,27 @@ async def _install_kernel_one(
             "before": before.to_dict(),
         }
 
+    # A step-supplied repo_url bootstraps the repository the kernel comes
+    # from (fresh lab hosts have no compose repos). The availability probe
+    # inside the command fails the install early with a clear message if
+    # the repo is unreachable, before any package action.
+    if spec.repo_url:
+        from providers.rhel_kernel import build_repo_setup_command
+
+        repo_result = await _ssh.run(
+            target, build_repo_setup_command(spec), timeout=300, mutating=True
+        )
+        if repo_result.exit_code != 0:
+            return {
+                "host": host,
+                "state": "install_failed",
+                "error": (
+                    "kernel repository bootstrap failed: "
+                    f"{repo_result.stderr or repo_result.stdout}"
+                ),
+                "before": before.to_dict(),
+            }
+
     result = await _ssh.run(
         target, build_install_command(spec), timeout=900, mutating=True
     )

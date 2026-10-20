@@ -494,7 +494,11 @@ class ProvisioningAgent(AgentBase):
             for host, record in inventory["results"].items()
             if record.get("requested", {}).get("state") == "not_found"
         }
-        if missing:
+        # not_found is expected on a fresh host when the step supplies a
+        # repo_url: install_kernel bootstraps the repository before dnf.
+        # Without a repo_url the operator must add one first — stopping is
+        # the documented behaviour.
+        if missing and not spec.repo_url:
             await self._kernel_step_stop(
                 ticket_id,
                 f"{spec.nevra} is not installed or available on every host "
@@ -502,6 +506,13 @@ class ProvisioningAgent(AgentBase):
                 missing,
             )
             return
+        if missing and spec.repo_url:
+            await self._add_comment(
+                ticket_id,
+                f"{spec.nevra} is not yet available on "
+                f"{', '.join(sorted(missing))}; the step supplies a repo_url "
+                "so install_kernel will bootstrap the repository first.",
+            )
 
         # The tools take the release string; the plan step supplies the
         # package, and each tool re-derives the full spec from the step.
