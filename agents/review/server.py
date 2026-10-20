@@ -117,7 +117,19 @@ async def read_skills(docs: list[dict]) -> str:
     for doc in docs:
         harness = doc.get("harness") or doc.get("category", "")
         filename = doc.get("filename") or doc.get("name", "")
-        if harness == "kube-burner":
+        if isinstance(harness, str) and harness.strip().lower() == "crucible":
+            results.append(
+                {
+                    "found": False,
+                    "harness": harness,
+                    "filename": filename,
+                    "message": (
+                        "Use get_skill_context(subject='harness/crucible', "
+                        "operation='bootstrap')."
+                    ),
+                }
+            )
+        elif harness == "kube-burner":
             results.append(
                 {
                     "found": False,
@@ -223,7 +235,7 @@ async def get_crucible_benchmark_context(*args, **kwargs) -> str:
 async def list_harness_docs(harness: str) -> str:
     """List documentation files available for a benchmark harness. Use this to discover reference material about result formats and interpretation."""
     await _ensure_init()
-    if harness == "crucible":
+    if isinstance(harness, str) and harness.strip().lower() == "crucible":
         return json.dumps(
             {
                 "found": False,
@@ -252,7 +264,7 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
         return json.dumps({"status": "error", "message": "No repo cache configured"})
     if not harness and "/" in doc_path:
         harness, doc_path = doc_path.strip().lstrip("/").split("/", 1)
-    if harness == "crucible":
+    if isinstance(harness, str) and harness.strip().lower() == "crucible":
         return json.dumps(
             {
                 "found": False,

@@ -15,8 +15,10 @@ from providers.skills.gateway import (
     SkillGatewayError,
     is_organization_ref,
 )
+from providers.skills.local_context import LocalContextSource
 
 _SOFTWARE_PREFIX = "skill://software/controller/harness/crucible/"
+_PROJECT_PREFIX = "skill://project/"
 _LOCAL_PREFIX = "skill://local/"
 _UPSTREAM_PREFIX = "skill://upstream/"
 _CONFIG_PREFIX = "skill://configuration/"
@@ -33,8 +35,10 @@ _MAX_SOURCE_DOCUMENT_BYTES = 1024 * 1024
 _MAX_SOURCE_SEARCH_BYTES = 4 * 1024 * 1024
 SKILL_GATEWAY_TOOL_DESCRIPTION = """Retrieve subject guidance and software references.
 
-Bootstrap returns applicable organization entrypoints, phase-compatible software
-entrypoints, and approved configuration-view refs. Read a returned file ref; use
+Bootstrap returns applicable bundled project and organization entrypoints,
+phase-compatible software entrypoints, and approved configuration-view refs.
+Project entries come from the explicit Crucible manifest and are filtered by
+the server-owned phase and agent. Read a returned file ref; use
 operation='list' with a directory ref to see its immediate children. List results
 include typed, reusable refs and do not read directory contents. Organization
 directories are not exposed; listing that source reports an unsupported
@@ -48,9 +52,10 @@ directory. Organization search uses POSIX extended regular expressions without
 backreferences and is limited to registered, phase-visible documents in the
 origin's organization source; its optional path narrows that scope. Controller
 search uses Python regular expressions and falls back to a literal query when
-the expression is invalid. Local and upstream search use literal alternatives
-separated by '|'. For list and search, max_bytes bounds the complete serialized
-result page.
+the expression is invalid. Project, local, and upstream search use literal
+alternatives separated by '|'. Project documents come only from the explicit
+manifest and are filtered by phase and agent. For list and search, max_bytes
+bounds the complete serialized result page.
 Continue each source with its next_cursor and the same operation, subject, query,
 and original scope (`from_ref`, `ref`, and `path`). Do not change an unscoped
 request into a scoped one while continuing. The cursor retains its original
@@ -199,6 +204,169 @@ def _software_document(document: dict[str, Any]) -> dict[str, Any]:
         "source": "controller",
         "scope": "software",
         "role": "software-reference",
+    }
+
+
+def _project_ref(path: str) -> str:
+    return _PROJECT_PREFIX + quote(path, safe="/")
+
+
+def _project_document(document: dict[str, Any]) -> dict[str, Any]:
+    """Expose manifest-selected project guidance with a safe provenance view."""
+    source_path = str(document.get("source_path", ""))
+    provenance = document.get("provenance", {})
+    provenance = provenance if isinstance(provenance, dict) else {}
+    safe_provenance = {
+        "source_id": "agentic-perf",
+        "revision": provenance.get("revision"),
+        "entry_id": provenance.get("entry_id"),
+        "path": source_path,
+        "harness": document.get("harness", "crucible"),
+        "benchmark": document.get("benchmark"),
+        "phase": provenance.get("phase"),
+        "agent": provenance.get("agent"),
+    }
+    if provenance.get("reason"):
+        safe_provenance["reason"] = provenance["reason"]
+    subjects = document.get("subject_area")
+    return {
+        "ref": _project_ref(source_path),
+        "uri": _project_ref(source_path),
+        "path": source_path,
+        "source_path": source_path,
+        "source": "agentic-perf",
+        "source_id": "agentic-perf",
+        "scope": "project",
+        "role": "project-guidance",
+        "authority": "supplemental",
+        "revision": provenance.get("revision"),
+        "provenance": safe_provenance,
+        "benchmark": document.get("benchmark"),
+        "subject_areas": LocalContextSource._values(subjects),
+        "entrypoint": bool(document.get("entrypoint", True)),
+        "size_bytes": document.get("size_bytes"),
+    }
+
+
+def _project_documents(
+    provider: Any,
+    *,
+    subject: str,
+    phase: str,
+    agent_name: str,
+    benchmark: str | None,
+) -> tuple[Any | None, list[dict[str, Any]]]:
+    if subject != "harness/crucible":
+        return None, []
+    source = getattr(provider, "project_context_source", None)
+    if source is None:
+        return None, []
+    documents = source.list_documents(
+        harness="crucible",
+        benchmark=benchmark,
+        phase=phase,
+        agent=agent_name,
+        subject_area="all",
+    )
+    exposed = [_project_document(item) for item in documents]
+    exposed.sort(key=lambda item: item["path"])
+    return source, exposed
+
+
+def _project_read_target(
+    documents: list[dict[str, Any]],
+    *,
+    ref: str,
+    path: str,
+    from_ref: str,
+) -> dict[str, Any]:
+    by_ref = {item["ref"]: item for item in documents}
+    if path:
+        if ref or from_ref not in by_ref:
+            raise SkillGatewayError(
+                "origin_required", "Pointer requires a returned project document ref"
+            )
+        if path.startswith(("/", "\\")) or "://" in path or "\\" in path:
+            raise SkillGatewayError("invalid_document", "Invalid relative pointer")
+        origin = by_ref[from_ref]["source_path"]
+        target = posixpath.normpath(posixpath.join(posixpath.dirname(origin), path))
+        if target in {"..", "."} or target.startswith("../"):
+            raise SkillGatewayError(
+                "invalid_document", "Pointer escapes the project source"
+            )
+        candidate = next(
+            (item for item in documents if item["source_path"] == target), None
+        )
+    else:
+        candidate = by_ref.get(ref)
+    if candidate is None:
+        raise SkillGatewayError("invalid_ref", "Use a returned project document ref")
+    return candidate
+
+
+def _project_search_documents(
+    source: Any,
+    documents: list[dict[str, Any]],
+    query: str,
+    *,
+    scope_path: str = "",
+) -> dict[str, Any]:
+    alternatives = [
+        part.strip().casefold() for part in query.split("|") if part.strip()
+    ]
+    if not alternatives or len(query) > 256:
+        raise SkillGatewayError(
+            "invalid_query", "Search query must contain 1 through 256 characters"
+        )
+    results = []
+    scanned_bytes = 0
+    complete = True
+    for document in documents:
+        relative = document["source_path"]
+        if scope_path and not (
+            relative == scope_path or relative.startswith(scope_path.rstrip("/") + "/")
+        ):
+            continue
+        content = source.read(relative)
+        if content is None:
+            complete = False
+            continue
+        scanned_bytes += len(content.encode("utf-8"))
+        if scanned_bytes > _MAX_SOURCE_SEARCH_BYTES:
+            complete = False
+            break
+        folded = content.casefold()
+        if alternatives and any(term in folded for term in alternatives):
+            line_number = next(
+                (
+                    number
+                    for number, line in enumerate(content.splitlines(), 1)
+                    if any(term in line.casefold() for term in alternatives)
+                ),
+                1,
+            )
+            line = content.splitlines()[line_number - 1]
+            results.append(
+                {
+                    "ref": document["ref"],
+                    "source_id": "agentic-perf",
+                    "path": relative,
+                    "line": line_number,
+                    "snippet": line[:512],
+                }
+            )
+            if len(results) >= 500:
+                complete = False
+                break
+    return {
+        "results": results,
+        "complete": complete,
+        "scanned_bytes": scanned_bytes,
+        "query_mode": "literal-alternatives",
+        "scope_path": scope_path or ".",
+        "scope_semantics": "manifest documents within the selected subtree",
+        "source": "agentic-perf",
+        "provenance_status": "project-content-revision",
     }
 
 
@@ -1048,6 +1216,13 @@ async def _skill_context_list_search(
     from providers.workspace.manager import WorkspaceManager
 
     manager = WorkspaceManager(ticket_id=ticket_id, agent_name=agent_name, phase=phase)
+    project_source, project_documents = _project_documents(
+        provider,
+        subject=subject,
+        phase=phase,
+        agent_name=agent_name,
+        benchmark=None,
+    )
     budget = max_bytes - max(0, response_overhead_bytes)
     if budget < 512:
         raise SkillGatewayError(
@@ -1089,6 +1264,8 @@ async def _skill_context_list_search(
             selected_sources = [
                 "controller"
                 if (ref or from_ref).startswith(_SOFTWARE_PREFIX)
+                else "project"
+                if (ref or from_ref).startswith(_PROJECT_PREFIX)
                 else "local"
                 if (ref or from_ref).startswith(_LOCAL_PREFIX)
                 else "upstream"
@@ -1103,6 +1280,8 @@ async def _skill_context_list_search(
                 if is_organization_ref(from_ref)
                 else "controller"
                 if from_ref.startswith(_SOFTWARE_PREFIX)
+                else "project"
+                if from_ref.startswith(_PROJECT_PREFIX)
                 else "local"
                 if from_ref.startswith(_LOCAL_PREFIX)
                 else "upstream"
@@ -1117,6 +1296,8 @@ async def _skill_context_list_search(
                 selected_sources.append("controller")
             if subject in _LOCAL_SUBJECT_DIRS:
                 selected_sources.extend(["local", "upstream"])
+            if project_documents:
+                selected_sources.append("project")
     if any(not source for source in selected_sources):
         raise SkillGatewayError("invalid_origin", "Use a returned source ref.")
 
@@ -1260,6 +1441,64 @@ async def _skill_context_list_search(
                 },
                 complete=software.get("complete") is True,
                 total=software.get("total_entries", len(items)),
+            )
+            continue
+        if operation == "list" and source_kind == "project":
+            if project_source is None:
+                raise SkillGatewayError(
+                    "source_unavailable", "Project context is unavailable"
+                )
+            if from_ref:
+                origin = _project_read_target(
+                    project_documents, ref="", path="", from_ref=from_ref
+                )
+                if path:
+                    origin = _project_read_target(
+                        project_documents,
+                        ref="",
+                        path=path,
+                        from_ref=from_ref,
+                    )
+            else:
+                origin = _project_read_target(
+                    project_documents, ref=ref, path="", from_ref=""
+                )
+            scope_path = posixpath.dirname(origin["source_path"])
+            items = [
+                {
+                    "ref": item["ref"],
+                    "uri": item["uri"],
+                    "path": item["source_path"],
+                    "source": "agentic-perf",
+                    "scope": "project",
+                    "type": "file",
+                    "size_bytes": item.get("size_bytes"),
+                    "provenance_status": "project-content-revision",
+                }
+                for item in project_documents
+                if posixpath.dirname(item["source_path"]) == scope_path
+            ]
+            binding.update({"scope": scope_path})
+            _append_source_page(
+                sources,
+                pages,
+                items=items,
+                key="results",
+                start=0,
+                budget=per_source_budget,
+                binding=binding,
+                metadata={
+                    "source": "agentic-perf",
+                    "source_id": "agentic-perf",
+                    "scope": "project",
+                    "scope_ref": origin["ref"],
+                    "scope_kind": "manifest-files",
+                    "recursive": False,
+                    "total_entries": len(items),
+                    "complete": True,
+                },
+                complete=True,
+                total=len(items),
             )
             continue
         if operation == "list":
@@ -1485,6 +1724,58 @@ async def _skill_context_list_search(
             )
             continue
 
+        if source_kind == "project":
+            if project_source is None:
+                raise SkillGatewayError(
+                    "source_unavailable", "Project context is unavailable"
+                )
+            scope_path = ""
+            if from_ref:
+                origin = _project_read_target(
+                    project_documents, ref="", path="", from_ref=from_ref
+                )
+                if path:
+                    target = _project_read_target(
+                        project_documents,
+                        ref="",
+                        path=path,
+                        from_ref=from_ref,
+                    )
+                    scope_path = target["source_path"]
+                else:
+                    scope_path = posixpath.dirname(origin["source_path"])
+            scanned = _project_search_documents(
+                project_source,
+                project_documents,
+                query,
+                scope_path=scope_path,
+            )
+            items = scanned["results"]
+            binding.update({"scope": scanned["scope_path"]})
+            _append_source_page(
+                sources,
+                pages,
+                items=items,
+                key="results",
+                start=0,
+                budget=per_source_budget,
+                binding=binding,
+                metadata={
+                    "source": "agentic-perf",
+                    "source_id": "agentic-perf",
+                    "scope": "project",
+                    "scope_ref": from_ref or None,
+                    "provenance_status": scanned["provenance_status"],
+                    "query_mode": scanned["query_mode"],
+                    "scanned_bytes": scanned["scanned_bytes"],
+                    "scan_scope": scanned["scope_path"],
+                    "scope_semantics": scanned["scope_semantics"],
+                },
+                complete=scanned["complete"],
+                total=len(items),
+            )
+            continue
+
         root_data = _source_root(source_kind, subject, local_skills_dir, repo_cache)
         if root_data is None:
             sources.append(
@@ -1652,6 +1943,13 @@ async def skill_context_gateway(
             "benchmark",
             "review",
         }
+        project_source, project_documents = _project_documents(
+            provider,
+            subject=subject,
+            phase=phase,
+            agent_name=agent_name,
+            benchmark=None,
+        )
         from agents.server_utils import controller_context_gateway
 
         if operation == "bootstrap":
@@ -1661,6 +1959,23 @@ async def skill_context_gateway(
                 for item in organization.get("documents", [])
             ]
             entrypoints = list(organization.get("entrypoints", []))
+            if project_source is not None:
+                project_revision = project_source.revision()
+                sources.append(
+                    {
+                        "source": "agentic-perf",
+                        "source_id": "agentic-perf",
+                        "scope": "project",
+                        "status": "available" if project_revision else "unavailable",
+                        "reason": "explicit_manifest_source",
+                        "revision": project_revision,
+                        "document_count": len(project_documents),
+                    }
+                )
+                documents.extend(project_documents)
+                entrypoints.extend(
+                    item["ref"] for item in project_documents if item["entrypoint"]
+                )
             if subject in _LOCAL_SUBJECT_DIRS:
                 local_documents = _list_local_documents(local_skills_dir, subject)
                 sources.append(
@@ -1751,6 +2066,20 @@ async def skill_context_gateway(
                     "sources": sources,
                     "documents": documents,
                     "entrypoints": entrypoints,
+                    "context_manifest": {
+                        "schema_version": 1,
+                        "subject": subject,
+                        "phase": phase,
+                        "document_count": len(documents),
+                        "documents": [
+                            {
+                                key: value
+                                for key, value in document.items()
+                                if key != "content"
+                            }
+                            for document in documents
+                        ],
+                    },
                     "configuration_views": views,
                     "context_conflicts": {
                         "potential_document_conflicts": [
@@ -1758,6 +2087,52 @@ async def skill_context_gateway(
                             for item in organization.get("overlaps", [])
                             if not item.get("same_content", False)
                         ],
+                        "cross_source_potential_overlaps": [
+                            {
+                                "kind": "same_path"
+                                if project_document["source_path"]
+                                == str(
+                                    other.get("source_path") or other.get("path") or ""
+                                )
+                                else "same_basename",
+                                "documents": [
+                                    project_document["ref"],
+                                    other.get("ref"),
+                                ],
+                                "scopes": [
+                                    "project",
+                                    other.get("scope", "organization"),
+                                ],
+                            }
+                            for project_document in project_documents
+                            for other in documents
+                            if other.get("scope") in {"organization", "software"}
+                            and (
+                                project_document["source_path"]
+                                == str(
+                                    other.get("source_path") or other.get("path") or ""
+                                )
+                                or posixpath.basename(project_document["source_path"])
+                                == posixpath.basename(
+                                    str(
+                                        other.get("source_path")
+                                        or other.get("path")
+                                        or ""
+                                    )
+                                )
+                            )
+                        ],
+                        "cross_source_comparison_required": {
+                            "project_vs_organization": bool(project_documents)
+                            and any(
+                                item.get("scope") == "organization"
+                                for item in documents
+                            ),
+                            "project_vs_software": bool(project_documents)
+                            and any(
+                                item.get("scope") == "software" for item in documents
+                            ),
+                        },
                         "exact_duplicate_documents": organization.get("duplicates", []),
                         "runtime_configuration_conflict": organization.get(
                             "runtime_config_conflict", False
@@ -1818,6 +2193,33 @@ async def skill_context_gateway(
                         "next_offset_bytes": document["next_offset"],
                     }
                 )
+                return json.dumps({"found": True, "document": document})
+            if ref.startswith(_PROJECT_PREFIX) or from_ref.startswith(_PROJECT_PREFIX):
+                if project_source is None:
+                    raise SkillGatewayError(
+                        "source_unavailable", "Project context is unavailable"
+                    )
+                target = _project_read_target(
+                    project_documents,
+                    ref=ref,
+                    path=path,
+                    from_ref=from_ref,
+                )
+                content = project_source.read(target["source_path"])
+                if content is None:
+                    raise SkillGatewayError(
+                        "document_unreadable", "Project document is unavailable"
+                    )
+                page = OrganizationSkillResolver._page(content, offset_bytes, max_bytes)
+                document = {
+                    **target,
+                    "scope": "project",
+                    "role": "project-guidance",
+                    "authority": "supplemental",
+                    **page,
+                    "offset_bytes": page["offset"],
+                    "next_offset_bytes": page["next_offset"],
+                }
                 return json.dumps({"found": True, "document": document})
             if ref.startswith(_LOCAL_PREFIX) or from_ref.startswith(_LOCAL_PREFIX):
                 if path and (ref or not from_ref):

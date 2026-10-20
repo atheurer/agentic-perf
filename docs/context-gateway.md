@@ -7,8 +7,10 @@ sources apply and preserves their scope and provenance.
 
 **Current status:** the active issue branch contains an implementation draft for
 administrator-managed organization sources and the initial `harness/crucible`
-subject. The wider migration across harnesses and other subjects is not complete.
-Authenticated user-level and project-level skill sources are future work. See
+subject. Crucible also has explicitly mapped, bundled project guidance filtered
+by phase and agent. This is a narrow project-local migration bridge, not a
+general project package service. Authenticated user-level sources and migration
+of other subjects remain future work. See
 [configuration](configuration.md#organization-skill-gateway) for current setup
 and [the detailed design](design-skill-gateway.md) for contracts and
 implementation boundaries.
@@ -34,7 +36,8 @@ received different instructions. A gateway helps by:
   organization sources once for the instance. The model cannot choose another
   user's identity, a source URL, a repository path, or credentials. User-level
   sources require authenticated identity and storage isolation and are not yet
-  implemented.
+  implemented. Bundled project guidance is limited to entries in the explicit
+  repository manifest and is filtered by agent and phase.
 - **Showing provenance and disagreement.** Responses preserve source, scope,
   revision, and document identity. Multiple organization repositories can
   contribute to a subject. Exact duplicates are identified; differing content
@@ -99,7 +102,7 @@ different purposes and should be inventoried before a subject is migrated:
 | Existing mechanism | Current role and migration treatment |
 | --- | --- |
 | Agent prompts | Include role instructions and, in some cases, harness-specific prose. Keep general reasoning and tool protocol here; classify reusable harness instructions before moving them. |
-| Repository `skills/` documents and `read_skills` | Provide static skill text for harnesses and domains. Migrate eligible material subject by subject; retain legacy access for subjects not yet migrated. |
+| Repository `skills/` documents and `read_skills` | Provide static skill text for harnesses and domains. Crucible project guidance is selected from `skills/context-manifest.json` and retrieved through the gateway; other subjects retain legacy access until migrated. |
 | `SkillProvider` and catalog tools | Supply structured benchmark discovery, templates, and harness-specific contracts. Keep typed discovery and validation behavior. Where their reference content needs shared scoped retrieval, connect the source through a subject adapter rather than turning operational contracts into free-form prose. |
 | Crucible controller documentation | The existing controller reader follows installed documentation pointers. The Crucible gateway adapter exposes the applicable controller entrypoint for benchmark and review phases. |
 | Upstream GitHub catalog access | Crucible triage retains bounded catalog and benchmark-detail operations that work before a controller is available. These structured operations remain distinct from full document retrieval. |
@@ -112,9 +115,12 @@ discovery or execution. The gateway can identify and retrieve the applicable
 reference; typed tools can continue to return benchmark catalogs, validated
 settings, or live data in their existing contracts.
 
-For Crucible, the gateway currently combines organization guidance with the
-installed controller documentation where that phase has a controller. Triage
-can use the bounded upstream Crucible catalog before a controller exists. A
+For Crucible, the gateway combines explicitly mapped project guidance,
+organization guidance, and installed controller documentation where that
+phase has a controller. The bundled project documents have the lowest default
+authority for overlapping soft guidance and are scoped by phase and agent.
+Direct Crucible skill and harness-document readers route callers to the gateway.
+Triage can use the bounded upstream Crucible catalog before a controller exists. A
 Crucible benchmark that uses a named workload can require both Crucible's
 benchmark integration documentation and, when needed, the native workload's
 own documentation; the gateway must not treat the latter as a replacement for
@@ -201,17 +207,20 @@ user sources at the same level still need HITL when material and unresolved.
 
 ## Crucible is the first migration, not the final coverage
 
-The current issue's implementation draft supports one or more administrator
+The current implementation draft supports one or more administrator
 organization sources (local paths or Git URLs), subject discovery, source
 provenance, duplicate and same-path conflict reporting, and ticket-scoped
-organization snapshots. The Crucible subject also retains phase-appropriate
-software sources: the installed controller documentation for benchmark/review
-and bounded upstream catalog tools for triage. Conflicting organization runtime
-configurations are configuration errors rather than merge candidates.
+organization snapshots. Crucible project guidance is separately declared in
+`skills/context-manifest.json`; each document names its phase and agent scope.
+The Crucible subject also retains phase-appropriate software sources: the
+installed controller documentation for benchmark/review and bounded upstream
+catalog tools for triage. Conflicting organization runtime configurations are
+configuration errors rather than merge candidates.
 
 This does **not** mean that all agentic-perf context already uses the gateway.
 Other harnesses still have existing skill-provider, local-document, prompt, or
-private-settings paths. User-level and project-level packages, native workload
-software adapters beyond the current Crucible sources, and migration of every
-other subject remain future work. The [detailed design](design-skill-gateway.md)
+private-settings paths. Authenticated user packages, a general project package
+service, native workload software adapters beyond the current Crucible sources,
+and migration of every other subject remain future work. The
+[detailed design](design-skill-gateway.md)
 tracks the Crucible migration inventory and the checks required before rollout.

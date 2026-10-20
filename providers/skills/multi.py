@@ -32,10 +32,12 @@ class MultiHarnessSkillProvider(SkillProvider):
         harnesses: dict[str, SkillProvider],
         private: PrivateSkillProvider | None = None,
         default_harness: str = "crucible",
+        project_context_source: Any | None = None,
     ) -> None:
         self._harnesses = harnesses
         self._private = private or PrivateSkillProvider()
         self._default = default_harness
+        self.project_context_source = project_context_source
 
     @property
     def default_harness(self) -> str:

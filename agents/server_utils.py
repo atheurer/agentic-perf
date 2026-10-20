@@ -109,6 +109,7 @@ def build_skill_provider(
     from providers.skills.ioscale import IoscaleSkillProvider
     from providers.skills.k8s_netperf import K8sNetperfSkillProvider
     from providers.skills.kube_burner import KubeBurnerSkillProvider
+    from providers.skills.local_context import LocalContextSource
     from providers.skills.multi import MultiHarnessSkillProvider
     from providers.skills.private import PrivateSkillProvider
     from providers.skills.vstorm import VstormSkillProvider
@@ -151,7 +152,17 @@ def build_skill_provider(
         if zathras_tests:
             harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
 
-    return MultiHarnessSkillProvider(harnesses, private, default_harness="crucible")
+    project_root = Path(__file__).resolve().parents[1]
+    manifest = project_root / "skills" / "context-manifest.json"
+    project_context_source = (
+        LocalContextSource(manifest, root=project_root) if manifest.is_file() else None
+    )
+    return MultiHarnessSkillProvider(
+        harnesses,
+        private,
+        default_harness="crucible",
+        project_context_source=project_context_source,
+    )
 
 
 async def build_organization_skill_resolver_async(

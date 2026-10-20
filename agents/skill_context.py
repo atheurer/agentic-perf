@@ -28,6 +28,9 @@ Read returned entrypoint documents from each available source using
 select relevant documents from its returned document list. Organization
 guidance, project-local guidance, and upstream software documentation are
 separate sources; bootstrap discovery does not load their document contents.
+A bundled project document is a temporary migration bridge with the lowest
+default authority for overlapping guidance. Compare it with applicable
+organization and software references, and report material conflicts.
 A subject identifies applicable guidance; it is not a
 software repository name or a complete inventory of related software sources.
 An unconfigured subject means no guidance package was found under that ID, not

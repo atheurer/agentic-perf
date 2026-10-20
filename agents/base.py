@@ -1794,6 +1794,7 @@ class AgentBase(ABC):
             # Skill & documentation reading
             "read_skills",
             "read_harness_doc",
+            "get_skill_context",
             "get_review_config",
             "get_execution_config",
             "get_example_runfile",

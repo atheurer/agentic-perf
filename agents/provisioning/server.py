@@ -1391,6 +1391,16 @@ async def install_k3s(hosts: list[str], user: str = "root") -> str:
 @mcp.tool()
 async def list_skill_docs(harness: str) -> str:
     """List available skill documents for a topic. Use 'general' for host-tuning, connectivity, and network-perf guides. Use a harness name (e.g. 'crucible') for harness-specific docs."""
+    category_root = (
+        harness.strip().strip("/").removeprefix("skills/").split("/", 1)[0].lower()
+    )
+    if category_root == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
     skill_dir = _SKILLS_DIR / harness
     if not skill_dir.is_dir():
         return json.dumps(
@@ -1403,7 +1413,25 @@ async def list_skill_docs(harness: str) -> str:
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
     """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'general', 'filename': 'host-tuning.md'}]). Always read 'host-tuning.md' in the 'general' harness before applying any host tuning — it defines the required tool ordering, BBR+fq dependency, and irqbalance strategy."""
-    return json.dumps(read_skill_documents(_SKILLS_DIR, docs))
+    allowed = []
+    rejected = []
+    for doc in docs:
+        harness = doc.get("harness") or doc.get("category", "")
+        if isinstance(harness, str) and harness.strip().lower() == "crucible":
+            rejected.append(
+                {
+                    "found": False,
+                    "harness": harness,
+                    "filename": doc.get("filename") or doc.get("name", ""),
+                    "message": (
+                        "Use get_skill_context(subject='harness/crucible', "
+                        "operation='bootstrap')."
+                    ),
+                }
+            )
+        else:
+            allowed.append(doc)
+    return json.dumps(rejected + read_skill_documents(_SKILLS_DIR, allowed))
 
 
 @mcp.tool()

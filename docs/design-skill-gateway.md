@@ -1,23 +1,26 @@
 # Subject-based skill gateway
 
-Status: implemented local review draft for issue #1118. Runtime activation and
-publication are pending review. The initial subject is `harness/crucible`.
+Status: implementation draft for issues #1118 and #246. Runtime activation and
+publication are pending review. The initial subject is `harness/crucible`, with
+an explicit bundled project-guidance manifest for its current consumers.
 
 ## Goal and first release
 
 Give agents one retrieval contract for the knowledge relevant to a subject.
-For Crucible, this combines administrator-maintained organization guidance with
-documentation from the installed Crucible controller. Organization guidance is
-available to all users of an agentic-perf instance. A future user source applies
-only to the authenticated user associated with a ticket.
+For Crucible, this combines administrator-maintained organization guidance,
+explicit bundled project guidance, and documentation from the installed
+Crucible controller. Organization guidance is available to all users of an
+agentic-perf instance. A future user source applies only to the authenticated
+user associated with a ticket.
 
 Use administrator-configured organization sources outside the public
 repository. The first release supports one or more local paths or Git URLs; a
-single-source shorthand keeps the common setup simple. Git
-authentication uses either the instance's existing OpenSSH identity/agent or
-a secret reference resolved by the existing secret provider. Implement
-organization scope first; reserve user and project extension points without
-enabling them prematurely.
+single-source shorthand keeps the common setup simple. Git authentication uses
+either the instance's existing OpenSSH identity/agent or a secret reference
+resolved by the existing secret provider. Bundled project guidance is a
+separate, explicit manifest-backed source for the Crucible workflow. It is
+filtered by phase and agent and has the lowest default authority for overlapping
+soft guidance. Authenticated user sources remain future work.
 
 The recommended first migration includes both guidance and structured Crucible
 runtime configuration. The draft includes this scope; a documents-only configuration
@@ -72,12 +75,14 @@ flowchart LR
   `agents/server_utils.py`. Its bootstrap reads the controller's `AGENTS.md`,
   then agents follow documentation pointers using bounded reads and searches.
 - The older `CrucibleContextGateway` provider has a manifest-backed
-  `LocalContextSource`, but that adapter is not the organization overlay for
-  the current controller-direct MCP tool. `skills/context-manifest.json` also
-  has no entries.
-- The Crucible benchmark agent excludes legacy `read_skills` and repository
-  lookup tools. Review still advertises `skills/crucible/*.md`, exposes
-  `read_skills`, and requests local skills in its prompt.
+  `LocalContextSource`. The shared gateway now exposes its explicit
+  `skills/context-manifest.json` entries as a separate project scope, filtered
+  by subject, phase, and agent. It does not infer guidance from the directory.
+- Crucible project documents are retrieved through `get_skill_context` in
+  benchmark, review, triage, provisioning, resource, and Analyze server
+  registrations. Legacy Crucible `read_skills`, `list_skill_docs`, and
+  controller-document readers reject direct reads and point to the gateway.
+  Other harnesses keep their current document paths.
 - `PrivateSkillProvider` reads instance-wide JSON from `PRIVATE_SKILLS_DIR`,
   normally `$AGENTIC_PERF_HOME/private-skills`. Provisioning tools consume
   sections such as `provisioning`, `constraints`, `platform_contract`, and
@@ -100,7 +105,7 @@ These are separate concepts:
 | Concept | Meaning | Initial example |
 | --- | --- | --- |
 | Subject | Stable topic requested by an agent or configured by an administrator | `harness/crucible` |
-| Scope | Who owns guidance and whom it applies to | Organization; future user/project |
+| Scope | Who owns guidance and whom it applies to | Organization; bundled Crucible project; future authenticated user |
 | Source | How the gateway obtains material | Configured directory or Crucible controller |
 | Role | How to use the material | Operational guidance, software reference, runtime configuration |
 | Revision | Exact material used by a ticket | Content digest; future repository commit |
@@ -131,14 +136,11 @@ options or workload syntax are not substitutes for those fields. Generic
 Crucible examples describe possible run-file patterns, not requirements for
 every benchmark.
 
-The installed `bench-uperf` README specifically documents that, for Crucible
-`remotehosts`, server `ifname` selects the data-plane interface and Crucible
-shares its service address with clients; omit client `remotehost` in that
-mode. The generic Crucible multi-pair example uses `remotehost` to illustrate
-per-engine scoping, which is easy to overgeneralize. Review that example as an
-upstream documentation follow-up: label its parameter as benchmark-specific or
-use a clearly identified uperf example. Do not turn `ifname` into a universal
-Crucible parameter; it is benchmark-specific too.
+The upstream Crucible documentation follow-up for matched client/server pair
+IDs is complete in [PR #714](https://github.com/perftool-incubator/crucible/pull/714)
+and [issue #712](https://github.com/perftool-incubator/crucible/issues/712).
+Use the versioned controller documentation for run-file examples rather than
+maintaining a duplicate workaround in this repository.
 
 The first implementation can follow the controller `AGENTS.md` pointer and
 read the installed integration files by path. It does not yet bind native uperf
@@ -155,6 +157,25 @@ an organization source root, repository credentials, or a different deployment.
 The instance configuration grants organization scope. A manifest cannot grant
 itself a different scope or claim another user. Phase and agent selectors control
 relevance within that scope; authorization is enforced separately.
+
+## Bundled Crucible project manifest
+
+`skills/context-manifest.json` maps the small set of public workflow documents
+that still need a project-local home. Each entry provides a stable id, a
+repository-relative Markdown path, the harness, optional subject tags, the
+consuming phase and agent, and whether the document is an entrypoint. The
+`LocalContextSource` reads only mapped files under the repository root; it does
+not expose neighboring files by directory discovery. Manifest and document
+sizes and entry counts are bounded.
+
+To add a document for the already-supported Crucible subject, add the Markdown
+file and an explicit manifest entry with the intended phase and agent. The
+shared gateway applies that scope during bootstrap, read, list, and search, so
+adding another document does not require an agent-specific reader or prompt
+allowlist change. A new subject or harness still requires an explicit gateway
+source and phase policy; a manifest entry alone does not enable it. Keep these
+documents limited to temporary workflow guidance and link to versioned software
+references for software behavior.
 
 ## Administrator configuration
 
@@ -441,18 +462,16 @@ must still be evaluated for the scope of the claim it makes.
 | Verified software/runtime facts | Runtime evidence and version-matched software documentation establish supported behavior. General upstream or local prose cannot change a schema or installed capability. |
 | Upstream context | Baseline knowledge, including general product and benchmark information. Use version-matched authoritative documentation for software behavior. |
 | Organization context | Applies to users of the configured instance. Normally takes precedence over upstream defaults for local procedures, environment details, and preferences. |
-| Authenticated user context | Applies only to that user's tickets. When available, normally takes precedence over organization defaults for personal preferences, unless those conflict with mandatory organization policy or verified behavior. |
+| Bundled project context | Temporary workflow guidance from explicit manifest entries. It has the lowest default authority for overlapping soft guidance and cannot override organization policy, software evidence, or enforced behavior. |
+| Authenticated user context | Future source, applicable only to that user's tickets. When available, normally takes precedence over organization defaults for personal preferences, unless those conflict with mandatory organization policy or verified behavior. |
 | Ticket guidance | Describes the current task and may select among compatible soft defaults or clarify which scoped source applies. It cannot waive mandatory policy or alter software capability. |
 | Hard requirements | Enforce through validated configuration or code. A Markdown instruction by itself is not a security or correctness boundary. |
 
-This feature implements multiple organization sources and the installed
-software/documentation source. Authenticated user-level skill sources are a
-future layer; the locality rule above defines the intended resolution behavior
-when they are added, and does not imply they are loaded today.
-
-Project scope is a future extension. Resolve project-specific defaults and
-requirements explicitly when implementing it; do not bake the previous
-conversation's tentative project/user ordering into the first release.
+This feature implements multiple organization sources, the installed
+software/documentation source, and a narrow bundled project source for the
+Crucible workflow. It does not implement authenticated user-level sources or a
+general project package service. Project documents must remain explicit in the
+manifest and scoped to the agents and phases that consume them.
 
 Documents remain distinct with scope, source id, revision, and role metadata.
 Arbitrary prose is not deep-merged. The gateway identifies exact duplicate
@@ -688,6 +707,7 @@ and now supports ticket-scoped continuation cursors. Local/upstream listing and
 search remain confined to their exposed subject document roots.
 
 Local administrator paths and organization Git sources are implemented in this
-draft. Authenticated user packages, project packages, and user-specific
-overrides remain future work. Git credentials use the existing secrets provider;
-this slice does not introduce a secrets gateway.
+draft. Bundled Crucible project guidance is selected from the explicit manifest;
+authenticated user packages and user-specific overrides remain future work.
+Git credentials use the existing secrets provider; this slice does not
+introduce a secrets gateway.

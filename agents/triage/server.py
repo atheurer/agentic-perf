@@ -78,7 +78,25 @@ async def get_skill_context(
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
     """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'jumpstarter', 'filename': 'image-selection.md'}]). Skill docs contain domain-specific knowledge for directive resolution."""
-    return json.dumps(read_skill_documents(SKILLS_DIR, docs))
+    allowed = []
+    rejected = []
+    for doc in docs:
+        harness = doc.get("harness") or doc.get("category", "")
+        if isinstance(harness, str) and harness.strip().lower() == "crucible":
+            rejected.append(
+                {
+                    "found": False,
+                    "harness": harness,
+                    "filename": doc.get("filename") or doc.get("name", ""),
+                    "message": (
+                        "Use get_skill_context(subject='harness/crucible', "
+                        "operation='bootstrap')."
+                    ),
+                }
+            )
+        else:
+            allowed.append(doc)
+    return json.dumps(rejected + read_skill_documents(SKILLS_DIR, allowed))
 
 
 @mcp.tool()

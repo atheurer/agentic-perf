@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,11 @@ class LocalContextSource:
     merely existing below the local root is not enough to expose it through
     the gateway.
     """
+
+    MAX_MANIFEST_BYTES = 1024 * 1024
+    MAX_DOCUMENT_BYTES = 1024 * 1024
+    MAX_BUNDLE_BYTES = 16 * 1024 * 1024
+    MAX_ENTRIES = 256
 
     def __init__(self, manifest_path: str | Path, *, root: str | Path | None = None):
         self.manifest_path = Path(manifest_path).resolve()
@@ -31,6 +37,8 @@ class LocalContextSource:
 
     def _entries(self) -> list[dict[str, Any]]:
         try:
+            if self.manifest_path.stat().st_size > self.MAX_MANIFEST_BYTES:
+                return []
             manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return []
@@ -41,7 +49,38 @@ class LocalContextSource:
             entries = [dict(value, id=key) for key, value in entries.items()]
         if not isinstance(entries, list):
             return []
-        return [entry for entry in entries if isinstance(entry, dict)]
+        return [
+            entry for entry in entries[: self.MAX_ENTRIES] if isinstance(entry, dict)
+        ]
+
+    def revision(self) -> str | None:
+        """Return a content revision for the manifest and its mapped documents."""
+        try:
+            if self.manifest_path.stat().st_size > self.MAX_MANIFEST_BYTES:
+                return None
+            manifest = self.manifest_path.read_bytes()
+        except OSError:
+            return None
+        digest = hashlib.sha256(manifest)
+        mapped = []
+        for entry in self._entries():
+            safe = self._safe_path(entry.get("path", entry.get("file")))
+            if safe is not None:
+                mapped.append(safe)
+        try:
+            total = 0
+            for relative, path in sorted(mapped, key=lambda item: item[0]):
+                size = path.stat().st_size
+                total += size
+                if size > self.MAX_DOCUMENT_BYTES or total > self.MAX_BUNDLE_BYTES:
+                    return None
+                digest.update(relative.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(path.read_bytes())
+                digest.update(b"\0")
+        except OSError:
+            return None
+        return digest.hexdigest()[:16]
 
     def _safe_path(self, relative: Any) -> tuple[str, Path] | None:
         if (
@@ -56,7 +95,12 @@ class LocalContextSource:
                 return None
         except (AttributeError, ValueError):
             return None
-        if not candidate.is_file():
+        if not candidate.is_file() or candidate.suffix.lower() != ".md":
+            return None
+        try:
+            if candidate.stat().st_size > self.MAX_DOCUMENT_BYTES:
+                return None
+        except OSError:
             return None
         return candidate.relative_to(self.root).as_posix(), candidate
 
@@ -117,6 +161,7 @@ class LocalContextSource:
     ) -> list[dict[str, Any]]:
         """Return mapped documents matching the requested gateway scope."""
         documents: list[dict[str, Any]] = []
+        revision = self.revision()
         for index, entry in enumerate(self._entries()):
             if not self._matches_scope(
                 entry,
@@ -135,7 +180,7 @@ class LocalContextSource:
             provenance = {
                 "source": "local",
                 "source_reason": "explicit_manifest_entry",
-                "manifest": str(self.manifest_path),
+                "revision": revision,
                 "entry_id": entry_id,
                 "path": relative,
                 "harness": harness,
@@ -157,6 +202,8 @@ class LocalContextSource:
                     "authority": "supplemental",
                     "provenance": provenance,
                     "benchmark": entry.get("benchmark"),
+                    "entrypoint": bool(entry.get("entrypoint", False)),
+                    "size_bytes": safe[1].stat().st_size,
                     "subject_area": entry.get(
                         "subject_area", entry.get("subjects", entry.get("subject"))
                     ),
