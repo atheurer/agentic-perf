@@ -1992,6 +1992,31 @@ class AgentBase(ABC):
         await self._throttle_tool_call()
 
         call_input, jq_filter = self._normalize_tool_input(tool_call)
+        tool_definition = next(
+            (tool for tool in self.tools if tool.name == tool_call.name), None
+        )
+        if tool_definition is None:
+            return ToolResult(
+                tool_use_id=tool_call.id,
+                content=self._tool_error_content(
+                    f"Tool {tool_call.name!r} is not available to this ticket.",
+                    "validation",
+                ),
+                is_error=True,
+            )
+        owner_harness = tool_definition.owner_harness
+        selected_harness = getattr(self, "_selected_harness", None)
+        if owner_harness is not None and owner_harness != selected_harness:
+            message = (
+                f"Tool {tool_call.name!r} requires ticket harness "
+                f"{owner_harness!r}; selected harness is "
+                f"{selected_harness or 'unset'!r}"
+            )
+            return ToolResult(
+                tool_use_id=tool_call.id,
+                content=self._tool_error_content(message, "validation"),
+                is_error=True,
+            )
 
         handler = self._tool_handlers.get(tool_call.name)
         if handler is not None:

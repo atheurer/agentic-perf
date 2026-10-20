@@ -10,8 +10,18 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import _MCP_TIMEOUT_CANCELLATION, AgentMCPClient
 from agents.skill_context import skill_context_prompt
+from agents.tool_ownership import selected_harness_from_ticket
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.skills.arcaflow_mcp import (
+    WORKFLOW_EXECUTE,
+    WORKFLOW_EXECUTION_CANCEL,
+    WORKFLOW_EXECUTION_OUTPUT,
+    WORKFLOW_EXECUTION_STATUS,
+    WORKFLOW_INPUT_EXPORT,
+    WORKFLOW_LOAD,
+    register_arcaflow_tool_ownership,
+)
 from providers.skills.base import EXECUTION_MODEL_CONTROLLER, EXECUTION_MODEL_DIRECT
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import current_trace_context
@@ -135,6 +145,7 @@ _LOCAL_TOOLS = [
             },
             "required": ["validation_id"],
         },
+        owner_harness="crucible",
     ),
     ToolDefinition(
         name="resolve_benchmark_approval",
@@ -158,6 +169,7 @@ _LOCAL_TOOLS = [
             },
             "required": ["decision"],
         },
+        owner_harness="crucible",
     ),
     ToolDefinition(
         name="submit_benchmark_result",
@@ -226,6 +238,7 @@ _WORKFLOW_TOOL = ToolDefinition(
         },
         "required": ["workflow_source", "input"],
     },
+    owner_harness="arcaflow-workflows",
 )
 
 
@@ -503,6 +516,7 @@ class BenchmarkAgent(AgentBase):
             ticket.get("custom_fields", {}).get("directives", {}),
             getattr(self, "_skill_provider", None),
         )
+        selected_ticket_harness = selected_harness_from_ticket(ticket)
 
         bench_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
@@ -511,6 +525,8 @@ class BenchmarkAgent(AgentBase):
         )
 
         mcp = AgentMCPClient(trace_context=self.trace_context)
+        mcp.set_harness_context(selected_ticket_harness)
+        self._selected_harness = selected_ticket_harness
         await mcp.connect_ticket_server(
             bench_server,
             name="benchmark",
@@ -541,6 +557,8 @@ class BenchmarkAgent(AgentBase):
         from agents.mcp_client import connect_external_servers
 
         connected_ext, ext_tools = await connect_external_servers(mcp, "benchmark")
+        if "arcaflow" in connected_ext:
+            register_arcaflow_tool_ownership(mcp)
 
         self._mcp = mcp
 
@@ -579,62 +597,10 @@ class BenchmarkAgent(AgentBase):
             await mcp.disconnect()
             self._mcp = None
 
-    # Tool sets per harness. Each harness declares the
-    # tools its benchmark agent needs. Tools not listed
-    # are hidden from the LLM to prevent exploration and
-    # scope creep (upstream #201).
-    _HARNESS_TOOLS: dict[str, set[str]] = {
-        "boot-time": {
-            "read_skills",
-            "execute_boot_time_test",
-            "submit_benchmark_result",
-            "request_clarification",
-            # Workspace tools needed when execute_boot_time_test
-            # spills its output to a workspace file.
-            "jq_file_from_workspace",
-            "read_file_from_workspace",
-            "list_files_from_workspace",
-        },
-        "arcaflow-plugins": {
-            "read_skills",
-            "set_ssh_context",
-            "check_host",
-            # From arcaflow_plugin_server.py:
-            "get_plugin_schema",
-            "execute_arcaflow_plugin",
-            # Large plugin schemas spill by reference; allow focused inspection.
-            "jq_file_from_workspace",
-            "read_file_from_workspace",
-            "list_files_from_workspace",
-            # From external Arcaflow MCP (plugin discovery):
-            "plugin_list",
-            "plugin_describe",
-            # Core:
-            "submit_benchmark_result",
-            "request_clarification",
-        },
-        "arcaflow-workflows": {
-            "read_skills",
-            "set_ssh_context",
-            "check_host",
-            "get_execution_config",
-            "get_runfile_schema",
-            "get_benchmark_params",
-            # Discovery tools — LLM uses these to understand
-            # the workflow schema and build valid input.
-            "workflow_load",
-            "workflow_list",
-            "workflow_input_build",
-            "workflow_input_validate",
-            # Execution goes through execute_arcaflow_workflow,
-            # which internally calls workflow_execute and polls
-            # status via the Arcaflow MCP client.
-            "execute_arcaflow_workflow",
-            "submit_benchmark_result",
-            "request_clarification",
-        },
-    }
-    _HARNESS_EXCLUDED_TOOLS: dict[str, set[str]] = {
+    # Temporary policy for harnesses that have migrated away from this legacy
+    # documentation and catalog bridge. Tool execution ownership is declared
+    # with each registration instead of in this context policy.
+    _LEGACY_CONTEXT_EXCLUDED_TOOLS: dict[str, set[str]] = {
         "crucible": {
             "read_skills",
             "list_harness_docs",
@@ -648,42 +614,28 @@ class BenchmarkAgent(AgentBase):
         "kube-burner": {
             "list_harness_docs",
             "read_harness_doc",
-            # Controller-side validation and immutable run-file approval are
-            # currently Crucible-only. Kube-burner receives its run-file
-            # directly at execution and uses request_clarification for HITL.
-            "validate_benchmark",
-            "present_runfile_for_approval",
-            "resolve_benchmark_approval",
         },
         "k8s-netperf": {
             "list_harness_docs",
             "read_harness_doc",
-            # This harness has no controller-side run-file validation or
-            # immutable approval workflow. Its execution handler validates
-            # the bundle it consumes.
-            "validate_benchmark",
-            "present_runfile_for_approval",
-            "resolve_benchmark_approval",
         },
     }
 
     def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:
-        """Filter tools based on harness type.
-
-        Harnesses listed in _HARNESS_TOOLS get a reduced
-        tool set. Unlisted harnesses keep all tools.
-        """
+        """Filter owned local tools and apply legacy documentation policy."""
+        selected_harness = selected_harness_from_ticket(ticket)
+        self.tools = [
+            tool
+            for tool in self.tools
+            if tool.owner_harness is None or tool.owner_harness == selected_harness
+        ]
         harness = self._effective_harness(
             ticket.get("custom_fields", {}).get("directives", {}),
             getattr(self, "_skill_provider", None),
         )
-        excluded = self._HARNESS_EXCLUDED_TOOLS.get(harness)
-        if excluded is not None:
-            self.tools = [t for t in self.tools if t.name not in excluded]
-            return
-        allowed = self._HARNESS_TOOLS.get(harness)
-        if allowed is not None:
-            self.tools = [t for t in self.tools if t.name in allowed]
+        excluded = self._LEGACY_CONTEXT_EXCLUDED_TOOLS.get(harness, set())
+        if excluded:
+            self.tools = [tool for tool in self.tools if tool.name not in excluded]
 
     def _ticket_execution_model(self, ticket: dict[str, Any]) -> str:
         cf = ticket.get("custom_fields", {})
@@ -775,6 +727,17 @@ class BenchmarkAgent(AgentBase):
         import uuid
 
         run_uuid = uuid.uuid4().hex[:8]
+        if getattr(self, "_selected_harness", None) != "arcaflow-workflows":
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": (
+                        "Arcaflow workflow execution requires the ticket to select "
+                        "the arcaflow-workflows harness."
+                    ),
+                }
+            )
         mcp = self._mcp
         if mcp is None:
             return json.dumps(
@@ -845,7 +808,7 @@ class BenchmarkAgent(AgentBase):
         ) -> None:
             cancel_task = asyncio.create_task(
                 mcp.call_tool(
-                    "workflow_execution_cancel",
+                    WORKFLOW_EXECUTION_CANCEL,
                     {"execution_id": execution_id},
                 )
             )
@@ -870,7 +833,7 @@ class BenchmarkAgent(AgentBase):
         if workflow_name:
             load_args["name"] = workflow_name
         try:
-            load_result = await mcp.call_tool("workflow_load", load_args)
+            load_result = await mcp.call_tool(WORKFLOW_LOAD, load_args)
             json.loads(load_result)  # validate response
         except Exception as e:
             return json.dumps(
@@ -884,7 +847,7 @@ class BenchmarkAgent(AgentBase):
         # 2. Export the validated input
         try:
             exported_result = await mcp.call_tool(
-                "workflow_input_export",
+                WORKFLOW_INPUT_EXPORT,
                 {"input": input},
             )
         except Exception as e:
@@ -899,7 +862,7 @@ class BenchmarkAgent(AgentBase):
         # 3. Execute the workflow
         launch_task = asyncio.create_task(
             mcp.call_tool(
-                "workflow_execute",
+                WORKFLOW_EXECUTE,
                 {"input": exported_result},
             )
         )
@@ -973,7 +936,7 @@ class BenchmarkAgent(AgentBase):
             for _ in range(max_polls):
                 try:
                     status_result = await mcp.call_tool(
-                        "workflow_execution_status",
+                        WORKFLOW_EXECUTION_STATUS,
                         {"execution_id": execution_id},
                     )
                     status_data = json.loads(status_result)
@@ -987,7 +950,7 @@ class BenchmarkAgent(AgentBase):
                 # Cancel the orphaned workflow before returning.
                 try:
                     await mcp.call_tool(
-                        "workflow_execution_cancel",
+                        WORKFLOW_EXECUTION_CANCEL,
                         {"execution_id": execution_id},
                     )
                 except Exception:
@@ -1018,7 +981,7 @@ class BenchmarkAgent(AgentBase):
         # 5. Get output
         try:
             output_result = await mcp.call_tool(
-                "workflow_execution_output",
+                WORKFLOW_EXECUTION_OUTPUT,
                 {"execution_id": execution_id},
             )
             output = json.loads(output_result)

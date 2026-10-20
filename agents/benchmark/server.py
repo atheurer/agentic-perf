@@ -50,6 +50,11 @@ from agents.skill_gateway import (
     skill_config_view,
     skill_context_gateway,
 )
+from agents.tool_ownership import (
+    ownership_metadata,
+    require_ticket_harness,
+    selected_harness_from_ticket,
+)
 from providers.execution import (
     AuditedFilesystem,
     AuditedSubprocessRunner,
@@ -61,6 +66,8 @@ from providers.skills.crucible import crucible_runfile_contract_errors
 logger = logging.getLogger(__name__)
 
 mcp = create_ticket_mcp("benchmark-agent")
+_CRUCIBLE_TOOL_OWNER = "crucible"
+_BOOT_TIME_TOOL_OWNER = "boot-time"
 
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
@@ -853,6 +860,12 @@ async def _ensure_init():
     except Exception:
         _repo_cache = None
     _initialized = True
+
+
+async def _require_tool_owner(owner_harness: str) -> None:
+    """Initialize the authenticated ticket context and enforce tool ownership."""
+    await _ensure_init()
+    require_ticket_harness(_ticket, owner_harness)
 
 
 def _get_validated_runfile(
@@ -2485,6 +2498,34 @@ async def execute_benchmark(
     the legacy runfile argument until they gain the same validation contract.
     """
     await _ensure_init()
+    harness_name = selected_harness_from_ticket(_ticket)
+    if not harness_name:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "harness_not_selected",
+                "message": (
+                    "The ticket must persist directives.harness before benchmark "
+                    "execution; use workflow_source for Arcaflow workflows."
+                ),
+            }
+        )
+    requested_harness = (
+        selected_harness_from_ticket(
+            {"custom_fields": {"directives": {"harness": harness}}}
+        )
+        if harness is not None
+        else harness_name
+    )
+    if requested_harness != harness_name:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "harness_mismatch",
+                "harness": harness_name,
+                "message": "Execution must use the harness selected by the ticket.",
+            }
+        )
 
     from agents.server_utils import assert_ticket_active
 
@@ -2505,7 +2546,7 @@ async def execute_benchmark(
                 validation_id,
                 replay_record,
                 controller,
-                harness or "crucible",
+                harness_name,
                 replay_record.get("run_command", "crucible run"),
             )
             replay_guard = _BenchmarkOperation(
@@ -2532,7 +2573,6 @@ async def execute_benchmark(
                 await replay_guard.close()
         return json.dumps(active_check)
     run_uuid = uuid.uuid4().hex[:8]
-    harness_name = harness or "crucible"
 
     # The approval gate applies only to Crucible, which has the
     # validate_benchmark → request_approval → execute pipeline.
@@ -4354,7 +4394,7 @@ async def execute_benchmark(
     return json.dumps(response)
 
 
-@mcp.tool()
+@mcp.tool(meta=ownership_metadata(_CRUCIBLE_TOOL_OWNER))
 async def validate_benchmark(
     controller: str,
     run_file: dict,
@@ -4367,7 +4407,7 @@ async def validate_benchmark(
     benchmark-parameter, and tool-parameter validation.  This tool never
     starts a benchmark, deploys endpoints, or starts supporting services.
     """
-    await _ensure_init()
+    await _require_tool_owner(_CRUCIBLE_TOOL_OWNER)
     run_file = _apply_runfile_safety_directives(run_file)
 
     harness_name = harness or "crucible"
@@ -4676,7 +4716,7 @@ def _boot_serial_diagnostics(serial_log_path: Path) -> dict[str, Any]:
     return diagnostics
 
 
-@mcp.tool()
+@mcp.tool(meta=ownership_metadata(_BOOT_TIME_TOOL_OWNER))
 async def execute_boot_time_test(
     sut_host: str,
     samples: int = 50,
@@ -4701,7 +4741,7 @@ async def execute_boot_time_test(
         clean_journal: Delete journal before each reboot cycle.
         description: Human-readable test description.
     """
-    await _ensure_init()
+    await _require_tool_owner(_BOOT_TIME_TOOL_OWNER)
 
     # ── Guardrail: one execution per agent session ───────
     global _boot_time_executed

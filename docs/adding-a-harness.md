@@ -44,6 +44,43 @@ discovery gate. Do not invent flags from memory. `get_example_runfile` must
 return the actual endpoint shape, and `validate_runfile` should return
 `{"valid": bool, "errors": list[str]}`.
 
+## Tool ownership
+
+Shared workspace, skill-gateway, and host-inspection tools remain unowned and
+available to the benchmark agent generally. If a harness adds a specialized
+MCP tool, declare its owner at the MCP registration and check the
+server-loaded ticket in the handler before execution. The registration
+attaches the harness owner to MCP metadata; the benchmark agent uses that
+metadata for tool discovery and client-side dispatch rejection. Keep the owner
+in one registration constant and use it for both
+`@mcp.tool(meta=ownership_metadata(OWNER))` and the handler's
+`require_ticket_harness(ticket, OWNER)` check, so adding the tool does not
+require a BenchmarkAgent allowlist change.
+
+Native benchmark handlers declare the same `owner_harness` on their
+`ToolDefinition`. Generic `execute_benchmark` remains shared, derives its
+execution harness from the ticket, and rejects a conflicting harness argument
+from the model. An unowned first-party tool is shared; do not use organization
+or user context to grant a specialized execution capability. Ownership-required
+external registration groups fail closed for tools without an owner.
+Owned execution requires a persisted ticket selection in
+`custom_fields.directives.harness` (or the legacy top-level
+`custom_fields.harness`); `workflow_source` selects Arcaflow workflows. A
+legacy ticket with none of these fields fails closed with an actionable
+execution error. A provider default or organization document does not grant
+execution ownership.
+
+For an upstream external MCP server that cannot attach tool metadata, put its
+tool groups in a small adapter beside the code that uses that server, then
+register those groups after connecting. Mark internal execution and polling
+tools as hidden from the model when the adapter calls them itself; they remain
+owned and callable by the adapter. Arcaflow's upstream integration in
+`providers/skills/arcaflow_mcp.py` is the reference. Unknown tools from an
+ownership-required server are hidden and rejected. Use
+`agents.<agent>.enabled_tools` groups only for external servers without a
+first-party adapter. See the
+[external MCP configuration](configuration.md#external_mcp_servers).
+
 ## A current provider shape
 
 `providers/skills/k8s_netperf.py` is a useful reference because it supplies

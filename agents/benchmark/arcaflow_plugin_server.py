@@ -23,10 +23,12 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from agents.mcp_audit import create_ticket_mcp
+from agents.tool_ownership import ownership_metadata, require_ticket_harness
 
 logger = logging.getLogger(__name__)
 
 mcp = create_ticket_mcp("arcaflow-plugin-runner")
+_ARCAFLOW_PLUGIN_OWNER = "arcaflow-plugins"
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -115,6 +117,12 @@ async def _ensure_init() -> None:
     _ssh, _ticket = await build_ssh_from_ticket()
 
 
+async def _require_tool_owner(owner_harness: str) -> None:
+    """Initialize the authenticated ticket context and enforce tool ownership."""
+    await _ensure_init()
+    require_ticket_harness(_ticket or {}, owner_harness)
+
+
 # ---------------------------------------------------------------------------
 # Progress callback
 # ---------------------------------------------------------------------------
@@ -130,7 +138,7 @@ def _plugin_progress(line: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(meta=ownership_metadata(_ARCAFLOW_PLUGIN_OWNER))
 async def get_plugin_schema(
     plugin_image: str,
     host: str = "",
@@ -147,7 +155,7 @@ async def get_plugin_schema(
         host: Target host IP. Uses the ticket's target
             if not specified.
     """
-    await _ensure_init()
+    await _require_tool_owner(_ARCAFLOW_PLUGIN_OWNER)
     if _ssh is None:
         return json.dumps({"error": "SSH not initialized"})
 
@@ -215,7 +223,7 @@ async def get_plugin_schema(
     )
 
 
-@mcp.tool()
+@mcp.tool(meta=ownership_metadata(_ARCAFLOW_PLUGIN_OWNER))
 async def execute_arcaflow_plugin(
     plugin_image: str,
     plugin_step: str,
@@ -234,7 +242,7 @@ async def execute_arcaflow_plugin(
         host: Target host IP. Uses the ticket's target
             if not specified.
     """
-    await _ensure_init()
+    await _require_tool_owner(_ARCAFLOW_PLUGIN_OWNER)
     if _ssh is None:
         return json.dumps({"error": "SSH not initialized"})
 

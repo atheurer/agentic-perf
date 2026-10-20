@@ -1135,7 +1135,22 @@ per-agent tool scoping.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled_tools` | `"all"` or list | `"all"` | Which tools from this server the agent's LLM can see. `"all"` exposes every tool. A list of tool names restricts visibility. Tools not listed are hidden from the LLM but remain callable by code. |
+| `enabled_tools` | `"all"`, list, or harness map | `"all"` | Which tools the agent can discover. A harness map also declares ownership for external tools that lack server metadata. |
+
+Use a harness map when one external server supplies harness-specific tools:
+
+```json
+"enabled_tools": {
+    "example-harness": ["example_discover", "example_execute"]
+}
+```
+
+Each tool must appear in one owner group. When a harness map is used, tools
+from that server without an owner declaration are rejected by the MCP client.
+The ticket's selected harness determines which owned tools are discoverable
+and callable. A plain list retains its existing visibility-only behavior. For
+first-party adapters, declare ownership beside the adapter in code rather
+than duplicating its tool groups in user configuration.
 
 The auth token (if configured) is sent as `Authorization: Bearer <token>`
 in the HTTP headers.
@@ -1161,19 +1176,7 @@ schema discovery.
                     "enabled_tools": ["plugin_list"]
                 },
                 "benchmark": {
-                    "enabled_tools": [
-                        "plugin_list",
-                        "plugin_describe",
-                        "workflow_load",
-                        "workflow_list",
-                        "workflow_input_build",
-                        "workflow_input_validate",
-                        "workflow_input_export",
-                        "workflow_execute",
-                        "workflow_execution_status",
-                        "workflow_execution_cancel",
-                        "workflow_execution_output"
-                    ]
+                    "enabled_tools": "all"
                 },
                 "review": {
                     "enabled_tools": [
@@ -1190,6 +1193,10 @@ schema discovery.
 When the Arcaflow MCP is not configured, the arcaflow-plugins
 harness falls back to Quay.io API scraping and local schema
 discovery (requires podman on the orchestrator host).
+The benchmark agent's Arcaflow adapter registers tool ownership in code, so
+this example does not need a second ownership list. It exposes discovery tools
+only to their selected harness, keeps raw workflow execution and polling calls
+hidden for local adapter use, and rejects unknown Arcaflow tools.
 
 ---
 
