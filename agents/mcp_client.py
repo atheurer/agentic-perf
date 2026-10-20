@@ -1412,11 +1412,18 @@ class AgentMCPClient:
             )
 
         if reconnected_route:
-            policy_error = await self._reconnected_tool_policy_error(
-                conn,
-                name,
-                internal_dispatch=internal_dispatch,
-            )
+            try:
+                policy_error = await self._reconnected_tool_policy_error(
+                    conn,
+                    name,
+                    internal_dispatch=internal_dispatch,
+                )
+            except asyncio.CancelledError as exc:
+                record_reconnect_cancellation(
+                    exc,
+                    RetryKind.TRANSPORT_BEFORE_SEND,
+                )
+                raise
             if policy_error:
                 message = self._redact_client_message(conn, context, policy_error)
                 terminal_recorded = self._record_boundary(
