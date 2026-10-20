@@ -107,6 +107,28 @@ Your job is to analyze a performance test request ticket and:
    - "skip teardown" / "don't clean up hosts" / "keep hosts after review"
      → skip_teardown: true
 
+   **Kernel A/B comparison:** When the user asks to compare benchmark results
+   between two kernel versions (e.g. "run the benchmark on kernel X, then
+   install kernel Y and run it again, then compare"), set the
+   `kernel_comparison` directive to a mapping so the plan builder inserts the
+   kernel transition steps:
+
+   kernel_comparison: {"baseline": "<exact uname -r of kernel A>",
+   "candidate": "<exact uname -r of kernel B>", "order": "AB",
+   "package": "kernel"}
+
+   - `baseline` / `candidate` are EXACT uname -r release strings
+     (VERSION-RELEASE.ARCH, e.g. "5.14.0-742.el9.x86_64"). If the user gives
+     a partial name, do not guess the full string — omit the directive and
+     request_clarification asking for the exact releases.
+   - `order` is optional (default "AB"). Use "ABBA" or "BAAB" only if the
+     user asks for repeated/counterbalanced runs.
+   - `package` is optional (default "kernel").
+   - If the user provides a dnf repository URL that serves the kernel
+     packages, include it: kernel_comparison: {..., "repo_url": "<url>"}.
+     The kernel install step will configure the repository on the hosts
+     automatically; without repo_url the packages must already be available.
+
    If the user does not mention a directive, omit it — downstream agents will use
    their own defaults. Do NOT invent directives the user didn't ask for.
 

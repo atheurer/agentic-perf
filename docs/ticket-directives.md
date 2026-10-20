@@ -134,6 +134,37 @@ To target a specific board instance:
 | `firewall_policy` | Firewall handling | `flush` |
 | `skip_teardown` | Keep hosts after run | `true` |
 
+### Kernel A/B Comparison
+
+Set `kernel_comparison` when the ticket should run the same benchmark on two
+kernels and compare. The triage plan builder (deterministic code) reshapes the
+execution plan into: resource → harness provision → kernel-A → benchmark →
+kernel-B → benchmark → review → teardown. Each kernel step installs the
+release if needed, selects it as the default boot entry, and serially reboots
+the benchmark hosts with post-reboot kernel verification; each step pauses for
+human approval before touching the hosts.
+
+| Field | Required | Description |
+|---|---|---|
+| `baseline` | yes | Exact `uname -r` release of kernel A (e.g. `5.14.0-427.13.1.el9_4.x86_64`) |
+| `candidate` | yes | Exact `uname -r` release of kernel B (e.g. `5.14.0-742.el9.x86_64`) |
+| `order` | no | `AB` (default), `ABBA`, or `BAAB` — run order across the plan |
+| `package` | no | RPM package providing the kernel (default `kernel`) |
+| `repo_url` | no | http(s) URL of a dnf repository serving the packages; the install step configures it on the hosts (with `sslverify=0`) before `dnf install`. Without it, the releases must already be installed or available. |
+
+Example description text for a ticket:
+
+```
+directives: kernel_comparison={"baseline": "5.14.0-427.13.1.el9_4.x86_64",
+"candidate": "5.14.0-742.el9.x86_64", "repo_url":
+"https://download.eng.rdu.redhat.com/rhel-9/composes/RHEL-9/RHEL-9.10.0-20260907.1/compose/BaseOS/x86_64/os/"}
+```
+
+The baseline release must match the hosts' currently running kernel for the
+first (parity) reboot; the candidate release is booted for the second run.
+Results land in two benchmark runs tagged with their `kernel_role`, which the
+review agent compares.
+
 ### Fleet Investigation
 
 | Field | Description | Values |

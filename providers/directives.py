@@ -59,6 +59,9 @@ _CORE_DIRECTIVES: set[str] = {
     "host_cleanup",
     "system_config",
     "update_harness",
+    # Kernel comparison (epic #995): a mapping directive consumed by the
+    # deterministic plan builder in providers/kernel_plan.py.
+    "kernel_comparison",
     # This resource directive must be known to the orchestrator even when the
     # Jumpstarter provider is imported lazily in a separate resource process.
     "jumpstarter_serial",
@@ -66,6 +69,7 @@ _CORE_DIRECTIVES: set[str] = {
 
 _CORE_ALIASES: dict[str, str] = {
     "exclude_host": "exclude_hosts",
+    "kernel-comparison": "kernel_comparison",
 }
 
 # ── Suffix / prefix normalization ─────────────────────────
