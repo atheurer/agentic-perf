@@ -2042,7 +2042,7 @@ async def build_repo_cache():
 
     for name, url in default_repos.items():
         if name == "crucible":
-            # Crucible is never cloned or refreshed by agentic-perf.
+            # The no-ticket cache skips Crucible; ticket-bound captures use SourceEpoch.
             continue
         try:
             await cache.ensure_repo(name, url)

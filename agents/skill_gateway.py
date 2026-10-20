@@ -313,13 +313,14 @@ def _project_read_target(
     ref: str,
     path: str,
     from_ref: str,
-    allow_directory: bool = False,
+    allow_directory_origin: bool = False,
+    allow_directory_target: bool = False,
 ) -> dict[str, Any]:
     by_ref = {item["ref"]: item for item in documents}
     origin = None
     if from_ref:
         if ref or from_ref not in by_ref:
-            if ref or not allow_directory:
+            if ref or not allow_directory_origin:
                 raise SkillGatewayError(
                     "origin_required", "Origin must be an exported project ref"
                 )
@@ -348,17 +349,42 @@ def _project_read_target(
         candidate = next(
             (item for item in documents if item["source_path"] == target), None
         )
-        if candidate is None and allow_directory:
-            candidate = _project_directory_target(
-                documents, _project_ref(target or ".")
-            )
+        if candidate is None:
+            try:
+                candidate = _project_directory_target(
+                    documents, _project_ref(target or ".")
+                )
+            except SkillGatewayError:
+                candidate = None
+            if candidate is not None and not allow_directory_target:
+                raise SkillGatewayError(
+                    "source_path_is_directory",
+                    "The project pointer is a directory; use operation='list'.",
+                )
     else:
         if origin is not None:
             candidate = origin
         else:
             candidate = by_ref.get(ref)
-            if candidate is None and allow_directory:
-                candidate = _project_directory_target(documents, ref)
+            if candidate is None:
+                try:
+                    candidate = _project_directory_target(documents, ref)
+                except SkillGatewayError:
+                    candidate = None
+                if candidate is not None and not allow_directory_target:
+                    raise SkillGatewayError(
+                        "source_path_is_directory",
+                        "The project ref is a directory; use operation='list'.",
+                    )
+        if (
+            candidate is not None
+            and candidate.get("is_directory")
+            and not allow_directory_target
+        ):
+            raise SkillGatewayError(
+                "source_path_is_directory",
+                "The project origin is a directory; use operation='list'.",
+            )
     if candidate is None:
         raise SkillGatewayError("invalid_ref", "Use a returned project document ref")
     return candidate
@@ -404,6 +430,53 @@ def _project_scope_path(target: dict[str, Any]) -> str:
     if target.get("is_directory"):
         return target["source_path"]
     return posixpath.dirname(target["source_path"])
+
+
+def _project_list_entries(
+    documents: list[dict[str, Any]], scope_path: str
+) -> list[dict[str, Any]]:
+    """Build immediate project children using only exported manifest documents."""
+    prefix = f"{scope_path.rstrip('/')}/" if scope_path else ""
+    entries: dict[str, dict[str, Any]] = {}
+    for document in documents:
+        source_path = document["source_path"]
+        if prefix:
+            if not source_path.startswith(prefix):
+                continue
+            remainder = source_path[len(prefix) :]
+        else:
+            remainder = source_path
+        if not remainder:
+            continue
+        child_name, separator, _tail = remainder.partition("/")
+        if separator:
+            child_path = (
+                posixpath.join(scope_path, child_name) if scope_path else child_name
+            )
+            if child_path not in entries:
+                child_ref = _project_ref(child_path)
+                entries[child_path] = {
+                    "ref": child_ref,
+                    "uri": child_ref,
+                    "path": child_path,
+                    "source": "agentic-perf",
+                    "scope": "project",
+                    "type": "directory",
+                    "size_bytes": None,
+                    "provenance_status": "project-content-revision",
+                }
+        elif posixpath.dirname(source_path) == scope_path:
+            entries[source_path] = {
+                "ref": document["ref"],
+                "uri": document["uri"],
+                "path": source_path,
+                "source": "agentic-perf",
+                "scope": "project",
+                "type": "file",
+                "size_bytes": document.get("size_bytes"),
+                "provenance_status": "project-content-revision",
+            }
+    return [entries[path] for path in sorted(entries)]
 
 
 def _project_search_documents(
@@ -2022,7 +2095,8 @@ async def _skill_context_list_search(
                     ref="",
                     path="",
                     from_ref=from_ref,
-                    allow_directory=True,
+                    allow_directory_origin=True,
+                    allow_directory_target=True,
                 )
                 if path:
                     origin = _project_read_target(
@@ -2030,7 +2104,8 @@ async def _skill_context_list_search(
                         ref="",
                         path=path,
                         from_ref=from_ref,
-                        allow_directory=True,
+                        allow_directory_origin=True,
+                        allow_directory_target=True,
                     )
             else:
                 origin = _project_read_target(
@@ -2038,23 +2113,11 @@ async def _skill_context_list_search(
                     ref=ref,
                     path="",
                     from_ref="",
-                    allow_directory=True,
+                    allow_directory_origin=True,
+                    allow_directory_target=True,
                 )
             scope_path = _project_scope_path(origin)
-            items = [
-                {
-                    "ref": item["ref"],
-                    "uri": item["uri"],
-                    "path": item["source_path"],
-                    "source": "agentic-perf",
-                    "scope": "project",
-                    "type": "file",
-                    "size_bytes": item.get("size_bytes"),
-                    "provenance_status": "project-content-revision",
-                }
-                for item in project_documents
-                if posixpath.dirname(item["source_path"]) == scope_path
-            ]
+            items = _project_list_entries(project_documents, scope_path)
             binding.update({"scope": scope_path})
             _append_source_page(
                 sources,
@@ -2069,7 +2132,7 @@ async def _skill_context_list_search(
                     "source_id": "agentic-perf",
                     "scope": "project",
                     "scope_ref": origin["ref"],
-                    "scope_kind": "manifest-files",
+                    "scope_kind": "manifest-immediate-children",
                     "recursive": False,
                     "total_entries": len(items),
                     "complete": True,
@@ -2367,7 +2430,8 @@ async def _skill_context_list_search(
                     ref="",
                     path="",
                     from_ref=from_ref,
-                    allow_directory=True,
+                    allow_directory_origin=True,
+                    allow_directory_target=True,
                 )
                 if path:
                     target = _project_read_target(
@@ -2375,7 +2439,8 @@ async def _skill_context_list_search(
                         ref="",
                         path=path,
                         from_ref=from_ref,
-                        allow_directory=True,
+                        allow_directory_origin=True,
+                        allow_directory_target=True,
                     )
                     scope_path = _project_scope_path(target)
                 else:
@@ -2923,7 +2988,13 @@ async def skill_context_gateway(
                     ref=ref,
                     path=path,
                     from_ref=from_ref,
+                    allow_directory_origin=True,
                 )
+                if target.get("is_directory"):
+                    raise SkillGatewayError(
+                        "source_path_is_directory",
+                        "The project ref is a directory; use operation='list'.",
+                    )
                 content = project_source.read(target["source_path"])
                 if content is None:
                     raise SkillGatewayError(

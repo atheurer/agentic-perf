@@ -132,8 +132,8 @@ class CrucibleSourceResolution:
 class CrucibleSourceResolver:
     """Resolve an already-present Crucible checkout without network access.
 
-    This compatibility resolver does not clone repositories. Ticket-bound
-    gateway captures are managed separately by ``TicketSourceEpoch``.
+    This no-ticket compatibility resolver does not clone repositories.
+    Ticket-bound gateway captures are managed separately by ``SourceEpoch``.
     """
 
     def __init__(
@@ -202,7 +202,7 @@ class CrucibleCatalogFetcher:
     """Read bounded files from a ticket checkout or compatibility HTTP source.
 
     The fetcher does not create checkouts; ticket checkout capture belongs to
-    ``CrucibleContextGateway`` and ``TicketSourceEpoch``.
+    ``CrucibleContextGateway`` and ``SourceEpoch``.
     """
 
     def __init__(
@@ -221,9 +221,13 @@ class CrucibleCatalogFetcher:
         self._ticket_checkout: Path | None = None
         self._ticket_revision: str | None = None
 
-    def bind_ticket_checkout(self, checkout: Path, revision: str) -> None:
+    def bind_ticket_checkout(
+        self, checkout: Path, revision: str, *, repository: str | None = None
+    ) -> None:
         self._ticket_checkout = checkout.resolve(strict=True)
         self._ticket_revision = revision
+        if repository is not None:
+            self._core_repository = repository
 
     @staticmethod
     def _raw_url(repository: str, path: str, ref: str = "master") -> str | None:
@@ -449,9 +453,20 @@ class CrucibleContextGateway:
             repository,
             ref=ref,
         )
-        checkout = (
-            self._source_epoch.snapshot_root / snapshot["checkout_path"]
-        ).resolve(strict=True)
+        repository_snapshot = snapshot.get("repository")
+        ref_snapshot = snapshot.get("ref")
+        revision = snapshot.get("revision")
+        checkout_path = snapshot.get("checkout_path")
+        if not all(
+            isinstance(value, str) and value
+            for value in (repository_snapshot, ref_snapshot, revision, checkout_path)
+        ):
+            raise SkillGatewayError(
+                "invalid_snapshot", "Pinned Crucible repository metadata is unavailable"
+            )
+        checkout = (self._source_epoch.snapshot_root / checkout_path).resolve(
+            strict=True
+        )
         try:
             checkout.relative_to(
                 self._source_epoch.snapshot_root / self._source_epoch.key
@@ -461,12 +476,16 @@ class CrucibleContextGateway:
                 "invalid_snapshot", "Pinned Crucible repository escaped ticket storage"
             ) from None
         self._ticket_repository_paths[(namespace, name)] = checkout
-        metadata = {"revision": str(snapshot["revision"])}
+        metadata = {
+            "revision": revision,
+            "repository": repository_snapshot,
+            "ref": ref_snapshot,
+        }
         captured_at = snapshot.get("captured_at")
         if isinstance(captured_at, str):
             metadata["captured_at"] = captured_at
         self._ticket_repository_metadata[(namespace, name)] = metadata
-        return checkout, str(snapshot["revision"])
+        return checkout, revision
 
     async def _ensure_ticket_core(self) -> Path | None:
         if self._source_epoch is None:
@@ -478,19 +497,24 @@ class CrucibleContextGateway:
             raise SkillGatewayError(
                 "source_unavailable", "Pinned Crucible core catalog is unavailable"
             )
+        core_metadata = self._ticket_repository_metadata[("core", "crucible")]
+        self._core_repository = core_metadata["repository"]
+        core_ref = core_metadata["ref"]
         self._source_repo = checkout
         self._source_provenance = {
             "effective_source": "github",
             "source_reason": "ticket_pinned_core_catalog",
             "repository": self._core_repository,
-            "ref": "HEAD",
+            "ref": core_ref,
             "commit": revision,
             "core_catalog_commit": revision,
             "captured_at": self._ticket_repository_metadata.get(
                 ("core", "crucible"), {}
             ).get("captured_at"),
         }
-        self._catalog_fetcher.bind_ticket_checkout(checkout, revision)
+        self._catalog_fetcher.bind_ticket_checkout(
+            checkout, revision, repository=self._core_repository
+        )
         return checkout
 
     async def _ensure_ticket_child(
@@ -822,8 +846,12 @@ class CrucibleContextGateway:
         if self._source_epoch is not None:
             for field in ("repository", "ref", "commit", "revision", "captured_at"):
                 source.pop(field, None)
-        source["repository"] = entry.get("repository")
-        source["ref"] = self._entry_ref(entry)
+        if entry:
+            source["repository"] = entry.get("repository")
+            source["ref"] = self._entry_ref(entry)
+        else:
+            source.setdefault("repository", None)
+            source.setdefault("ref", None)
         if self._source_epoch is not None:
             source["snapshot_status"] = (
                 "ticket_pinned" if repo_path is not None else "unavailable"
