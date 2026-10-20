@@ -1261,9 +1261,13 @@ verdicts, and operational directives.
 
 Crucible guidance is retrieved through the subject-scoped skill gateway.
 Administrator-configured organization documents and service configuration
-are private; software references remain upstream or controller sourced. See
-[skill gateway design](design-skill-gateway.md). Other harnesses retain local
-`skills/` documents through `read_skills`; repository tools serve repository docs:
+are private; software references remain upstream or controller sourced.
+Ticket-bound gateway captures for the current kube-burner, k8s-netperf, and AWS
+document maps use service-only storage with immutable revisions and closure
+cleanup. Zathras and Arcaflow retain their existing legacy retrieval paths.
+See [skill gateway design](design-skill-gateway.md) and the migration inventory
+in [issue #1153](https://github.com/atheurer/agentic-perf/issues/1153).
+Repository tools continue to serve repository docs:
 
 ```
 skills/

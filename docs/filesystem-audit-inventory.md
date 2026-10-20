@@ -71,13 +71,29 @@ service-only `skill-snapshots` directory, outside ticket workspaces, artifact
 roots, and served skill directories. The private snapshot includes runtime
 configuration; only manifest-listed document projections leave the resolver.
 The sensitive snapshot filename suppresses content digests in filesystem trace
-attributes. A durable pin is written after the snapshot and verified on reads;
-an audited descriptor plus a process-shared file lock serializes initial pins.
+attributes. A durable pin is written after the snapshot and verified on reads.
+The source preparation, attempt snapshot, and cleanup paths share a stable
+per-ticket lock under `skill-snapshots/source-pins`; a closed marker remains
+after the source pin and private content are removed. This fences workers that
+were already in flight when cleanup began. A small audited pending marker is
+written before organization Git capture so the periodic sweep can find a ticket
+whose first source pin has not finished yet.
 
-The same directory contains a ticket-specific organization source pin. It
-records a digest of the organization binding configuration and Git commit
-revisions before the first agent starts. Later agent and MCP processes for that
-ticket reuse those revisions. Ticket source-pin records and captured subject
-snapshots are removed after the orchestrator observes the ticket closed, either
-during task finalization or its periodic closed-ticket sweep. Immutable Git
-checkouts are shared cache entries and are retained for concurrent tickets.
+The organization source pin records the configuration binding and Git commits
+during ticket provider setup. A subject's private document/configuration
+snapshot is captured on first use and later phases reuse it. The separate
+`skill-source-epochs` service-only directory stores the explicit Crucible
+manifest package, the approved local Markdown maps for kube-burner,
+k8s-netperf, and AWS, and ticket-owned upstream Git checkouts. The upstream
+checkout records the exact resolved commit, configured ref, and first-use
+capture time. Its bare object store and detached worktree stay outside ticket
+workspaces and artifact roots. Missing or corrupt existing pins fail closed;
+an initial upstream failure does not fall back to a shared stale checkout.
+
+Both stores use critical audited mutations and stable locks outside the
+removable payload directories. Cleanup confirms `status == "closed"` with a
+direct state-store lookup before writing tombstones or deleting content. The
+periodic sweep skips missing, failed, or inconclusive ticket lookups, and runs
+even when no organization source is configured. Closed markers and stable lock
+files remain as small service metadata so late workers cannot recreate a
+snapshot after content removal.

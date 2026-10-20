@@ -5,12 +5,17 @@ subject-specific guidance and software references. It lets an agent request the
 knowledge relevant to its subject and phase, while the service controls which
 sources apply and preserves their scope and provenance.
 
-**Current status:** the active issue branch contains an implementation draft for
-administrator-managed organization sources and the initial `harness/crucible`
-subject. Crucible also has explicitly mapped, bundled project guidance filtered
-by phase and agent. This is a narrow project-local migration bridge, not a
-general project package service. Authenticated user-level sources and migration
-of other subjects remain future work. See
+**Current status:** this implementation slice addresses the gateway integration
+in [#1118](https://github.com/atheurer/agentic-perf/issues/1118) and the broader
+context migration inventory in
+[#1153](https://github.com/atheurer/agentic-perf/issues/1153). It includes
+administrator-managed organization sources, the `harness/crucible` subject,
+explicit Crucible project guidance, and ticket-bound captures for the existing
+kube-burner, k8s-netperf, and AWS local-document maps. Crucible catalog and child
+repository reads are pinned to exact upstream commits for ticket-bound calls.
+This is a narrow project-local migration bridge, not a general project package
+service. Zathras and Arcaflow retain their existing paths; authenticated
+user-level sources and migration of other subjects remain future work. See
 [configuration](configuration.md#organization-skill-gateway) for current setup
 and [the detailed design](design-skill-gateway.md) for contracts and
 implementation boundaries.
@@ -45,11 +50,14 @@ received different instructions. A gateway helps by:
   select a winner, and material conflicts that agents cannot resolve should be
   raised through HITL. Conflicting runtime configurations stop affected
   consumers rather than being silently merged.
-- **Supporting repeatable tickets.** A ticket pins its configured organization
-  source set and Git commits before its first agent starts. Later phases reuse
-  those immutable revisions while new tickets can see updates. Subject content
-  is copied into ticket-owned snapshots on first use and removed after closure;
-  shared immutable Git checkouts remain safe for concurrent tickets.
+- **Supporting repeatable tickets.** Configured organization Git sources are
+  resolved to commits during ticket provider setup. Manifest, local-map, and
+  upstream source content is captured lazily on its first applicable gateway
+  or catalog request. Later phases reuse those revisions while new tickets can
+  see updates. Captures and commit metadata remain in service-only storage, with
+  their revision and capture time returned as provenance. Cleanup runs only
+  after a direct ticket lookup confirms closure; stable locks and small closed
+  markers fence late readers and captures.
 - **Loading context when it is needed.** Agents retrieve bounded entrypoints,
   follow relevant document pointers, and search the subject's material instead
   of putting every subject's documents into every prompt. This helps keep
@@ -105,7 +113,8 @@ different purposes and should be inventoried before a subject is migrated:
 | Repository `skills/` documents and `read_skills` | Provide static skill text for harnesses and domains. Crucible project guidance is selected from `skills/context-manifest.json` and retrieved through the gateway; other subjects retain legacy access until migrated. |
 | `SkillProvider` and catalog tools | Supply structured benchmark discovery, templates, and harness-specific contracts. Keep typed discovery and validation behavior. Where their reference content needs shared scoped retrieval, connect the source through a subject adapter rather than turning operational contracts into free-form prose. |
 | Crucible controller documentation | The existing controller reader follows installed documentation pointers. The Crucible gateway adapter exposes the applicable controller entrypoint for benchmark and review phases. |
-| Upstream GitHub catalog access | Crucible triage retains bounded catalog and benchmark-detail operations that work before a controller is available. These structured operations remain distinct from full document retrieval. |
+| Upstream GitHub catalog access | Ticket-bound Crucible catalog and document reads use a ticket-owned core checkout and exact commit pins for selected child repositories. No-ticket catalog compatibility remains unpinned and is identified as such. |
+| Local harness and resource documents | kube-burner, k8s-netperf, and AWS expose the existing approved Markdown subsets through ticket-owned content captures. These adapters retain their existing refs and phase visibility. |
 | `private-skills/<harness>.json` | Legacy instance-wide structured settings are consumed by services. For a migrated subject, select a canonical validated configuration source; do not silently merge it with new organization settings. |
 | Ticket, workspace, result, and metric tools | Retrieve task-specific or potentially large operational data. They are not reusable subject guidance and should remain accessible through their purpose-built tools. |
 
@@ -126,6 +135,35 @@ benchmark integration documentation and, when needed, the native workload's
 own documentation; the gateway must not treat the latter as a replacement for
 the harness-specific parameter contract. See the [Crucible source and migration
 details](design-skill-gateway.md#one-benchmark-can-require-several-software-sources).
+
+## Ticket source lifetime
+
+Ticket identity comes from the trusted server context. The model cannot choose a
+ticket ID, repository, branch, or capture path. A first applicable request
+captures a complete manifest package or the approved local Markdown subset
+before filtering documents for the caller. Upstream adapters resolve the
+configured ref to a commit and read only from a ticket-owned checkout. If the
+first upstream capture fails, the source stays unavailable until a later retry;
+it never substitutes a stale shared cache. Once an existing pin is missing or
+corrupt, reads fail closed rather than capturing the current source again.
+
+The source epoch stores content, revisions, and capture timestamps outside
+ticket workspaces and artifacts. The Crucible catalog adapter pins the core
+catalog and each selected child repository on first use. A catalog-only call
+without trusted ticket context keeps the legacy unpinned discovery behavior and
+must not be treated as ticket provenance. Existing organization source-binding
+changes also fail closed for that ticket; updated bindings apply to new tickets.
+Upstream document exposure is bounded to 256 documents and 32 MiB per request,
+with a 1 MiB per-document limit. Crucible reports an incomplete inventory when
+those limits omit documents; kube-burner and k8s-netperf reject an oversized
+source listing. These limits bound retrieved guidance, not the upstream Git
+checkout used to pin its revision.
+
+On closure, the orchestrator confirms `status == "closed"` with the state store
+before cleanup. Stable per-ticket locks serialize capture and deletion. A
+service-only closed marker remains after content cleanup so an in-flight worker
+or stale MCP process cannot recreate a snapshot. The periodic sweep leaves data
+alone when the ticket lookup is missing, fails, or returns an unknown status.
 
 ## Migration plan
 
@@ -213,14 +251,19 @@ provenance, duplicate and same-path conflict reporting, and ticket-scoped
 organization snapshots. Crucible project guidance is separately declared in
 `skills/context-manifest.json`; each document names its phase and agent scope.
 The Crucible subject also retains phase-appropriate software sources: the
-installed controller documentation for benchmark/review and bounded upstream
-catalog tools for triage. Conflicting organization runtime configurations are
-configuration errors rather than merge candidates.
+installed controller documentation for benchmark/review and ticket-pinned
+upstream catalog repositories for ticket-bound discovery. The current local
+document maps for kube-burner, k8s-netperf, and AWS are captured per ticket;
+their legacy interfaces remain while this migration bridge is reviewed.
+Conflicting organization runtime configurations are configuration errors
+rather than merge candidates. Retire the project-local bridge only after
+equivalent upstream or organization coverage is available to every consuming
+phase.
 
 This does **not** mean that all agentic-perf context already uses the gateway.
-Other harnesses still have existing skill-provider, local-document, prompt, or
-private-settings paths. Authenticated user packages, a general project package
-service, native workload software adapters beyond the current Crucible sources,
-and migration of every other subject remain future work. The
+Zathras and Arcaflow retain their existing legacy paths. Authenticated user
+packages, a general project package service, native workload software adapters
+beyond the current Crucible sources, and migration of every other subject
+remain future work. The
 [detailed design](design-skill-gateway.md)
 tracks the Crucible migration inventory and the checks required before rollout.

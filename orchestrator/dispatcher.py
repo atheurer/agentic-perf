@@ -762,6 +762,7 @@ class Dispatcher:
                 llm_provider=llm,
                 state_store_url=self.store_url,
                 event_bus=self.events,
+                skill_provider=selected_skills,
             )
         elif agent_type == "gathering_context":
             agent = GatheringContextAgent(

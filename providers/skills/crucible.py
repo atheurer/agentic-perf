@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -15,6 +17,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 from .base import BenchmarkSuite, RunfileTemplate, SkillProvider
+from .gateway import SkillGatewayError
 from .local_context import LocalContextSource
 
 KEYWORD_MAP = {
@@ -33,6 +36,9 @@ KEYWORD_MAP = {
 }
 
 SKIP_RICKSHAW_KEYS = {"rickshaw-benchmark", "benchmark", "controller"}
+_MAX_CONTEXT_DOCUMENT_BYTES = 1024 * 1024
+_MAX_CONTEXT_DOCUMENTS = 256
+_MAX_CONTEXT_PACKAGE_BYTES = 32 * 1024 * 1024
 
 
 def crucible_runfile_contract_errors(run_file: dict[str, Any]) -> list[str]:
@@ -203,11 +209,19 @@ class CrucibleCatalogFetcher:
         *,
         fetch_file=None,
         timeout: float = 10.0,
+        ticket_source: bool = False,
     ) -> None:
         self._core_repository = core_repository
         self._fetch_file = fetch_file
         self._timeout = timeout
         self._cache: dict[tuple[str, str], str | None] = {}
+        self._ticket_source = ticket_source
+        self._ticket_checkout: Path | None = None
+        self._ticket_revision: str | None = None
+
+    def bind_ticket_checkout(self, checkout: Path, revision: str) -> None:
+        self._ticket_checkout = checkout.resolve(strict=True)
+        self._ticket_revision = revision
 
     @staticmethod
     def _raw_url(repository: str, path: str, ref: str = "master") -> str | None:
@@ -224,12 +238,34 @@ class CrucibleCatalogFetcher:
     def read_file(
         self, path: str, *, repository: str | None = None, ref: str = "master"
     ) -> str | None:
+        if self._ticket_source:
+            if self._ticket_checkout is None or not self._ticket_revision:
+                raise RuntimeError("Ticket-pinned Crucible catalog is not initialized")
+            if repository not in {None, self._core_repository}:
+                raise RuntimeError(
+                    "Ticket-pinned child repositories require their own checkout"
+                )
+            candidate = (self._ticket_checkout / path).resolve(strict=False)
+            if not candidate.is_relative_to(self._ticket_checkout):
+                return None
+            try:
+                return (
+                    candidate.read_text(encoding="utf-8")
+                    if candidate.is_file()
+                    else None
+                )
+            except OSError:
+                # A failed local read is retried on the next call at the same
+                # pinned revision; transient failures must not become absence.
+                return None
         repository = repository or self._core_repository
         key = (repository, f"{ref}:{path}")
         if key in self._cache:
             return self._cache[key]
+        cache_result = False
         if self._fetch_file is not None:
             content = self._fetch_file(repository, path, ref)
+            cache_result = isinstance(content, str)
         else:
             url = self._raw_url(repository, path, ref)
             content = None
@@ -247,9 +283,20 @@ class CrucibleCatalogFetcher:
                     )
                     if response.is_success:
                         content = response.text
+                        cache_result = True
+                    elif response.status_code == 404:
+                        # Only a confirmed not-found response is a stable
+                        # absence for this exact URL/ref.
+                        cache_result = True
+                    else:
+                        logger.warning(
+                            "Crucible file retrieval failed with HTTP %s",
+                            response.status_code,
+                        )
                 except httpx.HTTPError:
                     logger.warning("Unable to retrieve Crucible file %s", url)
-        self._cache[key] = content
+        if cache_result:
+            self._cache[key] = content
         return content
 
     def read_json(
@@ -325,6 +372,8 @@ class CrucibleContextGateway:
         local_context_source: LocalContextSource | None = None,
         local_context_manifest: str | Path | None = None,
         local_context_root: str | Path | None = None,
+        source_epoch: Any | None = None,
+        core_repository: str | None = None,
     ) -> None:
         self._home = Path(crucible_home)
         self._catalog_only = catalog_only
@@ -335,13 +384,25 @@ class CrucibleContextGateway:
             self._home / "subprojects" / "docs" / "examples" / "runfile"
         )
         self._repo_cache = repo_cache
-        self._source_provenance = source_provenance or {}
-        self._catalog_fetcher = catalog_fetcher or CrucibleCatalogFetcher(
-            os.environ.get(
-                "CRUCIBLE_SOURCE_REPO_URL",
-                "https://github.com/perftool-incubator/crucible.git",
-            )
+        self._source_epoch = source_epoch
+        self._core_repository = core_repository or os.environ.get(
+            "CRUCIBLE_SOURCE_REPO_URL",
+            "https://github.com/perftool-incubator/crucible.git",
         )
+        self._ticket_repository_paths: dict[tuple[str, str], Path] = {}
+        self._ticket_repository_metadata: dict[tuple[str, str], dict[str, str]] = {}
+        self._source_provenance = source_provenance or {}
+        if source_epoch is not None:
+            # Ticket calls must use the pinned checkout even if a compatibility
+            # fetcher was injected by a caller.
+            self._catalog_fetcher = CrucibleCatalogFetcher(
+                self._core_repository,
+                ticket_source=True,
+            )
+        else:
+            self._catalog_fetcher = catalog_fetcher or CrucibleCatalogFetcher(
+                self._core_repository
+            )
         if local_context_source is not None:
             self._local_context = local_context_source
         else:
@@ -356,6 +417,92 @@ class CrucibleContextGateway:
                 if manifest.is_file()
                 else None
             )
+
+    async def _ensure_ticket_repository(
+        self, namespace: str, name: str, repository: str, ref: str
+    ) -> tuple[Path, str]:
+        if self._source_epoch is None:
+            raise RuntimeError("Ticket source epoch is not configured")
+        if not isinstance(repository, str) or not repository:
+            raise SkillGatewayError(
+                "source_unavailable", "Catalog repository URL is unavailable"
+            )
+        if not repository.startswith("https://github.com/"):
+            raise SkillGatewayError(
+                "invalid_source", "Crucible catalog repositories must use GitHub HTTPS"
+            )
+        source_digest = hashlib.sha256(
+            f"{namespace}\0{name}".encode("utf-8")
+        ).hexdigest()
+        source_id = f"upstream:crucible:{source_digest}"
+        identity = f"{repository}\0{ref}"
+        snapshot = await asyncio.to_thread(
+            self._source_epoch.capture_git_repository,
+            source_id,
+            identity,
+            repository,
+            ref=ref,
+        )
+        checkout = (
+            self._source_epoch.snapshot_root / snapshot["checkout_path"]
+        ).resolve(strict=True)
+        try:
+            checkout.relative_to(
+                self._source_epoch.snapshot_root / self._source_epoch.key
+            )
+        except ValueError:
+            raise SkillGatewayError(
+                "invalid_snapshot", "Pinned Crucible repository escaped ticket storage"
+            ) from None
+        self._ticket_repository_paths[(namespace, name)] = checkout
+        metadata = {"revision": str(snapshot["revision"])}
+        captured_at = snapshot.get("captured_at")
+        if isinstance(captured_at, str):
+            metadata["captured_at"] = captured_at
+        self._ticket_repository_metadata[(namespace, name)] = metadata
+        return checkout, str(snapshot["revision"])
+
+    async def _ensure_ticket_core(self) -> Path | None:
+        if self._source_epoch is None:
+            return self._source_repo
+        checkout, revision = await self._ensure_ticket_repository(
+            "core", "crucible", self._core_repository, "HEAD"
+        )
+        if not (checkout / "config" / "repos.json").is_file():
+            raise SkillGatewayError(
+                "source_unavailable", "Pinned Crucible core catalog is unavailable"
+            )
+        self._source_repo = checkout
+        self._source_provenance = {
+            "effective_source": "github",
+            "source_reason": "ticket_pinned_core_catalog",
+            "repository": self._core_repository,
+            "ref": "HEAD",
+            "commit": revision,
+            "core_catalog_commit": revision,
+            "captured_at": self._ticket_repository_metadata.get(
+                ("core", "crucible"), {}
+            ).get("captured_at"),
+        }
+        self._catalog_fetcher.bind_ticket_checkout(checkout, revision)
+        return checkout
+
+    async def _ensure_ticket_child(
+        self, name: str, entry: dict[str, Any]
+    ) -> tuple[Path, str]:
+        repository = entry.get("repository")
+        return await self._ensure_ticket_repository(
+            self._entry_namespace(entry),
+            name,
+            repository,
+            self._entry_ref(entry),
+        )
+
+    async def _ensure_ticket_benchmark(self, benchmark: str) -> None:
+        await self._ensure_ticket_core()
+        entry = self._source_benchmark_entries().get(benchmark)
+        if entry is not None:
+            await self._ensure_ticket_child(benchmark, entry)
 
     _BENCHMARK_CONTEXT_FILES = (
         "AGENTS.md",
@@ -547,6 +694,8 @@ class CrucibleContextGateway:
     def _source_repository_path(self, name: str, entry: dict[str, Any]) -> Path | None:
         """Resolve one catalog entry without assuming a monolithic checkout."""
         repo_type = self._entry_namespace(entry)
+        if self._source_epoch is not None:
+            return self._ticket_repository_paths.get((repo_type, name))
         repo_name = self._entry_repo_name(entry)
         roots = []
         if self._source_repo:
@@ -644,6 +793,8 @@ class CrucibleContextGateway:
         beside it or activated as subproject symlinks.  No controller is needed
         for this lookup.
         """
+        if self._source_epoch is not None:
+            return self._ticket_repository_paths.get(("benchmark", name))
         candidates = [
             self._source_repo / "subprojects" / "benchmarks" / name
             if self._source_repo
@@ -670,16 +821,20 @@ class CrucibleContextGateway:
         }
         source.update(self._source_provenance)
         repo_path = self._source_benchmark_path(name, entry)
+        if self._source_epoch is not None:
+            source["snapshot_status"] = (
+                "ticket_pinned" if repo_path is not None else "unavailable"
+            )
+            source.update(
+                self._ticket_repository_metadata.get(
+                    (self._entry_namespace(entry), name), {}
+                )
+            )
+        else:
+            source["snapshot_status"] = "unpinned_no_ticket"
         if repo_path:
             try:
-                revision = AuditedSubprocessRunner().run_sync(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=repo_path,
-                    timeout=5,
-                    check=False,
-                )
-                if revision.returncode == 0:
-                    source["commit"] = revision.stdout.decode(errors="replace").strip()
+                source["commit"] = self._git_revision(repo_path)
             except (OSError, subprocess.SubprocessError):
                 pass
         return source
@@ -701,6 +856,8 @@ class CrucibleContextGateway:
         )
 
     def _ensure_source_benchmark(self, name: str, entry: dict[str, Any]) -> Path | None:
+        if self._source_epoch is not None:
+            return self._ticket_repository_paths.get(("benchmark", name))
         existing = self._source_benchmark_path(name, entry)
         if existing:
             return existing
@@ -720,6 +877,7 @@ class CrucibleContextGateway:
         This is intentionally a source-only, triage-time operation. Controller
         selection and post-provision refresh are separate phases.
         """
+        await self._ensure_ticket_core()
         entry = self._source_benchmark_entries().get(benchmark)
         if entry is None:
             return {
@@ -729,6 +887,11 @@ class CrucibleContextGateway:
                 "reason": "benchmark_not_in_catalog",
             }
 
+        if self._source_epoch is not None:
+            try:
+                await self._ensure_ticket_child(benchmark, entry)
+            except SkillGatewayError:
+                pass
         repo_path = self._ensure_source_benchmark(benchmark, entry)
         source = self._benchmark_source(benchmark, entry)
         result: dict[str, Any] = {
@@ -736,6 +899,7 @@ class CrucibleContextGateway:
             "benchmark": benchmark,
             "effective_source": "github",
             "source_reason": "catalog_repository",
+            "provenance_status": source.get("snapshot_status"),
             "source_assumption": False,
             "repository": source.get("repository"),
             "ref": source.get("ref"),
@@ -751,6 +915,8 @@ class CrucibleContextGateway:
         # Paths are fixed relative paths, and the resolved checkout is the only
         # permitted root. No caller-provided path is read here.
         root = repo_path.resolve()
+        package_bytes = 0
+        omitted_files = []
         for relative in self._BENCHMARK_CONTEXT_FILES:
             path = root / relative
             if not path.is_file():
@@ -759,11 +925,21 @@ class CrucibleContextGateway:
                 resolved = path.resolve()
                 if not resolved.is_relative_to(root):
                     continue
+                size_bytes = resolved.stat().st_size
+                if (
+                    size_bytes > _MAX_CONTEXT_DOCUMENT_BYTES
+                    or package_bytes + size_bytes > _MAX_CONTEXT_PACKAGE_BYTES
+                ):
+                    omitted_files.append(relative)
+                    continue
                 result["context"][relative] = resolved.read_text()
             except OSError:
                 continue
+            package_bytes += size_bytes
             result["files"].append(relative)
             result["missing_files"].remove(relative)
+        if omitted_files:
+            result["omitted_for_size_limit"] = omitted_files
         return result
 
     @staticmethod
@@ -809,12 +985,18 @@ class CrucibleContextGateway:
 
     @classmethod
     def _discover_context_inventory(
-        cls, root: Path, *, benchmark_namespace: bool = False
+        cls,
+        root: Path,
+        *,
+        benchmark_namespace: bool = False,
+        max_documents: int = _MAX_CONTEXT_DOCUMENTS,
+        max_package_bytes: int = _MAX_CONTEXT_PACKAGE_BYTES,
     ) -> tuple[list[str], dict[str, int]]:
         """Return safe files and counts for each deterministic exclusion reason."""
         root = root.resolve()
         found: list[str] = []
         excluded: dict[str, int] = {}
+        package_bytes = 0
         for path in sorted(root.rglob("*")):
             if not path.is_file():
                 continue
@@ -828,6 +1010,25 @@ class CrucibleContextGateway:
             if cls._safe_context_file(
                 root, relative, benchmark_namespace=benchmark_namespace
             ):
+                try:
+                    size_bytes = path.stat().st_size
+                except OSError:
+                    excluded["path_escape_or_unresolvable"] = (
+                        excluded.get("path_escape_or_unresolvable", 0) + 1
+                    )
+                    continue
+                if size_bytes > _MAX_CONTEXT_DOCUMENT_BYTES:
+                    excluded["document_too_large"] = (
+                        excluded.get("document_too_large", 0) + 1
+                    )
+                    continue
+                if (
+                    len(found) >= max_documents
+                    or package_bytes + size_bytes > max_package_bytes
+                ):
+                    excluded["package_limit"] = excluded.get("package_limit", 0) + 1
+                    continue
+                package_bytes += size_bytes
                 found.append(relative.as_posix())
                 continue
             if any(part.startswith(".") for part in relative.parts):
@@ -894,6 +1095,8 @@ class CrucibleContextGateway:
         ):
             return {"found": False, "reason": "unsupported_namespace"}
 
+        await self._ensure_ticket_core()
+
         benchmark_name = benchmark
         if namespace.startswith("benchmark/"):
             benchmark_name = namespace.split("/", 1)[1] or benchmark
@@ -922,16 +1125,27 @@ class CrucibleContextGateway:
             selected_source = "github"
 
         github_repositories: dict[str, tuple[Path, dict[str, Any]]] = {}
+        upstream_failures: dict[str, str] = {}
         if namespace.startswith(("core/", "tool/", "doc/", "benchmark/")):
-            for name, entry in self._repository_entries_for_namespace(
-                namespace
-            ).items():
+            entries = self._repository_entries_for_namespace(namespace)
+            for name, entry in entries.items():
+                if self._source_epoch is not None and selected_source == "github":
+                    try:
+                        await self._ensure_ticket_child(name, entry)
+                    except SkillGatewayError as exc:
+                        upstream_failures[name] = exc.code
+                        continue
                 repo = self._source_repository_path(name, entry)
                 if repo:
                     github_repositories[name] = (repo, entry)
         elif namespace == "all" and benchmark_name:
             entry = self._source_benchmark_entries().get(benchmark_name)
             if entry:
+                if self._source_epoch is not None and selected_source == "github":
+                    try:
+                        await self._ensure_ticket_child(benchmark_name, entry)
+                    except SkillGatewayError as exc:
+                        upstream_failures[benchmark_name] = exc.code
                 repo = self._source_repository_path(benchmark_name, entry)
                 if repo:
                     github_repositories[benchmark_name] = (repo, entry)
@@ -1033,14 +1247,27 @@ class CrucibleContextGateway:
         documents: list[dict[str, Any]] = []
         source_roots: dict[str, Path] = {}
         exclusion_counts: dict[str, int] = {}
+        remaining_documents = _MAX_CONTEXT_DOCUMENTS
+        remaining_package_bytes = _MAX_CONTEXT_PACKAGE_BYTES
         for name, root, provenance in sources:
             source_roots[name] = root
             discovered, source_exclusions = self._discover_context_inventory(
-                root, benchmark_namespace=name.startswith("benchmark/")
+                root,
+                benchmark_namespace=name.startswith("benchmark/"),
+                max_documents=remaining_documents,
+                max_package_bytes=remaining_package_bytes,
             )
             for reason, count in source_exclusions.items():
                 exclusion_counts[reason] = exclusion_counts.get(reason, 0) + count
             for relative in discovered:
+                remaining_documents -= 1
+                try:
+                    remaining_package_bytes -= (root / relative).stat().st_size
+                except OSError:
+                    exclusion_counts["path_escape_or_unresolvable"] = (
+                        exclusion_counts.get("path_escape_or_unresolvable", 0) + 1
+                    )
+                    continue
                 subject_match = self._subject_matches(relative, subject_area)
                 logical_ref = f"{name}/{relative}"
                 document = {
@@ -1111,6 +1338,9 @@ class CrucibleContextGateway:
             expected_namespaces = [namespace]
         inventory_complete = all(
             expected in available_namespaces for expected in expected_namespaces
+        ) and not any(
+            exclusion_counts.get(reason, 0)
+            for reason in ("document_too_large", "package_limit")
         )
         excluded_count = sum(exclusion_counts.values())
         response: dict[str, Any] = {
@@ -1134,6 +1364,11 @@ class CrucibleContextGateway:
             },
             "inventory": {
                 "complete": inventory_complete,
+                "limits_applied": {
+                    "upstream_documents": _MAX_CONTEXT_DOCUMENTS,
+                    "upstream_document_bytes": _MAX_CONTEXT_DOCUMENT_BYTES,
+                    "upstream_package_bytes": _MAX_CONTEXT_PACKAGE_BYTES,
+                },
                 "discovered": len(documents) + excluded_count,
                 "returned": len(documents),
                 "subject_matches": matching_count,
@@ -1162,6 +1397,8 @@ class CrucibleContextGateway:
                 }
             ),
         }
+        if upstream_failures:
+            response["source_failures"] = upstream_failures
         if operation in {"read", "search"} or include_content:
             requested = path.strip().removeprefix("workspace://")
             matches = documents
@@ -1328,6 +1565,8 @@ class CrucibleContextGateway:
         entry = catalog_entries.get(name)
         source_dir = self._source_benchmark_path(name, entry)
         source_dir = source_dir or self._controller_benchmark_path(name)
+        if self._source_epoch is not None and source_dir is None:
+            return meta
         if source_dir is None and entry:
             repository = entry.get("repository")
             ref = self._entry_ref(entry)
@@ -1380,6 +1619,7 @@ class CrucibleContextGateway:
         return [k for k in rickshaw if k not in SKIP_RICKSHAW_KEYS]
 
     async def list_benchmarks(self) -> list[BenchmarkSuite]:
+        await self._ensure_ticket_core()
         results = []
         source_entries = self._catalog_benchmark_entries()
         names = set(self._discover_benchmarks()) | set(source_entries)
@@ -1407,6 +1647,17 @@ class CrucibleContextGateway:
         return results
 
     async def get_benchmark(self, name: str) -> BenchmarkSuite | None:
+        if self._source_epoch is not None:
+            await self._ensure_ticket_core()
+            entry = self._catalog_benchmark_entries().get(name)
+            if entry is not None:
+                try:
+                    await self._ensure_ticket_child(name, entry)
+                except SkillGatewayError:
+                    # Keep the catalog identity available when a selected
+                    # child snapshot cannot be captured; its metadata remains
+                    # explicitly unavailable for this ticket.
+                    pass
         benchmarks = await self.list_benchmarks()
         for b in benchmarks:
             if b.name == name:
@@ -1414,6 +1665,7 @@ class CrucibleContextGateway:
         return None
 
     async def resolve_benchmark(self, requirements: dict[str, Any]) -> str | None:
+        await self._ensure_ticket_core()
         description = str(requirements.get("description", "")).lower()
         workload_type = str(requirements.get("workload_type", "")).lower()
         search_text = f"{description} {workload_type}"
@@ -1663,6 +1915,7 @@ class CrucibleContextGateway:
         }
 
     async def get_benchmark_params(self, benchmark: str) -> dict[str, Any] | None:
+        await self._ensure_ticket_benchmark(benchmark)
         meta = self._load_benchmark_meta(benchmark)
         return meta.get("multiplex")
 

@@ -33,11 +33,13 @@ class MultiHarnessSkillProvider(SkillProvider):
         private: PrivateSkillProvider | None = None,
         default_harness: str = "crucible",
         project_context_source: Any | None = None,
+        source_epoch: Any | None = None,
     ) -> None:
         self._harnesses = harnesses
         self._private = private or PrivateSkillProvider()
         self._default = default_harness
         self.project_context_source = project_context_source
+        self.source_epoch = source_epoch
 
     @property
     def default_harness(self) -> str:

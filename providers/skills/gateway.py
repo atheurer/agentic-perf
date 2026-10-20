@@ -17,6 +17,7 @@ import os
 import posixpath
 import re
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
@@ -647,6 +648,7 @@ class OrganizationSkillResolver:
         filesystem = None
         lock_fd = None
         pin_relative = f"source-pins/{ticket_key}.json" if ticket_id else ""
+        pending_relative = f"source-pins/{ticket_key}.pending.json" if ticket_id else ""
         pins: dict[str, Any] | None = None
 
         try:
@@ -670,8 +672,9 @@ class OrganizationSkillResolver:
                         break
                     except BlockingIOError:
                         await asyncio.sleep(0.05)
+                cls._ensure_ticket_open(root, ticket_id, ticket_key)
                 pin_path = root / pin_relative
-                if pin_path.exists():
+                if pin_path.exists() or pin_path.is_symlink():
                     try:
                         if pin_path.is_symlink():
                             raise ValueError("source pin cannot be a symlink")
@@ -703,6 +706,24 @@ class OrganizationSkillResolver:
                             json.dumps(pins, sort_keys=True),
                             mode=0o600,
                         )
+                else:
+                    # Register pending ticket ownership before source fetches.
+                    # The periodic sweeper can then discover this capture and
+                    # fence it after a positive closed-status lookup.
+                    filesystem.write(
+                        pending_relative,
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "ticket_key": ticket_key,
+                                "ticket_id": ticket_id,
+                                "descriptor_digest": descriptor_digest,
+                                "state": "capturing",
+                            },
+                            sort_keys=True,
+                        ),
+                        mode=0o600,
+                    )
             prepared_sources: dict[str, Any] = {}
             for item in git_descriptors:
                 source_id, source = item["id"], item["source"]
@@ -757,10 +778,21 @@ class OrganizationSkillResolver:
                     ),
                     mode=0o600,
                 )
+            if ticket_id and filesystem is not None:
+                filesystem.unlink(pending_relative, missing_ok=True)
             return prepared_sources
-        except SkillGatewayError:
+        except SkillGatewayError as exc:
+            if (
+                ticket_id
+                and filesystem is not None
+                and pins is None
+                and exc.code not in {"ticket_closed", "invalid_snapshot"}
+            ):
+                filesystem.unlink(pending_relative, missing_ok=True)
             raise
         except Exception:
+            if ticket_id and filesystem is not None and pins is None:
+                filesystem.unlink(pending_relative, missing_ok=True)
             raise SkillGatewayError(
                 "snapshot_unavailable",
                 "Cannot access ticket organization source pins",
@@ -773,6 +805,70 @@ class OrganizationSkillResolver:
                     if filesystem is not None:
                         filesystem.forget_descriptor(lock_fd)
                     os.close(lock_fd)
+
+    @staticmethod
+    def _ticket_lifecycle_paths(root: Path, ticket_key: str) -> tuple[Path, Path]:
+        lifecycle_path = root / "source-pins" / f"{ticket_key}.closed.json"
+        pin_path = root / "source-pins" / f"{ticket_key}.closed.pin.json"
+        return lifecycle_path, pin_path
+
+    @classmethod
+    def _ensure_ticket_open(cls, root: Path, ticket_id: str, ticket_key: str) -> None:
+        lifecycle_path, pin_path = cls._ticket_lifecycle_paths(root, ticket_key)
+        if lifecycle_path.parent.is_symlink():
+            raise SkillGatewayError(
+                "invalid_snapshot", "Ticket organization lifecycle record is corrupt"
+            )
+        if not any(
+            path.exists() or path.is_symlink() for path in (lifecycle_path, pin_path)
+        ):
+            return
+        try:
+            if lifecycle_path.is_symlink() or pin_path.is_symlink():
+                raise ValueError("lifecycle record cannot be a symlink")
+            data = cls._read_bytes(lifecycle_path, 4096)
+            pin = json.loads(cls._read_bytes(pin_path, 4096))
+            lifecycle = json.loads(data)
+            if (
+                pin.get("digest") != hashlib.sha256(data).hexdigest()
+                or lifecycle.get("schema_version") != 1
+                or lifecycle.get("ticket_key") != ticket_key
+                or lifecycle.get("ticket_id") != ticket_id
+                or lifecycle.get("state") != "closed"
+            ):
+                raise ValueError("invalid lifecycle record")
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            raise SkillGatewayError(
+                "invalid_snapshot", "Ticket organization lifecycle record is corrupt"
+            ) from None
+        raise SkillGatewayError(
+            "ticket_closed", "Ticket organization snapshots have been closed"
+        )
+
+    @classmethod
+    def _write_ticket_closed(
+        cls,
+        filesystem: AuditedFilesystem,
+        root: Path,
+        ticket_id: str,
+        ticket_key: str,
+    ) -> None:
+        lifecycle_path, pin_path = cls._ticket_lifecycle_paths(root, ticket_key)
+        data = json.dumps(
+            {
+                "schema_version": 1,
+                "ticket_key": ticket_key,
+                "ticket_id": ticket_id,
+                "state": "closed",
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        filesystem.write(lifecycle_path.relative_to(root).as_posix(), data, mode=0o600)
+        filesystem.write(
+            pin_path.relative_to(root).as_posix(),
+            json.dumps({"digest": hashlib.sha256(data).hexdigest()}, sort_keys=True),
+            mode=0o600,
+        )
 
     def for_attempt(
         self, ticket_id: str, attempt_id: str, phase: str
@@ -828,7 +924,7 @@ class OrganizationSkillResolver:
 
     def cleanup_ticket(self, ticket_id: str) -> int:
         """Remove ticket-owned source pins and captured content snapshots."""
-        if not ticket_id or not self.snapshot_root.is_dir():
+        if not ticket_id:
             return 0
 
         ticket_key = _digest([ticket_id])
@@ -838,85 +934,111 @@ class OrganizationSkillResolver:
             emit=self.audit_emit or durable_filesystem_emitter(),
             critical=True,
         )
+        lock_fd = None
         removed = 0
-
-        source_pin = self.snapshot_root / "source-pins" / f"{ticket_key}.json"
-        source_lock = self.snapshot_root / "source-pins" / f"{ticket_key}.lock"
-        if source_pin.is_file() and not source_pin.is_symlink():
-            filesystem.unlink(
-                source_pin.relative_to(self.snapshot_root), missing_ok=True
+        try:
+            filesystem.mkdir(".", mode=0o700)
+            filesystem.mkdir("source-pins", mode=0o700)
+            lock_fd = filesystem.open_descriptor(
+                f"source-pins/{ticket_key}.lock",
+                os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                mode=0o600,
             )
-            removed += 1
-        if source_lock.is_file() and not source_lock.is_symlink():
-            filesystem.unlink(
-                source_lock.relative_to(self.snapshot_root), missing_ok=True
-            )
-        source_pin_dir = self.snapshot_root / "source-pins"
-        if source_pin_dir.is_dir() and not source_pin_dir.is_symlink():
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
             try:
-                if not any(source_pin_dir.iterdir()):
-                    filesystem.rmdir("source-pins")
-            except OSError:
-                pass
+                self._ensure_ticket_open(self.snapshot_root, ticket_id, ticket_key)
+                already_closed = False
+            except SkillGatewayError as exc:
+                if exc.code == "ticket_closed":
+                    already_closed = True
+                elif exc.code == "invalid_snapshot":
+                    # Normalize an interrupted marker write while closure is
+                    # authoritative and the stable ticket lock is held.
+                    already_closed = False
+                else:
+                    raise
+            if not already_closed:
+                self._write_ticket_closed(
+                    filesystem, self.snapshot_root, ticket_id, ticket_key
+                )
 
-        for candidate in self.snapshot_root.iterdir():
-            if (
-                candidate.name == "source-pins"
-                or candidate.is_symlink()
-                or not candidate.is_dir()
-                or not re.fullmatch(r"[a-f0-9]{64}", candidate.name)
-            ):
-                continue
-            if not candidate.exists():
-                continue
-            owns_snapshot = False
-            pin_path = candidate / "pin.json"
-            snapshot_path = candidate / "private-snapshot.json"
-            try:
-                if pin_path.is_file() and not pin_path.is_symlink():
-                    pin = json.loads(self._read_bytes(pin_path, 64 * 1024))
-                    owns_snapshot = pin.get("ticket_key") == ticket_key
-                # Pre-upgrade snapshots did not record their owner. All current
-                # callers bind the initial attempt, so recover those safely.
-                if not owns_snapshot and snapshot_path.is_file():
-                    snapshot = json.loads(
-                        self._read_bytes(snapshot_path, 8 * MAX_PACKAGE_BYTES)
-                    )
-                    subject = snapshot.get("subject")
-                    owns_snapshot = (
-                        isinstance(subject, str)
-                        and candidate.name == _digest([ticket_id, "initial", subject])
-                    )
-            except (OSError, ValueError, TypeError, RecursionError):
-                continue
-            if not owns_snapshot:
-                continue
+            for candidate in self.snapshot_root.iterdir():
+                if (
+                    candidate.name == "source-pins"
+                    or candidate.is_symlink()
+                    or not candidate.is_dir()
+                    or not re.fullmatch(r"[a-f0-9]{64}", candidate.name)
+                ):
+                    continue
+                owns_snapshot = False
+                pin_path = candidate / "pin.json"
+                snapshot_path = candidate / "private-snapshot.json"
+                try:
+                    if pin_path.is_file() and not pin_path.is_symlink():
+                        pin = json.loads(self._read_bytes(pin_path, 64 * 1024))
+                        owns_snapshot = pin.get("ticket_key") == ticket_key
+                    # Pre-upgrade snapshots did not record their owner. All current
+                    # callers bind the initial attempt, so recover those safely.
+                    if not owns_snapshot and snapshot_path.is_file():
+                        snapshot = json.loads(
+                            self._read_bytes(snapshot_path, 8 * MAX_PACKAGE_BYTES)
+                        )
+                        subject = snapshot.get("subject")
+                        owns_snapshot = isinstance(
+                            subject, str
+                        ) and candidate.name == _digest([ticket_id, "initial", subject])
+                except (OSError, ValueError, TypeError, RecursionError):
+                    continue
+                if not owns_snapshot:
+                    continue
 
-            for current, directories, files in os.walk(
-                candidate, topdown=False, followlinks=False
-            ):
-                current_path = Path(current)
-                for name in files:
-                    filesystem.unlink(
-                        (current_path / name).relative_to(self.snapshot_root),
-                        missing_ok=True,
-                    )
-                for name in directories:
-                    child = current_path / name
-                    relative = child.relative_to(self.snapshot_root)
-                    if child.is_symlink():
-                        filesystem.unlink(relative, missing_ok=True)
-                    else:
-                        try:
-                            filesystem.rmdir(relative)
-                        except FileNotFoundError:
-                            pass
-            try:
-                filesystem.rmdir(candidate.relative_to(self.snapshot_root))
+                for current, directories, files in os.walk(
+                    candidate, topdown=False, followlinks=False
+                ):
+                    current_path = Path(current)
+                    for name in files:
+                        filesystem.unlink(
+                            (current_path / name).relative_to(self.snapshot_root),
+                            missing_ok=True,
+                        )
+                        removed += 1
+                    for name in directories:
+                        child = current_path / name
+                        relative = child.relative_to(self.snapshot_root)
+                        if child.is_symlink():
+                            filesystem.unlink(relative, missing_ok=True)
+                        else:
+                            try:
+                                filesystem.rmdir(relative)
+                            except FileNotFoundError:
+                                pass
+                try:
+                    filesystem.rmdir(candidate.relative_to(self.snapshot_root))
+                except FileNotFoundError:
+                    pass
+
+            source_pin = self.snapshot_root / "source-pins" / f"{ticket_key}.json"
+            if source_pin.is_file() and not source_pin.is_symlink():
+                filesystem.unlink(
+                    source_pin.relative_to(self.snapshot_root), missing_ok=True
+                )
                 removed += 1
-            except FileNotFoundError:
-                pass
-        return removed
+            pending_pin = (
+                self.snapshot_root / "source-pins" / f"{ticket_key}.pending.json"
+            )
+            if pending_pin.is_file() and not pending_pin.is_symlink():
+                filesystem.unlink(
+                    pending_pin.relative_to(self.snapshot_root), missing_ok=True
+                )
+                removed += 1
+            return removed
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    filesystem.forget_descriptor(lock_fd)
+                    os.close(lock_fd)
 
     def ticket_ids_with_source_pins(self) -> set[str]:
         """Return validated ticket ids whose gateway snapshots need lifecycle cleanup."""
@@ -940,6 +1062,54 @@ class OrganizationSkillResolver:
                     and path.stem == pin.get("ticket_key")
                 ):
                     ticket_ids.add(ticket_id)
+            except (OSError, ValueError, TypeError, RecursionError):
+                continue
+        for path in pin_dir.glob("*.pending.json"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                pending = json.loads(self._read_bytes(path, 4096))
+                ticket_id = pending.get("ticket_id")
+                ticket_key = pending.get("ticket_key")
+                if (
+                    pending.get("schema_version") == 1
+                    and pending.get("state") == "capturing"
+                    and isinstance(ticket_id, str)
+                    and bool(ticket_id)
+                    and ticket_key == _digest([ticket_id])
+                    and path.stem == f"{ticket_key}.pending"
+                ):
+                    ticket_ids.add(ticket_id)
+            except (OSError, ValueError, TypeError, RecursionError):
+                continue
+        for lifecycle_path in pin_dir.glob("*.closed.json"):
+            if lifecycle_path.is_symlink():
+                continue
+            ticket_key_from_name = lifecycle_path.name.removesuffix(".closed.json")
+            pin_path = pin_dir / f"{ticket_key_from_name}.closed.pin.json"
+            try:
+                data = self._read_bytes(lifecycle_path, 4096)
+                pin = json.loads(self._read_bytes(pin_path, 4096))
+                lifecycle = json.loads(data)
+                ticket_id = lifecycle.get("ticket_id")
+                ticket_key = lifecycle.get("ticket_key")
+                if (
+                    not pin_path.is_symlink()
+                    and pin.get("digest") == hashlib.sha256(data).hexdigest()
+                    and lifecycle.get("schema_version") == 1
+                    and lifecycle.get("state") == "closed"
+                    and isinstance(ticket_id, str)
+                    and bool(ticket_id)
+                    and ticket_key == _digest([ticket_id])
+                    and ticket_key_from_name == ticket_key
+                ):
+                    source_pin = pin_dir / f"{ticket_key}.json"
+                    pending_pin = pin_dir / f"{ticket_key}.pending.json"
+                    if any(
+                        path.is_file() and not path.is_symlink()
+                        for path in (source_pin, pending_pin)
+                    ):
+                        ticket_ids.add(ticket_id)
             except (OSError, ValueError, TypeError, RecursionError):
                 continue
         return ticket_ids
@@ -1264,7 +1434,10 @@ class OrganizationSkillResolver:
             raise SkillGatewayError("missing_attempt", "Trusted attempt is required")
         key = _digest([self.ticket_id, self.attempt_id, subject])
         binding_identity = _digest([binding.identity for binding in bindings])
+        ticket_key = _digest([self.ticket_id])
+        filesystem = None
         lock = None
+        ticket_lock = None
         try:
             filesystem = AuditedFilesystem(
                 RootedPath(self.snapshot_root, "skill-service"),
@@ -1273,11 +1446,33 @@ class OrganizationSkillResolver:
                 critical=True,
             )
             filesystem.mkdir(".", mode=0o700)
+            filesystem.mkdir("source-pins", mode=0o700)
+            ticket_lock = filesystem.open_descriptor(
+                f"source-pins/{ticket_key}.lock",
+                os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                mode=0o600,
+            )
+            try:
+                fcntl.flock(ticket_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SkillGatewayError(
+                    "snapshot_busy", "Ticket source capture is still in progress"
+                ) from None
+            self._ensure_ticket_open(self.snapshot_root, self.ticket_id, ticket_key)
             filesystem.mkdir(key, mode=0o700)
-            lock = filesystem.open_descriptor(f"{key}/lock", os.O_CREAT | os.O_RDWR)
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            lock = filesystem.open_descriptor(
+                f"{key}/lock",
+                os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                mode=0o600,
+            )
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SkillGatewayError(
+                    "snapshot_busy", "Organization snapshot is still being captured"
+                ) from None
             pin_path = self.snapshot_root / key / "pin.json"
-            if pin_path.exists():
+            if pin_path.exists() or pin_path.is_symlink():
                 try:
                     pin = json.loads(pin_path.read_text())
                     snapshot_path = self.snapshot_root / key / "private-snapshot.json"
@@ -1297,6 +1492,9 @@ class OrganizationSkillResolver:
                         "invalid_snapshot", "Pinned skill snapshot is unavailable"
                     ) from None
             snapshot = self._capture(bindings)
+            snapshot["captured_at"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            )
             content = json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode()
             filesystem.write(f"{key}/private-snapshot.json", content)
             filesystem.write(
@@ -1317,12 +1515,16 @@ class OrganizationSkillResolver:
                 "snapshot_unavailable", "Cannot access durable skill snapshot storage"
             ) from None
         finally:
-            if lock is not None:
+            for descriptor in (lock, ticket_lock):
+                if descriptor is None:
+                    continue
                 try:
                     try:
-                        fcntl.flock(lock, fcntl.LOCK_UN)
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
                     finally:
-                        os.close(lock)
+                        if filesystem is not None:
+                            filesystem.forget_descriptor(descriptor)
+                        os.close(descriptor)
                 except Exception:
                     raise SkillGatewayError(
                         "snapshot_unavailable", "Cannot release skill snapshot storage"
@@ -1379,6 +1581,7 @@ class OrganizationSkillResolver:
             "status": "available",
             "required": snapshot["required"],
             "revision": snapshot["revision"],
+            "captured_at": snapshot.get("captured_at"),
             "name": snapshot["name"],
             "service_configured": snapshot.get("service_configured", False),
             "sources": snapshot["sources"],

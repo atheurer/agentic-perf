@@ -11,13 +11,14 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from agents.base import AgentAbortedError, HITLDriftError
 from agents.server_utils import build_skill_provider_async
-from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
+from paths import AGENTIC_PERF_HOME, LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
 from providers.execution import (
     AmbiguousHTTPReplayError,
@@ -1104,11 +1105,7 @@ async def _cleanup_closed_ticket_skill_context(
     dispatcher: Dispatcher, ticket_id: str
 ) -> None:
     """Drop ticket-owned gateway snapshots only after the ticket is closed."""
-    if getattr(dispatcher, "_skill_provider_factory", None) is None:
-        return
-    resolver = getattr(dispatcher.skills, "organization_resolver", None)
-    if resolver is None:
-        return
+    resolver = _organization_snapshot_resolver(dispatcher)
     try:
         async with AuditedAsyncHTTPClient(
             timeout=10.0, headers=_auth_headers()
@@ -1123,7 +1120,22 @@ async def _cleanup_closed_ticket_skill_context(
         removed = await asyncio.to_thread(resolver.cleanup_ticket, ticket_id)
         if removed:
             logger.info(
-                "Removed %s ticket-owned skill gateway snapshots for %s",
+                "Removed %s ticket-owned organization skill snapshots for %s",
+                removed,
+                ticket_id,
+            )
+        from paths import SKILL_SOURCE_EPOCH_DIR
+        from providers.skills.source_epoch import SourceEpoch
+
+        removed = await asyncio.to_thread(
+            SourceEpoch(
+                SKILL_SOURCE_EPOCH_DIR,
+                ticket_id=ticket_id,
+            ).cleanup_ticket
+        )
+        if removed:
+            logger.info(
+                "Removed %s ticket-owned source snapshots for %s",
                 removed,
                 ticket_id,
             )
@@ -1133,20 +1145,86 @@ async def _cleanup_closed_ticket_skill_context(
         )
 
 
-def _cleanup_skill_context_for_closed_tickets(
+def _organization_snapshot_resolver(dispatcher: Dispatcher):
+    resolver = getattr(dispatcher.skills, "organization_resolver", None)
+    if resolver is not None:
+        return resolver
+    from providers.skills.gateway import OrganizationSkillResolver
+
+    return OrganizationSkillResolver(
+        {}, snapshot_root=AGENTIC_PERF_HOME / "skill-snapshots"
+    )
+
+
+async def _cleanup_skill_context_for_closed_tickets(
     dispatcher: Dispatcher, open_ticket_ids: set[str]
 ) -> list[tuple[str, int]]:
-    """Sweep ticket snapshots for closed tickets, including tickets idle at close."""
-    if getattr(dispatcher, "_skill_provider_factory", None) is None:
-        return []
-    resolver = getattr(dispatcher.skills, "organization_resolver", None)
-    if resolver is None:
-        return []
+    """Clean pinned tickets only after a direct status lookup confirms closure."""
+    candidate_ids = set()
+    organization_resolver = _organization_snapshot_resolver(dispatcher)
+    candidate_ids.update(organization_resolver.ticket_ids_with_source_pins())
+    from paths import SKILL_SOURCE_EPOCH_DIR
+    from providers.skills.source_epoch import SourceEpoch
+
+    candidate_ids.update(SourceEpoch.ticket_ids_with_pins(SKILL_SOURCE_EPOCH_DIR))
     removed = []
-    for ticket_id in resolver.ticket_ids_with_source_pins() - open_ticket_ids:
-        count = resolver.cleanup_ticket(ticket_id)
-        if count:
-            removed.append((ticket_id, count))
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
+        for ticket_id in candidate_ids - open_ticket_ids:
+            try:
+                response = await client.get(
+                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                )
+                if response.status_code != 200:
+                    logger.warning(
+                        "Skipping context cleanup for %s: ticket lookup returned HTTP %s",
+                        ticket_id,
+                        response.status_code,
+                    )
+                    continue
+                ticket = response.json()
+                if not isinstance(ticket, dict):
+                    logger.warning(
+                        "Skipping context cleanup for %s: ticket lookup returned an incomplete record",
+                        ticket_id,
+                    )
+                    continue
+                status = ticket.get("status")
+                if status != "closed":
+                    logger.info(
+                        "Skipping context cleanup for %s: closure was not confirmed (status=%r)",
+                        ticket_id,
+                        status,
+                    )
+                    continue
+            except Exception:
+                logger.warning(
+                    "Skipping context cleanup for %s: ticket closure could not be verified",
+                    ticket_id,
+                    exc_info=True,
+                )
+                continue
+
+            count = await asyncio.to_thread(
+                _cleanup_ticket_skill_snapshots,
+                organization_resolver,
+                ticket_id,
+                SKILL_SOURCE_EPOCH_DIR,
+            )
+            if count:
+                removed.append((ticket_id, count))
+    return removed
+
+
+def _cleanup_ticket_skill_snapshots(
+    organization_resolver: Any, ticket_id: str, source_epoch_dir: str | Path
+) -> int:
+    from providers.skills.source_epoch import SourceEpoch
+
+    removed = organization_resolver.cleanup_ticket(ticket_id)
+    removed += SourceEpoch(
+        source_epoch_dir,
+        ticket_id=ticket_id,
+    ).cleanup_ticket()
     return removed
 
 
@@ -2859,25 +2937,13 @@ async def _poll_loop_after_lease(
 
     collect_from_providers(skills)
 
-    gateway_config = config.raw.get("skill_gateway")
-    organization_config = (
-        gateway_config.get("organization") if isinstance(gateway_config, dict) else None
-    )
-    from providers.skills.gateway import organization_source_descriptors
+    async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
+        return await make_skill_provider(ticket_id, phase)
 
-    try:
-        organization_sources = organization_source_descriptors(
-            organization_config if isinstance(organization_config, dict) else {}
-        )
-    except (TypeError, ValueError):
-        organization_sources = []
-    skill_provider_factory = None
-    if organization_sources or organization_config:
-
-        async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
-            return await make_skill_provider(ticket_id, phase)
-
-        skill_provider_factory = refresh_ticket_skill_provider
+    # Ticket source captures also cover project-local and upstream context, so
+    # the provider lifecycle must exist even when no organization package is
+    # configured.
+    skill_provider_factory = refresh_ticket_skill_provider
 
     try:
         jumpstarter_configured = bool(
@@ -3123,11 +3189,10 @@ async def _poll_loop_after_lease(
                         ticket["id"]
                         for ticket in all_fetched
                         if isinstance(ticket.get("id"), str)
+                        and ticket.get("status") != "closed"
                     }
-                    removed_snapshots = await asyncio.to_thread(
-                        _cleanup_skill_context_for_closed_tickets,
-                        dispatcher,
-                        open_ticket_ids,
+                    removed_snapshots = await _cleanup_skill_context_for_closed_tickets(
+                        dispatcher, open_ticket_ids
                     )
                     for ticket_id, count in removed_snapshots:
                         logger.info(

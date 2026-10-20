@@ -29,3 +29,10 @@ with no runtime configuration or credentials. The temporary file is created
 and removed through the ticket's critical filesystem facade. This is an
 audited caller, with no raw subprocess exception. Deployment images must
 provide GNU grep.
+
+`providers/skills/source_epoch.py:capture_git_repository` uses
+`AuditedSubprocessRunner` for `git ls-remote`, fetch, and detached worktree
+creation. It resolves a configured ref once for a ticket, stores the exact
+commit and checkout in the service-only source epoch, and verifies that pinned
+checkout on later reads. The full checkout is not copied into a ticket
+workspace. This is an audited caller, with no raw subprocess exception.

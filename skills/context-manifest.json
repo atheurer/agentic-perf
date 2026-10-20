@@ -2,6 +2,15 @@
   "schema_version": 1,
   "entries": [
     {
+      "id": "crucible-analysis-methodology",
+      "path": "skills/crucible/analysis-methodology.md",
+      "harness": "crucible",
+      "phase": "analyze",
+      "agent": "analyze-agent",
+      "subjects": ["analysis", "results"],
+      "entrypoint": true
+    },
+    {
       "id": "crucible-benchmark-discovery",
       "path": "skills/crucible/benchmark-discovery.md",
       "harness": "crucible",

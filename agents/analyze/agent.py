@@ -17,6 +17,7 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from agents.skill_context import skill_context_prompt
+from agents.tool_ownership import selected_harness_from_ticket
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 
@@ -33,6 +34,7 @@ class AnalyzeAgent(AgentBase):
         llm_provider: LLMProvider,
         state_store_url: str,
         event_bus: EventBus | None = None,
+        skill_provider: Any | None = None,
     ) -> None:
         super().__init__(
             agent_name="analyze-agent",
@@ -40,13 +42,17 @@ class AnalyzeAgent(AgentBase):
             state_store_url=state_store_url,
             event_bus=event_bus,
         )
+        self._skill_provider = skill_provider
+
+    def _selected_harness(self, ticket: dict[str, Any]) -> str:
+        return selected_harness_from_ticket(
+            ticket,
+            default_harness=getattr(self._skill_provider, "default_harness", ""),
+        )
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
         prompt = ANALYZE_SYSTEM_PROMPT
-        harness = (
-            ticket.get("custom_fields", {}).get("directives", {}).get("harness", "")
-        )
-        if isinstance(harness, str) and harness.lower() == "crucible":
+        if self._selected_harness(ticket) == "crucible":
             prompt += "\n\n" + skill_context_prompt("harness/crucible")
         return prompt
 
@@ -315,9 +321,9 @@ class AnalyzeAgent(AgentBase):
             )
             parts.append("")
 
-        harness = directives.get("harness", "")
+        harness = self._selected_harness(ticket)
         if harness:
-            if isinstance(harness, str) and harness.lower() == "crucible":
+            if harness == "crucible":
                 parts.append(
                     "**Harness:** Crucible — retrieve applicable context through "
                     "`get_skill_context(subject='harness/crucible', "

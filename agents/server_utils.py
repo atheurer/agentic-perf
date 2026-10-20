@@ -96,6 +96,7 @@ def build_skill_provider(
     arcaflow_mcp_client: Any | None = None,
     skill_phase: str = "",
     organization_resolver: Any | None = None,
+    ticket_id: str | None = None,
 ):
     """Construct a MultiHarnessSkillProvider from environment variables.
 
@@ -112,6 +113,7 @@ def build_skill_provider(
     from providers.skills.local_context import LocalContextSource
     from providers.skills.multi import MultiHarnessSkillProvider
     from providers.skills.private import PrivateSkillProvider
+    from providers.skills.source_epoch import SourceEpoch
     from providers.skills.vstorm import VstormSkillProvider
     from providers.skills.zathras import ZathrasSkillProvider
 
@@ -136,9 +138,23 @@ def build_skill_provider(
     # workflow engine instead of direct podman execution.
     harnesses["arcaflow-workflows"] = harnesses["arcaflow-plugins"]
 
+    trusted_ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
+    source_epoch = None
+    if trusted_ticket_id:
+        from paths import SKILL_SOURCE_EPOCH_DIR
+
+        source_epoch = SourceEpoch(
+            SKILL_SOURCE_EPOCH_DIR,
+            ticket_id=trusted_ticket_id,
+        )
+
     if catalog_only:
         harnesses["crucible"] = CrucibleCatalogSkillProvider(
-            build_crucible_context_gateway(catalog_only=True)
+            build_crucible_context_gateway(
+                catalog_only=True,
+                source_url=source_url,
+                source_epoch=source_epoch,
+            )
         )
 
     private = PrivateSkillProvider(resolver=organization_resolver)
@@ -162,6 +178,7 @@ def build_skill_provider(
         private,
         default_harness="crucible",
         project_context_source=project_context_source,
+        source_epoch=source_epoch,
     )
 
 
@@ -218,11 +235,16 @@ async def build_skill_provider_async(
     **kwargs: Any,
 ):
     """Build skills after resolving authenticated organization Git sources."""
+    trusted_ticket_id = ticket_id or os.environ.get("TICKET_ID") or None
     resolver = await build_organization_skill_resolver_async(
         secrets_provider=secrets_provider,
-        ticket_id=ticket_id,
+        ticket_id=trusted_ticket_id,
     )
-    return build_skill_provider(organization_resolver=resolver, **kwargs)
+    return build_skill_provider(
+        organization_resolver=resolver,
+        ticket_id=trusted_ticket_id,
+        **kwargs,
+    )
 
 
 def build_crucible_context_gateway(
@@ -233,6 +255,7 @@ def build_crucible_context_gateway(
     source_url: str | None = None,
     resolve_source: bool = False,
     catalog_only: bool = False,
+    source_epoch: Any | None = None,
 ):
     """Build the internal Crucible context/catalog adapter.
 
@@ -246,6 +269,22 @@ def build_crucible_context_gateway(
 
     home = crucible_home or os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
     cache = repo_cache or RepoCache()
+    trusted_ticket_id = os.environ.get("TICKET_ID", "")
+    if source_epoch is None and trusted_ticket_id:
+        from paths import SKILL_SOURCE_EPOCH_DIR
+        from providers.skills.source_epoch import SourceEpoch
+
+        source_epoch = SourceEpoch(
+            SKILL_SOURCE_EPOCH_DIR,
+            ticket_id=trusted_ticket_id,
+        )
+    core_repository = source_url or (
+        cache.get_origin("crucible") if hasattr(cache, "get_origin") else None
+    )
+    core_repository = core_repository or os.environ.get(
+        "CRUCIBLE_SOURCE_REPO_URL",
+        "https://github.com/perftool-incubator/crucible.git",
+    )
     if resolve_source:
         logger.warning(
             "resolve_source is ignored; Crucible repositories are not cloned"
@@ -255,6 +294,8 @@ def build_crucible_context_gateway(
         source_repo=source_repo,
         repo_cache=cache,
         catalog_only=catalog_only,
+        source_epoch=source_epoch,
+        core_repository=core_repository,
     )
 
 

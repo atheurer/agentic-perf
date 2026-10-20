@@ -1,8 +1,11 @@
 # Subject-based skill gateway
 
-Status: implementation draft for issues #1118 and #246. Runtime activation and
-publication are pending review. The initial subject is `harness/crucible`, with
-an explicit bundled project-guidance manifest for its current consumers.
+Status: implementation draft for issues [#1118](https://github.com/atheurer/agentic-perf/issues/1118),
+[#246](https://github.com/atheurer/agentic-perf/issues/246), and the migration
+inventory [#1153](https://github.com/atheurer/agentic-perf/issues/1153).
+Runtime activation and publication are pending review. The initial subject is
+`harness/crucible`, with an explicit bundled project-guidance manifest and
+ticket-bound source captures for the gateway adapters covered by this slice.
 
 ## Goal and first release
 
@@ -254,12 +257,15 @@ optional SSH private keys use administrator-managed secret references from the
 existing secrets provider. A private-key secret must be usable
 non-interactively; passphrase-protected keys can use the existing SSH agent.
 SSH may instead use the service account's existing OpenSSH identity/agent and
-known-hosts file; strict host-key checking is enabled. The local cache stores
-mirrors and independent,
-immutable commit checkouts under service storage with restricted directory
-permissions. Each agent provider initialization refreshes the configured
-branch; the exact commit and content snapshot stay server-side, and existing
-ticket pins remain stable. Git source discovery is deferred by offline
+known-hosts file; strict host-key checking is enabled. The organization source
+resolver stores immutable checkouts under service storage with restricted
+directory permissions. For a ticket, configured organization refs are resolved
+during provider setup; later phases reuse those pins, while new tickets resolve
+the then-current ref. Manifest, local-map, and upstream gateway captures are
+lazy and occur on the first applicable request. The exact revision, capture
+time, and content remain server-side and are returned as source provenance.
+Existing tickets do not silently recapture content after a pin disappears;
+they fail closed. Git source discovery is deferred by offline
 `config show`; the first provider initialization reports fetch or authentication
 failures as required source errors. A remote skill source does not clone
 Crucible software repositories during catalog discovery.
@@ -501,9 +507,9 @@ account for validations and approvals that relied on previous settings.
 
 Adding a document/configuration counterpart under the same repository root
 affects new captures; existing tickets retain their pinned snapshot. Changing
-an explicit source binding or Git URL/ref is an error for an existing pin.
-Removing a pinned subject's binding reports unavailable rather than selecting
-legacy settings for that ticket.
+an explicit source binding or Git URL/ref fails closed for an existing pin; it
+does not silently capture the new source. Removing a pinned subject's binding
+reports unavailable rather than selecting legacy settings for that ticket.
 
 Controller/software context keeps its existing phase-appropriate refresh rules.
 Organization and controller revisions can be effective at the same time because
@@ -638,7 +644,11 @@ and reported in diagnostics.
 
 This local review draft implements the path and Git organization sources,
 subject discovery, gateway retrieval, and Crucible software adapter described
-above. Git accepts HTTPS and SSH branch URLs. Authentication can use the
+above. Ticket-bound Crucible catalog reads pin the core repository and each
+selected child repository to an exact commit. The existing kube-burner and
+k8s-netperf upstream adapters and kube-burner, k8s-netperf, and AWS local
+document maps use ticket-owned captures. Git accepts HTTPS and SSH branch URLs.
+Authentication can use the
 existing OpenSSH identity/agent, an HTTPS token secret reference, or an SSH key
 secret reference. Git fetches run through the audited subprocess provider;
 cache checkouts are independent of the mutable mirror, and ticket snapshots
@@ -707,7 +717,13 @@ and now supports ticket-scoped continuation cursors. Local/upstream listing and
 search remain confined to their exposed subject document roots.
 
 Local administrator paths and organization Git sources are implemented in this
-draft. Bundled Crucible project guidance is selected from the explicit manifest;
-authenticated user packages and user-specific overrides remain future work.
+draft. Bundled Crucible project guidance is selected from the explicit manifest.
+Project and upstream captures are stored outside ticket workspaces, tied to
+trusted ticket identity, and removed only after a direct state-store lookup
+confirms closure. Stable lock files and small closed markers fence in-flight
+captures and stale readers; cleanup still runs when no organization package is
+configured. The no-ticket catalog compatibility path remains unpinned and is
+reported separately. Zathras and Arcaflow remain on their existing paths.
+Authenticated user packages and user-specific overrides remain future work.
 Git credentials use the existing secrets provider; this slice does not
 introduce a secrets gateway.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import posixpath
 import re
@@ -15,7 +17,7 @@ from providers.skills.gateway import (
     SkillGatewayError,
     is_organization_ref,
 )
-from providers.skills.local_context import LocalContextSource
+from providers.skills.local_context import LocalContextSnapshot, LocalContextSource
 
 _SOFTWARE_PREFIX = "skill://software/controller/harness/crucible/"
 _PROJECT_PREFIX = "skill://project/"
@@ -32,6 +34,8 @@ _UPSTREAM_REPOS = {
     "harness/k8s-netperf": "k8s-netperf",
 }
 _MAX_SOURCE_DOCUMENT_BYTES = 1024 * 1024
+_MAX_UPSTREAM_DOCUMENTS = 256
+_MAX_UPSTREAM_PACKAGE_BYTES = 32 * 1024 * 1024
 _MAX_SOURCE_SEARCH_BYTES = 4 * 1024 * 1024
 SKILL_GATEWAY_TOOL_DESCRIPTION = """Retrieve subject guidance and software references.
 
@@ -228,6 +232,8 @@ def _project_document(document: dict[str, Any]) -> dict[str, Any]:
     }
     if provenance.get("reason"):
         safe_provenance["reason"] = provenance["reason"]
+    if isinstance(provenance.get("captured_at"), str):
+        safe_provenance["captured_at"] = provenance["captured_at"]
     subjects = document.get("subject_area")
     return {
         "ref": _project_ref(source_path),
@@ -248,9 +254,24 @@ def _project_document(document: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _project_documents(
+def _ticket_source_epoch(provider: Any, ticket_id: str) -> Any:
+    epoch = getattr(provider, "source_epoch", None)
+    if epoch is None:
+        from paths import SKILL_SOURCE_EPOCH_DIR
+        from providers.skills.source_epoch import SourceEpoch
+
+        epoch = SourceEpoch(SKILL_SOURCE_EPOCH_DIR, ticket_id=ticket_id)
+    if getattr(epoch, "ticket_id", None) != ticket_id:
+        raise SkillGatewayError(
+            "source_binding_changed", "Ticket source binding does not match"
+        )
+    return epoch
+
+
+async def _project_documents(
     provider: Any,
     *,
+    ticket_id: str,
     subject: str,
     phase: str,
     agent_name: str,
@@ -261,6 +282,19 @@ def _project_documents(
     source = getattr(provider, "project_context_source", None)
     if source is None:
         return None, []
+    epoch = _ticket_source_epoch(provider, ticket_id)
+    try:
+        snapshot_data = await asyncio.to_thread(
+            epoch.get_or_capture,
+            "local:agentic-perf-manifest",
+            source.binding_identity,
+            lambda: source.capture_snapshot().to_dict(),
+        )
+        source = LocalContextSnapshot.from_dict(snapshot_data)
+    except (OSError, ValueError, TypeError) as exc:
+        raise SkillGatewayError(
+            "source_snapshot_unavailable", "Project context snapshot is unavailable"
+        ) from exc
     documents = source.list_documents(
         harness="crucible",
         benchmark=benchmark,
@@ -374,9 +408,20 @@ def _config_ref(revision: str, subject: str, view: str) -> str:
     return f"{_CONFIG_PREFIX}{revision}/{subject}/{view}.json"
 
 
-def _source_ref(kind: str, subject: str, path: str) -> str:
+def _source_ref(
+    kind: str, subject: str, path: str, *, revision: str | None = None
+) -> str:
     prefix = _LOCAL_PREFIX if kind == "local" else _UPSTREAM_PREFIX
-    return prefix + quote(subject, safe="/") + "/" + quote(path, safe="/")
+    ref = prefix + quote(subject, safe="/") + "/" + quote(path, safe="/")
+    if kind == "upstream":
+        if not isinstance(revision, str) or not re.fullmatch(
+            r"[0-9a-f]{40,64}", revision
+        ):
+            raise SkillGatewayError(
+                "invalid_ref", "Upstream refs require a pinned revision"
+            )
+        ref += f"?revision={revision}"
+    return ref
 
 
 def _source_path_excluded(path: str) -> bool:
@@ -454,17 +499,31 @@ def _source_path_type(root: Path, relative: str, *, kind: str) -> tuple[Path, st
     )
 
 
-def _parse_source_ref(ref: str, kind: str) -> tuple[str, str]:
+def _parse_source_ref(ref: str, kind: str) -> tuple[str, str, str | None]:
     prefix = _LOCAL_PREFIX if kind == "local" else _UPSTREAM_PREFIX
     parsed = urlsplit(ref)
     if (
         not ref.startswith(prefix)
         or parsed.scheme != "skill"
         or parsed.netloc != kind
-        or parsed.query
         or parsed.fragment
     ):
         raise SkillGatewayError("invalid_ref", "Use a returned source document ref")
+    revision = None
+    if kind == "local":
+        if parsed.query:
+            raise SkillGatewayError("invalid_ref", "Use a returned local document ref")
+    else:
+        query = parsed.query.split("=")
+        if (
+            len(query) != 2
+            or query[0] != "revision"
+            or not re.fullmatch(r"[0-9a-f]{40,64}", query[1])
+        ):
+            raise SkillGatewayError(
+                "invalid_ref", "Upstream refs require a pinned revision"
+            )
+        revision = query[1]
     parts = unquote(parsed.path).lstrip("/").split("/", 2)
     if len(parts) != 3:
         raise SkillGatewayError("invalid_ref", "Use a returned source document ref")
@@ -477,7 +536,7 @@ def _parse_source_ref(ref: str, kind: str) -> tuple[str, str]:
     normalized = posixpath.normpath(path)
     if normalized in {"", ".", ".."} or normalized.startswith("../"):
         raise SkillGatewayError("invalid_document", "Invalid document path")
-    return subject, normalized
+    return subject, normalized, revision
 
 
 def _local_base(local_skills_dir: Path | None, subject: str) -> Path | None:
@@ -490,9 +549,258 @@ def _local_base(local_skills_dir: Path | None, subject: str) -> Path | None:
     return base
 
 
+class _TicketRepoView:
+    """Expose one verified ticket-owned checkout through RepoCache's read API."""
+
+    def __init__(
+        self,
+        name: str,
+        root: Path,
+        origin: str,
+        revision: str,
+        captured_at: str | None = None,
+    ) -> None:
+        self._name = name
+        self._root = root
+        self._origin = origin
+        self._revision = revision
+        self.captured_at = captured_at
+
+    def get_path(self, name: str) -> Path | None:
+        return self._root if name == self._name else None
+
+    def get_origin(self, name: str) -> str | None:
+        return self._origin if name == self._name else None
+
+    def get_revision(self, name: str) -> str | None:
+        return self._revision if name == self._name else None
+
+    def list_docs(
+        self,
+        name: str,
+        subdirs: list[str] | str = "docs",
+        extensions: list[str] | None = None,
+    ) -> list[dict[str, str | int]]:
+        if name != self._name:
+            return []
+        roots = [subdirs] if isinstance(subdirs, str) else subdirs
+        allowed = set(extensions or [".md", ".yml", ".yaml"])
+        results = []
+        package_bytes = 0
+        for subdir in roots:
+            directory = (self._root / subdir).resolve()
+            try:
+                directory.relative_to(self._root.resolve())
+            except (OSError, ValueError):
+                continue
+            if not directory.is_dir():
+                continue
+            for target in sorted(directory.rglob("*")):
+                if not target.is_file() or target.suffix.lower() not in allowed:
+                    continue
+                try:
+                    resolved = target.resolve(strict=True)
+                    resolved.relative_to(self._root.resolve())
+                    relative = resolved.relative_to(self._root.resolve()).as_posix()
+                except (OSError, ValueError, RuntimeError):
+                    continue
+                if _source_path_excluded(relative):
+                    continue
+                size_bytes = resolved.stat().st_size
+                if size_bytes > _MAX_SOURCE_DOCUMENT_BYTES:
+                    raise SkillGatewayError(
+                        "source_too_large", "Upstream document exceeds the limit"
+                    )
+                package_bytes += size_bytes
+                if (
+                    len(results) >= _MAX_UPSTREAM_DOCUMENTS
+                    or package_bytes > _MAX_UPSTREAM_PACKAGE_BYTES
+                ):
+                    raise SkillGatewayError(
+                        "source_too_large", "Upstream context package exceeds its limit"
+                    )
+                results.append({"path": relative, "size_bytes": size_bytes})
+        return sorted(results, key=lambda item: str(item["path"]))
+
+
+def _capture_local_tree(local_skills_dir: Path | None, subject: str) -> dict[str, Any]:
+    base = _local_base(local_skills_dir, subject)
+    if base is None:
+        return {
+            "available": False,
+            "revision": hashlib.sha256(b"missing").hexdigest(),
+            "documents": [],
+        }
+    listed = _list_local_documents(local_skills_dir, subject)
+    documents = []
+    total = 0
+    captured: dict[str, bytes] = {}
+    for item in listed:
+        relative = str(item["path"])
+        target, target_type = _source_path_type(base, relative, kind="local")
+        if target_type != "file":
+            continue
+        content_bytes = target.read_bytes()
+        if len(content_bytes) > _MAX_SOURCE_DOCUMENT_BYTES or b"\x00" in content_bytes:
+            raise SkillGatewayError(
+                "source_too_large", "Local document exceeds its limit"
+            )
+        total += len(content_bytes)
+        if total > 16 * _MAX_SOURCE_DOCUMENT_BYTES:
+            raise SkillGatewayError(
+                "source_too_large", "Local context package exceeds its limit"
+            )
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SkillGatewayError(
+                "source_unavailable", "Local document is not UTF-8"
+            ) from exc
+        captured[relative] = content_bytes
+        documents.append(
+            {
+                "path": relative,
+                "content": content,
+                "size_bytes": len(content_bytes),
+                "digest": hashlib.sha256(content_bytes).hexdigest(),
+            }
+        )
+    latest = _list_local_documents(local_skills_dir, subject)
+    if [item["path"] for item in latest] != [item["path"] for item in listed]:
+        raise SkillGatewayError(
+            "source_changed_during_capture", "Local source changed during capture"
+        )
+    for relative, content in captured.items():
+        target, target_type = _source_path_type(base, relative, kind="local")
+        if target_type != "file" or target.read_bytes() != content:
+            raise SkillGatewayError(
+                "source_changed_during_capture", "Local source changed during capture"
+            )
+    digest = hashlib.sha256()
+    for item in documents:
+        digest.update(item["path"].encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(captured[item["path"]])
+        digest.update(b"\0")
+    return {"available": True, "revision": digest.hexdigest(), "documents": documents}
+
+
+async def _ticket_source_snapshot(
+    provider: Any,
+    *,
+    ticket_id: str,
+    subject: str,
+    kind: str,
+    local_skills_dir: Path | None,
+    repo_cache: Any,
+) -> tuple[dict[str, Any] | None, Any | None]:
+    """Load one immutable ticket pin; upstream never falls back to shared cache files."""
+    if subject not in _LOCAL_SUBJECT_DIRS or kind not in {"local", "upstream"}:
+        return None, None
+    epoch = _ticket_source_epoch(provider, ticket_id)
+
+    if kind == "local":
+        root = Path(local_skills_dir).resolve() if local_skills_dir else Path()
+        identity = f"local-tree:{subject}:{root}"
+        try:
+            snapshot = await asyncio.to_thread(
+                epoch.get_or_capture,
+                f"local-tree:{subject}",
+                identity,
+                lambda: _capture_local_tree(local_skills_dir, subject),
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            raise SkillGatewayError(
+                "source_snapshot_unavailable", "Local context snapshot is unavailable"
+            ) from exc
+        result = (snapshot, None)
+    else:
+        repo_name = _UPSTREAM_REPOS.get(subject)
+        try:
+            source_id = f"upstream:{repo_name}"
+            snapshot = await asyncio.to_thread(epoch.read_pinned, source_id)
+            if snapshot is None:
+                get_origin = getattr(repo_cache, "get_origin", None)
+                origin = (
+                    get_origin(repo_name)
+                    if repo_name and callable(get_origin)
+                    else None
+                )
+                if not isinstance(origin, str) or not origin:
+                    raise SkillGatewayError(
+                        "source_unavailable",
+                        "No configured upstream origin is available",
+                    )
+                ref = "HEAD"
+            else:
+                origin = snapshot.get("repository")
+                ref = snapshot.get("ref")
+                if not isinstance(origin, str) or not isinstance(ref, str):
+                    raise SkillGatewayError(
+                        "invalid_snapshot", "Pinned upstream source metadata is invalid"
+                    )
+            identity = f"{origin}\0{ref}"
+            # Revalidate the durable record and its ticket-owned checkout on
+            # every list, read, or search request. In particular, do not let a
+            # provider-local cache outlive closed-ticket cleanup.
+            snapshot = await asyncio.to_thread(
+                epoch.capture_git_repository,
+                source_id,
+                identity,
+                origin,
+                ref=ref,
+            )
+            checkout = (epoch.snapshot_root / snapshot["checkout_path"]).resolve(
+                strict=True
+            )
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            raise SkillGatewayError(
+                "source_snapshot_unavailable", "Pinned upstream context is unavailable"
+            ) from exc
+        result = (
+            snapshot,
+            _TicketRepoView(
+                repo_name,
+                checkout,
+                origin,
+                str(snapshot["revision"]),
+                snapshot.get("captured_at"),
+            ),
+        )
+    return result
+
+
 def _list_local_documents(
-    local_skills_dir: Path | None, subject: str
+    local_skills_dir: Path | None,
+    subject: str,
+    *,
+    snapshot: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    if snapshot is not None:
+        revision = snapshot.get("revision")
+        documents = snapshot.get("documents")
+        if not isinstance(revision, str) or not isinstance(documents, list):
+            return []
+        results = []
+        for item in documents:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                continue
+            relative = item["path"]
+            ref = _source_ref("local", subject, relative)
+            results.append(
+                {
+                    "ref": ref,
+                    "uri": ref,
+                    "path": relative,
+                    "source": "agentic-perf",
+                    "scope": "local",
+                    "role": "operational-guidance",
+                    "revision": revision,
+                    "captured_at": snapshot.get("captured_at"),
+                    "size_bytes": item.get("size_bytes"),
+                }
+            )
+        return results
     base = _local_base(local_skills_dir, subject)
     if base is None:
         return []
@@ -534,6 +842,8 @@ def _list_source_directory(
     relative: str,
     *,
     provenance: tuple[str, str] | None = None,
+    revision: str | None = None,
+    captured_at: str | None = None,
     max_entries: int = 4096,
 ) -> dict[str, Any]:
     """List registered document types and immediate directories only."""
@@ -567,7 +877,7 @@ def _list_source_directory(
             continue
         if child_type not in {"directory", "file"}:
             continue
-        ref = _source_ref(kind, subject, child_relative)
+        ref = _source_ref(kind, subject, child_relative, revision=revision)
         source = (
             "agentic-perf"
             if kind == "local"
@@ -585,12 +895,92 @@ def _list_source_directory(
         if kind == "upstream":
             _source, provenance_status = provenance or ("upstream", "unverified")
             result["provenance_status"] = provenance_status
+            result["revision"] = revision
+            result["captured_at"] = captured_at
         results.append(result)
         if len(results) >= max_entries:
             complete = False
             break
     results.sort(key=lambda item: item["path"])
     return {"results": results, "complete": complete}
+
+
+def _local_snapshot_type(snapshot: dict[str, Any], relative: str) -> str:
+    documents = snapshot.get("documents", [])
+    paths = {
+        item.get("path")
+        for item in documents
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    if relative in paths:
+        return "file"
+    prefix = relative.rstrip("/") + "/" if relative else ""
+    if any(path.startswith(prefix) for path in paths):
+        return "directory"
+    raise SkillGatewayError(
+        "source_path_not_found", "The local source path does not exist"
+    )
+
+
+def _list_local_snapshot_directory(
+    snapshot: dict[str, Any], subject: str, relative: str
+) -> dict[str, Any]:
+    if not snapshot.get("available"):
+        raise SkillGatewayError("source_unavailable", "Local subject is unavailable")
+    if _local_snapshot_type(snapshot, relative) != "directory":
+        raise SkillGatewayError(
+            "source_path_not_directory",
+            "The requested source ref is a file; list its containing directory.",
+        )
+    prefix = relative.rstrip("/") + "/" if relative else ""
+    children: dict[str, str] = {}
+    sizes: dict[str, int] = {}
+    for item in snapshot.get("documents", []):
+        if not isinstance(item, dict):
+            continue
+        item_path = item.get("path")
+        if not isinstance(item_path, str) or not item_path.startswith(prefix):
+            continue
+        suffix = item_path[len(prefix) :]
+        if not suffix:
+            continue
+        child = suffix.split("/", 1)[0]
+        child_path = posixpath.join(relative, child) if relative else child
+        children[child_path] = "directory" if "/" in suffix else "file"
+        if children[child_path] == "file" and child_path == item_path:
+            sizes[child_path] = int(item.get("size_bytes", 0))
+    results = []
+    for path, kind in sorted(children.items()):
+        if kind == "file" and not path.lower().endswith(".md"):
+            continue
+        ref = _source_ref("local", subject, path)
+        results.append(
+            {
+                "ref": ref,
+                "uri": ref,
+                "path": path,
+                "source": "agentic-perf",
+                "scope": "local",
+                "type": kind,
+                "revision": snapshot.get("revision"),
+                "captured_at": snapshot.get("captured_at"),
+                "size_bytes": sizes.get(path) if kind == "file" else None,
+            }
+        )
+    return {"results": results, "complete": len(results) < 4096}
+
+
+def _resolve_local_snapshot_pointer(
+    snapshot: dict[str, Any], relative: str, pointer: str
+) -> tuple[str, str]:
+    if pointer.startswith(("/", "\\")) or "://" in pointer or "\\" in pointer:
+        raise SkillGatewayError("invalid_document", "Invalid relative pointer")
+    origin_type = _local_snapshot_type(snapshot, relative)
+    base = relative if origin_type == "directory" else posixpath.dirname(relative)
+    resolved = posixpath.normpath(posixpath.join(base, pointer))
+    if resolved in {"", ".", ".."} or resolved.startswith("../"):
+        raise SkillGatewayError("invalid_document", "Pointer leaves its source")
+    return resolved, _local_snapshot_type(snapshot, resolved)
 
 
 def _read_local_document(
@@ -601,7 +991,42 @@ def _read_local_document(
     offset_bytes: int,
     max_bytes: int,
     full_content: bool = False,
+    snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if snapshot is not None:
+        matches = [
+            item
+            for item in snapshot.get("documents", [])
+            if isinstance(item, dict) and item.get("path") == relative
+        ]
+        if not snapshot.get("available") or not matches:
+            raise SkillGatewayError(
+                "source_path_not_found", "The local document does not exist"
+            )
+        content = matches[0].get("content")
+        if not isinstance(content, str):
+            raise SkillGatewayError(
+                "source_read_failed", "The local document could not be read"
+            )
+        page = (
+            {"content": content, "offset": offset_bytes, "next_offset": None}
+            if full_content
+            else OrganizationSkillResolver._page(content, offset_bytes, max_bytes)
+        )
+        ref = _source_ref("local", subject, relative)
+        return {
+            "ref": ref,
+            "uri": ref,
+            "path": relative,
+            "source": "agentic-perf",
+            "scope": "local",
+            "role": "operational-guidance",
+            "revision": snapshot.get("revision"),
+            "captured_at": snapshot.get("captured_at"),
+            **page,
+            "offset_bytes": page["offset"],
+            "next_offset_bytes": page["next_offset"],
+        }
     base = _local_base(local_skills_dir, subject)
     if base is None:
         raise SkillGatewayError("source_unavailable", "Local subject is unavailable")
@@ -672,6 +1097,10 @@ def _upstream_provenance(repo_cache: Any, subject: str) -> tuple[str, str]:
         return "unknown cached repository", "unverified"
     get_origin = getattr(repo_cache, "get_origin", None)
     origin = get_origin(repo_name) if callable(get_origin) else None
+    get_revision = getattr(repo_cache, "get_revision", None)
+    revision = get_revision(repo_name) if callable(get_revision) else None
+    if isinstance(origin, str) and origin and isinstance(revision, str):
+        return origin, "pinned-upstream-commit"
     if isinstance(origin, str) and origin:
         return origin, "configured-cache-origin-unverified"
     return f"cached repository: {repo_name}", "unverified"
@@ -686,6 +1115,10 @@ def _list_upstream_documents(repo_cache: Any, subject: str) -> list[dict[str, An
         return []
     root = Path(source_path).resolve()
     source, provenance_status = _upstream_provenance(repo_cache, subject)
+    get_revision = getattr(repo_cache, "get_revision", None)
+    revision = get_revision(repo_name) if callable(get_revision) else None
+    if not isinstance(revision, str):
+        return []
     results = []
     for item in repo_cache.list_docs(repo_name, subdirs=["docs", "config"]):
         path = item.get("path")
@@ -701,7 +1134,7 @@ def _list_upstream_documents(repo_cache: Any, subject: str) -> list[dict[str, An
             ".yaml",
         }:
             continue
-        ref = _source_ref("upstream", subject, path)
+        ref = _source_ref("upstream", subject, path, revision=revision)
         results.append(
             {
                 "ref": ref,
@@ -710,6 +1143,8 @@ def _list_upstream_documents(repo_cache: Any, subject: str) -> list[dict[str, An
                 "source": source,
                 "scope": "upstream",
                 "provenance_status": provenance_status,
+                "revision": revision,
+                "captured_at": getattr(repo_cache, "captured_at", None),
                 "role": "software-reference",
                 "size_bytes": item.get("size_bytes", 0),
             }
@@ -725,6 +1160,7 @@ def _read_upstream_document(
     offset_bytes: int,
     max_bytes: int,
     full_content: bool = False,
+    expected_revision: str | None = None,
 ) -> dict[str, Any]:
     repo_name = _UPSTREAM_REPOS.get(subject)
     if not repo_name or repo_cache is None:
@@ -733,6 +1169,12 @@ def _read_upstream_document(
     if root is None:
         raise SkillGatewayError("source_unavailable", "Upstream cache is unavailable")
     root = Path(root).resolve()
+    get_revision = getattr(repo_cache, "get_revision", None)
+    revision = get_revision(repo_name) if callable(get_revision) else None
+    if not isinstance(revision, str) or revision != expected_revision:
+        raise SkillGatewayError(
+            "source_binding_changed", "Upstream revision does not match the ref"
+        )
     target, path_type = _source_path_type(root, relative, kind="upstream")
     if path_type == "directory":
         raise SkillGatewayError(
@@ -760,7 +1202,7 @@ def _read_upstream_document(
         if full_content
         else OrganizationSkillResolver._page(content, offset_bytes, max_bytes)
     )
-    ref = _source_ref("upstream", subject, relative)
+    ref = _source_ref("upstream", subject, relative, revision=revision)
     source, provenance_status = _upstream_provenance(repo_cache, subject)
     return {
         "ref": ref,
@@ -769,6 +1211,8 @@ def _read_upstream_document(
         "source": source,
         "scope": "upstream",
         "provenance_status": provenance_status,
+        "revision": revision,
+        "captured_at": getattr(repo_cache, "captured_at", None),
         "role": "software-reference",
         **page,
         "offset_bytes": page["offset"],
@@ -901,22 +1345,32 @@ def _search_source_documents(
     scope_path: str = "",
     local_skills_dir: Path | None = None,
     repo_cache: Any = None,
+    local_snapshot: dict[str, Any] | None = None,
+    expected_revision: str | None = None,
 ) -> dict[str, Any]:
     documents = (
-        _list_local_documents(local_skills_dir, subject)
+        _list_local_documents(local_skills_dir, subject, snapshot=local_snapshot)
         if kind == "local"
         else _list_upstream_documents(repo_cache, subject)
     )
     complete = len(documents) < 128 if kind == "local" else True
     if scope_path:
-        scope, scope_type = _source_path_type(root, scope_path, kind=kind)
+        if kind == "local":
+            scope_type = _local_snapshot_type(local_snapshot or {}, scope_path)
+            scope = None
+        else:
+            scope, scope_type = _source_path_type(root, scope_path, kind=kind)
         if scope_type == "directory":
             # Search inventories use repository-relative paths; normalize a
             # safe directory alias before filtering so its target's documents
             # remain discoverable with reusable canonical refs.
-            scope_path = scope.relative_to(root).as_posix()
+            scope_path = (
+                scope_path if kind == "local" else scope.relative_to(root).as_posix()
+            )
         if scope_type == "file":
-            allowed_ref = _source_ref(kind, subject, scope_path)
+            allowed_ref = _source_ref(
+                kind, subject, scope_path, revision=expected_revision
+            )
             if not any(item["ref"] == allowed_ref for item in documents):
                 raise SkillGatewayError(
                     "invalid_origin", "The file is not an exposed source document"
@@ -948,6 +1402,7 @@ def _search_source_documents(
                     offset_bytes=0,
                     max_bytes=16384,
                     full_content=True,
+                    snapshot=local_snapshot,
                 )
                 if kind == "local"
                 else _read_upstream_document(
@@ -957,6 +1412,7 @@ def _search_source_documents(
                     offset_bytes=0,
                     max_bytes=16384,
                     full_content=True,
+                    expected_revision=expected_revision,
                 )
             )
         except (OSError, ValueError, TypeError, SkillGatewayError):
@@ -1216,8 +1672,9 @@ async def _skill_context_list_search(
     from providers.workspace.manager import WorkspaceManager
 
     manager = WorkspaceManager(ticket_id=ticket_id, agent_name=agent_name, phase=phase)
-    project_source, project_documents = _project_documents(
+    project_source, project_documents = await _project_documents(
         provider,
+        ticket_id=ticket_id,
         subject=subject,
         phase=phase,
         agent_name=agent_name,
@@ -1329,6 +1786,49 @@ async def _skill_context_list_search(
         }
         if saved_binding:
             binding.update(saved_binding)
+        source_snapshot = None
+        source_repo_cache = repo_cache
+        source_revision = None
+        if source_kind in {"local", "upstream"}:
+            try:
+                source_snapshot, source_repo_cache = await _ticket_source_snapshot(
+                    provider,
+                    ticket_id=ticket_id,
+                    subject=subject,
+                    kind=source_kind,
+                    local_skills_dir=local_skills_dir,
+                    repo_cache=repo_cache,
+                )
+                if source_kind == "local":
+                    source_revision = source_snapshot.get("revision")
+                    if not source_snapshot.get("available"):
+                        raise SkillGatewayError(
+                            "source_unavailable", "Local subject is unavailable"
+                        )
+                else:
+                    source_revision = source_snapshot.get("revision")
+                    if source_repo_cache is None or not isinstance(
+                        source_revision, str
+                    ):
+                        raise SkillGatewayError(
+                            "source_unavailable",
+                            "Pinned upstream context is unavailable",
+                        )
+            except SkillGatewayError as exc:
+                sources.append(
+                    {
+                        "source": "agentic-perf"
+                        if source_kind == "local"
+                        else "upstream",
+                        "scope": source_kind,
+                        "found": False,
+                        "complete": False,
+                        "absence_confirmed": False,
+                        "status": "unavailable",
+                        "reason": exc.code,
+                    }
+                )
+                continue
         if cursor and saved_state.get("mode") == "items":
             items = saved_state.get("items")
             start = saved_state.get("index")
@@ -1503,40 +2003,88 @@ async def _skill_context_list_search(
             continue
         if operation == "list":
             kind = source_kind
-            source_root = _source_root(kind, subject, local_skills_dir, repo_cache)
-            if source_root is None:
-                raise SkillGatewayError("source_unavailable", "Source is not available")
-            root, provenance = source_root
-            if from_ref:
-                origin_subject, origin_path = _parse_source_ref(from_ref, kind)
-                if origin_subject != subject:
-                    raise SkillGatewayError(
-                        "invalid_origin", "Subject does not match source ref"
+            if kind == "local":
+                if from_ref:
+                    origin_subject, origin_path, origin_revision = _parse_source_ref(
+                        from_ref, kind
                     )
-                if path:
-                    relative, _kind = _resolve_source_pointer(
-                        kind, root, origin_path, path
-                    )
+                    if origin_subject != subject or origin_revision is not None:
+                        raise SkillGatewayError(
+                            "invalid_origin", "Subject does not match source ref"
+                        )
+                    if path:
+                        relative, _path_kind = _resolve_local_snapshot_pointer(
+                            source_snapshot, origin_path, path
+                        )
+                    else:
+                        origin_type = _local_snapshot_type(source_snapshot, origin_path)
+                        relative = (
+                            origin_path
+                            if origin_type == "directory"
+                            else posixpath.dirname(origin_path)
+                        )
                 else:
-                    _target, origin_type = _source_path_type(
-                        root, origin_path, kind=kind
+                    origin_subject, relative, origin_revision = _parse_source_ref(
+                        ref, kind
                     )
-                    relative = (
-                        origin_path
-                        if origin_type == "directory"
-                        else posixpath.dirname(origin_path)
-                    )
+                    if origin_subject != subject or origin_revision is not None:
+                        raise SkillGatewayError(
+                            "invalid_ref", "Subject does not match ref"
+                        )
+                listed = _list_local_snapshot_directory(
+                    source_snapshot, subject, relative
+                )
+                provenance = ("agentic-perf", "ticket-pinned-local-content")
+                source_revision = source_snapshot.get("revision")
             else:
-                origin_subject, relative = _parse_source_ref(ref, kind)
-                if origin_subject != subject:
-                    raise SkillGatewayError("invalid_ref", "Subject does not match ref")
-            listed = _list_source_directory(
-                kind,
-                root,
-                subject,
-                relative,
-                provenance=provenance,
-            )
+                source_root = _source_root(
+                    kind, subject, local_skills_dir, source_repo_cache
+                )
+                if source_root is None:
+                    raise SkillGatewayError(
+                        "source_unavailable", "Pinned source is not available"
+                    )
+                root, provenance = source_root
+                if from_ref:
+                    origin_subject, origin_path, origin_revision = _parse_source_ref(
+                        from_ref, kind
+                    )
+                    if origin_subject != subject or origin_revision != source_revision:
+                        raise SkillGatewayError(
+                            "source_binding_changed",
+                            "Upstream ref revision does not match",
+                        )
+                    if path:
+                        relative, _kind = _resolve_source_pointer(
+                            kind, root, origin_path, path
+                        )
+                    else:
+                        _target, origin_type = _source_path_type(
+                            root, origin_path, kind=kind
+                        )
+                        relative = (
+                            origin_path
+                            if origin_type == "directory"
+                            else posixpath.dirname(origin_path)
+                        )
+                else:
+                    origin_subject, relative, origin_revision = _parse_source_ref(
+                        ref, kind
+                    )
+                    if origin_subject != subject or origin_revision != source_revision:
+                        raise SkillGatewayError(
+                            "source_binding_changed",
+                            "Upstream ref revision does not match",
+                        )
+                listed = _list_source_directory(
+                    kind,
+                    root,
+                    subject,
+                    relative,
+                    provenance=provenance,
+                    revision=source_revision,
+                    captured_at=source_snapshot.get("captured_at"),
+                )
             binding.update({"scope": relative})
             _append_source_page(
                 sources,
@@ -1549,9 +2097,15 @@ async def _skill_context_list_search(
                 metadata={
                     "source": provenance[0],
                     "scope": kind,
-                    "scope_ref": _source_ref(kind, subject, relative),
+                    "scope_ref": _source_ref(
+                        kind,
+                        subject,
+                        relative,
+                        revision=source_revision if kind == "upstream" else None,
+                    ),
                     "scope_kind": "immediate_children",
                     "recursive": False,
+                    "captured_at": source_snapshot.get("captured_at"),
                     "total_entries": len(listed["results"]),
                     "complete": listed["complete"],
                 },
@@ -1776,31 +2330,49 @@ async def _skill_context_list_search(
             )
             continue
 
-        root_data = _source_root(source_kind, subject, local_skills_dir, repo_cache)
-        if root_data is None:
-            sources.append(
-                {
-                    "source": "agentic-perf" if source_kind == "local" else "upstream",
-                    "scope": source_kind,
-                    "found": False,
-                    "complete": False,
-                    "absence_confirmed": False,
-                    "reason": "source_unavailable",
-                }
+        local_snapshot = source_snapshot if source_kind == "local" else None
+        if source_kind == "local":
+            root = Path()
+            provenance = ("agentic-perf", "ticket-pinned-local-content")
+        else:
+            root_data = _source_root(
+                source_kind, subject, local_skills_dir, source_repo_cache
             )
-            continue
-        root, provenance = root_data
+            if root_data is None:
+                sources.append(
+                    {
+                        "source": "upstream",
+                        "scope": source_kind,
+                        "found": False,
+                        "complete": False,
+                        "absence_confirmed": False,
+                        "reason": "source_unavailable",
+                    }
+                )
+                continue
+            root, provenance = root_data
         scope_path = ""
         if from_ref:
-            origin_subject, origin_path = _parse_source_ref(from_ref, source_kind)
-            if origin_subject != subject:
+            origin_subject, origin_path, origin_revision = _parse_source_ref(
+                from_ref, source_kind
+            )
+            if (
+                origin_subject != subject
+                or (source_kind == "upstream" and origin_revision != source_revision)
+                or (source_kind == "local" and origin_revision is not None)
+            ):
                 raise SkillGatewayError(
-                    "invalid_origin", "Subject does not match source ref"
+                    "source_binding_changed", "Source ref does not match its ticket pin"
                 )
             if path:
-                scope_path, _scope_type = _resolve_source_pointer(
-                    source_kind, root, origin_path, path
-                )
+                if source_kind == "local":
+                    scope_path, _scope_type = _resolve_local_snapshot_pointer(
+                        local_snapshot, origin_path, path
+                    )
+                else:
+                    scope_path, _scope_type = _resolve_source_pointer(
+                        source_kind, root, origin_path, path
+                    )
             else:
                 scope_path = origin_path
         if cursor and saved_state.get("mode") == "items":
@@ -1813,7 +2385,9 @@ async def _skill_context_list_search(
             query,
             scope_path=scope_path,
             local_skills_dir=local_skills_dir,
-            repo_cache=repo_cache,
+            repo_cache=source_repo_cache,
+            local_snapshot=local_snapshot,
+            expected_revision=source_revision if source_kind == "upstream" else None,
         )
         items = scanned["results"]
         binding.update({"scope": scanned["scope_path"]})
@@ -1829,6 +2403,7 @@ async def _skill_context_list_search(
                 "source": scanned["source"],
                 "scope": source_kind,
                 "scope_ref": from_ref or None,
+                "revision": source_revision,
                 "provenance_status": scanned["provenance_status"],
                 "query_mode": scanned["query_mode"],
                 "scanned_bytes": scanned["scanned_bytes"],
@@ -1943,8 +2518,9 @@ async def skill_context_gateway(
             "benchmark",
             "review",
         }
-        project_source, project_documents = _project_documents(
+        project_source, project_documents = await _project_documents(
             provider,
+            ticket_id=ticket_id,
             subject=subject,
             phase=phase,
             agent_name=agent_name,
@@ -1960,7 +2536,9 @@ async def skill_context_gateway(
             ]
             entrypoints = list(organization.get("entrypoints", []))
             if project_source is not None:
-                project_revision = project_source.revision()
+                project_revision = getattr(project_source, "revision", None)
+                if callable(project_revision):
+                    project_revision = project_revision()
                 sources.append(
                     {
                         "source": "agentic-perf",
@@ -1969,6 +2547,7 @@ async def skill_context_gateway(
                         "status": "available" if project_revision else "unavailable",
                         "reason": "explicit_manifest_source",
                         "revision": project_revision,
+                        "captured_at": getattr(project_source, "captured_at", None),
                         "document_count": len(project_documents),
                     }
                 )
@@ -1977,34 +2556,92 @@ async def skill_context_gateway(
                     item["ref"] for item in project_documents if item["entrypoint"]
                 )
             if subject in _LOCAL_SUBJECT_DIRS:
-                local_documents = _list_local_documents(local_skills_dir, subject)
-                sources.append(
-                    {
-                        "source": "agentic-perf",
-                        "scope": "local",
-                        "status": "available" if local_documents else "unavailable",
-                        "document_count": len(local_documents),
-                    }
-                )
-                documents.extend(local_documents)
-                entrypoints.extend(item["ref"] for item in local_documents)
-                upstream_documents = _list_upstream_documents(repo_cache, subject)
-                upstream = _UPSTREAM_REPOS.get(subject)
-                if upstream:
-                    source, provenance_status = _upstream_provenance(
-                        repo_cache, subject
+                try:
+                    local_snapshot, _local_view = await _ticket_source_snapshot(
+                        provider,
+                        ticket_id=ticket_id,
+                        subject=subject,
+                        kind="local",
+                        local_skills_dir=local_skills_dir,
+                        repo_cache=repo_cache,
                     )
+                except SkillGatewayError as exc:
+                    local_snapshot = None
                     sources.append(
                         {
-                            "source": source,
-                            "scope": "upstream",
-                            "provenance_status": provenance_status,
-                            "status": "available"
-                            if upstream_documents
-                            else "unavailable",
-                            "document_count": len(upstream_documents),
+                            "source": "agentic-perf",
+                            "scope": "local",
+                            "status": "unavailable",
+                            "reason": exc.code,
+                            "complete": False,
                         }
                     )
+                local_documents = (
+                    _list_local_documents(
+                        local_skills_dir, subject, snapshot=local_snapshot
+                    )
+                    if local_snapshot and local_snapshot.get("available")
+                    else []
+                )
+                if local_snapshot is not None:
+                    sources.append(
+                        {
+                            "source": "agentic-perf",
+                            "scope": "local",
+                            "status": "available"
+                            if local_snapshot.get("available")
+                            else "unavailable",
+                            "reason": "ticket_pinned_local_content",
+                            "revision": local_snapshot.get("revision"),
+                            "captured_at": local_snapshot.get("captured_at"),
+                            "document_count": len(local_documents),
+                        }
+                    )
+                documents.extend(local_documents)
+                entrypoints.extend(item["ref"] for item in local_documents)
+                upstream = _UPSTREAM_REPOS.get(subject)
+                if upstream:
+                    try:
+                        (
+                            upstream_snapshot,
+                            upstream_cache,
+                        ) = await _ticket_source_snapshot(
+                            provider,
+                            ticket_id=ticket_id,
+                            subject=subject,
+                            kind="upstream",
+                            local_skills_dir=local_skills_dir,
+                            repo_cache=repo_cache,
+                        )
+                        upstream_documents = _list_upstream_documents(
+                            upstream_cache, subject
+                        )
+                        source, provenance_status = _upstream_provenance(
+                            upstream_cache, subject
+                        )
+                        sources.append(
+                            {
+                                "source": source,
+                                "scope": "upstream",
+                                "provenance_status": provenance_status,
+                                "status": "available",
+                                "revision": upstream_snapshot.get("revision"),
+                                "captured_at": upstream_snapshot.get("captured_at"),
+                                "reason": "ticket_pinned_upstream_commit",
+                                "document_count": len(upstream_documents),
+                            }
+                        )
+                    except SkillGatewayError as exc:
+                        upstream_documents = []
+                        sources.append(
+                            {
+                                "source": "upstream",
+                                "scope": "upstream",
+                                "status": "unavailable",
+                                "reason": exc.code,
+                                "complete": False,
+                            }
+                        )
                     documents.extend(upstream_documents)
             if software_allowed:
                 software = json.loads(
@@ -2226,19 +2863,22 @@ async def skill_context_gateway(
                     raise SkillGatewayError(
                         "invalid_document", "Use origin and relative pointer"
                     )
-                source_subject, relative = _parse_source_ref(
+                source_subject, relative, source_revision = _parse_source_ref(
                     from_ref if path else ref, "local"
                 )
-                if source_subject != subject:
+                if source_subject != subject or source_revision is not None:
                     raise SkillGatewayError("invalid_ref", "Subject does not match ref")
+                source_snapshot, _source_view = await _ticket_source_snapshot(
+                    provider,
+                    ticket_id=ticket_id,
+                    subject=subject,
+                    kind="local",
+                    local_skills_dir=local_skills_dir,
+                    repo_cache=repo_cache,
+                )
                 if path:
-                    base = _local_base(local_skills_dir, subject)
-                    if base is None:
-                        raise SkillGatewayError(
-                            "source_unavailable", "Local subject is unavailable"
-                        )
-                    relative, _target_type = _resolve_source_pointer(
-                        "local", base, relative, path
+                    relative, _target_type = _resolve_local_snapshot_pointer(
+                        source_snapshot, relative, path
                     )
                 document = _read_local_document(
                     local_skills_dir,
@@ -2246,6 +2886,7 @@ async def skill_context_gateway(
                     relative,
                     offset_bytes=offset_bytes,
                     max_bytes=max_bytes,
+                    snapshot=source_snapshot,
                 )
                 return json.dumps({"found": True, "document": document})
             if ref.startswith(_UPSTREAM_PREFIX) or from_ref.startswith(
@@ -2255,14 +2896,27 @@ async def skill_context_gateway(
                     raise SkillGatewayError(
                         "invalid_document", "Use origin and relative pointer"
                     )
-                source_subject, relative = _parse_source_ref(
+                source_subject, relative, source_revision = _parse_source_ref(
                     from_ref if path else ref, "upstream"
                 )
                 if source_subject != subject:
                     raise SkillGatewayError("invalid_ref", "Subject does not match ref")
+                source_snapshot, source_repo_cache = await _ticket_source_snapshot(
+                    provider,
+                    ticket_id=ticket_id,
+                    subject=subject,
+                    kind="upstream",
+                    local_skills_dir=local_skills_dir,
+                    repo_cache=repo_cache,
+                )
+                if source_revision != source_snapshot.get("revision"):
+                    raise SkillGatewayError(
+                        "source_binding_changed",
+                        "Upstream ref revision does not match the ticket pin",
+                    )
                 if path:
                     source = _source_root(
-                        "upstream", subject, local_skills_dir, repo_cache
+                        "upstream", subject, local_skills_dir, source_repo_cache
                     )
                     if source is None:
                         raise SkillGatewayError(
@@ -2272,11 +2926,12 @@ async def skill_context_gateway(
                         "upstream", source[0], relative, path
                     )
                 document = _read_upstream_document(
-                    repo_cache,
+                    source_repo_cache,
                     subject,
                     relative,
                     offset_bytes=offset_bytes,
                     max_bytes=max_bytes,
+                    expected_revision=source_revision,
                 )
                 return json.dumps({"found": True, "document": document})
             if not software_allowed:
