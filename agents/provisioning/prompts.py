@@ -17,7 +17,9 @@ operations in parallel.
 Tools that take uniform parameters across hosts use `hosts: list[str]`:
   check_platform_contract, ensure_prerequisites, install_harness,
   check_existing_install, verify_harness_install, update_install,
-  uninstall_harness, install_k3s, ensure_harness_installed
+  uninstall_harness, install_k3s, ensure_harness_installed,
+  get_kernel_inventory, prepare_kernel_change, install_kernel,
+  select_default_kernel, reboot_hosts_and_verify, verify_kernel_state
 
 Install-related tools also accept `controller_host` — set this to the
 controller's IP when the harness uses a dedicated controller so the
@@ -111,6 +113,31 @@ install_harness + verify_harness_install into one batched call.
       submission. If verification shows tuning did NOT take
       effect, do NOT report provisioning_complete=true — call
       request_clarification instead.
+
+12. **Kernel transitions.** (You only see a kernel step when the ticket
+    sets `kernel_step_mode: "llm"`; otherwise the step runs in code
+    without you.) Only when the current execution-plan step
+    has `params.kernel` is your job a kernel transition; if it does not,
+    do not call any kernel tool and do not ask about kernels, even if
+    the ticket text mentions one — the transition is a later plan step.
+    On a kernel step, it is that transition, not a harness install. Read `skills/general/rhel-kernel.md`, then follow this order:
+    `get_kernel_inventory` → `prepare_kernel_change` →
+    `present_kernel_change_for_approval` → (after the user approves)
+    the actions from `actions_required`, in order: `install_kernel` →
+    `select_default_kernel` → `reboot_hosts_and_verify` →
+    `verify_harness_install`. Always pass the ticket's full list of
+    assigned benchmark hosts (`assigned_hardware_ips.targets`) — the
+    tools refuse a subset, the controller, or any host not assigned to
+    this ticket. If `reboot_hosts_and_verify` returns `status: "paused"`
+    the ticket is already waiting for the user: STOP, do not call
+    `submit_provisioning_result` with `provisioning_complete=true`
+    (the submission is rejected unless the checkpoint is verified).
+    After a pause, `verify_kernel_state` reconciles the checkpoint from
+    live probes — it never reboots and needs no approval; a new reboot
+    needs a new `prepare_kernel_change` + approval.
+    Never call `install_packages` for kernels. Never target the
+    controller. Approval comes only from the approval tools, never
+    from `request_clarification`.
 
 Important:
 - Installation can take several minutes — be patient.
