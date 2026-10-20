@@ -72,6 +72,9 @@ roots, and served skill directories. The private snapshot includes runtime
 configuration; only manifest-listed document projections leave the resolver.
 The sensitive snapshot filename suppresses content digests in filesystem trace
 attributes. A durable pin is written after the snapshot and verified on reads.
+First-use subject snapshots write an audited pending marker before capture;
+handled failures remove it for retry, while interruption leaves residue that
+fails closed instead of recapturing changed source content.
 The source preparation, attempt snapshot, and cleanup paths share a stable
 per-ticket lock under `skill-snapshots/source-pins`; a closed marker remains
 after the source pin and private content are removed. This fences workers that

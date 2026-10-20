@@ -973,6 +973,7 @@ class OrganizationSkillResolver:
                 owns_snapshot = False
                 pin_path = candidate / "pin.json"
                 snapshot_path = candidate / "private-snapshot.json"
+                pending_capture_path = candidate / "capture-pending.json"
                 try:
                     if pin_path.is_file() and not pin_path.is_symlink():
                         pin = json.loads(self._read_bytes(pin_path, 64 * 1024))
@@ -987,6 +988,18 @@ class OrganizationSkillResolver:
                         owns_snapshot = isinstance(
                             subject, str
                         ) and candidate.name == _digest([ticket_id, "initial", subject])
+                    if (
+                        not owns_snapshot
+                        and pending_capture_path.is_file()
+                        and not pending_capture_path.is_symlink()
+                    ):
+                        pending = json.loads(
+                            self._read_bytes(pending_capture_path, 4096)
+                        )
+                        owns_snapshot = (
+                            pending.get("schema_version") == 1
+                            and pending.get("ticket_key") == ticket_key
+                        )
                 except (OSError, ValueError, TypeError, RecursionError):
                     continue
                 if not owns_snapshot:
@@ -1491,22 +1504,49 @@ class OrganizationSkillResolver:
                     raise SkillGatewayError(
                         "invalid_snapshot", "Pinned skill snapshot is unavailable"
                     ) from None
-            snapshot = self._capture(bindings)
-            snapshot["captured_at"] = datetime.now(timezone.utc).isoformat(
-                timespec="seconds"
-            )
-            content = json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode()
-            filesystem.write(f"{key}/private-snapshot.json", content)
+            snapshot_dir = self.snapshot_root / key
+            if any(path.name != "lock" for path in snapshot_dir.iterdir()):
+                raise SkillGatewayError(
+                    "invalid_snapshot", "Unpinned skill snapshot is unavailable"
+                )
+            pending_relative = f"{key}/capture-pending.json"
             filesystem.write(
-                f"{key}/pin.json",
+                pending_relative,
                 json.dumps(
                     {
-                        "digest": hashlib.sha256(content).hexdigest(),
-                        "ticket_key": _digest([self.ticket_id]),
+                        "schema_version": 1,
+                        "ticket_key": ticket_key,
                         "attempt_key": _digest([self.attempt_id]),
-                    }
+                    },
+                    sort_keys=True,
                 ),
+                mode=0o600,
             )
+            try:
+                snapshot = self._capture(bindings)
+                snapshot["captured_at"] = datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                )
+                content = json.dumps(
+                    snapshot, sort_keys=True, ensure_ascii=False
+                ).encode()
+                filesystem.write(f"{key}/private-snapshot.json", content)
+                filesystem.write(
+                    f"{key}/pin.json",
+                    json.dumps(
+                        {
+                            "digest": hashlib.sha256(content).hexdigest(),
+                            "ticket_key": ticket_key,
+                            "attempt_key": _digest([self.attempt_id]),
+                        }
+                    ),
+                )
+            except Exception:
+                # A handled capture failure is retryable. A process interruption
+                # leaves this marker behind so later reads fail closed.
+                filesystem.unlink(pending_relative, missing_ok=True)
+                raise
+            filesystem.unlink(pending_relative, missing_ok=True)
             return snapshot
         except SkillGatewayError:
             raise

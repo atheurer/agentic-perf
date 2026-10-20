@@ -67,6 +67,14 @@ class MCPToolCallError(RuntimeError):
         self.retry_classification = retry_classification
 
 
+class _MCPRegistrationRefreshError(RuntimeError):
+    """Tool registration could not be checked before a reconnected call."""
+
+    def __init__(self, tool_name: str, *, timed_out: bool) -> None:
+        super().__init__(f"Could not verify tool {tool_name!r} after MCP reconnect")
+        self.timed_out = timed_out
+
+
 @dataclass(frozen=True)
 class MCPHookResult:
     """Explicit result contract for provider hooks and internal dispatch.
@@ -1265,7 +1273,9 @@ class AgentMCPClient:
                 conn.name,
                 type(exc).__name__,
             )
-            return f"Could not verify tool {name!r} after MCP reconnect"
+            raise _MCPRegistrationRefreshError(
+                name, timed_out=isinstance(exc, TimeoutError)
+            ) from None
 
         if (
             self._servers.get(conn.name) is not conn
@@ -1424,6 +1434,35 @@ class AgentMCPClient:
                     RetryKind.TRANSPORT_BEFORE_SEND,
                 )
                 raise
+            except _MCPRegistrationRefreshError as exc:
+                state = (
+                    LifecycleState.TIMED_OUT if exc.timed_out else LifecycleState.FAILED
+                )
+                outcome = (
+                    OperationOutcome.TIMED_OUT
+                    if exc.timed_out
+                    else OperationOutcome.FAILURE
+                )
+                terminal_recorded = self._record_boundary(
+                    conn,
+                    state,
+                    context=context,
+                    tool_name=name,
+                    outcome=outcome,
+                    retry_kind=RetryKind.TRANSPORT_BEFORE_SEND,
+                    error=exc,
+                )
+                if audit_state is not None:
+                    audit_state.terminal_recorded = terminal_recorded
+                    audit_state.request_sent = False
+                    audit_state.retry_classification = "transport_before_send"
+                return MCPHookResult(
+                    content=self._redact_client_message(conn, context, str(exc)),
+                    is_error=True,
+                    request_sent=False,
+                    retry_classification="transport_before_send",
+                    audit_recorded=terminal_recorded,
+                )
             if policy_error:
                 message = self._redact_client_message(conn, context, policy_error)
                 terminal_recorded = self._record_boundary(

@@ -132,10 +132,8 @@ class CrucibleSourceResolution:
 class CrucibleSourceResolver:
     """Resolve an already-present Crucible checkout without network access.
 
-    Crucible repositories are deliberately never cloned or refreshed by
-    agentic-perf.  The designated controller or an explicitly configured
-    local checkout is the source of truth; unavailable content remains
-    unavailable for the caller to report.
+    This compatibility resolver does not clone repositories. Ticket-bound
+    gateway captures are managed separately by ``TicketSourceEpoch``.
     """
 
     def __init__(
@@ -201,7 +199,11 @@ class CrucibleSourceResolver:
 
 
 class CrucibleCatalogFetcher:
-    """Read a bounded set of Crucible files without creating a checkout."""
+    """Read bounded files from a ticket checkout or compatibility HTTP source.
+
+    The fetcher does not create checkouts; ticket checkout capture belongs to
+    ``CrucibleContextGateway`` and ``TicketSourceEpoch``.
+    """
 
     def __init__(
         self,
@@ -318,8 +320,9 @@ class CrucibleCatalogSkillProvider(SkillProvider):
     Crucible runtime context is served by ``CrucibleContextGateway`` rather
     than local skill files. Triage still needs Crucible to participate in the
     common capability interface, so this facade exposes only catalog-backed
-    benchmark identity and metadata. It never creates a checkout or generates
-    a run file.
+    benchmark identity and metadata. The ticket-bound gateway lazily captures
+    required repositories in service-only storage; this facade does not create
+    checkouts or generate run files.
     """
 
     def __init__(self, gateway: "CrucibleContextGateway") -> None:
@@ -423,6 +426,9 @@ class CrucibleContextGateway:
     ) -> tuple[Path, str]:
         if self._source_epoch is None:
             raise RuntimeError("Ticket source epoch is not configured")
+        cache_key = (namespace, name)
+        self._ticket_repository_paths.pop(cache_key, None)
+        self._ticket_repository_metadata.pop(cache_key, None)
         if not isinstance(repository, str) or not repository:
             raise SkillGatewayError(
                 "source_unavailable", "Catalog repository URL is unavailable"
@@ -726,9 +732,8 @@ class CrucibleContextGateway:
                     if cached and cached.is_dir():
                         return cached.resolve()
 
-        # Catalog URLs describe where a repository lives, but agentic-perf
-        # never clones them.  The repository must already be present in the
-        # controller checkout or in an explicitly supplied local checkout.
+        # Catalog URLs alone do not fetch children for no-ticket compatibility.
+        # Ticket-bound callers capture selected repositories through SourceEpoch.
         return None
 
     def _controller_repository_path(self, name: str) -> Path | None:
@@ -794,6 +799,8 @@ class CrucibleContextGateway:
         for this lookup.
         """
         if self._source_epoch is not None:
+            if not entry or entry.get("type") != "benchmark":
+                return None
             return self._ticket_repository_paths.get(("benchmark", name))
         candidates = [
             self._source_repo / "subprojects" / "benchmarks" / name
@@ -808,35 +815,49 @@ class CrucibleContextGateway:
                 return candidate
         return None
 
-    def _benchmark_source(
-        self, name: str, entry: dict[str, Any] | None = None
+    def _child_source_provenance(
+        self, name: str, entry: dict[str, Any], repo_path: Path | None
     ) -> dict[str, Any]:
-        entry = entry or {}
-        source: dict[str, Any] = {
-            "repository": entry.get("repository"),
-            "ref": self._entry_ref(entry) if entry else None,
-            "mode": (entry.get("checkout") or {}).get("mode"),
-            "catalog": "crucible/config/repos.json",
-            "metadata_files": ["multiplex.json", "rickshaw.json"],
-        }
-        source.update(self._source_provenance)
-        repo_path = self._source_benchmark_path(name, entry)
+        source = dict(self._source_provenance)
+        if self._source_epoch is not None:
+            for field in ("repository", "ref", "commit", "revision", "captured_at"):
+                source.pop(field, None)
+        source["repository"] = entry.get("repository")
+        source["ref"] = self._entry_ref(entry)
         if self._source_epoch is not None:
             source["snapshot_status"] = (
                 "ticket_pinned" if repo_path is not None else "unavailable"
             )
-            source.update(
-                self._ticket_repository_metadata.get(
+            if repo_path is not None:
+                metadata = self._ticket_repository_metadata.get(
                     (self._entry_namespace(entry), name), {}
                 )
-            )
+                source.update(metadata)
+                revision = metadata.get("revision")
+                if isinstance(revision, str):
+                    source["commit"] = revision
         else:
             source["snapshot_status"] = "unpinned_no_ticket"
-        if repo_path:
-            try:
-                source["commit"] = self._git_revision(repo_path)
-            except (OSError, subprocess.SubprocessError):
-                pass
+            if repo_path is not None:
+                try:
+                    source["commit"] = self._git_revision(repo_path)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        return source
+
+    def _benchmark_source(
+        self, name: str, entry: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        entry = entry or {}
+        repo_path = self._source_benchmark_path(name, entry)
+        source = self._child_source_provenance(name, entry, repo_path)
+        source.update(
+            {
+                "mode": (entry.get("checkout") or {}).get("mode"),
+                "catalog": "crucible/config/repos.json",
+                "metadata_files": ["multiplex.json", "rickshaw.json"],
+            }
+        )
         return source
 
     def _git_revision(self, repo_path: Path) -> str | None:
@@ -1210,9 +1231,7 @@ class CrucibleContextGateway:
                         self._benchmark_source(name, entry)
                         if entry.get("type") == "benchmark"
                         else {
-                            **self._source_provenance,
-                            "repository": entry.get("repository"),
-                            "ref": (entry.get("checkout") or {}).get("target"),
+                            **self._child_source_provenance(name, entry, repo),
                             "catalog": "crucible/config/repos.json",
                         },
                     )
@@ -1563,10 +1582,14 @@ class CrucibleContextGateway:
         ):
             return meta
         entry = catalog_entries.get(name)
-        source_dir = self._source_benchmark_path(name, entry)
-        source_dir = source_dir or self._controller_benchmark_path(name)
-        if self._source_epoch is not None and source_dir is None:
-            return meta
+        if self._source_epoch is not None:
+            source_dir = self._source_benchmark_path(name, entry)
+            if source_dir is None:
+                return meta
+        else:
+            source_dir = self._source_benchmark_path(
+                name, entry
+            ) or self._controller_benchmark_path(name)
         if source_dir is None and entry:
             repository = entry.get("repository")
             ref = self._entry_ref(entry)
@@ -1622,6 +1645,28 @@ class CrucibleContextGateway:
         await self._ensure_ticket_core()
         results = []
         source_entries = self._catalog_benchmark_entries()
+        if self._source_epoch is not None:
+            cached_names = {
+                name
+                for namespace, name in self._ticket_repository_paths
+                if namespace == "benchmark"
+            } | {
+                name
+                for namespace, name in self._ticket_repository_metadata
+                if namespace == "benchmark"
+            }
+            for name in sorted(cached_names):
+                entry = source_entries.get(name)
+                key = ("benchmark", name)
+                if entry is None:
+                    self._ticket_repository_paths.pop(key, None)
+                    self._ticket_repository_metadata.pop(key, None)
+                    continue
+                try:
+                    await self._ensure_ticket_child(name, entry)
+                except SkillGatewayError:
+                    # Keep the catalog name but do not expose invalid child metadata.
+                    pass
         names = set(self._discover_benchmarks()) | set(source_entries)
         for name in sorted(names):
             meta = self._load_benchmark_meta(name)

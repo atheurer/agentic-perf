@@ -313,29 +313,97 @@ def _project_read_target(
     ref: str,
     path: str,
     from_ref: str,
+    allow_directory: bool = False,
 ) -> dict[str, Any]:
     by_ref = {item["ref"]: item for item in documents}
-    if path:
+    origin = None
+    if from_ref:
         if ref or from_ref not in by_ref:
+            if ref or not allow_directory:
+                raise SkillGatewayError(
+                    "origin_required", "Origin must be an exported project ref"
+                )
+            origin = _project_directory_target(documents, from_ref)
+        else:
+            origin = by_ref[from_ref]
+    if path:
+        if origin is None:
             raise SkillGatewayError(
                 "origin_required", "Pointer requires a returned project document ref"
             )
         if path.startswith(("/", "\\")) or "://" in path or "\\" in path:
             raise SkillGatewayError("invalid_document", "Invalid relative pointer")
-        origin = by_ref[from_ref]["source_path"]
-        target = posixpath.normpath(posixpath.join(posixpath.dirname(origin), path))
-        if target in {"..", "."} or target.startswith("../"):
+        origin_path = origin["source_path"]
+        base_path = (
+            origin_path
+            if origin.get("is_directory")
+            else posixpath.dirname(origin_path)
+        )
+        target = posixpath.normpath(posixpath.join(base_path, path))
+        if target == ".." or target.startswith("../"):
             raise SkillGatewayError(
                 "invalid_document", "Pointer escapes the project source"
             )
+        target = "" if target == "." else target
         candidate = next(
             (item for item in documents if item["source_path"] == target), None
         )
+        if candidate is None and allow_directory:
+            candidate = _project_directory_target(
+                documents, _project_ref(target or ".")
+            )
     else:
-        candidate = by_ref.get(ref)
+        if origin is not None:
+            candidate = origin
+        else:
+            candidate = by_ref.get(ref)
+            if candidate is None and allow_directory:
+                candidate = _project_directory_target(documents, ref)
     if candidate is None:
         raise SkillGatewayError("invalid_ref", "Use a returned project document ref")
     return candidate
+
+
+def _project_directory_target(
+    documents: list[dict[str, Any]], ref: str
+) -> dict[str, Any]:
+    if not isinstance(ref, str) or not ref.startswith(_PROJECT_PREFIX):
+        raise SkillGatewayError("invalid_ref", "Use an exported project directory ref")
+    encoded_path = ref[len(_PROJECT_PREFIX) :]
+    source_path = unquote(encoded_path)
+    if _project_ref(source_path) != ref:
+        raise SkillGatewayError("invalid_ref", "Use a canonical project directory ref")
+    if source_path in {"", "."}:
+        directory = ""
+    elif (
+        source_path.startswith(("/", "\\"))
+        or "\\" in source_path
+        or posixpath.normpath(source_path) != source_path
+        or source_path.startswith("../")
+        or source_path == ".."
+    ):
+        raise SkillGatewayError("invalid_ref", "Invalid project directory ref")
+    else:
+        directory = source_path
+    prefix = f"{directory.rstrip('/')}/" if directory else ""
+    if not any(
+        item["source_path"].startswith(prefix) and item["source_path"] != directory
+        for item in documents
+    ):
+        raise SkillGatewayError(
+            "invalid_ref", "Project directory has no exported files"
+        )
+    return {
+        "ref": ref,
+        "source_path": directory,
+        "is_directory": True,
+    }
+
+
+def _project_scope_path(target: dict[str, Any]) -> str:
+    if target.get("is_directory"):
+        return target["source_path"]
+    return posixpath.dirname(target["source_path"])
 
 
 def _project_search_documents(
@@ -1950,7 +2018,11 @@ async def _skill_context_list_search(
                 )
             if from_ref:
                 origin = _project_read_target(
-                    project_documents, ref="", path="", from_ref=from_ref
+                    project_documents,
+                    ref="",
+                    path="",
+                    from_ref=from_ref,
+                    allow_directory=True,
                 )
                 if path:
                     origin = _project_read_target(
@@ -1958,12 +2030,17 @@ async def _skill_context_list_search(
                         ref="",
                         path=path,
                         from_ref=from_ref,
+                        allow_directory=True,
                     )
             else:
                 origin = _project_read_target(
-                    project_documents, ref=ref, path="", from_ref=""
+                    project_documents,
+                    ref=ref,
+                    path="",
+                    from_ref="",
+                    allow_directory=True,
                 )
-            scope_path = posixpath.dirname(origin["source_path"])
+            scope_path = _project_scope_path(origin)
             items = [
                 {
                     "ref": item["ref"],
@@ -2286,7 +2363,11 @@ async def _skill_context_list_search(
             scope_path = ""
             if from_ref:
                 origin = _project_read_target(
-                    project_documents, ref="", path="", from_ref=from_ref
+                    project_documents,
+                    ref="",
+                    path="",
+                    from_ref=from_ref,
+                    allow_directory=True,
                 )
                 if path:
                     target = _project_read_target(
@@ -2294,10 +2375,11 @@ async def _skill_context_list_search(
                         ref="",
                         path=path,
                         from_ref=from_ref,
+                        allow_directory=True,
                     )
-                    scope_path = target["source_path"]
+                    scope_path = _project_scope_path(target)
                 else:
-                    scope_path = posixpath.dirname(origin["source_path"])
+                    scope_path = _project_scope_path(origin)
             scanned = _project_search_documents(
                 project_source,
                 project_documents,

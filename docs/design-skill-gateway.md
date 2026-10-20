@@ -66,7 +66,7 @@ flowchart LR
     Tools[Provisioning and execution tools] --> Resolver
     Resolver --> Org[Organization repository]
     Resolver --> Software[Crucible software source]
-    Software --> GitHub[GitHub catalog and bounded triage metadata]
+    Software --> GitHub[Ticket-pinned Crucible catalog and selected children]
     Software --> Controller[Installed controller documentation]
     Tools --> Secrets[Existing secret resolver]
 ```
@@ -267,8 +267,10 @@ time, and content remain server-side and are returned as source provenance.
 Existing tickets do not silently recapture content after a pin disappears;
 they fail closed. Git source discovery is deferred by offline
 `config show`; the first provider initialization reports fetch or authentication
-failures as required source errors. A remote skill source does not clone
-Crucible software repositories during catalog discovery.
+failures as required source errors. The no-ticket compatibility catalog path
+uses bounded file fetches without creating ticket checkouts. Ticket-bound gateway
+catalog reads capture an exact service-only checkout lazily on first use and
+reuse that revision for the ticket.
 
 ## Organization repository and packages
 
@@ -425,24 +427,32 @@ credential references, and transport details stay server-side.
 Use a shared gateway implementation and MCP tool registration for every consuming
 agent. A ticket-scoped MCP server is a suitable initial host, using the existing
 `connect_ticket_server` and audit infrastructure. Software adapters retain the
-current Crucible controller and bounded catalog behavior. A catalog of available
+current Crucible controller and bounded catalog responses. A catalog of available
 subjects supports administrator diagnostics and agent subject discovery without
 claiming that every harness already has a software adapter.
 
 ### GitHub retrieval during triage
 
-`harness/crucible` retains both upstream and installed-software sources. Triage
-uses the existing bounded GitHub/repository-file retrieval for the Crucible
-catalog and the benchmark metadata needed to identify suites, roles, host
-requirements, and basic supported parameters. It requires neither a controller
-nor a local Crucible checkout, and does not clone or refresh Crucible repositories.
+`harness/crucible` retains both upstream and installed-software sources. Ticket-
+bound catalog reads capture the Crucible core repository at its resolved commit
+in service-only source storage before reading catalog data. Listing and resolving
+benchmarks need only that core capture; requesting details or context captures
+the selected child repository at the ref recorded in the pinned catalog. These
+captures are lazy, immutable for the ticket, and reused across phases and
+restarts. The gateway can do this without an installed controller or pre-existing
+Crucible checkout. The checkout size is not bounded; only returned catalog metadata and
+allowlisted context documents are subject to response/package limits.
+
+No-ticket compatibility reads retain the bounded GitHub file-fetch path and are
+reported as unpinned. They do not create ticket checkouts.
 
 Existing triage tools such as `list_benchmarks`, `resolve_benchmark`, and
 `get_benchmark_details` retain their structured interfaces. Their Crucible
 catalog provider uses the subject's software adapter and shared resolution
 contracts; agents do not need to replace benchmark discovery with raw document
-reads. Upstream files can be cached with their own revision/provenance without
-being treated as installed-runtime truth.
+reads. Ticket responses include the selected child revision and capture time,
+along with the separate core catalog commit. Upstream files are not treated as
+installed-runtime truth.
 
 Organization guidance is an additional source for the same subject. It does not
 replace the upstream catalog or the controller's documentation. Provisioning
@@ -673,8 +683,9 @@ Required checks before team rollout include:
 - Keep explicit subject binding overrides and report discovery failures.
 - Bootstrap organization guidance without a controller; retrieve software docs
   when the phase has a controller; report required-source failures explicitly.
-- Preserve existing controller entrypoint traversal, paging, search, path
-  containment, and triage's bounded/no-clone catalog behavior.
+- Preserve existing controller entrypoint traversal, paging, search, and path
+  containment. Keep ticket source capture lazy and service-only, and bound the
+  catalog metadata and context returned to agents.
 - Keep subjects, scopes, same-named documents, phases, and revisions distinct in
   gateway and workspace retrieval, including cache hits and handoffs.
 - Make source content updates affect new tickets while current tickets retain their
