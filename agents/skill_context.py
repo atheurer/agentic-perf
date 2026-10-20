@@ -43,10 +43,13 @@ skill files, repository caches, or workspace copies of source documents.
 Use `operation="search", query=<pattern>` when needed. Organization search
 accepts POSIX extended regex without backreferences. Project-local and cached
 upstream searches use case-insensitive literal terms; `|` separates
-alternatives. If organization search returns a continuation cursor, scope the
-next search with an organization `from_ref` and pass its `next_offset_bytes`.
-Other source searches are bounded discovery without continuation paging.
-Optionally pass `from_ref` to restrict discovery to that document's source.
+alternatives. Search and list results paginate independently by source. When a
+source returns `has_more: true` and `next_cursor`, repeat the same operation
+with that source's cursor and the same subject, query, and original scope
+(`from_ref`, `ref`, and `path`). Keep an unscoped search unscoped while
+continuing it; do not add an organization origin or change the relative path.
+Continue each source with its own cursor until it has no more results. Optionally
+pass `from_ref` to restrict discovery to that document's source.
 Read selected search results separately. Read pages contain `document.content`;
 continue the same read with `offset_bytes=next_offset_bytes` until it is null,
 keeping the same `max_bytes` (default 16384).

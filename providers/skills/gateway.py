@@ -1555,6 +1555,7 @@ class OrganizationSkillResolver:
         pattern: str,
         *,
         from_ref: str | None = None,
+        path: str | None = None,
         offset: int = 0,
         max_bytes: int = MAX_PAGE_BYTES,
     ) -> dict[str, Any]:
@@ -1568,7 +1569,13 @@ class OrganizationSkillResolver:
         if snapshot is None:
             raise SkillGatewayError("subject_unconfigured", "Subject is unconfigured")
         source_filter = None
+        scope_path = None
+        scan_scope = "all applicable organization documents"
         if ref:
+            if path:
+                raise SkillGatewayError(
+                    "invalid_scope", "Use from_ref with a relative search path"
+                )
             snapshot, relative = self._document(subject, ref, from_ref)
             paths = [relative]
         else:
@@ -1582,11 +1589,79 @@ class OrganizationSkillResolver:
                 if origin_entry is None:
                     raise SkillGatewayError("invalid_origin", "Unknown search origin")
                 source_filter = origin_entry["source_id"]
+                source_root = f"sources/{source_filter}"
+                base = posixpath.dirname(origin_path)
+                if path:
+                    pointer = urlsplit(path)
+                    if (
+                        pointer.scheme
+                        or pointer.netloc
+                        or pointer.query
+                        or pointer.fragment
+                        or path.startswith("/")
+                        or "\\" in path
+                    ):
+                        raise SkillGatewayError(
+                            "invalid_scope",
+                            "Search path must be relative to its origin",
+                        )
+                    pointer_path = unquote(pointer.path)
+                    if any(
+                        character in pointer_path
+                        for character in ("\x00", "\t", "\n", "\r")
+                    ):
+                        raise SkillGatewayError(
+                            "invalid_scope",
+                            "Search path contains unsupported characters",
+                        )
+                    scope_path = posixpath.normpath(posixpath.join(base, pointer_path))
+                else:
+                    scope_path = base
+                if scope_path != source_root and not scope_path.startswith(
+                    f"{source_root}/"
+                ):
+                    raise SkillGatewayError(
+                        "invalid_scope", "Search path leaves its organization source"
+                    )
+                scoped_documents = [
+                    document
+                    for document in snapshot["documents"]
+                    if self._visible(document)
+                    and document["source_id"] == source_filter
+                    and (
+                        document["path"] == scope_path
+                        or document["path"].startswith(f"{scope_path.rstrip('/')}/")
+                    )
+                ]
+                if not scoped_documents:
+                    raise SkillGatewayError(
+                        "invalid_scope",
+                        "Search path has no exported documents available in this phase",
+                    )
+                exact_document = any(
+                    document["path"] == scope_path for document in scoped_documents
+                )
+                scope_documents = (
+                    [
+                        document
+                        for document in scoped_documents
+                        if document["path"] == scope_path
+                    ]
+                    if exact_document
+                    else scoped_documents
+                )
+                source_path = scope_path.removeprefix(source_root).lstrip("/")
+                scan_scope = f"{source_filter}:{source_path or '.'}"
+            elif path:
+                raise SkillGatewayError(
+                    "invalid_scope", "Use from_ref with a relative search path"
+                )
             paths = [
-                d["path"]
-                for d in snapshot["documents"]
-                if self._visible(d)
-                and (source_filter is None or d["source_id"] == source_filter)
+                document["path"]
+                for document in snapshot["documents"]
+                if self._visible(document)
+                and (source_filter is None or document["source_id"] == source_filter)
+                and (scope_path is None or document in scope_documents)
             ]
         lines, positions = [], []
         for path in paths:
@@ -1718,6 +1793,7 @@ class OrganizationSkillResolver:
             "subject": subject,
             "source": "organization",
             "revision": snapshot["revision"],
+            "scan_scope": scan_scope,
             "matches_count": len(matches),
             "matches": page_matches,
             "search_limited": search_limited,

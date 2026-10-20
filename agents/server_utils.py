@@ -495,6 +495,21 @@ def _controller_relative_path(path: str) -> str | None:
     return candidate.as_posix()
 
 
+def _controller_relative_pointer(base: str, pointer: str) -> str | None:
+    """Resolve an in-root relative pointer before applying the path validator."""
+    if (
+        not pointer
+        or pointer.startswith(("/", "\\"))
+        or "\\" in pointer
+        or any(character in pointer for character in ("\x00", "\t", "\n", "\r"))
+    ):
+        return None
+    normalized = posixpath.normpath(posixpath.join(base, pointer))
+    if normalized in {"", "."}:
+        return ""
+    return _controller_relative_path(normalized)
+
+
 async def _search_controller_source(
     *,
     ssh: Any,
@@ -1201,15 +1216,15 @@ async def controller_context_gateway(
         origin_is_directory = origin_result.stdout.strip() == "directory"
         if operation == "read" and path:
             base = origin if origin_is_directory else posixpath.dirname(origin)
-            relative = _controller_relative_path(posixpath.join(base, path))
+            relative = _controller_relative_pointer(base, path)
         elif operation == "list" and path:
             base = origin if origin_is_directory else posixpath.dirname(origin)
-            relative = _controller_relative_path(posixpath.join(base, path))
+            relative = _controller_relative_pointer(base, path)
         elif operation == "list":
             relative = origin if origin_is_directory else posixpath.dirname(origin)
         elif operation == "search" and path:
             base = origin if origin_is_directory else posixpath.dirname(origin)
-            relative = _controller_relative_path(posixpath.join(base, path))
+            relative = _controller_relative_pointer(base, path)
         elif operation == "search":
             base = origin if origin_is_directory else posixpath.dirname(origin)
             relative = _controller_relative_path(base) if base else ""

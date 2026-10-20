@@ -45,12 +45,18 @@ and directory origins use that directory.
 Search without from_ref searches every applicable source. A file origin searches
 its parent directory; a directory origin searches recursively inside that
 directory. Organization search uses POSIX extended regular expressions without
-backreferences; controller search uses Python regular expressions and falls back
-to a literal query when the expression is invalid. Local and upstream search use
-literal alternatives separated by '|'. For list and search, max_bytes bounds the
-complete serialized result page.
-Continue each source with its next_cursor and the same operation and query; the
-cursor retains its original source, origin, and relative path.
+backreferences and is limited to registered, phase-visible documents in the
+origin's organization source; its optional path narrows that scope. Controller
+search uses Python regular expressions and falls back to a literal query when
+the expression is invalid. Local and upstream search use literal alternatives
+separated by '|'. For list and search, max_bytes bounds the complete serialized
+result page.
+Continue each source with its next_cursor and the same operation, subject, query,
+and original scope (`from_ref`, `ref`, and `path`). Do not change an unscoped
+request into a scoped one while continuing. The cursor retains its original
+source, origin, and relative path. If the next complete result cannot fit with
+the required response envelope, the gateway returns `page_too_small` without a
+continuation cursor.
 The opaque cursor is ticket-, agent-, phase-, subject-, source-, scope-, and
 query-bound. Search/list pages report scan completeness; an incomplete scan does
 not confirm that no matches exist. Read pages remain bounded to max_bytes of
@@ -824,9 +830,10 @@ def _source_page(
         if page and used + size > budget:
             break
         if not page and size > budget:
-            raise SkillGatewayError(
-                "page_too_small", "max_bytes cannot fit one complete result object"
-            )
+            # Let final envelope accounting decide whether this indivisible
+            # result fits the actual response budget.
+            page.append(item)
+            break
         page.append(item)
         used += size
         if len(page) >= 20:
@@ -851,6 +858,7 @@ def _append_source_page(
     organization_offset: int = 0,
 ) -> None:
     page = _source_page(items, start, budget)
+    has_more = start + len(page) < len(items) or backend_more
     source = {
         **metadata,
         key: page,
@@ -858,9 +866,10 @@ def _append_source_page(
         "matches_count": total,
         "complete": complete,
         "absence_confirmed": total == 0 and complete,
-        "has_more": start + len(page) < len(items) or backend_more,
-        "next_cursor": "c" * 32,
+        "has_more": has_more,
     }
+    if has_more:
+        source["next_cursor"] = "c" * 32
     sources.append(source)
     pages.append(
         {
@@ -881,6 +890,71 @@ def _compact_json_bytes(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
 
 
+def _page_has_pending_items(page: dict[str, Any]) -> bool:
+    if page["mode"] == "organization_offset":
+        return bool(page["items"]) or page["backend_more"]
+    return page["start"] < len(page["items"])
+
+
+def _page_too_small_result(
+    result: dict[str, Any], pages: list[dict[str, Any]], budget: int
+) -> str:
+    blocked_sources = []
+    for page in pages:
+        if page["source"][page["key"]] or not _page_has_pending_items(page):
+            continue
+        source_ref = (
+            page["source"].get("scope_ref")
+            or page["binding"].get("origin")
+            or page["binding"].get("ref")
+            or (
+                page["items"][page["start"]].get("ref")
+                if page["start"] < len(page["items"])
+                else None
+            )
+        )
+        blocked = {
+            "source": page["source"].get(
+                "source", page["source"].get("scope", "unknown")
+            )
+        }
+        if source_ref:
+            blocked["scope_ref"] = source_ref
+        blocked_sources.append(blocked)
+
+    return _page_too_small_response(
+        result["subject"], result["operation"], blocked_sources, budget
+    )
+
+
+def _page_too_small_response(
+    subject: str,
+    operation: str,
+    blocked_sources: list[dict[str, Any]],
+    budget: int,
+) -> str:
+    payload = {
+        "found": False,
+        "subject": subject,
+        "operation": operation,
+        "reason": "page_too_small",
+        "message": "Increase max_bytes and retry; no continuation cursor was created.",
+        "sources": blocked_sources,
+    }
+    while _compact_json_bytes(payload) > budget and len(blocked_sources) > 1:
+        blocked_sources.pop()
+    if _compact_json_bytes(payload) > budget:
+        for blocked in blocked_sources:
+            blocked.pop("scope_ref", None)
+    if _compact_json_bytes(payload) > budget:
+        payload = {
+            "found": False,
+            "operation": operation,
+            "reason": "page_too_small",
+        }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
 def _finalize_search_list_result(
     result: dict[str, Any],
     pages: list[dict[str, Any]],
@@ -891,15 +965,7 @@ def _finalize_search_list_result(
     while _compact_json_bytes(result) > budget:
         candidates = [page for page in pages if page["source"][page["key"]]]
         if not candidates:
-            return json.dumps(
-                {
-                    "found": False,
-                    "operation": result["operation"],
-                    "reason": "page_too_small",
-                    "message": "max_bytes cannot fit the complete result envelope.",
-                },
-                separators=(",", ":"),
-            )
+            return _page_too_small_result(result, pages, budget)
         page = max(
             candidates,
             key=lambda item: _compact_json_bytes(item["source"][item["key"]][-1]),
@@ -907,6 +973,12 @@ def _finalize_search_list_result(
         page["source"][page["key"]].pop()
         page["forced_more"] = True
         page["source"]["has_more"] = True
+        page["source"].setdefault("next_cursor", "c" * 32)
+    if any(
+        not page["source"][page["key"]] and _page_has_pending_items(page)
+        for page in pages
+    ):
+        return _page_too_small_result(result, pages, budget)
     for page in pages:
         source = page["source"]
         if page["mode"] == "organization_offset":
@@ -1039,7 +1111,7 @@ async def _skill_context_list_search(
             ]
         else:
             selected_sources = []
-            if organization.get("status") == "available":
+            if organization.get("status") in {"available", "unavailable"}:
                 selected_sources.append("organization")
             if subject == "harness/crucible" and phase in {"benchmark", "review"}:
                 selected_sources.append("controller")
@@ -1255,6 +1327,10 @@ async def _skill_context_list_search(
                         "complete": False,
                         "absence_confirmed": False,
                         "reason": organization.get("error", "source_unavailable"),
+                        "message": organization.get(
+                            "message",
+                            "Configured organization guidance could not be searched.",
+                        ),
                     }
                 )
                 continue
@@ -1267,28 +1343,52 @@ async def _skill_context_list_search(
                 if cursor and saved_state.get("mode") == "organization_offset"
                 else 0
             )
-            if origin_ref:
-                resolver.read(subject, origin_ref, max_bytes=16384)
-            org = resolver.search(
-                subject,
-                None,
-                query,
-                from_ref=origin_ref or None,
-                offset=org_offset,
-                max_bytes=max(128, per_source_budget - 128),
-            )
+            try:
+                org = resolver.search(
+                    subject,
+                    None,
+                    query,
+                    from_ref=origin_ref or None,
+                    path=path or None,
+                    offset=org_offset,
+                    max_bytes=max(128, per_source_budget - 128),
+                )
+            except SkillGatewayError as exc:
+                if exc.code != "page_too_small":
+                    raise
+                safe_ref = origin_ref or next(
+                    (
+                        document.get("ref")
+                        for document in organization.get("documents", [])
+                        if isinstance(document.get("ref"), str)
+                    ),
+                    None,
+                )
+                blocked = {"source": "organization"}
+                if safe_ref:
+                    blocked["scope_ref"] = safe_ref
+                return _page_too_small_response(subject, operation, [blocked], budget)
             org_matches = org.get("matches", [])
             complete = not org.get("search_limited", False)
             more = org.get("next_offset") is not None
-            binding.update({"scope": origin_ref or "all-organization-documents"})
+            binding.update(
+                {
+                    "scope": org.get(
+                        "scan_scope", "all applicable organization documents"
+                    )
+                }
+            )
             metadata = {
                 "source": "organization",
                 "scope": "organization",
                 "scope_ref": origin_ref or None,
+                "relative_path": path or None,
+                "scan_scope": org.get(
+                    "scan_scope", "all applicable organization documents"
+                ),
                 "revision": org.get("revision"),
                 "search_limited": org.get("search_limited", False),
                 "query_mode": "posix-extended-regex",
-                "scan_scope": origin_ref or "all applicable organization documents",
             }
             _append_source_page(
                 sources,
@@ -1527,13 +1627,20 @@ async def skill_context_gateway(
         organization = resolver.bootstrap(subject)
         organization.setdefault("scope", "organization")
         if organization.get("status") == "unavailable" and organization.get("required"):
+            unavailable_source = {
+                **organization,
+                "complete": False,
+                "absence_confirmed": False,
+            }
             return json.dumps(
                 {
                     "found": False,
+                    "complete": False,
+                    "absence_confirmed": False,
                     "subject": subject,
                     "operation": operation,
                     "reason": organization.get("error", "organization_unavailable"),
-                    "sources": [organization],
+                    "sources": [unavailable_source],
                 }
             )
         revision = organization.get("revision", "legacy")

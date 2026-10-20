@@ -349,6 +349,9 @@ named `AGENTS.md`. To follow a relative pointer inside a document, supply
 `from_ref` plus `path`. The gateway checks the origin's actual type: a file
 origin resolves relative to its parent, and a directory origin resolves inside
 that directory. Directory refs returned by `list` can be reused directly.
+Controller pointers are normalized after the gateway confirms the origin type;
+parent and sibling paths are accepted only when their normalized target remains
+inside the installed controller root and outside excluded paths.
 Listing returns only sorted immediate children, with file/directory types and
 exact refs. It never fetches child contents recursively. Organization package
 and service-config directories are not exposed; that backend reports listing as
@@ -356,19 +359,28 @@ unsupported while preserving its registered document and phase rules.
 
 Search without `from_ref` searches every applicable source. A file origin
 searches its parent directory, while a directory origin searches that subtree
-recursively. Software searches honor that scope, including encoded-colon
-repository refs. Every source returns a bounded page of structured results and
-its own opaque `next_cursor` when more results are available. Pass the same
-operation and query with that cursor to continue; the cursor retains the original
-source, origin, and relative path. Cursors live in the ticket's audited workspace
-snapshot and bind to ticket, agent, phase, subject, source, scope, and query;
-another ticket or scope cannot reuse them. `max_bytes` bounds the complete
-serialized list/search response, including its envelope and all source pages.
+recursively. For organization search, the optional path narrows a returned file
+origin's parent directory to an exported file or subtree in the same source;
+search sees only registered documents visible in the current phase. It does not
+enumerate package directories or service configuration. Software searches honor
+their scope, including encoded-colon repository refs. Every source returns a
+bounded page of structured results and its own opaque `next_cursor` when more
+results are available. Continue a source with that cursor and the same subject,
+operation, query, and original scope (`from_ref`, `ref`, and `path`); keep an
+unscoped search unscoped. Cursors live in the ticket's audited workspace snapshot
+and bind to ticket, agent, phase, subject, source, scope, and query; another
+ticket or scope cannot reuse them. `max_bytes` bounds the complete serialized
+list/search response, including its envelope and all source pages.
 The benchmark Crucible wrapper counts its run-file contract toward that budget;
 if the contract and result envelope cannot fit, it returns `page_too_small`
-without the contract.
+without the contract. If the next indivisible result cannot fit with the response
+envelope, `page_too_small` includes safe source refs and creates no continuation
+cursor; increase `max_bytes` to continue without a nonadvancing page.
 `offset_bytes` remains document-read pagination. Search and listing report
-whether scanning completed, so an incomplete scan cannot confirm absence.
+whether scanning completed, so an incomplete scan cannot confirm absence. A
+configured but unavailable source remains incomplete in the aggregate result;
+unconfigured sources are omitted, and phase-inapplicable documents are not
+treated as transport failures.
 
 Bootstrap can also identify approved configuration views for the current phase,
 such as execution defaults or review settings. Existing config-display tools can
