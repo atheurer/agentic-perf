@@ -1006,19 +1006,27 @@ Shared workspace, gateway, and host-inspection tools have no harness owner.
 Harness-specific MCP registrations attach `owner_harness` metadata beside the
 tool implementation. `AgentMCPClient.list_tools()` uses that metadata to hide
 tools for other ticket harnesses, and `call_tool()` enforces the same owner
-before sending a request. Native benchmark handlers use the owner carried by
-their `ToolDefinition`; owned local MCP handlers also resolve the selected
-harness from the server-loaded ticket before running.
+before sending a request. After reconnect, it refreshes the server's tool
+registration and checks ownership and visibility again before retrying. Native
+benchmark handlers use the owner carried by their `ToolDefinition`; owned
+local MCP handlers also resolve the selected harness from the server-loaded
+ticket before running.
 
-Generic benchmark execution derives its harness from the ticket and rejects a
-conflicting model-supplied `harness` argument. Adding a harness-owned tool
-therefore does not require editing a BenchmarkAgent tool-name table. For an
-upstream external MCP server that cannot return owner metadata, its adapter
-declares tool groups beside the integration that uses them. Arcaflow's
-registration in `providers/skills/arcaflow_mcp.py` owns plugin discovery and
-workflow tools; raw workflow execution and polling tools stay hidden from the
-model while remaining callable by the local workflow adapter. Unknown tools
-from that ownership-required Arcaflow server are hidden and rejected. Other
+Generic benchmark execution derives its harness from the same trusted ticket
+selection used by the prompt and discovery: `workflow_source`,
+`directives.harness`, legacy top-level harness, then the provider's
+code-configured default. It rejects a conflicting model-supplied `harness`
+argument and runs only when that provider declares generic execution support;
+Crucible's built-in fallback is guarded separately.
+Harnesses with dedicated execution tools do not receive the generic executor.
+Adding a harness-owned tool therefore does not require editing a BenchmarkAgent
+tool-name table. For an upstream external MCP server that cannot return owner
+metadata, its adapter declares tool groups beside the integration that uses
+them. Arcaflow's registration in `providers/skills/arcaflow_mcp.py` owns plugin
+discovery and workflow tools; raw workflow execution and polling tools stay
+hidden from the model while remaining callable by the local workflow adapter.
+Unknown tools from that ownership-required Arcaflow server are hidden and
+rejected. Other
 external servers without a first-party adapter can use `enabled_tools` groups
 keyed by harness; the group drives discovery and client-side rejection.
 

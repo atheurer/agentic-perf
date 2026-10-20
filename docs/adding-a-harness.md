@@ -63,12 +63,20 @@ execution harness from the ticket, and rejects a conflicting harness argument
 from the model. An unowned first-party tool is shared; do not use organization
 or user context to grant a specialized execution capability. Ownership-required
 external registration groups fail closed for tools without an owner.
-Owned execution requires a persisted ticket selection in
-`custom_fields.directives.harness` (or the legacy top-level
-`custom_fields.harness`); `workflow_source` selects Arcaflow workflows. A
-legacy ticket with none of these fields fails closed with an actionable
-execution error. A provider default or organization document does not grant
+Owned execution resolves its ticket selection in this order:
+`directives.workflow_source`, `directives.harness`, legacy top-level
+`custom_fields.harness`, then the provider's code-configured `default_harness`.
+This same selection drives the prompt, tool discovery, and dispatch, preserving
+default-only legacy tickets. Organization documents and user prose never grant
 execution ownership.
+
+The shared `execute_benchmark` handler also checks whether the selected
+provider declares `generic_execution_supported = True`. Set this beside the
+provider only when `agents/benchmark/server.py` implements that provider's
+generic execution branch. Harnesses with their own execution tools should
+leave the default false; unsupported calls are rejected before execution
+state changes. Crucible uses the server's built-in generic adapter and has a
+separate final guard on its fallback branch.
 
 For an upstream external MCP server that cannot attach tool metadata, put its
 tool groups in a small adapter beside the code that uses that server, then

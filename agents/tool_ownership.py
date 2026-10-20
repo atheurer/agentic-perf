@@ -61,8 +61,16 @@ def tool_visible_to_model(tool: Any) -> bool:
     return visible
 
 
-def selected_harness_from_ticket(ticket: dict[str, Any]) -> str:
-    """Resolve an explicitly persisted harness selection from this ticket."""
+def selected_harness_from_ticket(
+    ticket: dict[str, Any], *, default_harness: str = ""
+) -> str:
+    """Resolve the ticket selection, falling back to a trusted local default.
+
+    Selection precedence is persisted workflow source, directives.harness,
+    legacy custom_fields.harness, then the provider's code-configured default.
+    Organization prose and other ticket context never supply execution
+    ownership.
+    """
     from providers.skills.base import HARNESS_ALIASES, WORKFLOW_HARNESS
 
     custom_fields = ticket.get("custom_fields", {})
@@ -75,7 +83,9 @@ def selected_harness_from_ticket(ticket: dict[str, Any]) -> str:
         return WORKFLOW_HARNESS
 
     selected = directives.get("harness") or custom_fields.get("harness")
-    if not isinstance(selected, str):
+    if not isinstance(selected, str) or not selected:
+        selected = default_harness
+    if not isinstance(selected, str) or not selected:
         return ""
     return HARNESS_ALIASES.get(selected, selected)
 
@@ -83,11 +93,15 @@ def selected_harness_from_ticket(ticket: dict[str, Any]) -> str:
 def require_ticket_harness(
     ticket: dict[str, Any],
     owner_harness: str,
+    *,
+    default_harness: str = "",
 ) -> None:
     """Reject an owned handler unless the server-loaded ticket selects it."""
     if not owner_harness:
         raise ValueError("owner_harness must be a non-empty string")
-    selected_harness = selected_harness_from_ticket(ticket)
+    selected_harness = selected_harness_from_ticket(
+        ticket, default_harness=default_harness
+    )
     if selected_harness != owner_harness:
         raise ToolOwnershipError(
             f"Tool requires ticket harness {owner_harness!r}; "

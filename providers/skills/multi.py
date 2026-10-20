@@ -48,6 +48,11 @@ class MultiHarnessSkillProvider(SkillProvider):
     def get_provider(self, harness_name: str) -> SkillProvider | None:
         return self._harnesses.get(harness_name)
 
+    def supports_generic_execution_for(self, harness_name: str) -> bool:
+        """Return whether the selected adapter has a generic executor branch."""
+        provider = self.get_provider(harness_name)
+        return bool(getattr(provider, "generic_execution_supported", False))
+
     def bind_attempt(self, ticket_id: str, attempt_id: str, phase: str) -> None:
         """Use the server-selected attempt for all private-config consumers."""
         self._private.bind_attempt(ticket_id, attempt_id, phase)

@@ -509,14 +509,22 @@ class BenchmarkAgent(AgentBase):
             )
         return f"Approval {decision} for request {approval_id}. Do not execute the benchmark."
 
+    def _ticket_harness(self, ticket: dict[str, Any]) -> str:
+        """Resolve one trusted harness selection for prompt and tool policy."""
+        provider = getattr(self, "_skill_provider", None)
+        default_harness = getattr(provider, "default_harness", "")
+        return selected_harness_from_ticket(
+            ticket,
+            default_harness=(
+                default_harness if isinstance(default_harness, str) else ""
+            ),
+        )
+
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
         ticket = await self._get_ticket(ticket_id)
-        harness = self._effective_harness(
-            ticket.get("custom_fields", {}).get("directives", {}),
-            getattr(self, "_skill_provider", None),
-        )
-        selected_ticket_harness = selected_harness_from_ticket(ticket)
+        harness = self._ticket_harness(ticket)
+        selected_ticket_harness = harness
 
         bench_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
@@ -623,17 +631,13 @@ class BenchmarkAgent(AgentBase):
 
     def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:
         """Filter owned local tools and apply legacy documentation policy."""
-        selected_harness = selected_harness_from_ticket(ticket)
+        selected_harness = self._ticket_harness(ticket)
         self.tools = [
             tool
             for tool in self.tools
             if tool.owner_harness is None or tool.owner_harness == selected_harness
         ]
-        harness = self._effective_harness(
-            ticket.get("custom_fields", {}).get("directives", {}),
-            getattr(self, "_skill_provider", None),
-        )
-        excluded = self._LEGACY_CONTEXT_EXCLUDED_TOOLS.get(harness, set())
+        excluded = self._LEGACY_CONTEXT_EXCLUDED_TOOLS.get(selected_harness, set())
         if excluded:
             self.tools = [tool for tool in self.tools if tool.name not in excluded]
 
@@ -667,9 +671,7 @@ class BenchmarkAgent(AgentBase):
         directives = cf.get("directives", {})
         provider = cf.get("resource_provider") or directives.get("resource_provider")
         endpoint = directives.get("endpoint_type", "remotehosts")
-        harness = self._effective_harness(
-            directives, getattr(self, "_skill_provider", None)
-        )
+        harness = self._ticket_harness(ticket)
 
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,
@@ -807,7 +809,7 @@ class BenchmarkAgent(AgentBase):
             deadline: float,
         ) -> None:
             cancel_task = asyncio.create_task(
-                mcp.call_tool(
+                mcp.call_internal_tool(
                     WORKFLOW_EXECUTION_CANCEL,
                     {"execution_id": execution_id},
                 )
@@ -833,7 +835,7 @@ class BenchmarkAgent(AgentBase):
         if workflow_name:
             load_args["name"] = workflow_name
         try:
-            load_result = await mcp.call_tool(WORKFLOW_LOAD, load_args)
+            load_result = await mcp.call_internal_tool(WORKFLOW_LOAD, load_args)
             json.loads(load_result)  # validate response
         except Exception as e:
             return json.dumps(
@@ -846,7 +848,7 @@ class BenchmarkAgent(AgentBase):
 
         # 2. Export the validated input
         try:
-            exported_result = await mcp.call_tool(
+            exported_result = await mcp.call_internal_tool(
                 WORKFLOW_INPUT_EXPORT,
                 {"input": input},
             )
@@ -861,7 +863,7 @@ class BenchmarkAgent(AgentBase):
 
         # 3. Execute the workflow
         launch_task = asyncio.create_task(
-            mcp.call_tool(
+            mcp.call_internal_tool(
                 WORKFLOW_EXECUTE,
                 {"input": exported_result},
             )
@@ -935,7 +937,7 @@ class BenchmarkAgent(AgentBase):
         try:
             for _ in range(max_polls):
                 try:
-                    status_result = await mcp.call_tool(
+                    status_result = await mcp.call_internal_tool(
                         WORKFLOW_EXECUTION_STATUS,
                         {"execution_id": execution_id},
                     )
@@ -949,7 +951,7 @@ class BenchmarkAgent(AgentBase):
             else:
                 # Cancel the orphaned workflow before returning.
                 try:
-                    await mcp.call_tool(
+                    await mcp.call_internal_tool(
                         WORKFLOW_EXECUTION_CANCEL,
                         {"execution_id": execution_id},
                     )
@@ -980,7 +982,7 @@ class BenchmarkAgent(AgentBase):
 
         # 5. Get output
         try:
-            output_result = await mcp.call_tool(
+            output_result = await mcp.call_internal_tool(
                 WORKFLOW_EXECUTION_OUTPUT,
                 {"execution_id": execution_id},
             )
@@ -1099,10 +1101,7 @@ class BenchmarkAgent(AgentBase):
         if cf.get("resource_provider_metadata"):
             content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 
-        harness = self._effective_harness(
-            cf.get("directives", {}),
-            getattr(self, "_skill_provider", None),
-        )
+        harness = self._ticket_harness(ticket)
 
         skills_dir = Path(__file__).resolve().parent.parent.parent / "skills" / harness
         if (

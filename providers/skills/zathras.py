@@ -51,6 +51,8 @@ KEYWORD_MAP = {
 
 
 class ZathrasSkillProvider(SkillProvider):
+    generic_execution_supported = True
+
     def __init__(
         self,
         zathras_home: str | Path | None = None,

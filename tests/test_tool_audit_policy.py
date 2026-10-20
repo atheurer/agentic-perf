@@ -174,7 +174,9 @@ def _side_effect_category(path: str, call: str) -> str | None:
     # surfaced by the scanner.
     if path == "agents/resource/server.py" and call in _RESOURCE_HOST_PARSING_CALLS:
         return None
-    if "mcp" in lowered and ("call_tool" in lowered or "fastmcp" in lowered):
+    if "mcp" in lowered and any(
+        token in lowered for token in ("call_tool", "call_internal_tool", "fastmcp")
+    ):
         return "mcp"
     if "ssh" in lowered and leaf in {"run", "copy_to", "copy_from", "connect"}:
         return "ssh"

@@ -57,6 +57,10 @@ class RunfileTemplate:
 
 
 class SkillProvider(ABC):
+    # Providers that have an execution branch in execute_benchmark opt in.
+    # Direct-execution harnesses keep using their owning tool handlers.
+    generic_execution_supported = False
+
     @abstractmethod
     async def list_benchmarks(self) -> list[BenchmarkSuite]: ...
 

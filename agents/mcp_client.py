@@ -1060,11 +1060,10 @@ class AgentMCPClient:
         trace_context: TraceContext | None,
         audit_state: _MCPDispatchAuditState | None = None,
     ) -> MCPHookResult:
-        """Dispatch one provider-owned MCP call through audited client boundaries.
+        """Dispatch one adapter-owned MCP call through audited boundaries.
 
-        This is the explicit contract for a pre-call hook that must issue the
-        MCP request itself. The returned result carries whether a request was
-        sent and whether the MCP server returned an error.
+        The returned result carries whether a request was sent and whether the
+        MCP server returned an error.
         """
         server_name = self._tool_routing.get(name)
         if server_name is None:
@@ -1119,6 +1118,21 @@ class AgentMCPClient:
             arguments,
             trace_context,
             audit_state=audit_state,
+            internal_dispatch=True,
+        )
+
+    async def call_internal_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        trace_context: TraceContext | None = None,
+    ) -> str:
+        """Call an owned tool from trusted adapter code, including hidden tools."""
+        return await self.call_tool(
+            name,
+            arguments,
+            trace_context,
+            internal_dispatch=True,
         )
 
     async def _reconnect_server(
@@ -1227,6 +1241,68 @@ class AgentMCPClient:
                 )
                 return True
 
+    async def _reconnected_tool_policy_error(
+        self,
+        conn: _ServerConnection,
+        name: str,
+        *,
+        internal_dispatch: bool,
+    ) -> str | None:
+        """Recheck ownership against the refreshed server registration."""
+        if self._tool_routing.get(name) != conn.name:
+            return f"Tool {name!r} no longer routes to MCP server {conn.name!r}"
+        if self._servers.get(conn.name) is not conn:
+            return f"MCP server {conn.name!r} changed during reconnect"
+        session = conn.session
+        if session is None:
+            return f"MCP session for {conn.name!r} closed after reconnect"
+
+        try:
+            result = await session.list_tools()
+        except Exception as exc:
+            logger.warning(
+                "Could not refresh MCP tools for %s after reconnect (error_type=%s)",
+                conn.name,
+                type(exc).__name__,
+            )
+            return f"Could not verify tool {name!r} after MCP reconnect"
+
+        if (
+            self._servers.get(conn.name) is not conn
+            or conn.session is not session
+            or self._tool_routing.get(name) != conn.name
+        ):
+            return f"MCP route for tool {name!r} changed after reconnect"
+
+        tool = next((item for item in result.tools if item.name == name), None)
+        if tool is None:
+            self._tool_owners.pop(name, None)
+            return f"Tool {name!r} is not registered by MCP server {conn.name!r}"
+
+        try:
+            owner_harness = self._tool_owner(conn.name, tool)
+            visible_to_model = tool_visible_to_model(tool)
+        except ValueError:
+            return f"Tool {name!r} has invalid ownership metadata"
+
+        if owner_harness is None:
+            self._tool_owners.pop(name, None)
+        else:
+            self._tool_owners[name] = owner_harness
+
+        if owner_harness is None and conn.name in self._ownership_required_servers:
+            return f"Tool {name!r} has no owner in external server {conn.name!r}"
+        if owner_harness is not None and owner_harness != self._selected_harness:
+            return (
+                f"Tool {name!r} requires ticket harness {owner_harness!r}; "
+                f"selected harness is {self._selected_harness or 'unset'!r}"
+            )
+        if not internal_dispatch and (
+            not visible_to_model or (conn.name, name) in self._hidden_owned_tools
+        ):
+            return f"Tool {name!r} is reserved for internal dispatch"
+        return None
+
     async def _dispatch_mcp_request(
         self,
         conn: _ServerConnection,
@@ -1234,6 +1310,8 @@ class AgentMCPClient:
         arguments: dict[str, Any],
         context: TraceContext,
         audit_state: _MCPDispatchAuditState | None = None,
+        internal_dispatch: bool = False,
+        reconnected_route: bool = False,
     ) -> MCPHookResult:
         def record_reconnect_cancellation(
             exc: asyncio.CancelledError,
@@ -1295,12 +1373,20 @@ class AgentMCPClient:
                         and new_conn._reconnect_origin_session_id == conn.session_id
                         and self._tool_routing.get(name) == new_conn.name
                     ):
+                        retry_context = context.model_copy(
+                            update={
+                                "mcp_server": new_conn.name,
+                                "mcp_session_id": new_conn.session_id,
+                            }
+                        )
                         return await self._dispatch_mcp_request(
                             new_conn,
                             name,
                             arguments,
-                            context,
+                            retry_context,
                             audit_state=audit_state,
+                            internal_dispatch=internal_dispatch,
+                            reconnected_route=True,
                         )
 
             error = RuntimeError("MCP session closed before tool dispatch")
@@ -1324,6 +1410,35 @@ class AgentMCPClient:
                 retry_classification="transport_before_send",
                 audit_recorded=terminal_recorded,
             )
+
+        if reconnected_route:
+            policy_error = await self._reconnected_tool_policy_error(
+                conn,
+                name,
+                internal_dispatch=internal_dispatch,
+            )
+            if policy_error:
+                message = self._redact_client_message(conn, context, policy_error)
+                terminal_recorded = self._record_boundary(
+                    conn,
+                    LifecycleState.REJECTED,
+                    context=context,
+                    tool_name=name,
+                    outcome=OperationOutcome.REJECTED,
+                    retry_kind=RetryKind.VALIDATION,
+                    error=message,
+                )
+                if audit_state is not None:
+                    audit_state.terminal_recorded = terminal_recorded
+                    audit_state.request_sent = False
+                    audit_state.retry_classification = "validation"
+                return MCPHookResult(
+                    content=message,
+                    is_error=True,
+                    request_sent=False,
+                    retry_classification="validation",
+                    audit_recorded=terminal_recorded,
+                )
 
         try:
             self._record_boundary(
@@ -1493,6 +1608,8 @@ class AgentMCPClient:
         name: str,
         arguments: dict[str, Any],
         trace_context: TraceContext | None = None,
+        *,
+        internal_dispatch: bool = False,
     ) -> str:
         server_name = self._tool_routing.get(name)
         if server_name is None:
@@ -1705,7 +1822,13 @@ class AgentMCPClient:
                     outcome=OperationOutcome.SUCCESS,
                 )
                 return short_circuit
-        result = await self._dispatch_mcp_request(conn, name, arguments, context)
+        result = await self._dispatch_mcp_request(
+            conn,
+            name,
+            arguments,
+            context,
+            internal_dispatch=internal_dispatch,
+        )
         if result.is_error:
             raise MCPToolCallError(result.content, result.retry_classification)
         content = result.content

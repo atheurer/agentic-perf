@@ -865,7 +865,26 @@ async def _ensure_init():
 async def _require_tool_owner(owner_harness: str) -> None:
     """Initialize the authenticated ticket context and enforce tool ownership."""
     await _ensure_init()
-    require_ticket_harness(_ticket, owner_harness)
+    default_harness = getattr(_skill_provider, "default_harness", "")
+    require_ticket_harness(
+        _ticket,
+        owner_harness,
+        default_harness=(default_harness if isinstance(default_harness, str) else ""),
+    )
+
+
+def _supports_generic_execution(harness_name: str) -> bool:
+    """Check the selected adapter's code-declared generic execution support."""
+    # Crucible's execution adapter is implemented directly in this server;
+    # other harnesses declare support beside their provider registration.
+    if harness_name == _CRUCIBLE_TOOL_OWNER:
+        return True
+    if hasattr(_skill_provider, "supports_generic_execution_for"):
+        return _skill_provider.supports_generic_execution_for(harness_name)
+    provider = _skill_provider
+    if hasattr(_skill_provider, "get_provider"):
+        provider = _skill_provider.get_provider(harness_name)
+    return bool(getattr(provider, "generic_execution_supported", False))
 
 
 def _get_validated_runfile(
@@ -2498,15 +2517,20 @@ async def execute_benchmark(
     the legacy runfile argument until they gain the same validation contract.
     """
     await _ensure_init()
-    harness_name = selected_harness_from_ticket(_ticket)
+    default_harness = getattr(_skill_provider, "default_harness", "")
+    harness_name = selected_harness_from_ticket(
+        _ticket,
+        default_harness=(default_harness if isinstance(default_harness, str) else ""),
+    )
     if not harness_name:
         return json.dumps(
             {
                 "status": "rejected",
                 "reason_code": "harness_not_selected",
                 "message": (
-                    "The ticket must persist directives.harness before benchmark "
-                    "execution; use workflow_source for Arcaflow workflows."
+                    "The ticket must select a harness or inherit the configured "
+                    "provider default before benchmark execution; use "
+                    "workflow_source for Arcaflow workflows."
                 ),
             }
         )
@@ -2524,6 +2548,19 @@ async def execute_benchmark(
                 "reason_code": "harness_mismatch",
                 "harness": harness_name,
                 "message": "Execution must use the harness selected by the ticket.",
+            }
+        )
+
+    if not _supports_generic_execution(harness_name):
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "generic_execution_unsupported",
+                "harness": harness_name,
+                "message": (
+                    f"The {harness_name!r} harness has no generic benchmark "
+                    "execution adapter. Use its owning execution tool."
+                ),
             }
         )
 
@@ -4023,7 +4060,18 @@ async def execute_benchmark(
                 )
         return json.dumps(response)
 
-    # Default: crucible (and any unknown harness that uses JSON run-files)
+    # Crucible is the only server-local default executor. All other harnesses
+    # must reach an explicit provider-owned branch above.
+    if harness_name != _CRUCIBLE_TOOL_OWNER:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "generic_execution_unsupported",
+                "harness": harness_name,
+                "message": "No generic execution adapter is registered for this harness.",
+            }
+        )
+
     ticket_id = os.environ.get("TICKET_ID", "")
     if validation_id and operation_guard is None:
         intent_key, intent_hash, immutable_intent = _benchmark_intent_identity(

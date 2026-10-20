@@ -95,6 +95,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/mcp_audit.py", "_protect_operation", "mcp"),
     ("agents/mcp_audit.py", "_protected_result", "mcp"),
     ("agents/mcp_audit.py", "create_ticket_mcp", "mcp"),
+    ("agents/mcp_client.py", "call_internal_tool", "mcp"),
     ("agents/mcp_client.py", "_dispatch_mcp_request", "mcp"),
     ("agents/platform/server.py", "_provision_jumpstarter", "filesystem"),
     ("agents/provisioning/agent.py", "_apply_system_config", "filesystem"),
@@ -1334,6 +1335,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/mcp_audit.py:create_ticket_mcp",
+        "2027-12-31",
+    ),
+    ("agents/mcp_client.py", "call_internal_tool", "mcp"): (
+        "audited",
+        "observability-maintainers",
+        "agents/mcp_client.py:call_internal_tool",
         "2027-12-31",
     ),
     ("agents/mcp_client.py", "_dispatch_mcp_request", "mcp"): (

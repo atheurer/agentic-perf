@@ -175,6 +175,8 @@ _BENCHMARKS: dict[str, dict[str, Any]] = {
 
 
 class KubeBurnerSkillProvider(SkillProvider):
+    generic_execution_supported = True
+
     async def list_benchmarks(self) -> list[BenchmarkSuite]:
         results = []
         for name, info in _BENCHMARKS.items():
