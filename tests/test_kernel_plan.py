@@ -485,3 +485,67 @@ class TestRunnerNotFoundHandling:
         comment = agent._add_comment.await_args.args[1]
         assert "repo_url" in comment
         agent._handle_completion.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Handoff-gate compatibility: the gate imports helpers from this module
+# ---------------------------------------------------------------------------
+
+
+class TestHandoffGateCompatibility:
+    """Regression: rewriting kernel_plan.py dropped preceding_kernel_step,
+    which orchestrator/handoff.py imports; any handoff check on a plan with
+    a kernel step then raised ImportError. These tests pin the gate against
+    the transformer's output so the module cannot silently break it again.
+    """
+
+    @staticmethod
+    def _ticket(plan):
+        return {
+            "custom_fields": {
+                "provisioning_complete": True,
+                "hosts_provisioned": ["10.0.0.1"],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.100",
+                    "targets": ["10.0.0.1"],
+                },
+                "provisioning_verification": {
+                    "status": "verified",
+                    "details": "harness verified",
+                },
+                "execution_plan": plan,
+                "kernel_transitions": {"2": {"state": "verified"}},
+            }
+        }
+
+    def test_transformed_plan_passes_the_gate_when_verified(self):
+        from orchestrator.handoff import check_handoff
+
+        plan, _ = build_kernel_comparison_plan(default_plan(), dict(GOOD))
+        # Mid-run: the plan advanced to the first benchmark (id 3), which
+        # follows the kernel-A step (id 2).
+        plan["current_step"] = 3
+        ok, reason = check_handoff("executing_benchmark", self._ticket(plan))
+        assert ok, reason
+
+    def test_transformed_plan_blocks_the_gate_when_unverified(self):
+        from orchestrator.handoff import check_handoff
+
+        plan, _ = build_kernel_comparison_plan(default_plan(), dict(GOOD))
+        plan["current_step"] = 3
+        ticket = self._ticket(plan)
+        ticket["custom_fields"]["kernel_transitions"] = {
+            "2": {"state": "reconnect_timeout"}
+        }
+        ok, reason = check_handoff("executing_benchmark", ticket)
+        assert not ok
+        assert "reconnect_timeout" in reason
+
+    def test_helpers_survive_module_rewrite(self):
+        from providers.kernel_plan import kernel_steps, preceding_kernel_step
+
+        plan, _ = build_kernel_comparison_plan(default_plan(), dict(GOOD))
+        steps = kernel_steps(plan)
+        assert [s["id"] for s in steps] == [2, 4]
+        assert preceding_kernel_step(plan, 3)["id"] == 2
+        assert preceding_kernel_step(plan, 2) is None

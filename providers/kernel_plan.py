@@ -173,3 +173,30 @@ def build_kernel_comparison_plan(
         "run_ids": list(plan.get("run_ids") or []),
         "steps": new_steps,
     }, ""
+
+
+def kernel_steps(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return all provision steps that have a kernel param."""
+    return [
+        step for step in plan.get("steps", []) if step.get("params", {}).get("kernel")
+    ]
+
+
+def preceding_kernel_step(
+    plan: dict[str, Any],
+    benchmark_step_id: int,
+) -> dict[str, Any] | None:
+    """Find the most recent kernel provision step before a benchmark step.
+
+    The handoff gate uses this to require a verified transition before a
+    benchmark may run (orchestrator/handoff.py::
+    _check_executing_benchmark).
+    """
+    steps = plan.get("steps", [])
+    result = None
+    for step in steps:
+        if step["id"] >= benchmark_step_id:
+            break
+        if step.get("params", {}).get("kernel"):
+            result = step
+    return result
