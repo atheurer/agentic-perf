@@ -16,6 +16,8 @@ from typing import Any
 
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
+from agents.skill_context import skill_context_prompt
+from agents.tool_ownership import selected_harness_from_ticket
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 
@@ -32,6 +34,7 @@ class AnalyzeAgent(AgentBase):
         llm_provider: LLMProvider,
         state_store_url: str,
         event_bus: EventBus | None = None,
+        skill_provider: Any | None = None,
     ) -> None:
         super().__init__(
             agent_name="analyze-agent",
@@ -39,9 +42,19 @@ class AnalyzeAgent(AgentBase):
             state_store_url=state_store_url,
             event_bus=event_bus,
         )
+        self._skill_provider = skill_provider
+
+    def _selected_harness(self, ticket: dict[str, Any]) -> str:
+        return selected_harness_from_ticket(
+            ticket,
+            default_harness=getattr(self._skill_provider, "default_harness", ""),
+        )
 
     def _system_prompt(self, ticket: dict[str, Any]) -> str:
-        return ANALYZE_SYSTEM_PROMPT
+        prompt = ANALYZE_SYSTEM_PROMPT
+        if self._selected_harness(ticket) == "crucible":
+            prompt += "\n\n" + skill_context_prompt("harness/crucible")
+        return prompt
 
     def _build_messages(
         self,
@@ -308,15 +321,22 @@ class AnalyzeAgent(AgentBase):
             )
             parts.append("")
 
-        harness = directives.get("harness", "")
+        harness = self._selected_harness(ticket)
         if harness:
-            parts.append(
-                f"**Harness:** {harness} — start by reading "
-                f"the investigation methodology skill: "
-                f"`list_skill_docs('{harness}')` then "
-                f"`read_skills(docs=[{{'harness': '{harness}', "
-                f"'filename': 'investigation-methodology.md'}}])`"
-            )
+            if harness == "crucible":
+                parts.append(
+                    "**Harness:** Crucible — retrieve applicable context through "
+                    "`get_skill_context(subject='harness/crucible', "
+                    "operation='bootstrap')`."
+                )
+            else:
+                parts.append(
+                    f"**Harness:** {harness} — start by reading "
+                    f"the investigation methodology skill: "
+                    f"`list_skill_docs('{harness}')` then "
+                    f"`read_skills(docs=[{{'harness': '{harness}', "
+                    f"'filename': 'investigation-methodology.md'}}])`"
+                )
             parts.append("")
 
         parts.append(

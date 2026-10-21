@@ -9,8 +9,19 @@ from typing import Any
 
 from agents.base import AgentBase
 from agents.mcp_client import _MCP_TIMEOUT_CANCELLATION, AgentMCPClient
+from agents.skill_context import skill_context_prompt
+from agents.tool_ownership import selected_harness_from_ticket
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.skills.arcaflow_mcp import (
+    WORKFLOW_EXECUTE,
+    WORKFLOW_EXECUTION_CANCEL,
+    WORKFLOW_EXECUTION_OUTPUT,
+    WORKFLOW_EXECUTION_STATUS,
+    WORKFLOW_INPUT_EXPORT,
+    WORKFLOW_LOAD,
+    register_arcaflow_tool_ownership,
+)
 from providers.skills.base import EXECUTION_MODEL_CONTROLLER, EXECUTION_MODEL_DIRECT
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import current_trace_context
@@ -134,6 +145,7 @@ _LOCAL_TOOLS = [
             },
             "required": ["validation_id"],
         },
+        owner_harness="crucible",
     ),
     ToolDefinition(
         name="resolve_benchmark_approval",
@@ -157,6 +169,7 @@ _LOCAL_TOOLS = [
             },
             "required": ["decision"],
         },
+        owner_harness="crucible",
     ),
     ToolDefinition(
         name="submit_benchmark_result",
@@ -225,6 +238,7 @@ _WORKFLOW_TOOL = ToolDefinition(
         },
         "required": ["workflow_source", "input"],
     },
+    owner_harness="arcaflow-workflows",
 )
 
 
@@ -495,13 +509,22 @@ class BenchmarkAgent(AgentBase):
             )
         return f"Approval {decision} for request {approval_id}. Do not execute the benchmark."
 
+    def _ticket_harness(self, ticket: dict[str, Any]) -> str:
+        """Resolve one trusted harness selection for prompt and tool policy."""
+        provider = getattr(self, "_skill_provider", None)
+        default_harness = getattr(provider, "default_harness", "")
+        return selected_harness_from_ticket(
+            ticket,
+            default_harness=(
+                default_harness if isinstance(default_harness, str) else ""
+            ),
+        )
+
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id
         ticket = await self._get_ticket(ticket_id)
-        harness = self._effective_harness(
-            ticket.get("custom_fields", {}).get("directives", {}),
-            getattr(self, "_skill_provider", None),
-        )
+        harness = self._ticket_harness(ticket)
+        selected_ticket_harness = harness
 
         bench_server = str(Path(__file__).with_name("server.py"))
         infra_server = str(Path(__file__).parent.parent / "infra" / "server.py")
@@ -510,6 +533,8 @@ class BenchmarkAgent(AgentBase):
         )
 
         mcp = AgentMCPClient(trace_context=self.trace_context)
+        mcp.set_harness_context(selected_ticket_harness)
+        self._selected_harness = selected_ticket_harness
         await mcp.connect_ticket_server(
             bench_server,
             name="benchmark",
@@ -540,6 +565,8 @@ class BenchmarkAgent(AgentBase):
         from agents.mcp_client import connect_external_servers
 
         connected_ext, ext_tools = await connect_external_servers(mcp, "benchmark")
+        if "arcaflow" in connected_ext:
+            register_arcaflow_tool_ownership(mcp)
 
         self._mcp = mcp
 
@@ -578,105 +605,41 @@ class BenchmarkAgent(AgentBase):
             await mcp.disconnect()
             self._mcp = None
 
-    # Tool sets per harness. Each harness declares the
-    # tools its benchmark agent needs. Tools not listed
-    # are hidden from the LLM to prevent exploration and
-    # scope creep (upstream #201).
-    _HARNESS_TOOLS: dict[str, set[str]] = {
+    # Temporary policy for harnesses that have migrated away from this legacy
+    # documentation and catalog bridge. Tool execution ownership is declared
+    # with each registration instead of in this context policy.
+    _LEGACY_CONTEXT_EXCLUDED_TOOLS: dict[str, set[str]] = {
         "crucible": {
             "read_skills",
             "list_harness_docs",
             "read_harness_doc",
-            "get_execution_config",
             "get_runfile_schema",
             "get_benchmark_params",
             "get_tool_params",
             "get_example_runfile",
-            "setup_passwordless_ssh",
-            "validate_benchmark",
-            "execute_benchmark",
-            "get_run_logs",
-            "submit_benchmark_result",
-            "present_runfile_for_approval",
-            "resolve_benchmark_approval",
-            "request_clarification",
+            "get_crucible_benchmark_context",
         },
-        "boot-time": {
-            "read_skills",
-            "execute_boot_time_test",
-            "submit_benchmark_result",
-            "request_clarification",
-            # Workspace tools needed when execute_boot_time_test
-            # spills its output to a workspace file.
-            "jq_file_from_workspace",
-            "read_file_from_workspace",
-            "list_files_from_workspace",
-        },
-        "arcaflow-plugins": {
-            "read_skills",
-            "set_ssh_context",
-            "check_host",
-            # From arcaflow_plugin_server.py:
-            "get_plugin_schema",
-            "execute_arcaflow_plugin",
-            # From external Arcaflow MCP (plugin discovery):
-            "plugin_list",
-            "plugin_describe",
-            # Core:
-            "submit_benchmark_result",
-            "request_clarification",
-        },
-        "arcaflow-workflows": {
-            "read_skills",
-            "set_ssh_context",
-            "check_host",
-            "get_execution_config",
-            "get_runfile_schema",
-            "get_benchmark_params",
-            # Discovery tools — LLM uses these to understand
-            # the workflow schema and build valid input.
-            "workflow_load",
-            "workflow_list",
-            "workflow_input_build",
-            "workflow_input_validate",
-            # Execution goes through execute_arcaflow_workflow,
-            # which internally calls workflow_execute and polls
-            # status via the Arcaflow MCP client.
-            "execute_arcaflow_workflow",
-            "submit_benchmark_result",
-            "request_clarification",
-        },
-    }
-    _HARNESS_EXCLUDED_TOOLS: dict[str, set[str]] = {
-        "crucible": {
-            "read_skills",
+        "kube-burner": {
             "list_harness_docs",
             "read_harness_doc",
-            "get_execution_config",
-            "get_runfile_schema",
-            "get_benchmark_params",
-            "get_tool_params",
-            "get_example_runfile",
+        },
+        "k8s-netperf": {
+            "list_harness_docs",
+            "read_harness_doc",
         },
     }
 
     def _apply_tool_scoping(self, ticket: dict[str, Any]) -> None:
-        """Filter tools based on harness type.
-
-        Harnesses listed in _HARNESS_TOOLS get a reduced
-        tool set. Unlisted harnesses keep all tools.
-        """
-        harness = self._effective_harness(
-            ticket.get("custom_fields", {}).get("directives", {}),
-            getattr(self, "_skill_provider", None),
-        )
-        excluded = self._HARNESS_EXCLUDED_TOOLS.get(harness)
-        if excluded is not None:
-            self.tools = [t for t in self.tools if t.name not in excluded]
-            return
-        allowed = self._HARNESS_TOOLS.get(harness)
-        if allowed is not None:
-            self.tools = [t for t in self.tools if t.name in allowed]
+        """Filter owned local tools and apply legacy documentation policy."""
+        selected_harness = self._ticket_harness(ticket)
+        self.tools = [
+            tool
+            for tool in self.tools
+            if tool.owner_harness is None or tool.owner_harness == selected_harness
+        ]
+        excluded = self._LEGACY_CONTEXT_EXCLUDED_TOOLS.get(selected_harness, set())
+        if excluded:
+            self.tools = [tool for tool in self.tools if tool.name not in excluded]
 
     def _ticket_execution_model(self, ticket: dict[str, Any]) -> str:
         cf = ticket.get("custom_fields", {})
@@ -708,25 +671,28 @@ class BenchmarkAgent(AgentBase):
         directives = cf.get("directives", {})
         provider = cf.get("resource_provider") or directives.get("resource_provider")
         endpoint = directives.get("endpoint_type", "remotehosts")
-        harness = self._effective_harness(
-            directives, getattr(self, "_skill_provider", None)
-        )
+        harness = self._ticket_harness(ticket)
 
         fragments = self._load_prompt_fragments(
             Path(__file__).parent,
             resource_provider=provider,
-            endpoint_type=endpoint,
+            endpoint_type=None if harness == "crucible" else endpoint,
         )
 
-        # Load harness-specific prompt fragment (e.g., crucible.md,
-        # jumpstarter.md).  These contain harness-specific execution
-        # instructions that don't belong in the base prompt.
+        # Adapter tool contracts remain in fragments; runtime documentation
+        # for migrated subjects is retrieved through the gateway.
         harness_fragment = ""
         prompts_dir = Path(__file__).parent / "prompts"
         # For controller harnesses, also try the harness name
         harness_fragment = self._load_prompt_fragment(prompts_dir, harness)
 
         prompt = BENCHMARK_BASE_PROMPT
+        if harness == "crucible":
+            prompt += "\n\n" + skill_context_prompt("harness/crucible")
+        elif harness == "kube-burner":
+            prompt += "\n\n" + skill_context_prompt("harness/kube-burner")
+        elif harness == "k8s-netperf":
+            prompt += "\n\n" + skill_context_prompt("harness/k8s-netperf")
 
         if self._ticket_execution_model(ticket) == EXECUTION_MODEL_DIRECT:
             prompt += (
@@ -763,6 +729,17 @@ class BenchmarkAgent(AgentBase):
         import uuid
 
         run_uuid = uuid.uuid4().hex[:8]
+        if getattr(self, "_selected_harness", None) != "arcaflow-workflows":
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "run_id": f"arcaflow-wf-{run_uuid}",
+                    "error": (
+                        "Arcaflow workflow execution requires the ticket to select "
+                        "the arcaflow-workflows harness."
+                    ),
+                }
+            )
         mcp = self._mcp
         if mcp is None:
             return json.dumps(
@@ -832,8 +809,8 @@ class BenchmarkAgent(AgentBase):
             deadline: float,
         ) -> None:
             cancel_task = asyncio.create_task(
-                mcp.call_tool(
-                    "workflow_execution_cancel",
+                mcp.call_internal_tool(
+                    WORKFLOW_EXECUTION_CANCEL,
                     {"execution_id": execution_id},
                 )
             )
@@ -858,7 +835,7 @@ class BenchmarkAgent(AgentBase):
         if workflow_name:
             load_args["name"] = workflow_name
         try:
-            load_result = await mcp.call_tool("workflow_load", load_args)
+            load_result = await mcp.call_internal_tool(WORKFLOW_LOAD, load_args)
             json.loads(load_result)  # validate response
         except Exception as e:
             return json.dumps(
@@ -871,8 +848,8 @@ class BenchmarkAgent(AgentBase):
 
         # 2. Export the validated input
         try:
-            exported_result = await mcp.call_tool(
-                "workflow_input_export",
+            exported_result = await mcp.call_internal_tool(
+                WORKFLOW_INPUT_EXPORT,
                 {"input": input},
             )
         except Exception as e:
@@ -886,8 +863,8 @@ class BenchmarkAgent(AgentBase):
 
         # 3. Execute the workflow
         launch_task = asyncio.create_task(
-            mcp.call_tool(
-                "workflow_execute",
+            mcp.call_internal_tool(
+                WORKFLOW_EXECUTE,
                 {"input": exported_result},
             )
         )
@@ -960,8 +937,8 @@ class BenchmarkAgent(AgentBase):
         try:
             for _ in range(max_polls):
                 try:
-                    status_result = await mcp.call_tool(
-                        "workflow_execution_status",
+                    status_result = await mcp.call_internal_tool(
+                        WORKFLOW_EXECUTION_STATUS,
                         {"execution_id": execution_id},
                     )
                     status_data = json.loads(status_result)
@@ -974,8 +951,8 @@ class BenchmarkAgent(AgentBase):
             else:
                 # Cancel the orphaned workflow before returning.
                 try:
-                    await mcp.call_tool(
-                        "workflow_execution_cancel",
+                    await mcp.call_internal_tool(
+                        WORKFLOW_EXECUTION_CANCEL,
                         {"execution_id": execution_id},
                     )
                 except Exception:
@@ -1005,8 +982,8 @@ class BenchmarkAgent(AgentBase):
 
         # 5. Get output
         try:
-            output_result = await mcp.call_tool(
-                "workflow_execution_output",
+            output_result = await mcp.call_internal_tool(
+                WORKFLOW_EXECUTION_OUTPUT,
                 {"execution_id": execution_id},
             )
             output = json.loads(output_result)
@@ -1124,13 +1101,13 @@ class BenchmarkAgent(AgentBase):
         if cf.get("resource_provider_metadata"):
             content += f"\n## Provider Metadata (raw)\n```json\n{json.dumps(cf['resource_provider_metadata'], indent=2)}\n```\n"
 
-        harness = self._effective_harness(
-            cf.get("directives", {}),
-            getattr(self, "_skill_provider", None),
-        )
+        harness = self._ticket_harness(ticket)
 
         skills_dir = Path(__file__).resolve().parent.parent.parent / "skills" / harness
-        if harness != "crucible" and skills_dir.is_dir():
+        if (
+            harness not in {"crucible", "kube-burner", "k8s-netperf"}
+            and skills_dir.is_dir()
+        ):
             content += f"\n## {harness} Skills (read these first)\n"
             content += "These contain critical lessons from prior runs:\n\n"
             for f in sorted(skills_dir.glob("*.md")):
@@ -1154,7 +1131,11 @@ class BenchmarkAgent(AgentBase):
 
         # Crucible documentation is served by the source-aware gateway.  Keep
         # the generic cache path for harnesses that have not adopted it yet.
-        if self._repo_cache and harness != "crucible":
+        if self._repo_cache and harness not in {
+            "crucible",
+            "kube-burner",
+            "k8s-netperf",
+        }:
             docs = self._repo_cache.list_docs(harness, subdirs=["docs", "config"])
             if docs:
                 content += f"\n## Available {harness} Documentation\n"

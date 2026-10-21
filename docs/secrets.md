@@ -34,28 +34,36 @@ for provider-specific details.
 
 ### QUADS API TLS trust
 
-The QUADS connection settings live in
-`~/.agentic-perf/secrets/quads/config.json`. QUADS uses HTTPS by default. If
-the optional `ca_bundle` field is omitted, its HTTPS client uses the host's
-default system CA trust store. To trust a specific CA bundle, set `ca_bundle`
-to its file path:
+Shared QUADS connection defaults belong in the organization service
+configuration at `service-config/resource/quads.json`. The endpoint and TLS
+trust are service configuration, not credentials. QUADS uses HTTPS by default;
+if the optional `ca_bundle` field is omitted, its HTTPS client uses the host's
+system CA trust store. A local `quads/config.json` value overrides an
+organization connection default for that installation, which provides a
+migration path for existing local settings.
+
+The local `~/.agentic-perf/secrets/quads/config.json` remains the source for
+QUADS credentials and installation-specific settings, which may be user-specific
+in a single-user deployment. It is not a per-user context source for a shared
+agentic-perf service:
 
 ```json
 {
-  "api_host": "quads.example.com",
   "email": "quads-operator@example.com",
   "password": "<quads-password>",
   "owner": "<quads-owner>",
   "ssh_key_path": "/path/to/ssh/key",
-  "default_root_password": "<default-root-password>",
-  "api_scheme": "https",
-  "ca_bundle": "/etc/pki/tls/certs/ca-bundle.crt"
+  "default_root_password": "<default-root-password>"
 }
 ```
 
-When set, this bundle is the QUADS client's trust source. Include any public
-roots the endpoint needs in that file. TLS certificate-chain and hostname
-verification stay enabled. This setting only affects QUADS HTTPS connections.
+When `ca_bundle` is set in either source, that file is the QUADS client's trust
+source. Include any public roots the endpoint needs in that file. TLS
+certificate-chain and hostname verification stay enabled. This setting only
+affects QUADS HTTPS connections.
+
+For compatibility, `api_host`, `api_scheme`, and `ca_bundle` may remain in the
+local file. Remove a local key to use its organization service-config value.
 
 ### Local (file-backed)
 
@@ -85,6 +93,38 @@ Vault secrets are **never persisted to disk** beyond the operation
 that needs them. When a consumer requires a file path (e.g., for
 SCP), the `secret_file()` context manager materializes an ephemeral
 file (mode 0600 in a 0700 tmpdir) and deletes it on exit.
+
+### HTTPS Git file references
+
+A secret path can point to one file in a Git repository with this marker URI:
+
+```text
+git-secret+https://gitlab.cee.redhat.com/group/repo.git?ref=master&path=secret.json
+```
+
+`ref` names a branch and `path` is one repository-relative file path. This
+currently supports repositories on the exact host `gitlab.cee.redhat.com`,
+with GitLab API v4 available at the host root (`/api/v4`). Other GitLab hosts,
+Git hosting services, custom ports, and GitLab instances mounted below a URL
+prefix are not supported.
+
+The provider resolves exactly that project/ref/file through GitLab's
+repository-files raw API. It does not fetch a Git pack or other repository
+blobs. The project must allow anonymous HTTPS reads through that API endpoint.
+The request does not use Git credentials, Git configuration, SSH, `.netrc`,
+ambient proxy settings, or credentials embedded in proxy URLs. TLS certificate
+and hostname verification stay enabled. Redirects are rejected before their
+response body is read; the raw API endpoint must serve the file directly.
+Response bytes are requested with identity encoding, streamed under a 64 KiB
+limit, and subject to an overall request deadline.
+
+Git secret values are not cached. `get_secret()` keeps the bounded value in
+memory; `secret_file()` creates a mode-0600 file inside a mode-0700 temporary
+directory and removes it when the context exits. `get_secret_file()` returns
+`None` for Git references because they have no stable file path. Other schemes,
+including `git-secret+ssh://`, are rejected. Resolution errors identify the
+sanitized repository and branch and distinguish anonymous access failures,
+invalid project/ref/file paths, rejected redirects, and oversized files.
 
 **Requirements:**
 

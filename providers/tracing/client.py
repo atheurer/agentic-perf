@@ -10,7 +10,12 @@ import httpx
 from paths import TRACE_SPOOL_DIR
 
 from .models import TraceEventV1
-from .spool import SpoolError, TraceSpool, drain_abandoned_spools
+from .spool import (
+    DEFAULT_TRACE_SPOOL_MAX_BYTES,
+    SpoolError,
+    TraceSpool,
+    drain_abandoned_spools,
+)
 
 
 class TraceDeliveryError(RuntimeError):
@@ -25,7 +30,7 @@ class TraceClient:
         *,
         spool_dir: Path = TRACE_SPOOL_DIR,
         instance_id: str | None = None,
-        max_spool_bytes: int = 64 * 1024 * 1024,
+        max_spool_bytes: int = DEFAULT_TRACE_SPOOL_MAX_BYTES,
         client: httpx.Client | None = None,
     ) -> None:
         self.url = url.rstrip("/") + "/api/v1/traces/events"

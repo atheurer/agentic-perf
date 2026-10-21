@@ -5,7 +5,15 @@ runs via `podman run` on the target host.
 
 1. Call `get_plugin_schema` with the plugin image to discover
    available steps and input parameters.
-2. Build the input based on the schema and ticket parameters.
+   If the response says `spilled_to_workspace`, use
+   `jq_file_from_workspace` on its `file_ref` to inspect only the selected
+   step's input schema (for example, `.schema.steps.workload.input`). Do not
+   guess from a truncated preview or try to emit the entire schema.
+2. Build the input from that schema and the ticket parameters. For the
+   stress-ng plugin, the `workload` input has a required `timeout` and a
+   required `stressors` array. Each CPU entry looks like
+   `{"stressor":"cpu","workers":1}`; `stressor` is inside an array item,
+   not a top-level input field.
 3. Call `execute_arcaflow_plugin` with:
    - `plugin_image`: full container image ref
    - `plugin_step`: step name (e.g. 'sysbenchcpu', 'uperf')

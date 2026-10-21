@@ -133,10 +133,18 @@ class QuadsResourceProvider(ResourceProvider):
         )
 
     @classmethod
-    async def from_secrets(cls, secrets_provider) -> QuadsResourceProvider:
+    async def from_secrets(
+        cls,
+        secrets_provider,
+        *,
+        organization_config: dict[str, Any] | None = None,
+    ) -> QuadsResourceProvider:
         from providers.quads import QuadsClient
 
-        client = await QuadsClient.from_secrets(secrets_provider)
+        client = await QuadsClient.from_secrets(
+            secrets_provider,
+            organization_config=organization_config,
+        )
         return cls(client)
 
     async def check_available(self, requirements: dict[str, Any]) -> dict[str, Any]:
@@ -214,8 +222,11 @@ class QuadsResourceProvider(ResourceProvider):
         selection = self.validate_reservation_selection(selection)
         hostnames = selection["hostnames"]
 
-        logger.info(f"[quads-provider] Creating assignment: {description}")
-        assignment = await self._client.create_assignment(description)
+        ticket_key = ticket_id.strip() if isinstance(ticket_id, str) else ""
+        if not ticket_key:
+            raise ValueError("QUADS reservation requires an Agentic Perf ticket key")
+        logger.info("[quads-provider] Creating assignment for ticket: %s", ticket_key)
+        assignment = await self._client.create_assignment(ticket_key)
         logger.info(
             f"[quads-provider] Assignment created: id={assignment['id']} "
             f"cloud={assignment['cloud_name']}"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from providers.secrets.base import SecretsProvider
@@ -37,9 +38,13 @@ class ResourceProviderRegistry:
         self,
         secrets_provider: SecretsProvider,
         instance_name: str | None = None,
+        organization_resolver: Any | None = None,
+        organization_resolver_factory: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
         self._secrets = secrets_provider
         self._instance_name = instance_name
+        self._organization_resolver = organization_resolver
+        self._organization_resolver_factory = organization_resolver_factory
         self._providers: dict[str, ResourceProvider] = {}
 
     async def list_configured_providers(self) -> list[dict[str, Any]]:
@@ -83,11 +88,38 @@ class ResourceProviderRegistry:
             provider = await cls.from_secrets(
                 self._secrets, instance_name=self._instance_name
             )
+        elif name == "quads":
+            provider = await cls.from_secrets(
+                self._secrets,
+                organization_config=await self._organization_service_config(
+                    "resource/quads"
+                ),
+            )
         else:
             provider = await cls.from_secrets(self._secrets)
         self._providers[name] = provider
         logger.info(f"[registry] Loaded resource provider: {name}")
         return provider
+
+    async def _organization_service_config(self, subject: str) -> dict[str, Any] | None:
+        resolver = self._organization_resolver
+        if resolver is None and self._organization_resolver_factory is not None:
+            resolver = await self._organization_resolver_factory()
+            self._organization_resolver = resolver
+        if resolver is None or not resolver.has_runtime_config(subject):
+            return None
+        config = resolver.get_runtime_config(subject)
+        if config is None:
+            return None
+        source = resolver.bootstrap(subject)
+        logger.info(
+            "[registry] Loaded organization service configuration through the "
+            "skill gateway: subject=%s revision=%s sources=%s",
+            subject,
+            source.get("revision"),
+            source.get("runtime_config_sources", []),
+        )
+        return config
 
     async def close_all(self) -> None:
         for name, provider in self._providers.items():

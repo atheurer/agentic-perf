@@ -1,25 +1,21 @@
-# Crucible Run-File Construction
+# Crucible run-file workflow notes
 
-Run-file structure, endpoint semantics, benchmark parameters, and
-environment-specific behavior must come from the controller-sourced Crucible
-documentation through `get_crucible_benchmark_context`. This local document is
-not a source of benchmark or endpoint guidance.
+Use the current controller-sourced schema, benchmark subproject documents, and
+tool metadata through get_skill_context to construct a run file. The
+agentic-perf validator enforces its own run-file contract; pass the exact file
+that validated to execute_benchmark, and do not modify it between validation
+and execution.
 
-Before approval, construct the run file from the controller-sourced schema and
-validate it with `validate_benchmark`. Do not execute an unvalidated run file.
+Do not copy a generic run-file example's parameters into every benchmark. In
+particular, per-ID remotehost configuration is benchmark-specific. For a
+normal Crucible uperf client, peer discovery comes from Crucible's endpoint
+metadata; do not add a client remotehost override unless the installed
+bench-uperf documentation requires it. The uperf server's ifname option
+selects the interface address it advertises; it is a server-side interface
+choice, not a substitute for a client remotehost value. Follow the installed
+benchmark subproject documentation when its behavior differs.
 
-## General structural reminders
-
-- `benchmarks` and `endpoints` are top-level sections.
-- `tags` is a required top-level object. Use `{}` when there are no tags;
-  do not omit the key or use an array.
-- Every benchmark entry must include `mv-params` when required by the
-  controller-sourced schema.
-- Tool arguments use the controller-sourced tool metadata format; do not invent
-  additional fields.
-- Client/server engines that form a benchmark pair must use the ID pairing
-  defined by that benchmark's controller-sourced documentation.
-
-If a run-file detail is not established by the current controller context,
-search and read the relevant Crucible or benchmark repository document. Do not
-rely on this file for that detail.
+If validation rejects a required role, profiler, or endpoint combination,
+inspect the returned schema and current controller guidance. Do not invent
+engine IDs or endpoints to work around the validator. Ask for clarification if
+the supported configuration cannot be established.

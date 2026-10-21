@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from agents.benchmark.agent import BenchmarkAgent
+from providers.llm.base import ToolDefinition
 
 
 class TestHarnessToolScoping:
@@ -14,15 +15,21 @@ class TestHarnessToolScoping:
             state_store_url="http://localhost:8090",
         )
 
-    def _make_tools(self, names: list[str]):
-        tools = []
-        for name in names:
-            t = MagicMock()
-            t.name = name
-            tools.append(t)
-        return tools
+    def _make_tools(
+        self, names: list[str], owner_harnesses: dict[str, str] | None = None
+    ):
+        owners = owner_harnesses or {}
+        return [
+            ToolDefinition(
+                name=name,
+                description="",
+                input_schema={},
+                owner_harness=owners.get(name),
+            )
+            for name in names
+        ]
 
-    def test_boot_time_filters_to_allowed(self):
+    def test_boot_time_hides_tools_owned_by_other_harnesses(self):
         agent = self._make_agent()
         agent.tools = self._make_tools(
             [
@@ -37,7 +44,12 @@ class TestHarnessToolScoping:
                 "get_benchmark_params",
                 "write_remote_file",
                 "read_remote_file",
-            ]
+            ],
+            owner_harnesses={
+                "execute_boot_time_test": "boot-time",
+                "execute_benchmark": "crucible",
+                "get_benchmark_params": "crucible",
+            },
         )
         ticket = {
             "custom_fields": {
@@ -48,9 +60,14 @@ class TestHarnessToolScoping:
         names = {t.name for t in agent.tools}
         assert names == {
             "read_skills",
+            "set_ssh_context",
+            "check_host",
             "execute_boot_time_test",
             "submit_benchmark_result",
             "request_clarification",
+            "get_execution_config",
+            "write_remote_file",
+            "read_remote_file",
         }
 
     def test_unlisted_harness_keeps_all_tools(self):
@@ -89,7 +106,7 @@ class TestHarnessToolScoping:
             {"custom_fields": {"directives": {"harness": "crucible"}}}
         )
         assert {tool.name for tool in agent.tools} == {
-            "get_crucible_benchmark_context",
+            "get_execution_config",
             "execute_benchmark",
         }
 
@@ -108,6 +125,76 @@ class TestHarnessToolScoping:
         )[0]["content"]
         assert "uperf-run-file.md" not in content
         assert "read_skills" not in content
+
+    def test_kube_burner_routes_guidance_through_gateway(self):
+        agent = self._make_agent()
+        agent.tools = self._make_tools(
+            [
+                "get_skill_context",
+                "read_skills",
+                "list_harness_docs",
+                "read_harness_doc",
+                "execute_benchmark",
+            ]
+        )
+        ticket = {
+            "custom_fields": {
+                "directives": {"harness": "kube-burner", "endpoint_type": "kube"},
+            },
+        }
+
+        agent._apply_tool_scoping(ticket)
+        prompt = agent._system_prompt(ticket)
+
+        assert {tool.name for tool in agent.tools} == {
+            "get_skill_context",
+            "read_skills",
+            "execute_benchmark",
+        }
+        assert 'get_skill_context(subject="harness/kube-burner"' in prompt
+        assert "config-guide.md" not in prompt
+        assert "workloads.md" not in prompt
+
+    def test_k8s_netperf_routes_context_through_gateway(self):
+        agent = self._make_agent()
+        repo_cache = MagicMock()
+        repo_cache.list_docs.return_value = [{"path": "docs/netperf-guide.md"}]
+        agent._repo_cache = repo_cache
+        ticket = {
+            "id": "PERF-OTHER-KUBE-HARNESS",
+            "summary": "Run k8s-netperf",
+            "description": "Run a Kubernetes network benchmark.",
+            "custom_fields": {
+                "directives": {"harness": "k8s-netperf", "endpoint_type": "kube"},
+            },
+        }
+
+        prompt = agent._system_prompt(ticket)
+        messages = agent._build_messages(ticket)[0]["content"]
+
+        assert 'get_skill_context(subject="harness/k8s-netperf"' in prompt
+        assert 'get_skill_context(subject="harness/kube-burner"' not in prompt
+        assert "k8s-netperf Skills" not in messages
+        assert "config-guide.md" not in messages
+        assert "Available k8s-netperf Documentation" not in messages
+        assert "docs/netperf-guide.md" not in messages
+        assert "read_harness_doc" not in prompt
+
+        agent.tools = self._make_tools(
+            [
+                "get_skill_context",
+                "list_harness_docs",
+                "read_harness_doc",
+                "validate_benchmark",
+                "execute_benchmark",
+            ],
+            owner_harnesses={"validate_benchmark": "crucible"},
+        )
+        agent._apply_tool_scoping(ticket)
+        assert {tool.name for tool in agent.tools} == {
+            "get_skill_context",
+            "execute_benchmark",
+        }
 
     def test_no_harness_directive_keeps_all_tools(self):
         agent = self._make_agent()
@@ -138,15 +225,21 @@ class TestHarnessToolScoping:
                 "workflow_load",
                 "workflow_input_build",
                 "workflow_input_validate",
-                "workflow_input_export",
-                "workflow_execute",
-                "workflow_execution_status",
-                "workflow_execution_output",
+                "execute_arcaflow_workflow",
                 "execute_benchmark",
                 "get_plugin_schema",
                 "plugin_list",
                 "request_clarification",
-            ]
+            ],
+            owner_harnesses={
+                "workflow_load": "arcaflow-workflows",
+                "workflow_input_build": "arcaflow-workflows",
+                "workflow_input_validate": "arcaflow-workflows",
+                "execute_arcaflow_workflow": "arcaflow-workflows",
+                "execute_benchmark": "crucible",
+                "get_plugin_schema": "arcaflow-plugins",
+                "plugin_list": "arcaflow-plugins",
+            },
         )
         agent._apply_tool_scoping(
             {
@@ -166,6 +259,7 @@ class TestHarnessToolScoping:
             "workflow_load",
             "workflow_input_build",
             "workflow_input_validate",
+            "execute_arcaflow_workflow",
             "request_clarification",
         }
 

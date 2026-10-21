@@ -44,6 +44,51 @@ discovery gate. Do not invent flags from memory. `get_example_runfile` must
 return the actual endpoint shape, and `validate_runfile` should return
 `{"valid": bool, "errors": list[str]}`.
 
+## Tool ownership
+
+Shared workspace, skill-gateway, and host-inspection tools remain unowned and
+available to the benchmark agent generally. If a harness adds a specialized
+MCP tool, declare its owner at the MCP registration and check the
+server-loaded ticket in the handler before execution. The registration
+attaches the harness owner to MCP metadata; the benchmark agent uses that
+metadata for tool discovery and client-side dispatch rejection. Keep the owner
+in one registration constant and use it for both
+`@mcp.tool(meta=ownership_metadata(OWNER))` and the handler's
+`require_ticket_harness(ticket, OWNER)` check, so adding the tool does not
+require a BenchmarkAgent allowlist change.
+
+Native benchmark handlers declare the same `owner_harness` on their
+`ToolDefinition`. Generic `execute_benchmark` remains shared, derives its
+execution harness from the ticket, and rejects a conflicting harness argument
+from the model. An unowned first-party tool is shared; do not use organization
+or user context to grant a specialized execution capability. Ownership-required
+external registration groups fail closed for tools without an owner.
+Owned execution resolves its ticket selection in this order:
+`directives.workflow_source`, `directives.harness`, legacy top-level
+`custom_fields.harness`, then the provider's code-configured `default_harness`.
+This same selection drives the prompt, tool discovery, and dispatch, preserving
+default-only legacy tickets. Organization documents and user prose never grant
+execution ownership.
+
+The shared `execute_benchmark` handler also checks whether the selected
+provider declares `generic_execution_supported = True`. Set this beside the
+provider only when `agents/benchmark/server.py` implements that provider's
+generic execution branch. Harnesses with their own execution tools should
+leave the default false; unsupported calls are rejected before execution
+state changes. Crucible uses the server's built-in generic adapter and has a
+separate final guard on its fallback branch.
+
+For an upstream external MCP server that cannot attach tool metadata, put its
+tool groups in a small adapter beside the code that uses that server, then
+register those groups after connecting. Mark internal execution and polling
+tools as hidden from the model when the adapter calls them itself; they remain
+owned and callable by the adapter. Arcaflow's upstream integration in
+`providers/skills/arcaflow_mcp.py` is the reference. Unknown tools from an
+ownership-required server are hidden and rejected. Use
+`agents.<agent>.enabled_tools` groups only for external servers without a
+first-party adapter. See the
+[external MCP configuration](configuration.md#external_mcp_servers).
+
 ## A current provider shape
 
 `providers/skills/k8s_netperf.py` is a useful reference because it supplies

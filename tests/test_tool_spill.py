@@ -7,7 +7,7 @@ import pytest
 
 import paths
 from agents.base import AgentBase
-from providers.llm.base import ToolCall
+from providers.llm.base import ToolCall, ToolDefinition
 
 
 class DummyAgent(AgentBase):
@@ -19,6 +19,19 @@ class DummyAgent(AgentBase):
 
     async def _handle_completion(self, ticket_id, response):
         return None
+
+
+def _register_visible_test_tool(agent: AgentBase, name: str) -> None:
+    if any(tool.name == name for tool in agent.tools):
+        return
+    agent.tools.append(
+        ToolDefinition(
+            name=name,
+            description="",
+            input_schema={"type": "object", "properties": {}},
+            owner_harness=None,
+        )
+    )
 
 
 @pytest.fixture
@@ -50,6 +63,7 @@ async def test_agent_has_native_workspace_tools(agent):
 async def test_tool_output_under_threshold_not_spilled(agent):
     small_payload = json.dumps({"status": "ok", "count": 5})
     agent._tool_handlers["fetch_status"] = AsyncMock(return_value=small_payload)
+    _register_visible_test_tool(agent, "fetch_status")
 
     call = ToolCall(id="call_1", name="fetch_status", input={})
     res = await agent._execute_tool(call)
@@ -63,6 +77,7 @@ async def test_tool_output_over_threshold_spilled_and_queryable(agent):
     large_data = {"series": [i * 1.5 for i in range(5000)]}
     large_payload = json.dumps(large_data)
     agent._tool_handlers["get_metrics"] = AsyncMock(return_value=large_payload)
+    _register_visible_test_tool(agent, "get_metrics")
 
     call = ToolCall(id="call_2", name="get_metrics", input={})
     res = await agent._execute_tool(call)
@@ -114,6 +129,7 @@ async def test_exempt_tools_not_spilled(agent, monkeypatch):
 
     large_payload = json.dumps({"rows": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]})
     for tool_name in exempt_tools:
+        _register_visible_test_tool(agent, tool_name)
         agent._tool_handlers[tool_name] = AsyncMock(return_value=large_payload)
         call = ToolCall(id=f"call_{tool_name}", name=tool_name, input={})
         res = await agent._execute_tool(call)
@@ -137,6 +153,7 @@ async def test_caller_configured_threshold(tmp_path, monkeypatch):
 
     payload_150_bytes = json.dumps({"data": "x" * 150})
     custom_agent._tool_handlers["get_data"] = AsyncMock(return_value=payload_150_bytes)
+    _register_visible_test_tool(custom_agent, "get_data")
 
     call = ToolCall(id="call_custom", name="get_data", input={})
     res = await custom_agent._execute_tool(call)
@@ -163,6 +180,7 @@ async def test_in_flight_jq_filter_returns_data_in_same_turn(agent):
     agent._tool_handlers["get_cache_topology"] = AsyncMock(
         return_value=json.dumps(large_data)
     )
+    _register_visible_test_tool(agent, "get_cache_topology")
 
     # Tool call with in-flight jq_filter to extract only ccd_id and cpus
     call = ToolCall(
@@ -189,6 +207,7 @@ async def test_in_flight_jq_filter_returns_data_in_same_turn(agent):
 async def test_in_flight_jq_filter_invalid_query_returns_error_descriptor(agent):
     data = {"status": "ok", "items": [1, 2, 3]}
     agent._tool_handlers["get_items"] = AsyncMock(return_value=json.dumps(data))
+    _register_visible_test_tool(agent, "get_items")
 
     call = ToolCall(
         id="call_err",
@@ -243,6 +262,7 @@ async def test_mcp_chart_tool_receives_schema_declared_jq_filter(agent):
 
 async def test_mcp_generic_tool_preserves_post_result_filtering(agent):
     agent._mcp = AsyncMock()
+    _register_visible_test_tool(agent, "remote_json_tool")
     agent._mcp.call_tool.return_value = json.dumps(
         {"items": [{"id": 1}, {"id": 2}], "ignored": "large response"}
     )

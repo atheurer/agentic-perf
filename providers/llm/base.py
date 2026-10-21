@@ -47,6 +47,7 @@ class ToolDefinition:
     name: str
     description: str
     input_schema: dict[str, Any]
+    owner_harness: str | None = None
 
 
 @dataclass

@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+import pytest
+
 ROOT = Path(__file__).parents[1]
 WRAPPER_PATH = "providers/execution/filesystem.py"
 EXCLUDED_SOURCE_DIRS = {
@@ -1271,6 +1273,7 @@ def _facade_state_by_scope(
     parameters_by_scope: dict[str, set[str]] = {scope: set() for scope in scope_names}
     fields_by_class: dict[str, set[str]] = {}
     returns: dict[str, set[int | None]] = {}
+    facade_parameter_lines: dict[tuple[str, str], int] = {}
 
     class_body_scopes = {
         (
@@ -1358,6 +1361,14 @@ def _facade_state_by_scope(
                 if parent_scope != "<module>"
                 else node.name
             )
+            # Typed helper parameters carry the same source-level contract as
+            # imported facade return annotations. Lookalike/shadowed imports
+            # remain unknown, and every later rebind still invalidates trust.
+            args = node.args
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+                if is_facade_annotation(arg.annotation, parent_scope):
+                    bindings.setdefault(def_scope, {})[arg.arg] = True
+                    facade_parameter_lines[(def_scope, arg.arg)] = arg.lineno
             annotation = node.returns
             indices: set[int | None] = set()
             if is_facade_annotation(annotation, parent_scope):
@@ -1526,11 +1537,17 @@ def _facade_state_by_scope(
                 if name:
                     facade_assignment_lines[(scope, name)] = node.lineno
     facade_assignment_lines.update(recognized_facade_assignment_lines)
+    # Check all assignments after a typed parameter's declaration, including
+    # unknown rebinds followed by a later valid facade assignment.
+    facade_assignment_lines.update(facade_parameter_lines)
 
     invalid_bindings: set[tuple[str, str]] = set()
     invalid_fields: set[tuple[str, str]] = set()
     invalid_bindings.update(
-        (scope, name) for scope, names in parameters_by_scope.items() for name in names
+        (scope, name)
+        for scope, names in parameters_by_scope.items()
+        for name in names
+        if (scope, name) not in facade_parameter_lines
     )
     for node in nodes:
         if isinstance(node, ast.Assign):
@@ -2157,6 +2174,57 @@ def test_aliases_cannot_hide_os_open_mutations() -> None:
     resolved = [_resolved_call_name(node.func, aliases) for node in calls]
     assert resolved == ["os.open", "os.open", "pathlib.Path.open", "pathlib.Path"]
     assert all(_is_mutation(node, name) for node, name in zip(calls[:3], resolved[:3]))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from providers.execution import AuditedFilesystem\n"
+        "def mutate(fs: AuditedFilesystem):\n    fs.mkdir('cache')\n",
+        "from providers.execution.filesystem import AuditedFilesystem as Facade\n"
+        "async def mutate(fs: Facade, /):\n    fs.unlink('cache')\n",
+        "import providers.execution.filesystem as audited\n"
+        "def mutate(*, fs: audited.AuditedFilesystem):\n    fs.rmdir('cache')\n",
+    ],
+)
+def test_imported_facade_parameters_are_audited(source: str) -> None:
+    assert _inventory_from_sources({"helper.py": source}) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from providers.execution import AuditedFilesystem\n"
+        "from pathlib import Path\n"
+        "def mutate(fs: AuditedFilesystem):\n"
+        "    fs = Path('raw')\n    fs.unlink()\n",
+        "from providers.execution import AuditedFilesystem\n"
+        "from pathlib import Path\n"
+        "def mutate(fs: AuditedFilesystem):\n"
+        "    fs = Path('raw')\n    fs.unlink()\n"
+        "    fs = AuditedFilesystem.system(root)\n",
+        "from providers.execution import AuditedFilesystem\n"
+        "def outer(fs: AuditedFilesystem):\n"
+        "    def mutate(fs):\n        fs.unlink('raw')\n",
+        "from providers.execution import AuditedFilesystem\n"
+        "from pathlib import Path\n"
+        "def outer():\n    AuditedFilesystem = Path\n"
+        "    def mutate(fs: AuditedFilesystem):\n        fs.unlink('raw')\n",
+        "class AuditedFilesystem: pass\n"
+        "def mutate(fs: AuditedFilesystem):\n    fs.unlink('raw')\n",
+        "from providers.execution import AuditedFilesystem\n"
+        "def mutate(fs: 'AuditedFilesystem'):\n    fs.unlink('raw')\n",
+        "from providers.execution import AuditedFilesystem\n"
+        "from pathlib import Path\n"
+        "def mutate(fs: AuditedFilesystem | Path):\n    fs.unlink('raw')\n",
+        "from providers.execution import AuditedFilesystem\n"
+        "def mutate(fs: AuditedFilesystem):\n"
+        "    for fs in unknown_objects:\n        fs.unlink('raw')\n",
+    ],
+)
+def test_unknown_or_rebound_facade_parameters_remain_raw(source: str) -> None:
+    mutations = _inventory_from_sources({"helper.py": source})
+    assert any(mutation.call == "fs.unlink" for mutation in mutations)
 
 
 def test_no_raw_mutations_outside_audited_filesystem() -> None:

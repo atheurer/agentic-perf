@@ -10,11 +10,12 @@ EXCLUDED = {
     "orchestrator/leader_lease.py",
     "orchestrator/poller.py",
     "providers/execution/http.py",
+    "providers/secrets/git_reference.py",
     "providers/skills/arcaflow_plugins.py",
     "providers/skills/crucible.py",
     "providers/tracing/client.py",
 }
-EXCLUDED_CALLS = {"orchestrator/dispatcher.py": {150}}
+EXCLUDED_CALLS = {"orchestrator/dispatcher.py": {152}}
 
 
 def _direct_httpx_calls(path: Path) -> list[int]:

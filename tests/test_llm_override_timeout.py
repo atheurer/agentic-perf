@@ -72,6 +72,7 @@ async def _run_override(
     mock_agent.DEFAULT_GLOBAL_MAX_ITERATIONS = 100
 
     dispatcher = MagicMock()
+    dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
     dispatcher.store_url = "http://localhost:9999"
     dispatcher.create_agent.return_value = mock_agent
     dispatcher.mark_done = AsyncMock()

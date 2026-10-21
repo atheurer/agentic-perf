@@ -659,6 +659,13 @@ def _make_context_run_agent(
         state_store_url="http://localhost:8090",
         event_bus=EventBus(log_dir=tmp_path / "logs"),
         max_iterations=0,
+        tools=[
+            ToolDefinition(
+                name="read_file",
+                description="Read a test file.",
+                input_schema={"type": "object", "properties": {}},
+            )
+        ],
         tool_handlers={
             "read_file": AsyncMock(return_value="current tool response"),
         },

@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import shlex
 import sys
@@ -39,9 +40,15 @@ from agents.ethtool import (
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     build_secrets_provider,
-    build_skill_provider,
+    build_skill_provider_async,
     build_ssh_from_ticket,
     read_skill_documents,
+)
+from agents.skill_gateway import (
+    SKILL_GATEWAY_TOOL_DESCRIPTION,
+    organization_manages_harness,
+    skill_config_view,
+    skill_context_gateway,
 )
 from providers.llm.base import ToolDefinition
 from providers.ssh import SSHExecutor
@@ -76,8 +83,12 @@ async def _ensure_init():
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = build_skill_provider(resolve_source=False)
     _secrets_provider = build_secrets_provider()
+    _skill_provider = await build_skill_provider_async(
+        secrets_provider=_secrets_provider,
+        resolve_source=False,
+        skill_phase="provisioning",
+    )
     _initialized = True
 
 
@@ -314,10 +325,11 @@ async def _ensure_prerequisites_one(
     host: str,
     is_controller: bool,
     extra_packages: list[str],
+    endpoint_type: str,
 ) -> dict:
     """Check and install missing prerequisites on a single host."""
     already_present = []
-    to_install = list(BASE_HOST_PACKAGES)
+    to_install = list(BASE_HOST_PACKAGES) if endpoint_type == "remotehosts" else []
     for pkg in extra_packages:
         if pkg not in to_install:
             to_install.append(pkg)
@@ -849,10 +861,37 @@ async def _verify_harness_install_one(
     path = install_path or provisioning.get(
         "install_target_path", f"/opt/{harness_name}"
     )
-    verify_cmd = provisioning.get("verify_command", f"{path}/bin/{harness_name} help")
+    default_verify_cmd = (
+        f"{path}/bin/burden -h"
+        if harness_name == "zathras"
+        else f"{path}/bin/{harness_name} help"
+    )
+    verify_cmd = provisioning.get("verify_command", default_verify_cmd)
+    zathras_help_command = False
+    if harness_name == "zathras":
+        try:
+            verify_args = shlex.split(verify_cmd)
+        except ValueError:
+            verify_args = []
+        if (
+            len(verify_args) == 2
+            and Path(verify_args[0]).name == "burden"
+            and verify_args[-1] in {"-h", "--usage"}
+        ):
+            zathras_help_command = True
+            # Normalize the older organization setting while it is updated.
+            if verify_args[-1] == "--usage":
+                verify_args[-1] = "-h"
+                verify_cmd = shlex.join(verify_args)
 
     result = await _ssh.run(host, verify_cmd)
-    harness_verified = result.exit_code == 0
+    help_output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    zathras_help_succeeded = (
+        zathras_help_command
+        and result.exit_code == 1
+        and re.search(r"\busage\b", help_output, re.IGNORECASE) is not None
+    )
+    harness_verified = result.exit_code == 0 or zathras_help_succeeded
     context: dict[str, Any] | None = None
 
     # The context gateway bootstraps Crucible from the controller's installed
@@ -1177,25 +1216,33 @@ async def ensure_prerequisites(
     """Check and install missing prerequisites on all hosts in one call.
 
     Harness prerequisites (podman, git, jq, curl) are checked and installed
-    only on the controller_host. Base host packages (nmap-ncat) are always
-    installed on ALL hosts for connectivity testing. Additional extra_packages
-    are also installed on all hosts. Use this instead of calling
+    only on the controller_host. The base host package nmap-ncat is installed
+    on all hosts only for remotehosts endpoints, where host-to-host TCP
+    connectivity is tested. It is omitted for kube endpoints. Additional
+    extra_packages are installed on all hosts. Use this instead of calling
     check_host_prerequisites then install_packages separately.
 
     Args:
         hosts: List of host IPs to process
         extra_packages: Additional packages to install on all hosts
-            beyond the base host packages
+            beyond the endpoint-specific base host packages
         controller_host: The controller IP — harness prereqs are only
             installed here. If empty, harness prereqs are skipped on
             all hosts (only extra_packages are installed).
     """
     await _ensure_init()
+    custom_fields = _ticket.get("custom_fields", {})
+    directives = custom_fields.get("directives", {})
+    endpoint_type = directives.get("endpoint_type", "remotehosts")
+    if endpoint_type not in {"remotehosts", "kube"}:
+        return json.dumps({"error": "endpoint_type must be 'remotehosts' or 'kube'."})
     extras = extra_packages or []
 
     async def _run_one(host: str) -> dict:
         is_controller = host == controller_host
-        return await _ensure_prerequisites_one(host, is_controller, extras)
+        return await _ensure_prerequisites_one(
+            host, is_controller, extras, endpoint_type
+        )
 
     results = await _gather_for_hosts(hosts, _run_one)
     return json.dumps(_summarize(results))
@@ -1344,6 +1391,16 @@ async def install_k3s(hosts: list[str], user: str = "root") -> str:
 @mcp.tool()
 async def list_skill_docs(harness: str) -> str:
     """List available skill documents for a topic. Use 'general' for host-tuning, connectivity, and network-perf guides. Use a harness name (e.g. 'crucible') for harness-specific docs."""
+    category_root = (
+        harness.strip().strip("/").removeprefix("skills/").split("/", 1)[0].lower()
+    )
+    if category_root == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
     skill_dir = _SKILLS_DIR / harness
     if not skill_dir.is_dir():
         return json.dumps(
@@ -1356,7 +1413,25 @@ async def list_skill_docs(harness: str) -> str:
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
     """Read one or more skill documents in one call. Each entry in docs must be a dict with 'harness' and 'filename' (e.g. [{'harness': 'general', 'filename': 'host-tuning.md'}]). Always read 'host-tuning.md' in the 'general' harness before applying any host tuning — it defines the required tool ordering, BBR+fq dependency, and irqbalance strategy."""
-    return json.dumps(read_skill_documents(_SKILLS_DIR, docs))
+    allowed = []
+    rejected = []
+    for doc in docs:
+        harness = doc.get("harness") or doc.get("category", "")
+        if isinstance(harness, str) and harness.strip().lower() == "crucible":
+            rejected.append(
+                {
+                    "found": False,
+                    "harness": harness,
+                    "filename": doc.get("filename") or doc.get("name", ""),
+                    "message": (
+                        "Use get_skill_context(subject='harness/crucible', "
+                        "operation='bootstrap')."
+                    ),
+                }
+            )
+        else:
+            allowed.append(doc)
+    return json.dumps(rejected + read_skill_documents(_SKILLS_DIR, allowed))
 
 
 @mcp.tool()
@@ -3076,10 +3151,53 @@ async def ensure_harness_installed(
     return json.dumps(_summarize(results))
 
 
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+    cursor: str = "",
+) -> str:
+    """Retrieve guidance through server-owned subject and source bindings."""
+    await _ensure_init()
+    return await skill_context_gateway(
+        _skill_provider,
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="provisioning-agent",
+        phase="provisioning",
+        subject=subject,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+        cursor=cursor,
+    )
+
+
 @mcp.tool()
 async def get_private_config(harness_name: str, key: str) -> str:
-    """Fetch private configuration for a benchmark harness. Returns organization-specific data like install method, repo paths, registry URLs, and constraints (supported OS, prerequisites). Use key='constraints' to check OS and platform requirements before attempting installation."""
+    """Get approved harness installation or platform settings. For Crucible, key must be constraints, provisioning, or platform_contract; commands, secret bindings, and installation contracts remain service-only. Read operational guidance through get_skill_context."""
     await _ensure_init()
+    if harness_name == "crucible" or organization_manages_harness(
+        _skill_provider, harness_name
+    ):
+        try:
+            result = await skill_config_view(
+                _skill_provider, harness_name, key, "provisioning"
+            )
+        except Exception:
+            return json.dumps(
+                {"key": key, "value": None, "reason": "configuration_view_unavailable"}
+            )
+        return json.dumps({"key": key, "value": result})
     result = await _skill_provider.get_private_config(harness_name, key)
     if result is None:
         return json.dumps(

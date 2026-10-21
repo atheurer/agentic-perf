@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agents.provisioning.prompts import PROVISIONING_BASE_PROMPT
 from agents.provisioning.server import (
     _parse_os_release,
     _summarize,
@@ -34,7 +35,7 @@ ZATHRAS_PRIVATE_CONFIG = {
         "git_url": "https://github.com/redhat-performance/zathras.git",
         "install_script": "install.sh",
         "install_target_path": "/opt/zathras",
-        "verify_command": "/opt/zathras/bin/burden --usage",
+        "verify_command": "/opt/zathras/bin/burden -h",
         "update_command": "cd /opt/zathras && git pull && ./install.sh",
         "run_install_as_root": "yes | ./install.sh",
         "pre_install_steps": [
@@ -44,6 +45,17 @@ ZATHRAS_PRIVATE_CONFIG = {
         "on_existing_install": "skip",
     },
 }
+
+
+def test_skip_existing_install_preserves_existing_but_installs_when_missing():
+    prompt = " ".join(PROVISIONING_BASE_PROMPT.split())
+
+    assert '"skip": preserve and verify an existing installation' in prompt
+    assert (
+        "if it is missing, install it from the approved provisioning config" in prompt
+    )
+    assert "Use ensure_harness_installed for this behavior" in prompt
+
 
 CRUCIBLE_PRIVATE_CONFIG = {
     "platform_contract": {
@@ -174,8 +186,7 @@ async def test_check_existing_reads_from_config(mock_provider):
     """Verify that harness config provides the paths needed for check_existing_install."""
     zathras_config = await mock_provider.get_all_private_config("zathras")
     assert (
-        zathras_config["provisioning"]["verify_command"]
-        == "/opt/zathras/bin/burden --usage"
+        zathras_config["provisioning"]["verify_command"] == "/opt/zathras/bin/burden -h"
     )
     assert zathras_config["provisioning"]["install_target_path"] == "/opt/zathras"
 
@@ -241,6 +252,61 @@ async def test_verify_crucible_fails_readiness_when_context_missing(
     assert result["context_ready"] is False
     assert result["verified"] is False
     assert "context" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_verify_zathras_accepts_help_exit_one_and_normalizes_legacy_command(
+    mock_ssh, monkeypatch
+):
+    """Zathras help exits 1; usage output proves the installation is present."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/zathras/bin/burden -h": SSHResult(
+            exit_code=1,
+            stdout="Zathras burden version 3.2\nUsage: burden [options]",
+        ),
+    }
+    provisioning = {
+        "install_target_path": "/opt/zathras",
+        "verify_command": "/opt/zathras/bin/burden --usage",
+    }
+
+    result = await _verify_harness_install_one("controller", "zathras", provisioning)
+
+    assert result["verified"] is True
+    assert result["harness_verified"] is True
+    assert result["output"].startswith("Zathras burden version 3.2")
+    assert mock_ssh.calls[0]["command"] == "/opt/zathras/bin/burden -h"
+
+
+@pytest.mark.asyncio
+async def test_verify_zathras_does_not_accept_exit_one_without_usage(
+    mock_ssh, monkeypatch
+):
+    """An arbitrary failing Zathras command remains a verification failure."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/zathras/bin/burden -h": SSHResult(
+            exit_code=1,
+            stderr="unable to load required config",
+        ),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "zathras",
+        {
+            "install_target_path": "/opt/zathras",
+            "verify_command": "/opt/zathras/bin/burden -h",
+        },
+    )
+
+    assert result["verified"] is False
+    assert result["harness_verified"] is False
 
 
 @pytest.mark.asyncio
@@ -660,6 +726,7 @@ async def test_all_tools_use_hosts_or_targets():
             "request_clarification",
             "submit_provisioning_result",
             # Skill doc tools — no host param at all
+            "get_skill_context",
             "list_skill_docs",
             "read_skills",
             # Per-host tuning tools — parameters vary per host (CPU, interface)
@@ -743,6 +810,7 @@ async def test_ensure_prerequisites_controller_gets_harness_prereqs():
             "10.0.0.1",
             is_controller=True,
             extra_packages=[],
+            endpoint_type="remotehosts",
         )
 
     assert "jq" in result["already_present"]
@@ -773,6 +841,7 @@ async def test_ensure_prerequisites_target_gets_base_packages():
             "10.0.0.2",
             is_controller=False,
             extra_packages=[],
+            endpoint_type="remotehosts",
         )
 
     assert "nmap-ncat" in result["newly_installed"]
@@ -801,6 +870,7 @@ async def test_ensure_prerequisites_no_output_on_success():
             "10.0.0.1",
             is_controller=False,
             extra_packages=[],
+            endpoint_type="remotehosts",
         )
 
     assert "output" not in result
@@ -828,6 +898,7 @@ async def test_ensure_prerequisites_reports_failures():
             "10.0.0.1",
             is_controller=False,
             extra_packages=["nonexistent-pkg"],
+            endpoint_type="remotehosts",
         )
 
     assert "nonexistent-pkg" in result["failed"]

@@ -12,12 +12,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.shared.exceptions import McpError
 from mcp.types import CONNECTION_CLOSED
 
 from agents.mcp_stdio import audited_stdio_client
+from agents.tool_ownership import owner_harness_from_tool, tool_visible_to_model
 from providers.llm.base import ToolDefinition
 from providers.redaction import get_shared_redactor
 from providers.tracing import (
@@ -64,6 +66,14 @@ class MCPToolCallError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.retry_classification = retry_classification
+
+
+class _MCPRegistrationRefreshError(RuntimeError):
+    """Tool registration could not be checked before a reconnected call."""
+
+    def __init__(self, tool_name: str, *, timed_out: bool) -> None:
+        super().__init__(f"Could not verify tool {tool_name!r} after MCP reconnect")
+        self.timed_out = timed_out
 
 
 @dataclass(frozen=True)
@@ -208,6 +218,11 @@ class AgentMCPClient:
     ) -> None:
         self._servers: dict[str, _ServerConnection] = {}
         self._tool_routing: dict[str, str] = {}
+        self._tool_owners: dict[str, str] = {}
+        self._tool_owner_overrides: dict[tuple[str, str], str] = {}
+        self._hidden_owned_tools: set[tuple[str, str]] = set()
+        self._ownership_required_servers: set[str] = set()
+        self._selected_harness: str | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._disconnect_lock = asyncio.Lock()
         self._disconnect_requests = 0
@@ -234,6 +249,56 @@ class AgentMCPClient:
         from agents.fencing import current_fence_context
 
         self._fence_context = current_fence_context()
+
+    def set_harness_context(self, harness: str) -> None:
+        """Bind owned tool discovery and dispatch to the selected ticket harness."""
+        self._selected_harness = harness
+
+    def register_tool_owner(
+        self,
+        server_name: str,
+        tool_name: str,
+        owner_harness: str,
+        *,
+        visible_to_model: bool = True,
+    ) -> None:
+        """Declare owner and model visibility for a remote tool registration."""
+        if not server_name or not tool_name or not owner_harness:
+            raise ValueError("server, tool, and owner harness are required")
+        if not isinstance(visible_to_model, bool):
+            raise ValueError("visible_to_model must be a boolean")
+        key = (server_name, tool_name)
+        existing_owner = self._tool_owner_overrides.get(key)
+        if existing_owner is None and self._tool_routing.get(tool_name) == server_name:
+            existing_owner = self._tool_owners.get(tool_name)
+        if existing_owner is not None and existing_owner != owner_harness:
+            raise ValueError(
+                f"Tool {tool_name!r} from {server_name!r} has conflicting "
+                "harness owner registrations"
+            )
+        self._tool_owner_overrides[key] = owner_harness
+        if visible_to_model:
+            self._hidden_owned_tools.discard(key)
+        else:
+            self._hidden_owned_tools.add(key)
+        if self._tool_routing.get(tool_name) == server_name:
+            self._tool_owners[tool_name] = owner_harness
+
+    def require_tool_ownership(self, server_name: str) -> None:
+        """Fail closed for external registration groups with owned tools."""
+        if not server_name:
+            raise ValueError("server_name is required")
+        self._ownership_required_servers.add(server_name)
+
+    def _tool_owner(self, server_name: str, tool: Any) -> str | None:
+        declared = owner_harness_from_tool(tool)
+        configured = self._tool_owner_overrides.get((server_name, tool.name))
+        if declared and configured and declared != configured:
+            raise ValueError(
+                f"Tool {tool.name!r} from {server_name!r} declares conflicting "
+                "harness owners"
+            )
+        return declared or configured
 
     def _ensure_trace_client(self) -> None:
         """Attach the configured recorder when the client is in use."""
@@ -792,8 +857,16 @@ class AgentMCPClient:
                         for tool_name, server in self._tool_routing.items()
                         if server != name
                     }
+                    self._tool_owners = {
+                        tool_name: owner
+                        for tool_name, owner in self._tool_owners.items()
+                        if self._tool_routing.get(tool_name) is not None
+                    }
                     for tool in result.tools:
                         self._tool_routing[tool.name] = name
+                        owner = self._tool_owner(name, tool)
+                        if owner is not None:
+                            self._tool_owners[tool.name] = owner
                     conn._task = task
         except asyncio.CancelledError as exc:
             cancellation_state = _cancellation_state(exc)
@@ -845,9 +918,9 @@ class AgentMCPClient:
         Args:
             include: If provided, only return tools whose names
                 are in this set. Tools not in the set are still
-                callable via call_tool() — this only controls
-                what the LLM sees. If None, all tools are
-                returned.
+                hidden from the LLM, while harness-owned tools
+                also require the selected harness at dispatch.
+                If None, all otherwise-visible tools are returned.
         """
         tools = []
         for conn in self._servers.values():
@@ -856,6 +929,25 @@ class AgentMCPClient:
                 continue
             result = await session.list_tools()
             for t in result.tools:
+                owner_harness = self._tool_owner(conn.name, t)
+                if (
+                    owner_harness is None
+                    and conn.name in self._ownership_required_servers
+                ):
+                    continue
+                if owner_harness is not None:
+                    self._tool_owners[t.name] = owner_harness
+                    if owner_harness != self._selected_harness:
+                        continue
+                    if (
+                        not tool_visible_to_model(t)
+                        or (
+                            conn.name,
+                            t.name,
+                        )
+                        in self._hidden_owned_tools
+                    ):
+                        continue
                 if include is not None and t.name not in include:
                     continue
                 tools.append(
@@ -863,6 +955,7 @@ class AgentMCPClient:
                         name=t.name,
                         description=t.description or "",
                         input_schema=t.inputSchema,
+                        owner_harness=owner_harness,
                     )
                 )
         return tools
@@ -976,11 +1069,10 @@ class AgentMCPClient:
         trace_context: TraceContext | None,
         audit_state: _MCPDispatchAuditState | None = None,
     ) -> MCPHookResult:
-        """Dispatch one provider-owned MCP call through audited client boundaries.
+        """Dispatch one adapter-owned MCP call through audited boundaries.
 
-        This is the explicit contract for a pre-call hook that must issue the
-        MCP request itself. The returned result carries whether a request was
-        sent and whether the MCP server returned an error.
+        The returned result carries whether a request was sent and whether the
+        MCP server returned an error.
         """
         server_name = self._tool_routing.get(name)
         if server_name is None:
@@ -1035,6 +1127,21 @@ class AgentMCPClient:
             arguments,
             trace_context,
             audit_state=audit_state,
+            internal_dispatch=True,
+        )
+
+    async def call_internal_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        trace_context: TraceContext | None = None,
+    ) -> str:
+        """Call an owned tool from trusted adapter code, including hidden tools."""
+        return await self.call_tool(
+            name,
+            arguments,
+            trace_context,
+            internal_dispatch=True,
         )
 
     async def _reconnect_server(
@@ -1143,6 +1250,75 @@ class AgentMCPClient:
                 )
                 return True
 
+    async def _reconnected_tool_policy_error(
+        self,
+        conn: _ServerConnection,
+        name: str,
+        *,
+        internal_dispatch: bool,
+    ) -> str | None:
+        """Recheck ownership against the refreshed server registration."""
+        if self._tool_routing.get(name) != conn.name:
+            return f"Tool {name!r} no longer routes to MCP server {conn.name!r}"
+        if self._servers.get(conn.name) is not conn:
+            return f"MCP server {conn.name!r} changed during reconnect"
+        session = conn.session
+        if session is None:
+            return f"MCP session for {conn.name!r} closed after reconnect"
+
+        try:
+            result = await session.list_tools()
+        except Exception as exc:
+            logger.warning(
+                "Could not refresh MCP tools for %s after reconnect (error_type=%s)",
+                conn.name,
+                type(exc).__name__,
+            )
+            raise _MCPRegistrationRefreshError(
+                name,
+                timed_out=isinstance(exc, TimeoutError)
+                or (
+                    isinstance(exc, McpError)
+                    and exc.error.code == httpx.codes.REQUEST_TIMEOUT
+                ),
+            ) from None
+
+        if (
+            self._servers.get(conn.name) is not conn
+            or conn.session is not session
+            or self._tool_routing.get(name) != conn.name
+        ):
+            return f"MCP route for tool {name!r} changed after reconnect"
+
+        tool = next((item for item in result.tools if item.name == name), None)
+        if tool is None:
+            self._tool_owners.pop(name, None)
+            return f"Tool {name!r} is not registered by MCP server {conn.name!r}"
+
+        try:
+            owner_harness = self._tool_owner(conn.name, tool)
+            visible_to_model = tool_visible_to_model(tool)
+        except ValueError:
+            return f"Tool {name!r} has invalid ownership metadata"
+
+        if owner_harness is None:
+            self._tool_owners.pop(name, None)
+        else:
+            self._tool_owners[name] = owner_harness
+
+        if owner_harness is None and conn.name in self._ownership_required_servers:
+            return f"Tool {name!r} has no owner in external server {conn.name!r}"
+        if owner_harness is not None and owner_harness != self._selected_harness:
+            return (
+                f"Tool {name!r} requires ticket harness {owner_harness!r}; "
+                f"selected harness is {self._selected_harness or 'unset'!r}"
+            )
+        if not internal_dispatch and (
+            not visible_to_model or (conn.name, name) in self._hidden_owned_tools
+        ):
+            return f"Tool {name!r} is reserved for internal dispatch"
+        return None
+
     async def _dispatch_mcp_request(
         self,
         conn: _ServerConnection,
@@ -1150,6 +1326,8 @@ class AgentMCPClient:
         arguments: dict[str, Any],
         context: TraceContext,
         audit_state: _MCPDispatchAuditState | None = None,
+        internal_dispatch: bool = False,
+        reconnected_route: bool = False,
     ) -> MCPHookResult:
         def record_reconnect_cancellation(
             exc: asyncio.CancelledError,
@@ -1211,12 +1389,20 @@ class AgentMCPClient:
                         and new_conn._reconnect_origin_session_id == conn.session_id
                         and self._tool_routing.get(name) == new_conn.name
                     ):
+                        retry_context = context.model_copy(
+                            update={
+                                "mcp_server": new_conn.name,
+                                "mcp_session_id": new_conn.session_id,
+                            }
+                        )
                         return await self._dispatch_mcp_request(
                             new_conn,
                             name,
                             arguments,
-                            context,
+                            retry_context,
                             audit_state=audit_state,
+                            internal_dispatch=internal_dispatch,
+                            reconnected_route=True,
                         )
 
             error = RuntimeError("MCP session closed before tool dispatch")
@@ -1240,6 +1426,71 @@ class AgentMCPClient:
                 retry_classification="transport_before_send",
                 audit_recorded=terminal_recorded,
             )
+
+        if reconnected_route:
+            try:
+                policy_error = await self._reconnected_tool_policy_error(
+                    conn,
+                    name,
+                    internal_dispatch=internal_dispatch,
+                )
+            except asyncio.CancelledError as exc:
+                record_reconnect_cancellation(
+                    exc,
+                    RetryKind.TRANSPORT_BEFORE_SEND,
+                )
+                raise
+            except _MCPRegistrationRefreshError as exc:
+                state = (
+                    LifecycleState.TIMED_OUT if exc.timed_out else LifecycleState.FAILED
+                )
+                outcome = (
+                    OperationOutcome.TIMED_OUT
+                    if exc.timed_out
+                    else OperationOutcome.FAILURE
+                )
+                terminal_recorded = self._record_boundary(
+                    conn,
+                    state,
+                    context=context,
+                    tool_name=name,
+                    outcome=outcome,
+                    retry_kind=RetryKind.TRANSPORT_BEFORE_SEND,
+                    error=exc,
+                )
+                if audit_state is not None:
+                    audit_state.terminal_recorded = terminal_recorded
+                    audit_state.request_sent = False
+                    audit_state.retry_classification = "transport_before_send"
+                return MCPHookResult(
+                    content=self._redact_client_message(conn, context, str(exc)),
+                    is_error=True,
+                    request_sent=False,
+                    retry_classification="transport_before_send",
+                    audit_recorded=terminal_recorded,
+                )
+            if policy_error:
+                message = self._redact_client_message(conn, context, policy_error)
+                terminal_recorded = self._record_boundary(
+                    conn,
+                    LifecycleState.REJECTED,
+                    context=context,
+                    tool_name=name,
+                    outcome=OperationOutcome.REJECTED,
+                    retry_kind=RetryKind.VALIDATION,
+                    error=message,
+                )
+                if audit_state is not None:
+                    audit_state.terminal_recorded = terminal_recorded
+                    audit_state.request_sent = False
+                    audit_state.retry_classification = "validation"
+                return MCPHookResult(
+                    content=message,
+                    is_error=True,
+                    request_sent=False,
+                    retry_classification="validation",
+                    audit_recorded=terminal_recorded,
+                )
 
         try:
             self._record_boundary(
@@ -1409,6 +1660,8 @@ class AgentMCPClient:
         name: str,
         arguments: dict[str, Any],
         trace_context: TraceContext | None = None,
+        *,
+        internal_dispatch: bool = False,
     ) -> str:
         server_name = self._tool_routing.get(name)
         if server_name is None:
@@ -1485,6 +1738,42 @@ class AgentMCPClient:
                 error=message,
             )
             raise MCPToolCallError(message, "validation") from exc
+
+        owner_harness = self._tool_owners.get(name)
+        ownership_required = server_name in self._ownership_required_servers
+        if ownership_required and owner_harness is None:
+            message = self._redact_client_message(
+                conn,
+                context,
+                f"Tool {name!r} has no owner in external server {server_name!r}",
+            )
+            self._record_boundary(
+                conn,
+                LifecycleState.REJECTED,
+                context=context,
+                tool_name=name,
+                outcome=OperationOutcome.REJECTED,
+                retry_kind=RetryKind.VALIDATION,
+                error=message,
+            )
+            raise MCPToolCallError(message, "validation")
+        if owner_harness is not None and owner_harness != self._selected_harness:
+            message = self._redact_client_message(
+                conn,
+                context,
+                f"Tool {name!r} requires ticket harness {owner_harness!r}; "
+                f"selected harness is {self._selected_harness or 'unset'!r}",
+            )
+            self._record_boundary(
+                conn,
+                LifecycleState.REJECTED,
+                context=context,
+                tool_name=name,
+                outcome=OperationOutcome.REJECTED,
+                retry_kind=RetryKind.VALIDATION,
+                error=message,
+            )
+            raise MCPToolCallError(message, "validation")
 
         # Pre-call hook: provider-specific guards
         # (e.g., Jumpstarter one-connect, timeout).
@@ -1585,7 +1874,13 @@ class AgentMCPClient:
                     outcome=OperationOutcome.SUCCESS,
                 )
                 return short_circuit
-        result = await self._dispatch_mcp_request(conn, name, arguments, context)
+        result = await self._dispatch_mcp_request(
+            conn,
+            name,
+            arguments,
+            context,
+            internal_dispatch=internal_dispatch,
+        )
         if result.is_error:
             raise MCPToolCallError(result.content, result.retry_classification)
         content = result.content
@@ -1814,6 +2109,10 @@ class AgentMCPClient:
                         pass
             self._servers.clear()
             self._tool_routing.clear()
+            self._tool_owners.clear()
+            self._tool_owner_overrides.clear()
+            self._ownership_required_servers.clear()
+            self._hidden_owned_tools.clear()
             trace_close_error = None
             try:
                 if self._trace_client is not None and self._owns_trace_client:
@@ -1861,9 +2160,12 @@ async def connect_external_servers(
 
     - ``"all"`` or omitted: all tools visible
     - list of names: only those tools visible
+    - mapping of harness owners to tool-name lists: only the selected harness
+      sees those tools, and dispatch rejects owner mismatches
 
-    Tools not in ``enabled_tools`` are hidden from the LLM
-    but remain callable via ``call_tool()`` in code.
+    A harness-owner mapping is the registration contract for external servers
+    that cannot attach MCP metadata. Tools from that server without a declared
+    owner are rejected at dispatch.
 
     Args:
         client: The agent's MCP client.
@@ -1950,6 +2252,52 @@ async def connect_external_servers(
         else:
             continue
 
+        tools_cfg = agent_config.get("enabled_tools", "all")
+        tool_owners: dict[str, str] = {}
+        if isinstance(tools_cfg, dict):
+            enabled_names: set[str] = set()
+            valid_groups = True
+            for owner_harness, names in tools_cfg.items():
+                if (
+                    not isinstance(owner_harness, str)
+                    or not owner_harness
+                    or not isinstance(names, list)
+                    or not all(isinstance(tool_name, str) for tool_name in names)
+                ):
+                    valid_groups = False
+                    break
+                for tool_name in names:
+                    previous_owner = tool_owners.get(tool_name)
+                    if previous_owner is not None and previous_owner != owner_harness:
+                        valid_groups = False
+                        break
+                    tool_owners[tool_name] = owner_harness
+                    enabled_names.add(tool_name)
+                if not valid_groups:
+                    break
+            if not valid_groups:
+                logger.warning(
+                    "[mcp] Skipping external server %r: invalid enabled_tools "
+                    "harness ownership groups",
+                    name,
+                )
+                continue
+            tools_cfg = enabled_names
+        elif isinstance(tools_cfg, list):
+            if not all(isinstance(tool_name, str) for tool_name in tools_cfg):
+                logger.warning(
+                    "[mcp] Skipping external server %r: enabled_tools must contain "
+                    "only tool names",
+                    name,
+                )
+                continue
+        elif tools_cfg not in {"all", None}:
+            logger.warning(
+                "[mcp] Skipping external server %r: invalid enabled_tools config",
+                name,
+            )
+            continue
+
         if not transport:
             logger.warning(
                 f"[mcp] Skipping external server {name!r}: missing transport"
@@ -2023,12 +2371,17 @@ async def connect_external_servers(
 
             # Collect tool scoping for this agent, retaining the owning
             # server's policy instead of flattening all policies together.
-            tools_cfg = agent_config.get("enabled_tools", "all")
             if isinstance(tools_cfg, list):
                 enabled_tools[name] = set(tools_cfg)
+            elif isinstance(tools_cfg, set):
+                enabled_tools[name] = tools_cfg
             else:
                 # "all" or omitted means no filtering for this server.
                 enabled_tools[name] = None
+            if tool_owners:
+                client.require_tool_ownership(name)
+                for tool_name, owner_harness in tool_owners.items():
+                    client.register_tool_owner(name, tool_name, owner_harness)
         except Exception:
             logger.warning(
                 f"[mcp] Failed to connect to {name!r} at {url}",

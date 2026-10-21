@@ -174,7 +174,9 @@ def _side_effect_category(path: str, call: str) -> str | None:
     # surfaced by the scanner.
     if path == "agents/resource/server.py" and call in _RESOURCE_HOST_PARSING_CALLS:
         return None
-    if "mcp" in lowered and ("call_tool" in lowered or "fastmcp" in lowered):
+    if "mcp" in lowered and any(
+        token in lowered for token in ("call_tool", "call_internal_tool", "fastmcp")
+    ):
         return "mcp"
     if "ssh" in lowered and leaf in {"run", "copy_to", "copy_from", "connect"}:
         return "ssh"
@@ -1404,7 +1406,7 @@ async def test_each_registered_chat_name_gets_a_correlated_audit_pair(
     monkeypatch.setattr(
         chat_tools,
         "_get_benchmark_catalog_provider",
-        lambda: CatalogProvider(),
+        AsyncMock(return_value=CatalogProvider()),
     )
 
     registrations = _chat_registrations()
@@ -1694,6 +1696,8 @@ async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair()
         # state-store adapter, so the installed handler takes its successful
         # path without creating a ticket or touching a host.
         if isinstance(agent, BenchmarkAgent):
+            ticket["custom_fields"]["directives"] = {"harness": "crucible"}
+            agent._selected_harness = "crucible"
             run_file: dict[str, object] = {}
             ticket["custom_fields"]["benchmark_validations"] = {
                 "records": {

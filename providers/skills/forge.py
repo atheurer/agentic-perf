@@ -170,6 +170,8 @@ _VALID_PROFILES = {"profile1", "profile2", "profile3", "profile4"}
 
 
 class ForgeSkillProvider(SkillProvider):
+    generic_execution_supported = True
+
     async def list_benchmarks(self) -> list[BenchmarkSuite]:
         results = []
         for name, info in _BENCHMARKS.items():

@@ -507,7 +507,8 @@ async def test_status_only_reservation_failure_does_not_set_flag():
 
     srv._initialized = True
     srv._registry = mock_registry
-    srv._ticket = {"custom_fields": {}}
+    # Reach the provider response rather than the missing-ticket-key guard.
+    srv._ticket = {"id": "PERF-TEST", "custom_fields": {}}
 
     raw = await srv.reserve_resources(
         provider="quads",
@@ -518,8 +519,40 @@ async def test_status_only_reservation_failure_does_not_set_flag():
     result = json.loads(raw)
 
     assert result["status"] == "failed"
+    mock_provider.reserve.assert_awaited_once()
     assert srv._resources_allocated is False
     assert srv._reservation_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_quads_caller_ticket_key_cannot_replace_missing_active_context(
+    monkeypatch,
+):
+    """A model-supplied ticket key must not authorize a QUADS allocation."""
+    import agents.resource.server as srv
+
+    monkeypatch.delenv("TICKET_ID", raising=False)
+    registry = MagicMock()
+    registry.get_provider = AsyncMock()
+    srv._initialized = True
+    srv._registry = registry
+    srv._ticket = {"custom_fields": {"resource_provider": "quads"}}
+
+    result = json.loads(
+        await srv.reserve_resources(
+            provider="quads",
+            selection={"hostnames": ["host-01"]},
+            description="test",
+            ticket_id="PERF-CALLER",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["provider_call_started"] is False
+    assert "No Agentic Perf ticket key" in result["error"]
+    registry.get_provider.assert_not_awaited()
+    assert srv._reservation_failures == 0
+    assert srv._reservation_uncertain is False
 
 
 # ---------------------------------------------------------------------------

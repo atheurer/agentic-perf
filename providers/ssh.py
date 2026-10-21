@@ -386,15 +386,19 @@ class SSHExecutor:
                 cleanup_failed = False
                 cleanup_exit_code: int | None = None
                 try:
-                    cleanup = await state.child().run(
+                    cleanup_executor = state.child()
+                    cleanup_kwargs: dict[str, Any] = {
+                        "timeout": 5,
+                        "key_path": state.key_path,
+                    }
+                    # Test/dry-run instance overrides predate the audit
+                    # keyword. Real child executors fail closed here.
+                    if "run" not in cleanup_executor.__dict__:
+                        cleanup_kwargs["mutating"] = True
+                    cleanup = await cleanup_executor.run(
                         state.host,
                         f"rm -rf {state.run_dir}",
-                        timeout=5,
-                        key_path=state.key_path,
-                        mutating=True,
-                        # Test/dry-run instance overrides predate the audit
-                        # keyword. Real child executors fail closed here.
-                        **({"mutating": True} if "run" not in self.__dict__ else {}),
+                        **cleanup_kwargs,
                     )
                     if cleanup.exit_code != 0:
                         cleanup_failed = True

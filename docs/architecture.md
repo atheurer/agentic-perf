@@ -171,6 +171,12 @@ agents. `awaiting_customer_guidance` resumes to the previous status when the
 user replies. The `planning_investigation` agent is a stub that auto-advances;
 all other investigation loop agents are fully implemented.
 
+If an agent finishes without advancing the ticket from its dispatched status,
+the orchestrator backs off and retries that stage up to five times. This
+includes `triage_pending`; exhausted retries pause automatic dispatch and add a
+ticket comment for human review. Moving the ticket to another status clears
+the retry limit.
+
 ### Analysis Agent (Data-First Investigation)
 
 The analysis agent investigates performance questions by querying
@@ -802,8 +808,11 @@ but not lease management tools (`jmp_create_lease`,
   `awaiting_hardware`, any existing Jumpstarter lease is
   released. This handles the case where a user sends a ticket
   back to resource acquisition after a provisioning failure.
-- **Lease sweep:** Each poll cycle, the orchestrator checks for
-  orphaned leases whose tickets have reached a terminal status.
+- **Lease sweep:** When Jumpstarter is configured, the orchestrator checks
+  for orphaned leases at the configured
+  `jumpstarter_lease_sweep_interval_seconds` interval (60 seconds by
+  default), independently of ticket polling. A value of `0` disables the
+  sweep. It releases leases whose tickets have reached a terminal status.
   This is a failsafe for leases not cleaned up by teardown
   (crashed orchestrators, skipped teardown, manual closure).
   The normal lease release path is the resource agent's
@@ -990,6 +999,36 @@ calling agent's type. The gathering_context, evaluate, and review
 agents call this in their `run()` method. See
 [Configuration](configuration.md#external_mcp_servers) for the
 config schema.
+
+### Benchmark tool ownership
+
+Shared workspace, gateway, and host-inspection tools have no harness owner.
+Harness-specific MCP registrations attach `owner_harness` metadata beside the
+tool implementation. `AgentMCPClient.list_tools()` uses that metadata to hide
+tools for other ticket harnesses, and `call_tool()` enforces the same owner
+before sending a request. After reconnect, it refreshes the server's tool
+registration and checks ownership and visibility again before retrying. Native
+benchmark handlers use the owner carried by their `ToolDefinition`; owned
+local MCP handlers also resolve the selected harness from the server-loaded
+ticket before running.
+
+Generic benchmark execution derives its harness from the same trusted ticket
+selection used by the prompt and discovery: `workflow_source`,
+`directives.harness`, legacy top-level harness, then the provider's
+code-configured default. It rejects a conflicting model-supplied `harness`
+argument and runs only when that provider declares generic execution support;
+Crucible's built-in fallback is guarded separately.
+Harnesses with dedicated execution tools do not receive the generic executor.
+Adding a harness-owned tool therefore does not require editing a BenchmarkAgent
+tool-name table. For an upstream external MCP server that cannot return owner
+metadata, its adapter declares tool groups beside the integration that uses
+them. Arcaflow's registration in `providers/skills/arcaflow_mcp.py` owns plugin
+discovery and workflow tools; raw workflow execution and polling tools stay
+hidden from the model while remaining callable by the local workflow adapter.
+Unknown tools from that ownership-required Arcaflow server are hidden and
+rejected. Other
+external servers without a first-party adapter can use `enabled_tools` groups
+keyed by harness; the group drives discovery and client-side rejection.
 
 **Conditional prompt guidance:**
 
@@ -1220,16 +1259,20 @@ verdicts, and operational directives.
 
 ## Skill Documentation
 
-The `skills/` directory contains per-harness documentation that agents read
-at runtime through `list_harness_docs` and `read_harness_doc` tools:
+Crucible guidance is retrieved through the subject-scoped skill gateway.
+Administrator-configured organization documents and service configuration
+are private; software references remain upstream or controller sourced.
+Ticket-bound gateway captures for the current kube-burner, k8s-netperf, and AWS
+document maps use service-only storage with immutable revisions and closure
+cleanup. Zathras and Arcaflow retain their existing legacy retrieval paths.
+See [skill gateway design](design-skill-gateway.md) and the migration inventory
+in [issue #1153](https://github.com/atheurer/agentic-perf/issues/1153).
+Repository tools continue to serve repository docs:
 
 ```
 skills/
   crucible/
-    cdm-query-guide.md     # How to query the CommonDataModel for results
-    kube-endpoints.md       # Kubernetes endpoint configuration
-    run-file-pitfalls.md    # Common run-file mistakes and solutions
-    userenv-guide.md        # User environment selection
+    README.md              # Generic subject gateway pointer
   zathras/
     local-config-guide.md   # Local execution configuration
     scenario-construction.md # Building test scenarios

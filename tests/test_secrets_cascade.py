@@ -16,6 +16,7 @@ from providers.secrets.cascade import (
     CascadingSecretsProvider,
     build_cascade_for_user,
 )
+from providers.secrets.git_reference import GitSecretReferenceProvider
 from providers.secrets.local import LocalSecretsProvider
 
 
@@ -23,6 +24,12 @@ def _write_secret(base, path, content="secret-value"):
     full = base / path
     full.parent.mkdir(parents=True, exist_ok=True)
     full.write_text(content)
+
+
+def _unwrap_git_reference_provider(provider):
+    if isinstance(provider, GitSecretReferenceProvider):
+        return provider._inner
+    return provider
 
 
 def _make_fake_vault(
@@ -351,7 +358,9 @@ class TestDispatcherSecrets:
 
         dispatcher, _ = self._make_dispatcher(secrets_root, user_store)
         secrets = dispatcher._get_secrets_for_ticket({"created_by": "alice"})
-        assert isinstance(secrets, CascadingSecretsProvider)
+        assert isinstance(
+            _unwrap_git_reference_provider(secrets), CascadingSecretsProvider
+        )
 
     def test_returns_shared_for_unclaimed(self, secrets_root):
         from state_store.identity import UserStore
@@ -360,7 +369,7 @@ class TestDispatcherSecrets:
         dispatcher, shared = self._make_dispatcher(secrets_root, user_store)
 
         result = dispatcher._get_secrets_for_ticket({"created_by": ""})
-        assert result is shared
+        assert _unwrap_git_reference_provider(result) is shared
 
     def test_returns_shared_in_legacy_mode(self, secrets_root):
         from orchestrator.dispatcher import Dispatcher
@@ -374,7 +383,7 @@ class TestDispatcherSecrets:
         )
 
         result = dispatcher._get_secrets_for_ticket({"created_by": "alice"})
-        assert result is shared
+        assert _unwrap_git_reference_provider(result) is shared
 
     def test_returns_shared_for_unknown_user(self, secrets_root):
         from state_store.identity import UserStore
@@ -383,7 +392,7 @@ class TestDispatcherSecrets:
         dispatcher, shared = self._make_dispatcher(secrets_root, user_store)
 
         result = dispatcher._get_secrets_for_ticket({"created_by": "ghost"})
-        assert result is shared
+        assert _unwrap_git_reference_provider(result) is shared
 
     def test_returns_shared_for_none_ticket(self, secrets_root):
         from orchestrator.dispatcher import Dispatcher
@@ -397,7 +406,7 @@ class TestDispatcherSecrets:
         )
 
         result = dispatcher._get_secrets_for_ticket(None)
-        assert result is shared
+        assert _unwrap_git_reference_provider(result) is shared
 
     def test_cascade_includes_user_groups(self, secrets_root):
         from state_store.identity import UserStore
@@ -415,7 +424,9 @@ class TestDispatcherSecrets:
 
         dispatcher, _ = self._make_dispatcher(secrets_root, user_store)
         secrets = dispatcher._get_secrets_for_ticket({"created_by": "alice"})
-        assert isinstance(secrets, CascadingSecretsProvider)
+        assert isinstance(
+            _unwrap_git_reference_provider(secrets), CascadingSecretsProvider
+        )
 
     async def test_shared_layer_excludes_users_and_groups(self, secrets_root):
         from state_store.identity import UserStore
@@ -1026,8 +1037,11 @@ class TestDispatcherVaultConfig:
         cascade = dispatcher._get_secrets_for_ticket(
             {"created_by": "alice"},
         )
-        assert isinstance(cascade, CascadingSecretsProvider)
-        labels = [label for label, _ in cascade._layers]
+        assert isinstance(
+            _unwrap_git_reference_provider(cascade), CascadingSecretsProvider
+        )
+        inner_cascade = _unwrap_git_reference_provider(cascade)
+        labels = [label for label, _ in inner_cascade._layers]
         assert "vault:shared" in labels
 
     def test_no_vault_config_backward_compat(self, secrets_root):
@@ -1048,6 +1062,9 @@ class TestDispatcherVaultConfig:
         cascade = dispatcher._get_secrets_for_ticket(
             {"created_by": "alice"},
         )
-        assert isinstance(cascade, CascadingSecretsProvider)
-        labels = [label for label, _ in cascade._layers]
+        assert isinstance(
+            _unwrap_git_reference_provider(cascade), CascadingSecretsProvider
+        )
+        inner_cascade = _unwrap_git_reference_provider(cascade)
+        labels = [label for label, _ in inner_cascade._layers]
         assert "vault:shared" not in labels
