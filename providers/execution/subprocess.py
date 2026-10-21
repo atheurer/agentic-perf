@@ -312,6 +312,8 @@ class AuditedSubprocessRunner:
         cwd: Path | str | None = None,
         env: dict[str, str] | None = None,
         stdin: bytes | None = None,
+        stdin_pipe: bool = False,
+        stdin_size: int | None = None,
         stdout: Any = asyncio.subprocess.PIPE,
         stderr: Any = asyncio.subprocess.PIPE,
         mutating: bool = False,
@@ -335,7 +337,9 @@ class AuditedSubprocessRunner:
                 *argv,
                 cwd=cwd,
                 env=env,
-                stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+                stdin=(
+                    asyncio.subprocess.PIPE if stdin is not None or stdin_pipe else None
+                ),
                 stdout=stdout,
                 stderr=stderr,
             )
@@ -362,7 +366,7 @@ class AuditedSubprocessRunner:
                     key: hashlib.sha256(value.encode()).hexdigest()[:16]
                     for key, value in (env or {}).items()
                 },
-                stdin_size=len(stdin or b""),
+                stdin_size=(len(stdin or b"") if stdin_size is None else stdin_size),
             )
         )
         tracked = AuditedProcess(self, process, argv, child)

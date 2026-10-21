@@ -74,7 +74,11 @@ async def test_triage_list_matches_shared_catalog(monkeypatch):
 
     provider = _Provider({"crucible": _Harness([_suite("uperf")])})
     expected, _ = await list_benchmark_catalog(provider)
-    monkeypatch.setattr(triage_server, "_get_provider", lambda: provider)
+
+    async def get_provider():
+        return provider
+
+    monkeypatch.setattr(triage_server, "_get_provider", get_provider)
 
     result = json.loads(await triage_server.list_benchmarks())
 

@@ -45,3 +45,30 @@ def test_boot_time_review_keeps_artifact_tools_and_describes_artifact_analysis()
     assert "## Boot-Time Results" in prompt
     assert "list_benchmark_artifacts and read_benchmark_artifact" in prompt
     assert "There are no external result files" not in prompt
+
+
+def test_crucible_review_always_uses_gateway_even_after_analysis():
+    from agents.review.agent import ReviewAgent
+
+    agent = ReviewAgent.__new__(ReviewAgent)
+    agent._skill_provider = None
+    prompt = agent._system_prompt(
+        {
+            "custom_fields": {
+                "directives": {"harness": "crucible"},
+                "analysis_result": {
+                    "finding": "Existing measurements are inconclusive."
+                },
+            }
+        }
+    )
+
+    normalized_prompt = " ".join(prompt.split())
+    assert 'get_skill_context(subject="harness/crucible"' in normalized_prompt
+    assert (
+        "authenticated user context before organization context, organization before"
+        in normalized_prompt
+    )
+    assert "upstream before bundled project-local docs" in normalized_prompt
+    assert "temporary fallback with the lowest default authority" in normalized_prompt
+    assert "does not yet load user-scoped skill packages" in normalized_prompt

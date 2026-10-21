@@ -43,9 +43,10 @@ install_harness + verify_harness_install into one batched call.
 
 1. **Determine the harness name.** Check the ticket's "directives"
    section for a "harness" field first. If not present, look for the
-   harness field in benchmark metadata. Then call get_private_config
-   with that harness name and key "provisioning" to learn the harness's
-   provisioning requirements.
+   harness field in benchmark metadata. For Crucible, bootstrap
+   `get_skill_context(subject="harness/crucible")` and read the returned
+   configuration view named `provisioning`. For other harnesses, call
+   `get_private_config` with that harness name and key `provisioning`.
 
 2. **Check platform contract** with all hosts and the harness_name to
    verify each host's OS, repos, and packages are compatible. If
@@ -90,9 +91,9 @@ install_harness + verify_harness_install into one batched call.
    happens, silently. Check the ticket's parsed_specs for IRQ
    pinning, NIC queue count, congestion control, qdisc, or other
    tuning. If ANY are present:
-   a. Read `read_skills(docs=[{"harness": "general",
-      "filename": "host-tuning.md"}])` for required ordering
-      (tune_nic → pin_irq) and irqbalance strategy
+   a. Call `get_skill_context(subject="general/host-tuning",
+      operation="bootstrap")` and read the returned entrypoint for
+      required ordering (tune_nic → pin_irq) and irqbalance strategy
    b. Apply with tune_nic, tune_tcp, pin_irq as needed — one
       call per host per tool
    c. When RX flow-steering rules are requested, call
@@ -114,9 +115,11 @@ install_harness + verify_harness_install into one batched call.
 
 Important:
 - Installation can take several minutes — be patient.
-- On freshly provisioned or QUADS-allocated hosts, call
-  disable_firewall on ALL endpoint hosts before connectivity checks
-  or benchmarks. Do NOT call on shared or production hosts.
+- Change firewall settings only according to explicit ticket instructions or
+  retrieved organization policy. Confirm the policy's host scope and any
+  restrictions before calling disable_firewall. If required connectivity
+  cannot be established and no applicable policy is available, request
+  clarification.
 - Read the private skill config FIRST to understand what to do.
 - Follow the on_existing_install directive exactly.
 - Always pass the harness_name to install, verify, and check tools.
