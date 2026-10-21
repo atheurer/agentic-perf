@@ -324,6 +324,14 @@ class AgentBase(ABC):
         the last ``fleet_iteration_epoch`` event. This resets
         the per-agent budget each fleet iteration so agents
         don't exhaust their budget across the full fleet.
+
+        Likewise, a ``hitl_resume_epoch`` event (emitted by the
+        state store when a human reply transitions the ticket out of
+        ``awaiting_customer_guidance``) restarts the budgets: the
+        iteration caps guard autonomous operation between human
+        touchpoints, so a pause-and-resume cycle must not consume
+        them (#1231). Without this reset an agent that once hit its
+        limit is locked out again on every subsequent dispatch.
         """
         from providers.events import EventBus
 
@@ -332,7 +340,10 @@ class AgentBase(ABC):
         global_iters = 0
         try:
             for evt in events.get_events(ticket_id, since=0, limit=100_000):
-                if evt.get("event_type") == "fleet_iteration_epoch":
+                if evt.get("event_type") in (
+                    "fleet_iteration_epoch",
+                    "hitl_resume_epoch",
+                ):
                     agent_iters = 0
                     global_iters = 0
                 elif evt.get("event_type") == "llm_request":
