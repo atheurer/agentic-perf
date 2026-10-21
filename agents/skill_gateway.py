@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import posixpath
 import re
 import secrets
@@ -37,6 +38,8 @@ _MAX_SOURCE_DOCUMENT_BYTES = 1024 * 1024
 _MAX_UPSTREAM_DOCUMENTS = 256
 _MAX_UPSTREAM_PACKAGE_BYTES = 32 * 1024 * 1024
 _MAX_SOURCE_SEARCH_BYTES = 4 * 1024 * 1024
+_MAX_LOCAL_DIRECTORY_ALIASES = 256
+_MAX_LOCAL_TREE_ENTRIES = 8192
 SKILL_GATEWAY_TOOL_DESCRIPTION = """Retrieve subject guidance and software references.
 
 Bootstrap returns applicable bundled project and organization entrypoints,
@@ -764,6 +767,64 @@ class _TicketRepoView:
         return sorted(results, key=lambda item: str(item["path"]))
 
 
+def _capture_local_directory_aliases(base: Path) -> dict[str, str]:
+    """Capture bounded, safe directory symlinks without following them."""
+    aliases: dict[str, str] = {}
+    scanned_entries = 0
+    for current, directory_names, file_names in os.walk(
+        base, topdown=True, followlinks=False
+    ):
+        scanned_entries += len(directory_names) + len(file_names)
+        if scanned_entries > _MAX_LOCAL_TREE_ENTRIES:
+            raise SkillGatewayError(
+                "source_too_large", "Local directory inventory exceeds its limit"
+            )
+        current_path = Path(current)
+        for name in tuple(directory_names):
+            candidate = current_path / name
+            if not candidate.is_symlink():
+                continue
+            alias = candidate.relative_to(base).as_posix()
+            if _source_path_excluded(alias):
+                continue
+            try:
+                link_target = Path(os.readlink(candidate))
+                lexical_target = (
+                    link_target
+                    if link_target.is_absolute()
+                    else candidate.parent / link_target
+                )
+                lexical_target = Path(os.path.abspath(lexical_target))
+                lexical_target.relative_to(base)
+                resolved = candidate.resolve(strict=True)
+                if not resolved.is_dir() or resolved != lexical_target.resolve(
+                    strict=True
+                ):
+                    continue
+                canonical = resolved.relative_to(base).as_posix()
+                if canonical == ".":
+                    canonical = ""
+                if _source_path_excluded(canonical):
+                    continue
+                target_component = base
+                has_symlink_chain = False
+                for part in Path(canonical).parts:
+                    target_component = target_component / part
+                    if target_component.is_symlink():
+                        has_symlink_chain = True
+                        break
+                if has_symlink_chain:
+                    continue
+            except (OSError, ValueError, RuntimeError):
+                continue
+            aliases[alias] = canonical
+            if len(aliases) > _MAX_LOCAL_DIRECTORY_ALIASES:
+                raise SkillGatewayError(
+                    "source_too_large", "Local directory aliases exceed their limit"
+                )
+    return dict(sorted(aliases.items()))
+
+
 def _capture_local_tree(local_skills_dir: Path | None, subject: str) -> dict[str, Any]:
     base = _local_base(local_skills_dir, subject)
     if base is None:
@@ -772,6 +833,7 @@ def _capture_local_tree(local_skills_dir: Path | None, subject: str) -> dict[str
             "revision": hashlib.sha256(b"missing").hexdigest(),
             "documents": [],
         }
+    directory_aliases = _capture_local_directory_aliases(base)
     listed = _list_local_documents(local_skills_dir, subject)
     documents = []
     total = 0
@@ -811,6 +873,10 @@ def _capture_local_tree(local_skills_dir: Path | None, subject: str) -> dict[str
         raise SkillGatewayError(
             "source_changed_during_capture", "Local source changed during capture"
         )
+    if _capture_local_directory_aliases(base) != directory_aliases:
+        raise SkillGatewayError(
+            "source_changed_during_capture", "Local directory aliases changed"
+        )
     for relative, content in captured.items():
         target, target_type = _source_path_type(base, relative, kind="local")
         if target_type != "file" or target.read_bytes() != content:
@@ -818,12 +884,24 @@ def _capture_local_tree(local_skills_dir: Path | None, subject: str) -> dict[str
                 "source_changed_during_capture", "Local source changed during capture"
             )
     digest = hashlib.sha256()
+    digest.update(b"local-tree-v2\0documents\0")
     for item in documents:
         digest.update(item["path"].encode("utf-8"))
         digest.update(b"\0")
         digest.update(captured[item["path"]])
         digest.update(b"\0")
-    return {"available": True, "revision": digest.hexdigest(), "documents": documents}
+    digest.update(b"directory-aliases\0")
+    for alias, canonical in directory_aliases.items():
+        digest.update(alias.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(canonical.encode("utf-8"))
+        digest.update(b"\0")
+    return {
+        "available": True,
+        "revision": digest.hexdigest(),
+        "documents": documents,
+        "directory_aliases": directory_aliases,
+    }
 
 
 async def _ticket_source_snapshot(
@@ -1046,7 +1124,90 @@ def _list_source_directory(
     return {"results": results, "complete": complete}
 
 
+def _local_snapshot_resolved_path(snapshot: dict[str, Any], relative: str) -> str:
+    """Resolve a local directory alias using only the ticket-pinned map."""
+    if not isinstance(relative, str) or relative.startswith(("/", "\\")):
+        raise SkillGatewayError("invalid_document", "Invalid local source path")
+    normalized = posixpath.normpath(relative)
+    if normalized in {"..", "."} and relative not in {"", "."}:
+        raise SkillGatewayError("invalid_document", "Invalid local source path")
+    if normalized.startswith("../") or "\\" in normalized or ":" in normalized:
+        raise SkillGatewayError("invalid_document", "Invalid local source path")
+    normalized = "" if normalized == "." else normalized
+    if _source_path_excluded(normalized):
+        raise SkillGatewayError("invalid_document", "Source path is excluded")
+
+    aliases = snapshot.get("directory_aliases", {})
+    if not isinstance(aliases, dict) or len(aliases) > _MAX_LOCAL_DIRECTORY_ALIASES:
+        raise SkillGatewayError(
+            "invalid_snapshot", "Local directory alias map is invalid"
+        )
+    checked: dict[str, str] = {}
+    for alias, canonical in aliases.items():
+        if not isinstance(alias, str) or not isinstance(canonical, str):
+            raise SkillGatewayError(
+                "invalid_snapshot", "Local directory alias map is invalid"
+            )
+        alias_path = posixpath.normpath(alias)
+        canonical_path = posixpath.normpath(canonical)
+        alias_path = "" if alias_path == "." else alias_path
+        canonical_path = "" if canonical_path == "." else canonical_path
+        if (
+            not alias_path
+            or alias_path == ".."
+            or alias_path != alias
+            or canonical_path == ".."
+            or canonical_path != canonical
+            or alias_path.startswith("../")
+            or canonical_path.startswith("../")
+            or alias_path.startswith("/")
+            or canonical_path.startswith("/")
+            or "\\" in alias_path
+            or "\\" in canonical_path
+            or ":" in alias_path
+            or ":" in canonical_path
+            or _source_path_excluded(alias_path)
+            or _source_path_excluded(canonical_path)
+            or alias_path == canonical_path
+        ):
+            raise SkillGatewayError(
+                "invalid_snapshot", "Local directory alias map is invalid"
+            )
+        checked[alias_path] = canonical_path
+
+    # A mapping target must not itself pass through another alias. This also
+    # rejects cycles, so request resolution always uses one pinned mapping.
+    for alias, canonical in checked.items():
+        if any(
+            canonical == other or canonical.startswith(f"{other}/") for other in checked
+        ):
+            raise SkillGatewayError("invalid_snapshot", "Local directory alias chain")
+
+    for alias in sorted(checked, key=lambda item: (-len(item), item)):
+        if normalized == alias or normalized.startswith(f"{alias}/"):
+            suffix = normalized[len(alias) :].lstrip("/")
+            resolved = posixpath.normpath(posixpath.join(checked[alias], suffix))
+            resolved = "" if resolved == "." else resolved
+            if (
+                resolved == ".."
+                or resolved.startswith("../")
+                or _source_path_excluded(resolved)
+            ):
+                raise SkillGatewayError("invalid_document", "Invalid local source path")
+            if any(
+                (resolved == other or resolved.startswith(f"{other}/"))
+                and other != alias
+                for other in checked
+            ):
+                raise SkillGatewayError(
+                    "invalid_document", "Local directory alias chain"
+                )
+            return resolved
+    return normalized
+
+
 def _local_snapshot_type(snapshot: dict[str, Any], relative: str) -> str:
+    relative = _local_snapshot_resolved_path(snapshot, relative)
     documents = snapshot.get("documents", [])
     paths = {
         item.get("path")
@@ -1068,6 +1229,7 @@ def _list_local_snapshot_directory(
 ) -> dict[str, Any]:
     if not snapshot.get("available"):
         raise SkillGatewayError("source_unavailable", "Local subject is unavailable")
+    relative = _local_snapshot_resolved_path(snapshot, relative)
     if _local_snapshot_type(snapshot, relative) != "directory":
         raise SkillGatewayError(
             "source_path_not_directory",
@@ -1116,11 +1278,13 @@ def _resolve_local_snapshot_pointer(
 ) -> tuple[str, str]:
     if pointer.startswith(("/", "\\")) or "://" in pointer or "\\" in pointer:
         raise SkillGatewayError("invalid_document", "Invalid relative pointer")
+    relative = _local_snapshot_resolved_path(snapshot, relative)
     origin_type = _local_snapshot_type(snapshot, relative)
     base = relative if origin_type == "directory" else posixpath.dirname(relative)
     resolved = posixpath.normpath(posixpath.join(base, pointer))
     if resolved in {"", ".", ".."} or resolved.startswith("../"):
         raise SkillGatewayError("invalid_document", "Pointer leaves its source")
+    resolved = _local_snapshot_resolved_path(snapshot, resolved)
     return resolved, _local_snapshot_type(snapshot, resolved)
 
 
@@ -1135,6 +1299,7 @@ def _read_local_document(
     snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if snapshot is not None:
+        relative = _local_snapshot_resolved_path(snapshot, relative)
         matches = [
             item
             for item in snapshot.get("documents", [])
@@ -1497,6 +1662,7 @@ def _search_source_documents(
     complete = len(documents) < 128 if kind == "local" else True
     if scope_path:
         if kind == "local":
+            scope_path = _local_snapshot_resolved_path(local_snapshot or {}, scope_path)
             scope_type = _local_snapshot_type(local_snapshot or {}, scope_path)
             scope = None
         else:

@@ -161,44 +161,85 @@ class TestProvisioningToolScoping:
 
 
 class TestBenchmarkToolScoping:
-    """Test _HARNESS_TOOLS on the benchmark agent."""
+    """Test ownership metadata used to scope benchmark agent tools."""
 
-    def test_arcaflow_scoping(self):
-        from agents.benchmark.agent import BenchmarkAgent
+    @pytest.mark.asyncio
+    async def test_arcaflow_scoping(self):
+        from agents.benchmark import arcaflow_plugin_server
+        from agents.benchmark.agent import _WORKFLOW_TOOL
+        from agents.tool_ownership import owner_harness_from_tool
+        from providers.skills.arcaflow_mcp import (
+            PLUGIN_DESCRIBE,
+            PLUGIN_LIST,
+            WORKFLOW_EXECUTE,
+            WORKFLOW_EXECUTION_CANCEL,
+            WORKFLOW_EXECUTION_OUTPUT,
+            WORKFLOW_EXECUTION_STATUS,
+            WORKFLOW_INPUT_BUILD,
+            WORKFLOW_INPUT_EXPORT,
+            WORKFLOW_INPUT_VALIDATE,
+            WORKFLOW_LIST,
+            WORKFLOW_LOAD,
+            register_arcaflow_tool_ownership,
+        )
 
-        # arcaflow-plugins: direct plugin execution via podman
-        plugins = BenchmarkAgent._HARNESS_TOOLS.get("arcaflow-plugins")
-        assert plugins is not None
-        assert "execute_arcaflow_plugin" in plugins
-        assert "execute_benchmark" not in plugins
-        assert "get_plugin_schema" in plugins
-        assert "plugin_list" in plugins
-        assert "plugin_describe" in plugins
-        assert "jq_file_from_workspace" in plugins
-        assert "read_file_from_workspace" in plugins
-        assert "list_files_from_workspace" in plugins
-        # Workflow tools should NOT be in the plugins harness
-        assert "workflow_load" not in plugins
-        assert "workflow_execute" not in plugins
+        plugin_tools = {
+            name: await arcaflow_plugin_server.mcp.get_tool(name)
+            for name in ("get_plugin_schema", "execute_arcaflow_plugin")
+        }
+        assert all(
+            owner_harness_from_tool(tool) == "arcaflow-plugins"
+            for tool in plugin_tools.values()
+        )
+        assert _WORKFLOW_TOOL.owner_harness == "arcaflow-workflows"
 
-        # arcaflow-workflows: MCP workflow execution
-        workflows = BenchmarkAgent._HARNESS_TOOLS.get("arcaflow-workflows")
-        assert workflows is not None
-        assert "workflow_load" in workflows
-        assert "workflow_input_build" in workflows
-        assert "workflow_input_validate" in workflows
-        assert "execute_arcaflow_workflow" in workflows
-        # Raw execution tools are internal to execute_arcaflow_workflow
-        assert "workflow_execute" not in workflows
-        assert "workflow_execution_status" not in workflows
-        # Plugin tools should NOT be in the workflows harness
-        assert "execute_benchmark" not in workflows
-        assert "get_plugin_schema" not in workflows
-        assert "plugin_list" not in workflows
+        class OwnershipRegistry:
+            def __init__(self):
+                self.owners = {}
 
-        # Unrestricted shell access is not part of any harness allowlist.
-        assert "write_remote_file" not in plugins
-        assert "write_remote_file" not in workflows
+            def require_tool_ownership(self, server_name):
+                assert server_name == "arcaflow"
+
+            def register_tool_owner(
+                self,
+                server_name,
+                tool_name,
+                owner_harness,
+                *,
+                visible_to_model=True,
+            ):
+                assert server_name == "arcaflow"
+                self.owners[tool_name] = (owner_harness, visible_to_model)
+
+        registry = OwnershipRegistry()
+        register_arcaflow_tool_ownership(registry)
+
+        assert {
+            name
+            for name, (owner, visible) in registry.owners.items()
+            if owner == "arcaflow-plugins" and visible
+        } == {PLUGIN_LIST, PLUGIN_DESCRIBE}
+        assert {
+            name
+            for name, (owner, visible) in registry.owners.items()
+            if owner == "arcaflow-workflows" and visible
+        } == {
+            WORKFLOW_LOAD,
+            WORKFLOW_LIST,
+            WORKFLOW_INPUT_BUILD,
+            WORKFLOW_INPUT_VALIDATE,
+        }
+        assert {
+            name
+            for name, (owner, visible) in registry.owners.items()
+            if owner == "arcaflow-workflows" and not visible
+        } == {
+            WORKFLOW_INPUT_EXPORT,
+            WORKFLOW_EXECUTE,
+            WORKFLOW_EXECUTION_STATUS,
+            WORKFLOW_EXECUTION_CANCEL,
+            WORKFLOW_EXECUTION_OUTPUT,
+        }
 
     def test_external_tool_filter_keeps_local_and_enabled_workflow_tools(self):
         from agents.benchmark.agent import _filter_external_tools
@@ -223,27 +264,47 @@ class TestBenchmarkToolScoping:
             "workflow_load",
         }
 
-    def test_boot_time_scoping(self):
+    @pytest.mark.asyncio
+    async def test_boot_time_scoping(self):
+        from agents.benchmark import server
+        from agents.tool_ownership import owner_harness_from_tool
+
+        tool = await server.mcp.get_tool("execute_boot_time_test")
+        assert owner_harness_from_tool(tool) == "boot-time"
+
+    @pytest.mark.asyncio
+    async def test_crucible_scoping_excludes_legacy_docs_but_keeps_validation(self):
+        from agents.benchmark import server
         from agents.benchmark.agent import BenchmarkAgent
+        from agents.tool_ownership import owner_harness_from_tool
 
-        allowed = BenchmarkAgent._HARNESS_TOOLS.get("boot-time")
-        assert allowed is not None
-        assert "execute_boot_time_test" in allowed
-        # execute_benchmark is not in boot-time (uses its own tool).
-        assert "execute_benchmark" not in allowed
+        validation_tool = await server.mcp.get_tool("validate_benchmark")
+        assert owner_harness_from_tool(validation_tool) == "crucible"
 
-    def test_crucible_scoping_excludes_legacy_docs_but_keeps_validation(self):
-        from agents.benchmark.agent import BenchmarkAgent
-
-        allowed = BenchmarkAgent._HARNESS_TOOLS.get("crucible")
-        excluded = BenchmarkAgent._HARNESS_EXCLUDED_TOOLS.get("crucible")
-        assert allowed is None
-        assert excluded is not None
-        assert "read_skills" in excluded
-        assert "list_harness_docs" in excluded
-        assert "read_harness_doc" in excluded
-        assert "validate_benchmark" not in excluded
-        assert "execute_benchmark" not in excluded
+        agent = BenchmarkAgent.__new__(BenchmarkAgent)
+        agent.tools = [
+            ToolDefinition(
+                name=name,
+                description="",
+                input_schema={},
+                owner_harness=owner,
+            )
+            for name, owner in (
+                ("validate_benchmark", owner_harness_from_tool(validation_tool)),
+                ("execute_benchmark", None),
+                ("read_skills", None),
+                ("list_harness_docs", None),
+                ("read_harness_doc", None),
+                ("get_benchmark_params", None),
+            )
+        ]
+        agent._apply_tool_scoping(
+            {"custom_fields": {"directives": {"harness": "crucible"}}}
+        )
+        assert {tool.name for tool in agent.tools} == {
+            "validate_benchmark",
+            "execute_benchmark",
+        }
 
 
 @pytest.mark.asyncio

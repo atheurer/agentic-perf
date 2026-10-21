@@ -1696,6 +1696,8 @@ async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair()
         # state-store adapter, so the installed handler takes its successful
         # path without creating a ticket or touching a host.
         if isinstance(agent, BenchmarkAgent):
+            ticket["custom_fields"]["directives"] = {"harness": "crucible"}
+            agent._selected_harness = "crucible"
             run_file: dict[str, object] = {}
             ticket["custom_fields"]["benchmark_validations"] = {
                 "records": {

@@ -162,7 +162,10 @@ class TestBenchmarkSkillAndDocTools:
             res = json.loads(res_str)
             assert len(res) == 1
             assert res[0]["found"] is False
-            assert "get_skill_context(subject='harness/crucible')" in res[0]["message"]
+            assert (
+                "get_skill_context(subject='harness/crucible', operation='bootstrap')"
+                in res[0]["message"]
+            )
 
     @pytest.mark.asyncio
     async def test_read_skills_batch(self, mock_skills_dir: Path):
@@ -178,7 +181,10 @@ class TestBenchmarkSkillAndDocTools:
             res = json.loads(res_str)
             assert len(res) == 2
             assert res[0]["found"] is False
-            assert "get_skill_context(subject='harness/crucible')" in res[0]["message"]
+            assert (
+                "get_skill_context(subject='harness/crucible', operation='bootstrap')"
+                in res[0]["message"]
+            )
             assert res[1]["found"] is True
 
     @pytest.mark.asyncio

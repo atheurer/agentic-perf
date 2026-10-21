@@ -2258,7 +2258,6 @@ async def test_controller_gateway_distinguishes_invalid_and_missing_origins(
 
         async def run(self, host, command, **kwargs):
             self.calls += 1
-            assert "realpath -e" in command
             return SSHResult("directory", "", 0)
 
     pointer_ssh = PointerSSH()
@@ -2272,7 +2271,7 @@ async def test_controller_gateway_distinguishes_invalid_and_missing_origins(
             operation="search",
             query="README",
             from_ref="repos/safe",
-            path="../../outside",
+            path="../../../outside",
         )
     )
     assert invalid_pointer["reason"] == "invalid_origin"

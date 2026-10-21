@@ -72,11 +72,21 @@ def _make_agent(
     tool_handlers: dict | None = None,
 ) -> _StubAgent:
     """Create a _StubAgent with optional tool handlers."""
+    handlers = tool_handlers or {}
+    tools = [
+        ToolDefinition(
+            name=name,
+            description="Test tool",
+            input_schema={"type": "object", "properties": {}},
+        )
+        for name in handlers
+    ]
     agent = _StubAgent(
         agent_name="test-agent",
         llm_provider=_FinishingLLM(),
         state_store_url="http://localhost:8090",
-        tool_handlers=tool_handlers or {},
+        tools=tools,
+        tool_handlers=handlers,
         event_bus=EventBus(log_dir=tmp_path / "logs"),
     )
     agent._client = AsyncMock()
@@ -163,8 +173,16 @@ class TestExecuteToolReraise:
             agent_name="test-agent",
             llm_provider=ToolLLM(),
             state_store_url="http://store",
+            tools=[
+                ToolDefinition(
+                    name="cancel",
+                    description="Test tool",
+                    input_schema={"type": "object", "properties": {}},
+                )
+            ],
             tool_handlers={"cancel": cancel},
         )
+        agent._client = AsyncMock()
         agent._tool_min_interval = 0
         agent._get_ticket = AsyncMock(
             return_value={"id": "T", "status": "run", "custom_fields": {}}
@@ -187,6 +205,13 @@ class TestExecuteToolReraise:
         agent._mcp = MagicMock()
         agent._mcp.call_tool = AsyncMock(
             side_effect=HITLDriftError("mcp drift"),
+        )
+        agent.tools.append(
+            ToolDefinition(
+                name="mcp_only_tool",
+                description="Test MCP tool",
+                input_schema={"type": "object", "properties": {}},
+            )
         )
         tc = _make_tool_call(name="mcp_only_tool")
 

@@ -44,6 +44,13 @@ matching characters in filenames. The scanner also resolves import aliases and
 straightforward local assignments such as `delete = os.unlink`. It fails
 closed when raw mutator function objects are passed or returned.
 
+Imported `AuditedFilesystem` return annotations and directly typed helper
+parameters identify audited facade receivers. Import aliases are supported;
+lookalike types, shadowed imports, unresolved string annotations, and union
+annotations remain unknown. Rebinding a typed parameter to an unknown object
+revokes that recognition. This is source-level type inference, not runtime
+enforcement of Python annotations.
+
 The static scan cannot reliably follow dynamic lookup (`getattr`, reflection,
 computed names), arbitrary rebinding or alias flows, or all third-party APIs.
 Writes performed by subprocesses, native extensions, and database engines

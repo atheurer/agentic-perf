@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from agents.review.prompts import REVIEW_SYSTEM_PROMPT
-from agents.skill_gateway import SKILL_GATEWAY_TOOL_DESCRIPTION, skill_context_gateway
+from agents.skill_gateway import (
+    SKILL_GATEWAY_TOOL_DESCRIPTION,
+    _source_ref,
+    skill_context_gateway,
+)
 from providers.skills.gateway import OrganizationSkillResolver, SkillGatewayError
 from providers.skills.k8s_netperf import K8sNetperfSkillProvider
 from providers.skills.multi import MultiHarnessSkillProvider
@@ -70,6 +75,74 @@ def _resolver(*sources: tuple[str, Path]) -> OrganizationSkillResolver:
             }
         }
     )
+
+
+def _pin_upstream_fixture(
+    epoch: Any,
+    source_id: str,
+    repository_url: str,
+    files: dict[str, str],
+    *,
+    symlinks: dict[str, tuple[str, bool]] | None = None,
+) -> str:
+    """Create a clean ticket-owned git checkout with a pinned HTTPS identity."""
+    ref = "fixture"
+    source_key = epoch._source_key(source_id)
+    repository_relative = f"{epoch.key}/repositories/{source_key}.git"
+    checkout_relative = f"{epoch.key}/checkouts/{source_key}"
+    repository = epoch.snapshot_root / repository_relative
+    checkout = epoch.snapshot_root / checkout_relative
+    seed = epoch.snapshot_root.parent / f"{epoch.key}-{source_key}-seed"
+    seed.mkdir(parents=True)
+
+    def git(*arguments: str, cwd: Path | None = None) -> str:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    git("init", str(seed))
+    git("-C", str(seed), "config", "user.name", "Gateway test")
+    git("-C", str(seed), "config", "user.email", "gateway-test@example.invalid")
+    for relative, content in files.items():
+        target = seed / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    for relative, (target, is_directory) in (symlinks or {}).items():
+        link = seed / relative
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target, target_is_directory=is_directory)
+    git("-C", str(seed), "add", "--all")
+    git("-C", str(seed), "commit", "-m", "gateway fixture")
+    revision = git("-C", str(seed), "rev-parse", "HEAD")
+
+    repository.parent.mkdir(parents=True, exist_ok=True)
+    git("init", "--bare", str(repository))
+    git("--git-dir", str(repository), "fetch", str(seed), revision)
+    checkout.parent.mkdir(parents=True, exist_ok=True)
+    git(
+        "--git-dir",
+        str(repository),
+        "worktree",
+        "add",
+        "--detach",
+        str(checkout),
+        revision,
+    )
+    snapshot = {
+        "revision": revision,
+        "repository": repository_url,
+        "ref": ref,
+        "repository_path": repository_relative,
+        "checkout_path": checkout_relative,
+    }
+    identity = f"{repository_url}\0{ref}"
+    epoch.get_or_capture(source_id, identity, lambda: snapshot)
+    return revision
 
 
 def test_named_sources_discover_subject_union(tmp_path: Path) -> None:
@@ -394,6 +467,9 @@ async def test_local_directory_alias_searches_its_resolved_subtree(
     real = docs / "real"
     real.mkdir(parents=True)
     (real / "needle.md").write_text("needle through a safe directory alias")
+    other = docs / "other"
+    other.mkdir()
+    (other / "needle.md").write_text("needle after alias retarget")
     (docs / "alias").symlink_to(real, target_is_directory=True)
 
     class Provider:
@@ -417,6 +493,214 @@ async def test_local_directory_alias_searches_its_resolved_subtree(
     assert source["found"] is True
     assert source["complete"] is True
     assert [item["path"] for item in source["results"]] == ["docs/real/needle.md"]
+    original_revision = source["revision"]
+
+    listed = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-LOCAL-ALIAS-SEARCH",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="list",
+            ref="skill://local/harness/kube-burner/docs/alias",
+            local_skills_dir=skills,
+        )
+    )
+    assert [item["path"] for item in listed["sources"][0]["results"]] == [
+        "docs/real/needle.md"
+    ]
+
+    pointer_read = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-LOCAL-ALIAS-SEARCH",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="read",
+            from_ref="skill://local/harness/kube-burner/docs/alias",
+            path="needle.md",
+            local_skills_dir=skills,
+        )
+    )
+    assert pointer_read["document"]["path"] == "docs/real/needle.md"
+
+    direct_read = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-LOCAL-ALIAS-SEARCH",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="read",
+            ref="skill://local/harness/kube-burner/docs/alias/needle.md",
+            local_skills_dir=skills,
+        )
+    )
+    assert direct_read["found"] is True
+    assert direct_read["document"]["path"] == "docs/real/needle.md"
+
+    (docs / "alias").unlink()
+    (docs / "alias").symlink_to(other, target_is_directory=True)
+    pinned = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-LOCAL-ALIAS-SEARCH",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="search",
+            query="needle",
+            from_ref="skill://local/harness/kube-burner/docs/alias",
+            local_skills_dir=skills,
+        )
+    )["sources"][0]
+    assert [item["path"] for item in pinned["results"]] == ["docs/real/needle.md"]
+    assert pinned["revision"] == original_revision
+
+    recaptured = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-LOCAL-ALIAS-RETARGETED",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="search",
+            query="needle",
+            from_ref="skill://local/harness/kube-burner/docs/alias",
+            local_skills_dir=skills,
+        )
+    )["sources"][0]
+    assert [item["path"] for item in recaptured["results"]] == ["docs/other/needle.md"]
+    assert recaptured["revision"] != original_revision
+
+
+@pytest.mark.asyncio
+async def test_local_directory_alias_to_subject_root_is_normalized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    skills = tmp_path / "skills"
+    subject_root = skills / "kube-burner"
+    subject_root.mkdir(parents=True)
+    (subject_root / "SKILL.md").write_text("root needle guidance")
+    (subject_root / "shortcut").symlink_to(subject_root, target_is_directory=True)
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    result = json.loads(
+        await skill_context_gateway(
+            Provider(),
+            ticket_id="PERF-LOCAL-ROOT-ALIAS",
+            agent_name="benchmark-agent",
+            phase="benchmark",
+            subject="harness/kube-burner",
+            operation="search",
+            query="needle",
+            from_ref="skill://local/harness/kube-burner/shortcut",
+            local_skills_dir=skills,
+        )
+    )
+
+    source = result["sources"][0]
+    assert source["found"] is True
+    assert [item["path"] for item in source["results"]] == ["SKILL.md"]
+
+
+@pytest.mark.asyncio
+async def test_local_directory_aliases_do_not_expose_credentials_or_outside_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import paths
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    skills = tmp_path / "skills"
+    subject_root = skills / "kube-burner"
+    docs = subject_root / "docs"
+    docs.mkdir(parents=True)
+    private = subject_root / "private"
+    private.mkdir()
+    (private / "token.md").write_text("credential-needle")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("outside-needle")
+    (docs / "credentials").symlink_to(private, target_is_directory=True)
+    (docs / "escape").symlink_to(outside, target_is_directory=True)
+
+    class Provider:
+        organization_resolver = OrganizationSkillResolver.from_instance_config({})
+
+    for alias, reason in (
+        ("credentials", "invalid_document"),
+        ("escape", "source_path_not_found"),
+    ):
+        result = json.loads(
+            await skill_context_gateway(
+                Provider(),
+                ticket_id="PERF-LOCAL-UNSAFE-ALIASES",
+                agent_name="benchmark-agent",
+                phase="benchmark",
+                subject="harness/kube-burner",
+                operation="search",
+                query="needle",
+                from_ref=f"skill://local/harness/kube-burner/docs/{alias}",
+                local_skills_dir=skills,
+            )
+        )
+        assert result["reason"] == reason
+
+
+def test_local_alias_capture_is_bounded_and_rechecked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agents.skill_gateway as gateway
+
+    skills = tmp_path / "skills"
+    subject_root = skills / "kube-burner"
+    docs = subject_root / "docs"
+    docs.mkdir(parents=True)
+    first = docs / "first"
+    second = docs / "second"
+    first.mkdir()
+    second.mkdir()
+    (docs / "alias-one").symlink_to(first, target_is_directory=True)
+    (docs / "alias-two").symlink_to(second, target_is_directory=True)
+
+    monkeypatch.setattr(gateway, "_MAX_LOCAL_DIRECTORY_ALIASES", 1)
+    with pytest.raises(SkillGatewayError) as alias_limit:
+        gateway._capture_local_tree(skills, "harness/kube-burner")
+    assert alias_limit.value.code == "source_too_large"
+
+    monkeypatch.setattr(gateway, "_MAX_LOCAL_DIRECTORY_ALIASES", 256)
+    monkeypatch.setattr(gateway, "_MAX_LOCAL_TREE_ENTRIES", 1)
+    with pytest.raises(SkillGatewayError) as tree_limit:
+        gateway._capture_local_tree(skills, "harness/kube-burner")
+    assert tree_limit.value.code == "source_too_large"
+
+    monkeypatch.setattr(gateway, "_MAX_LOCAL_TREE_ENTRIES", 8192)
+    monkeypatch.setattr(gateway, "_MAX_LOCAL_DIRECTORY_ALIASES", 256)
+    original_capture = gateway._capture_local_directory_aliases
+    call_count = 0
+
+    def retarget_after_capture(base: Path) -> dict[str, str]:
+        nonlocal call_count
+        aliases = original_capture(base)
+        call_count += 1
+        if call_count == 1:
+            (docs / "alias-one").unlink()
+            (docs / "alias-one").symlink_to(second, target_is_directory=True)
+        return aliases
+
+    monkeypatch.setattr(
+        gateway, "_capture_local_directory_aliases", retarget_after_capture
+    )
+    with pytest.raises(SkillGatewayError) as changed:
+        gateway._capture_local_tree(skills, "harness/kube-burner")
+    assert changed.value.code == "source_changed_during_capture"
 
 
 @pytest.mark.asyncio
@@ -426,36 +710,51 @@ async def test_upstream_symlinks_cannot_escape_exposed_docs_trees(
     import paths
 
     monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
-    repo_root = tmp_path / "cache" / "kube-burner"
-    docs = repo_root / "docs"
-    source = repo_root / "src"
-    docs.mkdir(parents=True)
-    source.mkdir()
-    real_docs = docs / "real"
-    real_docs.mkdir()
-    (real_docs / "needle.md").write_text("needle through a safe directory alias")
-    (docs / "visible.md").write_text("public docs guidance")
-    (source / "secret.md").write_text("secretphrase out of scope")
-    (docs / "safe-link.md").symlink_to(docs / "visible.md")
-    (docs / "alias").symlink_to(real_docs, target_is_directory=True)
-    (docs / "internal").symlink_to(source, target_is_directory=True)
-
     from providers.skills.repo_cache import RepoCache
+    from providers.skills.source_epoch import SourceEpoch
 
-    cache = RepoCache(cache_dir=repo_root.parent)
+    cache = RepoCache(cache_dir=tmp_path / "cache")
+    ticket_id = "PERF-UPSTREAM-SYMLINK-BOUNDARY"
+    origin = "https://gitlab.example.org/team/kube-burner.git"
+    epoch = SourceEpoch(tmp_path / "source-epochs", ticket_id=ticket_id)
+    revision = _pin_upstream_fixture(
+        epoch,
+        "upstream:kube-burner",
+        origin,
+        {
+            "docs/real/needle.md": "needle through a safe directory alias",
+            "docs/visible.md": "public docs guidance",
+            "src/secret.md": "secretphrase out of scope",
+        },
+        symlinks={
+            "docs/safe-link.md": ("visible.md", False),
+            "docs/alias": ("real", True),
+            "docs/internal": ("../src", True),
+        },
+    )
 
     class Provider:
         organization_resolver = OrganizationSkillResolver.from_instance_config({})
+        source_epoch = epoch
 
-    unsafe_directory_ref = "skill://upstream/harness/kube-burner/docs/internal"
-    unsafe_document_ref = "skill://upstream/harness/kube-burner/docs/internal/secret.md"
-    safe_directory_ref = "skill://upstream/harness/kube-burner/docs"
+    unsafe_directory_ref = _source_ref(
+        "upstream", "harness/kube-burner", "docs/internal", revision=revision
+    )
+    unsafe_document_ref = _source_ref(
+        "upstream",
+        "harness/kube-burner",
+        "docs/internal/secret.md",
+        revision=revision,
+    )
+    safe_directory_ref = _source_ref(
+        "upstream", "harness/kube-burner", "docs", revision=revision
+    )
 
     async def invoke(**kwargs: Any) -> dict[str, Any]:
         return json.loads(
             await skill_context_gateway(
                 Provider(),
-                ticket_id="PERF-UPSTREAM-SYMLINK-BOUNDARY",
+                ticket_id=ticket_id,
                 agent_name="benchmark-agent",
                 phase="benchmark",
                 subject="harness/kube-burner",
@@ -507,11 +806,16 @@ async def test_upstream_symlinks_cannot_escape_exposed_docs_trees(
         item["path"] for item in bootstrap["documents"] if item["scope"] == "upstream"
     }
     assert "docs/internal/secret.md" not in upstream_paths
-    assert "docs/safe-link.md" in upstream_paths
+    assert "docs/visible.md" in upstream_paths
 
     safe_read = await invoke(
         operation="read",
-        ref="skill://upstream/harness/kube-burner/docs/safe-link.md",
+        ref=_source_ref(
+            "upstream",
+            "harness/kube-burner",
+            "docs/safe-link.md",
+            revision=revision,
+        ),
     )
     assert safe_read["found"] is True
     assert safe_read["document"]["content"] == "public docs guidance"
@@ -519,7 +823,12 @@ async def test_upstream_symlinks_cannot_escape_exposed_docs_trees(
     safe_alias_search = await invoke(
         operation="search",
         query="needle",
-        from_ref="skill://upstream/harness/kube-burner/docs/alias",
+        from_ref=_source_ref(
+            "upstream",
+            "harness/kube-burner",
+            "docs/alias",
+            revision=revision,
+        ),
     )
     alias_source = safe_alias_search["sources"][0]
     assert alias_source["found"] is True
@@ -1060,31 +1369,33 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
     local.mkdir(parents=True)
     (local / "config-guide.md").write_text("Use lowercase create jobs.\n")
     cache_root = tmp_path / "cache"
-    upstream = cache_root / "kube-burner" / "docs"
-    upstream.mkdir(parents=True)
-    (upstream / "getting-started.md").write_text("Upstream usage reference.\n")
-    (upstream / "advanced.md").write_text(
-        "This separate document describes the specialmode operation.\n"
-    )
-    git_config = cache_root / "kube-burner" / ".git" / "config"
-    git_config.parent.mkdir()
-    git_config.write_text(
-        '[remote "origin"]\n\turl = https://gitlab.example.org/team/kube-burner.git\n'
-    )
-
     from providers.skills.repo_cache import RepoCache
+    from providers.skills.source_epoch import SourceEpoch
 
     cache = RepoCache(cache_dir=cache_root)
     resolver = OrganizationSkillResolver.from_instance_config({})
+    ticket_id = "TEST-KUBE-BURNER-CONTEXT"
+    origin = "https://gitlab.example.org/team/kube-burner.git"
+    epoch = SourceEpoch(tmp_path / "source-epochs", ticket_id=ticket_id)
+    revision = _pin_upstream_fixture(
+        epoch,
+        "upstream:kube-burner",
+        origin,
+        {
+            "docs/getting-started.md": "Upstream usage reference.\n",
+            "docs/advanced.md": "This separate document describes the specialmode operation.\n",
+        },
+    )
 
     class Provider:
         organization_resolver = resolver
+        source_epoch = epoch
 
     bootstrap = json.loads(
         asyncio.run(
             skill_context_gateway(
                 Provider(),
-                ticket_id="TEST-KUBE-BURNER-CONTEXT",
+                ticket_id=ticket_id,
                 agent_name="benchmark-agent",
                 phase="benchmark",
                 subject="harness/kube-burner",
@@ -1109,13 +1420,13 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
     )
     assert local_doc["source"] == "agentic-perf"
     assert upstream_doc["source"] == "https://gitlab.example.org/team/kube-burner.git"
-    assert upstream_doc["provenance_status"] == "configured-cache-origin-unverified"
+    assert upstream_doc["provenance_status"] == "pinned-upstream-commit"
 
     upstream_read = json.loads(
         asyncio.run(
             skill_context_gateway(
                 Provider(),
-                ticket_id="TEST-KUBE-BURNER-CONTEXT",
+                ticket_id=ticket_id,
                 agent_name="benchmark-agent",
                 phase="benchmark",
                 subject="harness/kube-burner",
@@ -1132,7 +1443,7 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
         asyncio.run(
             skill_context_gateway(
                 Provider(),
-                ticket_id="TEST-KUBE-BURNER-CONTEXT",
+                ticket_id=ticket_id,
                 agent_name="benchmark-agent",
                 phase="benchmark",
                 subject="harness/kube-burner",
@@ -1153,7 +1464,7 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
         asyncio.run(
             skill_context_gateway(
                 Provider(),
-                ticket_id="TEST-KUBE-BURNER-CONTEXT",
+                ticket_id=ticket_id,
                 agent_name="benchmark-agent",
                 phase="benchmark",
                 subject="harness/kube-burner",
@@ -1170,11 +1481,29 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
         "upstream",
     ]
     assert default_upstream_search["sources"][1]["found"] is True
+    no_local_ticket_id = "TEST-KUBE-BURNER-UPSTREAM-ONLY"
+    no_local_epoch = SourceEpoch(
+        tmp_path / "source-epochs", ticket_id=no_local_ticket_id
+    )
+    _pin_upstream_fixture(
+        no_local_epoch,
+        "upstream:kube-burner",
+        origin,
+        {
+            "docs/getting-started.md": "Upstream usage reference.\n",
+            "docs/advanced.md": "This separate document describes the specialmode operation.\n",
+        },
+    )
+
+    class NoLocalProvider:
+        organization_resolver = resolver
+        source_epoch = no_local_epoch
+
     upstream_only_search = json.loads(
         asyncio.run(
             skill_context_gateway(
-                Provider(),
-                ticket_id="TEST-KUBE-BURNER-CONTEXT",
+                NoLocalProvider(),
+                ticket_id=no_local_ticket_id,
                 agent_name="benchmark-agent",
                 phase="benchmark",
                 subject="harness/kube-burner",
@@ -1200,7 +1529,12 @@ def test_kube_burner_gateway_exposes_local_and_cached_upstream_docs(
                 phase="benchmark",
                 subject="harness/kube-burner",
                 operation="read",
-                ref="skill://upstream/harness/kube-burner/README.md",
+                ref=_source_ref(
+                    "upstream",
+                    "harness/kube-burner",
+                    "README.md",
+                    revision=revision,
+                ),
                 local_skills_dir=skills,
                 repo_cache=cache,
             )
@@ -1218,28 +1552,30 @@ def test_k8s_netperf_gateway_exposes_local_and_cached_upstream_docs(
     local.mkdir(parents=True)
     (local / "config-guide.md").write_text("Local execution contract.\n")
     cache_root = tmp_path / "cache"
-    upstream = cache_root / "k8s-netperf" / "docs"
-    upstream.mkdir(parents=True)
-    (upstream / "README.md").write_text("Upstream k8s-netperf reference.\n")
-    git_config = cache_root / "k8s-netperf" / ".git" / "config"
-    git_config.parent.mkdir()
-    git_config.write_text(
-        '[remote "origin"]\n\turl = https://github.com/cloud-bulldozer/k8s-netperf.git\n'
-    )
-
     from providers.skills.repo_cache import RepoCache
+    from providers.skills.source_epoch import SourceEpoch
 
     cache = RepoCache(cache_dir=cache_root)
     resolver = OrganizationSkillResolver.from_instance_config({})
+    ticket_id = "TEST-K8S-NETPERF-CONTEXT"
+    origin = "https://github.com/cloud-bulldozer/k8s-netperf.git"
+    epoch = SourceEpoch(tmp_path / "source-epochs", ticket_id=ticket_id)
+    _pin_upstream_fixture(
+        epoch,
+        "upstream:k8s-netperf",
+        origin,
+        {"docs/README.md": "Upstream k8s-netperf reference.\n"},
+    )
 
     class Provider:
         organization_resolver = resolver
+        source_epoch = epoch
 
     bootstrap = json.loads(
         asyncio.run(
             skill_context_gateway(
                 Provider(),
-                ticket_id="TEST-K8S-NETPERF-CONTEXT",
+                ticket_id=ticket_id,
                 agent_name="benchmark-agent",
                 phase="benchmark",
                 subject="harness/k8s-netperf",
@@ -1317,14 +1653,25 @@ async def test_kube_burner_provenance_uses_harness_repos_override(
     assert cache.get_origin("kube-burner") == override
 
     resolver = OrganizationSkillResolver.from_instance_config({})
+    ticket_id = "TEST-KUBE-BURNER-OVERRIDE"
+    from providers.skills.source_epoch import SourceEpoch
+
+    epoch = SourceEpoch(tmp_path / "source-epochs", ticket_id=ticket_id)
+    _pin_upstream_fixture(
+        epoch,
+        "upstream:kube-burner",
+        override,
+        {"docs/usage.md": "Fork usage docs.\n"},
+    )
 
     class Provider:
         organization_resolver = resolver
+        source_epoch = epoch
 
     result = json.loads(
         await skill_context_gateway(
             Provider(),
-            ticket_id="TEST-KUBE-BURNER-OVERRIDE",
+            ticket_id=ticket_id,
             agent_name="benchmark-agent",
             phase="benchmark",
             subject="harness/kube-burner",
@@ -1335,7 +1682,7 @@ async def test_kube_burner_provenance_uses_harness_repos_override(
         source for source in result["sources"] if source["scope"] == "upstream"
     )
     assert upstream["source"] == override
-    assert upstream["provenance_status"] == "configured-cache-origin-unverified"
+    assert upstream["provenance_status"] == "pinned-upstream-commit"
 
 
 @pytest.mark.asyncio

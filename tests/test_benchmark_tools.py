@@ -13,6 +13,17 @@ from providers.skills.base import RunfileTemplate
 from tests.conftest import MockSkillProvider, MockSSHExecutor, make_benchmark_handlers
 
 
+@pytest.fixture(autouse=True)
+def _crucible_ticket_context(monkeypatch):
+    import agents.benchmark.server as server
+
+    monkeypatch.setattr(
+        server,
+        "_ticket",
+        {"custom_fields": {"directives": {"harness": "crucible"}}},
+    )
+
+
 @pytest.fixture
 def mock_provider() -> MockSkillProvider:
     return MockSkillProvider(

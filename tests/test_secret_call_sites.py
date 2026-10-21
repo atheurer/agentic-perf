@@ -11,6 +11,7 @@ import importlib.util
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from providers.ssh import SSHExecutor, SSHResult
@@ -132,9 +133,18 @@ class TestV2EnvFile:
         original_ssh = server._ssh
         original_init = server._initialized
         original_skill = server._skill_provider
+        original_ticket = server._ticket
         server._ssh = mock_ssh
         server._initialized = True
-        server._skill_provider = None
+        server._skill_provider = SimpleNamespace(
+            default_harness="",
+            supports_generic_execution_for=lambda harness: harness
+            == "benchmark-runner",
+            validate_runfile=AsyncMock(return_value={"valid": True}),
+        )
+        server._ticket = {
+            "custom_fields": {"directives": {"harness": "benchmark-runner"}}
+        }
 
         with patch(
             "agents.server_utils.assert_ticket_active",
@@ -151,6 +161,7 @@ class TestV2EnvFile:
                 server._ssh = original_ssh
                 server._initialized = original_init
                 server._skill_provider = original_skill
+                server._ticket = original_ticket
 
         for cmd in ssh_commands:
             assert password not in cmd, f"Password found in SSH command: {cmd}"

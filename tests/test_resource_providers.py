@@ -240,6 +240,7 @@ class TestQuadsResourceProvider:
             selection={"hostnames": ["host1.example.com"]},
             description="test assignment",
             duration_hours=36,
+            ticket_id="PERF-TEST",
         )
 
         assert result["status"] == "success"
@@ -248,6 +249,7 @@ class TestQuadsResourceProvider:
         assert result["provider_metadata"]["assignment_id"] == 42
         assert result["provider_metadata"]["cloud_name"] == "cloud01"
         assert result["hosts"] == ["host1.example.com"]
+        mock_client.create_assignment.assert_awaited_once_with("PERF-TEST")
 
     @pytest.mark.asyncio
     async def test_reserve_max_hosts(self):

@@ -348,7 +348,7 @@ async def test_base_agent_mcp_dispatch_multi_server():
     from unittest.mock import AsyncMock, MagicMock
 
     from agents.base import AgentBase
-    from providers.llm.base import ToolCall
+    from providers.llm.base import ToolCall, ToolDefinition
 
     class _TestAgent(AgentBase):
         def _system_prompt(self, ticket):
@@ -364,7 +364,20 @@ async def test_base_agent_mcp_dispatch_multi_server():
         agent_name="test",
         llm_provider=MagicMock(),
         state_store_url="http://localhost:9999",
-        tools=[],
+        tools=[
+            ToolDefinition(
+                name="local_tool",
+                description="",
+                input_schema={"type": "object"},
+                owner_harness=None,
+            ),
+            ToolDefinition(
+                name="check_host",
+                description="",
+                input_schema={"type": "object"},
+                owner_harness=None,
+            ),
+        ],
         tool_handlers={"local_tool": AsyncMock(return_value="local ok")},
     )
 

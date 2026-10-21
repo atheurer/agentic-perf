@@ -17,12 +17,12 @@ def test_benchmark_crucible_prompt_and_tool_scope_with_default_or_explicit_harne
     agent = BenchmarkAgent.__new__(BenchmarkAgent)
     agent._skill_provider = SimpleNamespace(default_harness="crucible")
     agent.tools = [
-        SimpleNamespace(name="get_skill_context"),
-        SimpleNamespace(name="read_skills"),
-        SimpleNamespace(name="list_harness_docs"),
-        SimpleNamespace(name="read_harness_doc"),
-        SimpleNamespace(name="get_execution_config"),
-        SimpleNamespace(name="validate_benchmark"),
+        SimpleNamespace(name="get_skill_context", owner_harness=None),
+        SimpleNamespace(name="read_skills", owner_harness=None),
+        SimpleNamespace(name="list_harness_docs", owner_harness=None),
+        SimpleNamespace(name="read_harness_doc", owner_harness=None),
+        SimpleNamespace(name="get_execution_config", owner_harness=None),
+        SimpleNamespace(name="validate_benchmark", owner_harness=None),
     ]
     ticket = {"custom_fields": {"directives": directives}}
 

@@ -530,6 +530,8 @@ class CrucibleContextGateway:
 
     async def _ensure_ticket_benchmark(self, benchmark: str) -> None:
         await self._ensure_ticket_core()
+        if self._source_epoch is None:
+            return
         entry = self._source_benchmark_entries().get(benchmark)
         if entry is not None:
             await self._ensure_ticket_child(benchmark, entry)

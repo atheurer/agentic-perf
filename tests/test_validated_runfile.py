@@ -16,6 +16,20 @@ from tests.conftest import MockSkillProvider, MockSSHExecutor, make_benchmark_ha
 # ── Fixtures ──────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _crucible_ticket_context(monkeypatch):
+    import agents.benchmark.server as server
+
+    monkeypatch.setattr(
+        server,
+        "_ticket",
+        {
+            "id": "PERF-TEST",
+            "custom_fields": {"directives": {"harness": "crucible"}},
+        },
+    )
+
+
 @dataclass
 class _FakeSSHResult:
     exit_code: int = 0
