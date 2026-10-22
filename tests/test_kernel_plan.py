@@ -501,6 +501,8 @@ class TestHandoffGateCompatibility:
 
     @staticmethod
     def _ticket(plan):
+        release = plan["steps"][2]["params"]["kernel"]["release"]
+        spec_dict = {"release": release, "package": "kernel"}
         return {
             "custom_fields": {
                 "provisioning_complete": True,
@@ -514,7 +516,31 @@ class TestHandoffGateCompatibility:
                     "details": "harness verified",
                 },
                 "execution_plan": plan,
-                "kernel_transitions": {"2": {"state": "verified"}},
+                # Full checkpoint shape required by the replayed gate's
+                # verification_from_transition: state, spec binding,
+                # requested hosts, canonical addresses, and per-host
+                # completed-reboot evidence.
+                "kernel_transitions": {
+                    "2": {
+                        "state": "verified",
+                        "kernel": release,
+                        "package": "kernel",
+                        "kernel_spec": spec_dict,
+                        "requested_hosts": ["10.0.0.1"],
+                        "addresses": {"10.0.0.1": "10.0.0.1"},
+                        "reboot_policy": "always",
+                        "hosts": {
+                            "10.0.0.1": {
+                                "state": "verified",
+                                "observed_kernel": release,
+                                "post_boot_id": "post-1",
+                                "pre_boot_id": "pre-1",
+                                "reboot_issued": True,
+                                "reboot_pending": False,
+                            }
+                        },
+                    }
+                },
             }
         }
 
