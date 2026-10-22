@@ -207,6 +207,7 @@ async def test_verify_crucible_is_read_only_and_reports_context(mock_ssh, monkey
     mock_ssh._results = {
         "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
         "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+        "/root/.crucible/identity": SSHResult(stdout="identity=1"),
     }
 
     result = await _verify_harness_install_one(
@@ -218,6 +219,8 @@ async def test_verify_crucible_is_read_only_and_reports_context(mock_ssh, monkey
     assert result["verified"] is True
     assert result["harness_verified"] is True
     assert result["context_ready"] is True
+    assert result["identity_ready"] is True
+    assert "warning" not in result["message"]
     assert result["context"] == {
         "ready": True,
         "bootstrap": "/opt/crucible/AGENTS.md",
@@ -1007,3 +1010,64 @@ async def test_all_install_tools_have_controller_host():
         assert "controller_host" in tool.input_schema["properties"], (
             f"Tool {name} missing controller_host property"
         )
+
+
+@pytest.mark.asyncio
+async def test_verify_crucible_warns_when_identity_is_missing(mock_ssh, monkeypatch):
+    """A fresh host has no crucible identity; verification stays verified
+    (services and harness are fine) but the message must carry the
+    warning so the run-file email failure is surfaced near the cause."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
+        "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+        "/root/.crucible/identity": SSHResult(stdout="identity=0"),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is True
+    assert result["identity_ready"] is False
+    assert "CRUCIBLE_EMAIL" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_verify_annotates_changed_host_key_with_refresh_recipe(
+    mock_ssh, monkeypatch
+):
+    """A reimage presents new host keys; the verification error must name
+    the offending known_hosts entry and the both-forms refresh recipe."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(
+            exit_code=255,
+            stderr=(
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                "Offending ED25519 key in /root/.ssh/known_hosts:61\n"
+                "Host key verification failed.\n"
+            ),
+        ),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is False
+    assert "Offending ED25519 key in /root/.ssh/known_hosts:61" in result["error"]
+    assert "ssh-keygen -R /root/.ssh/known_hosts:61" not in result["error"]
+    assert "ssh-keygen -R" in result["error"]
+    assert "resolved IP" in result["error"]
+    assert "both forms" not in result["error"] or "BOTH forms" in result["error"]

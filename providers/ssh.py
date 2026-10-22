@@ -54,6 +54,49 @@ class SSHResult:
     exit_code: int
 
 
+def annotate_host_key_error(stderr: str) -> str:
+    """Append an operator recipe when SSH refuses a changed remote host key.
+
+    Lab allocations wipe hosts between assignments, so a reimage presents
+    new keys and every SSH step fails closed with "REMOTE HOST
+    IDENTIFICATION HAS CHANGED". The raw message names the offending
+    known_hosts entry by hostname or IP, but not both — tools connect by
+    resolved address while operators test with hostnames, so the fix must
+    refresh both forms. surfacing the precise recipe at the failure site
+    keeps the agent's guidance actionable instead of a dead "unreachable".
+    """
+    if "REMOTE HOST IDENTIFICATION HAS CHANGED" not in stderr:
+        return stderr
+    offending = re.search(r"Offending \S+ key in (\S+):(\d+)", stderr)
+    known_host = offending.group(1) if offending else "<host-or-ip>"
+    # The banner and repeat warnings are pure noise; dropping them keeps
+    # the actionable recipe inside the tool result's error budget.
+    kept = "\n".join(
+        line
+        for line in stderr.splitlines()
+        if "REMOTE HOST IDENTIFICATION" not in line
+        and "IT IS POSSIBLE THAT SOMEONE" not in line
+        and "Someone could be eavesdropping" not in line
+        and "It is also possible that a host key" not in line
+        and "Please contact your system administrator" not in line
+        and "Add correct host key" not in line
+        and "Host key verification failed" not in line
+        and set(line.strip()) != {"@"}
+    )
+    recipe = (
+        "The remote host key changed — on lab hosts this usually means the "
+        "machine was reimaged between allocations. To trust the new key, "
+        "refresh BOTH forms on the orchestrator host (tools connect by "
+        "resolved IP, humans by hostname): "
+        f"ssh-keygen -R {known_host}; "
+        "ssh-keygen -R <the other form (hostname or IP)>; "
+        "then re-scan: ssh-keyscan -T 5 -t ecdsa,ed25519 <host> <ip> "
+        ">> ~/.ssh/known_hosts. Verify the new key's fingerprint with the "
+        "host owner before accepting it."
+    )
+    return f"{kept.rstrip()}\n\n{recipe}"
+
+
 @dataclass
 class _ProgressState:
     """Per-task state that lets the public progress wrapper close safely."""

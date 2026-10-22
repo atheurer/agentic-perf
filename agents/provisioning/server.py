@@ -52,7 +52,7 @@ from agents.skill_gateway import (
 )
 from providers.llm.base import ToolDefinition
 from providers.rhel_kernel import KernelSpec
-from providers.ssh import SSHExecutor
+from providers.ssh import SSHExecutor, annotate_host_key_error
 
 logger = logging.getLogger(__name__)
 
@@ -924,26 +924,51 @@ async def _verify_harness_install_one(
                 else "bootstrap document is not readable"
             )
 
+        # Run-file validation requires a non-empty run email, which comes
+        # from the controller's crucible identity; a fresh host has none
+        # and the failure otherwise appears only much later as a schema
+        # error far from the cause. Surface it read-only at verification
+        # time (#1233). The services themselves are run-dynamic (crucible
+        # starts valkey/opensearch/cdm with the run), so they are not
+        # probed here — the skill doc covers the preflight instead.
+        identity_probe = (
+            "test -r /root/.crucible/identity"
+            " && grep -q CRUCIBLE_EMAIL /root/.crucible/identity"
+            " && printf 'identity=1' || printf 'identity=0'"
+        )
+        identity_result = await _ssh.run(host, identity_probe, timeout=15)
+        identity_ready = "identity=1" in (identity_result.stdout or "")
+
     context_ready = context is None or context["ready"]
     verified = harness_verified and context_ready
+    # A changed remote host key (lab reimage) surfaces here as a failed
+    # verification; annotate the stderr with the refresh recipe so the
+    # operator guidance reaches the agent and the comment verbatim.
+    error_output = annotate_host_key_error(result.stderr or "")
     message = (
         f"{harness_name} verified"
         if verified
         else (
             f"{harness_name} executable verified but controller context is not ready"
             if harness_verified and context is not None and not context_ready
-            else f"Verification failed: {result.stderr[:200]}"
+            else f"Verification failed: {error_output[:200]}"
         )
     )
+    if harness_name == "crucible" and verified and not identity_ready:
+        message += (
+            " (warning: /root/.crucible/identity is missing CRUCIBLE_EMAIL — "
+            "run-file validation will fail until it is set)"
+        )
     return {
         "host": host,
         "harness": harness_name,
         "verified": verified,
         "harness_verified": harness_verified,
         "context_ready": context_ready,
+        "identity_ready": identity_ready if harness_name == "crucible" else None,
         "install_path": path,
         "output": result.stdout[:500] if result.stdout else "",
-        "error": result.stderr[:500] if result.stderr else "",
+        "error": error_output[:500] if error_output else "",
         "context": context,
         "message": message,
     }
