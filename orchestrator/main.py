@@ -623,11 +623,29 @@ def _capture_step_results(agent_type: str, cf: dict) -> dict:
     (IPs, run_ids, provisioning info) survives teardown.
     """
     if agent_type == "benchmark":
+        # The active validation's runfile fingerprint is the identity of
+        # what actually ran. Workload-group enforcement compares it
+        # across steps in the same group (#998 immutability), so it must
+        # survive teardown like run_id and the run file itself.
+        validations = cf.get("benchmark_validations") or {}
+        records = (
+            validations.get("records", {}) if isinstance(validations, dict) else {}
+        )
+        active = validations.get("active_validation_id")
+        record = records.get(active) if active and isinstance(records, dict) else None
         return {
             "run_id": cf.get("run_id", ""),
             "benchmark_status": cf.get("benchmark_status", ""),
             "benchmark_duration": cf.get("benchmark_duration"),
             "run_file_used": cf.get("run_file_used", {}),
+            "runfile_fingerprint": (
+                (record or {}).get("runfile_fingerprint", "")
+                if isinstance(record, dict)
+                else ""
+            ),
+            "runfile": (
+                (record or {}).get("run_file") if isinstance(record, dict) else None
+            ),
         }
     elif agent_type == "resource":
         return {
