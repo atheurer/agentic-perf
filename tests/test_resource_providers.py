@@ -108,6 +108,82 @@ class TestResourceProviderRegistry:
         with pytest.raises(ValueError, match="not configured"):
             await reg.get_provider("aws")
 
+    @pytest.mark.asyncio
+    async def test_quads_provider_receives_organization_service_config(
+        self, quads_secrets, monkeypatch
+    ):
+        from providers.resource.quads import QuadsResourceProvider
+
+        organization_config = {
+            "connection": {
+                "api_host": "org-quads.example.test",
+                "api_scheme": "https",
+            }
+        }
+        resolver = MagicMock()
+        resolver.has_runtime_config.return_value = True
+        resolver.get_runtime_config.return_value = organization_config
+        resolver.bootstrap.return_value = {
+            "revision": "gateway-revision",
+            "runtime_config_sources": ["org-operations"],
+        }
+        resolver_factory = AsyncMock(return_value=resolver)
+        provider = MagicMock()
+        from_secrets = AsyncMock(return_value=provider)
+        monkeypatch.setattr(QuadsResourceProvider, "from_secrets", from_secrets)
+
+        registry = ResourceProviderRegistry(
+            quads_secrets,
+            organization_resolver_factory=resolver_factory,
+        )
+        result = await registry.get_provider("quads")
+
+        assert result is provider
+        resolver_factory.assert_awaited_once()
+        from_secrets.assert_awaited_once_with(
+            quads_secrets,
+            organization_config=organization_config,
+        )
+        resolver.get_runtime_config.assert_called_once_with("resource/quads")
+        resolver.bootstrap.assert_called_once_with("resource/quads")
+
+    @pytest.mark.asyncio
+    async def test_other_resource_providers_do_not_load_gateway_config(
+        self, aws_secrets, monkeypatch
+    ):
+        from providers.resource.aws import AWSResourceProvider
+
+        provider = MagicMock()
+        from_secrets = AsyncMock(return_value=provider)
+        monkeypatch.setattr(AWSResourceProvider, "from_secrets", from_secrets)
+        resolver_factory = AsyncMock()
+        registry = ResourceProviderRegistry(
+            aws_secrets,
+            organization_resolver_factory=resolver_factory,
+        )
+
+        result = await registry.get_provider("aws")
+
+        assert result is provider
+        resolver_factory.assert_not_awaited()
+
+    def test_resource_agent_uses_ticket_skill_resolver_for_teardown(
+        self, quads_secrets
+    ):
+        from agents.resource.agent import ResourceAgent
+
+        resolver = MagicMock()
+        skills = MagicMock()
+        skills.organization_resolver = resolver
+        agent = ResourceAgent(
+            llm_provider=MagicMock(),
+            state_store_url="http://state-store.invalid",
+            secrets_provider=quads_secrets,
+            skill_provider=skills,
+        )
+
+        assert agent._registry._organization_resolver is resolver
+
 
 # ---------------------------------------------------------------------------
 # QUADS adapter tests
@@ -164,6 +240,7 @@ class TestQuadsResourceProvider:
             selection={"hostnames": ["host1.example.com"]},
             description="test assignment",
             duration_hours=36,
+            ticket_id="PERF-TEST",
         )
 
         assert result["status"] == "success"
@@ -172,6 +249,7 @@ class TestQuadsResourceProvider:
         assert result["provider_metadata"]["assignment_id"] == 42
         assert result["provider_metadata"]["cloud_name"] == "cloud01"
         assert result["hosts"] == ["host1.example.com"]
+        mock_client.create_assignment.assert_awaited_once_with("PERF-TEST")
 
     @pytest.mark.asyncio
     async def test_reserve_max_hosts(self):
@@ -181,12 +259,14 @@ class TestQuadsResourceProvider:
         mock_client.ssh_key_path = "/fake/key"
         provider = QuadsResourceProvider(mock_client)
 
-        result = await provider.reserve(
-            selection={"hostnames": [f"host{i}" for i in range(11)]},
-            description="too many",
-        )
-        assert result["status"] == "failed"
-        assert "Max 10" in result["message"]
+        from providers.resource.selection import ReservationSelectionError
+
+        with pytest.raises(ReservationSelectionError, match="at most 10"):
+            await provider.reserve(
+                selection={"hostnames": [f"host{i}" for i in range(11)]},
+                description="too many",
+            )
+        mock_client.create_assignment.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_terminate(self):
@@ -1541,7 +1621,15 @@ class TestProviderCorrectAutoReservation:
             state_store_url="http://localhost:8090",
         )
         agent._mcp = AsyncMock()
-        agent._mcp.call_tool = AsyncMock(side_effect=mcp_call)
+
+        async def mcp_dispatch(name, arguments):
+            if name == "prepare_reservation_selection":
+                return json.dumps(
+                    {"status": "ready", "selection": arguments["selection"]}
+                )
+            return await mcp_call(name, arguments)
+
+        agent._mcp.call_tool = AsyncMock(side_effect=mcp_dispatch)
         agent._client = AsyncMock()
         ticket_response = AsyncMock(
             status_code=200,
@@ -1648,6 +1736,10 @@ class TestProviderCorrectAutoReservation:
                 if metadata_reads == 1:
                     return "{}"
                 return json.dumps({"instance_ids": ["i-new"]})
+            if name == "prepare_reservation_selection":
+                return json.dumps(
+                    {"status": "ready", "selection": arguments["selection"]}
+                )
             if name == "reserve_resources":
                 reserve_calls.append(arguments)
                 return json.dumps(
@@ -1803,6 +1895,106 @@ class TestProviderCorrectAutoReservation:
                     "reservation_selections": [{"hostnames": ["host-old.example.com"]}],
                 },
                 "hostnames": ["host-new.example.com"],
+            },
+        }
+        old_metadata = dict(ticket["custom_fields"]["resource_provider_metadata"])
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        old_provider.terminate.assert_awaited_once_with("42", old_metadata)
+
+    @pytest.mark.asyncio
+    async def test_quads_role_requirements_reuse_saved_assignment(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "quads",
+                "resource_reservation_id": "42",
+                "resource_provider_metadata": {
+                    "assignment_id": 42,
+                    "reservation_selections": [
+                        {
+                            "hostnames": ["host-target.example.com"],
+                            "duration_hours": 36,
+                        }
+                    ],
+                },
+                "required_hosts": [
+                    {
+                        "roles": ["target"],
+                        "os": "rhel-9",
+                        "nic_speed_gbps": 100,
+                    }
+                ],
+            },
+        }
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        agent._registry.get_provider.assert_not_awaited()
+        old_provider.terminate.assert_not_awaited()
+        agent._client.patch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_changed_quads_required_host_pin_releases_assignment(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "quads",
+                "resource_reservation_id": "42",
+                "resource_provider_metadata": {
+                    "assignment_id": 42,
+                    "reservation_selections": [{"hostnames": ["host-old.example.com"]}],
+                },
+                "required_hosts": [
+                    {
+                        "roles": ["target"],
+                        "provider_hostname": "host-new.example.com",
+                    }
+                ],
+            },
+        }
+        old_metadata = dict(ticket["custom_fields"]["resource_provider_metadata"])
+        agent = self._make_agent(ticket, lambda _name, _args: "{}")
+        old_provider = MagicMock()
+        old_provider.terminate = AsyncMock(return_value={"status": "terminated"})
+        agent._registry = MagicMock()
+        agent._registry.get_provider = AsyncMock(return_value=old_provider)
+
+        assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
+
+        old_provider.terminate.assert_awaited_once_with("42", old_metadata)
+
+    @pytest.mark.asyncio
+    async def test_changed_quads_managed_host_count_releases_assignment(self):
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "quads",
+                "resource_reservation_id": "42",
+                "resource_provider_metadata": {
+                    "assignment_id": 42,
+                    "reservation_selections": [
+                        {"hostnames": ["host-target.example.com"]}
+                    ],
+                },
+                "required_hosts": [
+                    {
+                        "roles": ["controller"],
+                        "provider_hostname": "host-target.example.com",
+                    },
+                    {"roles": ["target"]},
+                ],
             },
         }
         old_metadata = dict(ticket["custom_fields"]["resource_provider_metadata"])
@@ -2447,10 +2639,7 @@ class TestProviderCorrectAutoReservation:
             (
                 "jumpstarter",
                 {"board_selector": "board-type=ride4"},
-                {
-                    "board_selector": "board-type=ride4",
-                    "jumpstarter_selector": "board-type=ride4",
-                },
+                {"jumpstarter_selector": "board-type=ride4"},
             ),
         ],
     )
@@ -2458,9 +2647,22 @@ class TestProviderCorrectAutoReservation:
         self, provider, ticket_fields, expected
     ):
         from agents.resource.agent import _auto_reservation_selection
+        from providers.resource.selection import validate_reservation_selection
 
+        selection = _auto_reservation_selection(
+            provider, {"custom_fields": ticket_fields}
+        )
+        assert selection == expected
+        eligibility = None
+        if provider == "quads":
+            eligibility = [{hostname} for hostname in expected["hostnames"]]
         assert (
-            _auto_reservation_selection(provider, {"custom_fields": ticket_fields})
+            validate_reservation_selection(
+                provider,
+                selection,
+                required_hosts=ticket_fields.get("required_hosts"),
+                eligible_hostnames_by_requirement=eligibility,
+            )
             == expected
         )
 
@@ -2607,6 +2809,10 @@ class TestProviderCorrectAutoReservation:
         assert fields["resource_reservation_id"] == expected_id
         assert fields.get("fresh_host", False) is fresh_host
         assert fields["assigned_hardware_ips"] == expected_hardware
+        call_names = [call.args[0] for call in agent._mcp.call_tool.await_args_list]
+        assert call_names.index("prepare_reservation_selection") < call_names.index(
+            "reserve_resources"
+        )
         if provider == "quads":
             assert (
                 fields["quads_assignment_id"]
@@ -3049,13 +3255,14 @@ class TestPSAPCCResourceProvider:
     async def test_reserve_no_cluster_id(self):
         provider, client = self._make_provider()
 
-        result = await provider.reserve(
-            selection={},
-            description="missing cluster",
-        )
+        from providers.resource.selection import ReservationSelectionError
 
-        assert result["status"] == "failed"
-        assert "No cluster_id" in result["message"]
+        with pytest.raises(ReservationSelectionError, match="cluster_id"):
+            await provider.reserve(
+                selection={},
+                description="missing cluster",
+            )
+        client.get_cluster.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reserve_cluster_not_found(self):

@@ -90,6 +90,7 @@ def _side_effecting(
 # names, rather than Python function names, make FastMCP aliases first-class.
 TOOL_AUDIT_POLICY = (
     *_read_only(
+        "agents/analyze/server.py:get_skill_context",
         "agents/analyze/server.py:read_skills",
         "agents/analyze/server.py:list_skill_docs",
         "agents/analyze/server.py:get_ticket_results",
@@ -104,13 +105,13 @@ TOOL_AUDIT_POLICY = (
         "agents/synthesis/server.py:submit_synthesis_result",
     ),
     *_read_only(
+        "agents/benchmark/server.py:get_skill_context",
         "agents/benchmark/server.py:read_skills",
         "agents/benchmark/server.py:list_harness_docs",
         "agents/benchmark/server.py:read_harness_doc",
         "agents/benchmark/server.py:get_execution_config",
         "agents/benchmark/server.py:get_runfile_schema",
         "agents/benchmark/server.py:get_benchmark_params",
-        "agents/benchmark/server.py:get_crucible_benchmark_context",
         "agents/benchmark/server.py:get_tool_params",
         "agents/benchmark/server.py:get_example_runfile",
         "agents/benchmark/server.py:get_run_logs",
@@ -179,6 +180,7 @@ TOOL_AUDIT_POLICY = (
         "agents/platform/server.py:request_clarification",
     ),
     *_read_only(
+        "agents/provisioning/server.py:get_skill_context",
         "agents/provisioning/server.py:check_platform_contract",
         "agents/provisioning/server.py:check_host_prerequisites",
         "agents/provisioning/server.py:verify_harness_install",
@@ -220,9 +222,11 @@ TOOL_AUDIT_POLICY = (
         "agents/provisioning/server.py:verify_kernel_state",
     ),
     *_read_only(
+        "agents/resource/server.py:get_skill_context",
         "agents/resource/server.py:parse_host_config",
         "agents/resource/server.py:list_resource_providers",
         "agents/resource/server.py:check_available_resources",
+        "agents/resource/server.py:prepare_reservation_selection",
         "agents/resource/server.py:get_reservation_status",
         "agents/resource/server.py:validate_host",
         "agents/resource/server.py:get_host_inventory",
@@ -235,8 +239,8 @@ TOOL_AUDIT_POLICY = (
     ),
     *_read_only(
         "agents/retrospective/server.py:get_transcript_analysis",
+        "agents/review/server.py:get_skill_context",
         "agents/review/server.py:read_skills",
-        "agents/review/server.py:get_crucible_benchmark_context",
         "agents/review/server.py:list_harness_docs",
         "agents/review/server.py:read_harness_doc",
         "agents/review/server.py:read_run_results",
@@ -244,6 +248,7 @@ TOOL_AUDIT_POLICY = (
         "agents/review/server.py:cdm_api_requests",
         "agents/review/server.py:compare_results",
         "agents/review/server.py:get_review_config",
+        "agents/triage/server.py:get_skill_context",
         "agents/triage/server.py:read_skills",
         "agents/triage/server.py:list_benchmarks",
         "agents/triage/server.py:get_benchmark_details",

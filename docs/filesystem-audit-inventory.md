@@ -44,6 +44,13 @@ matching characters in filenames. The scanner also resolves import aliases and
 straightforward local assignments such as `delete = os.unlink`. It fails
 closed when raw mutator function objects are passed or returned.
 
+Imported `AuditedFilesystem` return annotations and directly typed helper
+parameters identify audited facade receivers. Import aliases are supported;
+lookalike types, shadowed imports, unresolved string annotations, and union
+annotations remain unknown. Rebinding a typed parameter to an unknown object
+revokes that recognition. This is source-level type inference, not runtime
+enforcement of Python annotations.
+
 The static scan cannot reliably follow dynamic lookup (`getattr`, reflection,
 computed names), arbitrary rebinding or alias flows, or all third-party APIs.
 Writes performed by subprocesses, native extensions, and database engines
@@ -64,3 +71,39 @@ dependency is deliberate: trace storage is itself system-context data, and
 keeping its file mutations in the facade avoids an exception for the audit
 transport. SQLite's own on-disk writes remain the documented database-engine
 boundary.
+
+Organization skill attempt snapshots use the same critical facade with the
+logical `skill-service://` namespace. Their storage is under the instance's
+service-only `skill-snapshots` directory, outside ticket workspaces, artifact
+roots, and served skill directories. The private snapshot includes runtime
+configuration; only manifest-listed document projections leave the resolver.
+The sensitive snapshot filename suppresses content digests in filesystem trace
+attributes. A durable pin is written after the snapshot and verified on reads.
+First-use subject snapshots write an audited pending marker before capture;
+handled failures remove it for retry, while interruption leaves residue that
+fails closed instead of recapturing changed source content.
+The source preparation, attempt snapshot, and cleanup paths share a stable
+per-ticket lock under `skill-snapshots/source-pins`; a closed marker remains
+after the source pin and private content are removed. This fences workers that
+were already in flight when cleanup began. A small audited pending marker is
+written before organization Git capture so the periodic sweep can find a ticket
+whose first source pin has not finished yet.
+
+The organization source pin records the configuration binding and Git commits
+during ticket provider setup. A subject's private document/configuration
+snapshot is captured on first use and later phases reuse it. The separate
+`skill-source-epochs` service-only directory stores the explicit Crucible
+manifest package, the approved local Markdown maps for kube-burner,
+k8s-netperf, and AWS, and ticket-owned upstream Git checkouts. The upstream
+checkout records the exact resolved commit, configured ref, and first-use
+capture time. Its bare object store and detached worktree stay outside ticket
+workspaces and artifact roots. Missing or corrupt existing pins fail closed;
+an initial upstream failure does not fall back to a shared stale checkout.
+
+Both stores use critical audited mutations and stable locks outside the
+removable payload directories. Cleanup confirms `status == "closed"` with a
+direct state-store lookup before writing tombstones or deleting content. The
+periodic sweep skips missing, failed, or inconclusive ticket lookups, and runs
+even when no organization source is configured. Closed markers and stable lock
+files remain as small service metadata so late workers cannot recreate a
+snapshot after content removal.

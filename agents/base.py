@@ -324,6 +324,14 @@ class AgentBase(ABC):
         the last ``fleet_iteration_epoch`` event. This resets
         the per-agent budget each fleet iteration so agents
         don't exhaust their budget across the full fleet.
+
+        Likewise, a ``hitl_resume_epoch`` event (emitted by the
+        state store when a human reply transitions the ticket out of
+        ``awaiting_customer_guidance``) restarts the budgets: the
+        iteration caps guard autonomous operation between human
+        touchpoints, so a pause-and-resume cycle must not consume
+        them (#1231). Without this reset an agent that once hit its
+        limit is locked out again on every subsequent dispatch.
         """
         from providers.events import EventBus
 
@@ -332,7 +340,10 @@ class AgentBase(ABC):
         global_iters = 0
         try:
             for evt in events.get_events(ticket_id, since=0, limit=100_000):
-                if evt.get("event_type") == "fleet_iteration_epoch":
+                if evt.get("event_type") in (
+                    "fleet_iteration_epoch",
+                    "hitl_resume_epoch",
+                ):
                     agent_iters = 0
                     global_iters = 0
                 elif evt.get("event_type") == "llm_request":
@@ -1794,6 +1805,7 @@ class AgentBase(ABC):
             # Skill & documentation reading
             "read_skills",
             "read_harness_doc",
+            "get_skill_context",
             "get_review_config",
             "get_execution_config",
             "get_example_runfile",
@@ -1992,6 +2004,31 @@ class AgentBase(ABC):
         await self._throttle_tool_call()
 
         call_input, jq_filter = self._normalize_tool_input(tool_call)
+        tool_definition = next(
+            (tool for tool in self.tools if tool.name == tool_call.name), None
+        )
+        if tool_definition is None:
+            return ToolResult(
+                tool_use_id=tool_call.id,
+                content=self._tool_error_content(
+                    f"Tool {tool_call.name!r} is not available to this ticket.",
+                    "validation",
+                ),
+                is_error=True,
+            )
+        owner_harness = tool_definition.owner_harness
+        selected_harness = getattr(self, "_selected_harness", None)
+        if owner_harness is not None and owner_harness != selected_harness:
+            message = (
+                f"Tool {tool_call.name!r} requires ticket harness "
+                f"{owner_harness!r}; selected harness is "
+                f"{selected_harness or 'unset'!r}"
+            )
+            return ToolResult(
+                tool_use_id=tool_call.id,
+                content=self._tool_error_content(message, "validation"),
+                is_error=True,
+            )
 
         handler = self._tool_handlers.get(tool_call.name)
         if handler is not None:

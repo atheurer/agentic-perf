@@ -11,13 +11,14 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from agents.base import AgentAbortedError, HITLDriftError
-from agents.server_utils import build_skill_provider
-from paths import LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
+from agents.server_utils import build_skill_provider_async
+from paths import AGENTIC_PERF_HOME, LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
 from providers.events import EventBus
 from providers.execution import (
     AmbiguousHTTPReplayError,
@@ -430,8 +431,12 @@ async def _resolve_api_key_secret(
             f"LLM API-key secret '{secret_path}' is configured for "
             f"agent {agent_type or 'default'}, but no secrets provider is available"
         )
+    from providers.secrets.git_reference import GitSecretReferenceError
+
     try:
         value = await secrets_provider.get_secret(secret_path)
+    except GitSecretReferenceError as exc:
+        raise SecretReferenceError(str(exc)) from None
     except Exception:
         # Provider exception messages may contain backend details. Keep logs
         # and ticket failure comments free of any returned credential data.
@@ -606,6 +611,9 @@ PLAN_AGENT_STATUS = {
     "synthesis": "synthesizing_results",
     "build_image": "building_image",
 }
+# Triage advances the ticket itself instead of using the execution-plan loop,
+# but it needs the same no-progress retry protection as plan-managed stages.
+DISPATCH_RETRY_STATUSES = frozenset({*PLAN_AGENT_STATUS.values(), "triage_pending"})
 
 
 def _capture_step_results(agent_type: str, cf: dict) -> dict:
@@ -1141,6 +1149,133 @@ def _resource_reconciliation_required_before_resume(status: str, ticket: dict) -
         return True
 
 
+async def _cleanup_closed_ticket_skill_context(
+    dispatcher: Dispatcher, ticket_id: str
+) -> None:
+    """Drop ticket-owned gateway snapshots only after the ticket is closed."""
+    resolver = _organization_snapshot_resolver(dispatcher)
+    try:
+        async with AuditedAsyncHTTPClient(
+            timeout=10.0, headers=_auth_headers()
+        ) as client:
+            response = await client.get(
+                f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+            )
+            if response.status_code != 200:
+                return
+            if response.json().get("status") != "closed":
+                return
+        removed = await asyncio.to_thread(resolver.cleanup_ticket, ticket_id)
+        if removed:
+            logger.info(
+                "Removed %s ticket-owned organization skill snapshots for %s",
+                removed,
+                ticket_id,
+            )
+        from paths import SKILL_SOURCE_EPOCH_DIR
+        from providers.skills.source_epoch import SourceEpoch
+
+        removed = await asyncio.to_thread(
+            SourceEpoch(
+                SKILL_SOURCE_EPOCH_DIR,
+                ticket_id=ticket_id,
+            ).cleanup_ticket
+        )
+        if removed:
+            logger.info(
+                "Removed %s ticket-owned source snapshots for %s",
+                removed,
+                ticket_id,
+            )
+    except Exception:
+        logger.exception(
+            "Could not clean ticket-owned skill gateway snapshots for %s", ticket_id
+        )
+
+
+def _organization_snapshot_resolver(dispatcher: Dispatcher):
+    resolver = getattr(dispatcher.skills, "organization_resolver", None)
+    if resolver is not None:
+        return resolver
+    from providers.skills.gateway import OrganizationSkillResolver
+
+    return OrganizationSkillResolver(
+        {}, snapshot_root=AGENTIC_PERF_HOME / "skill-snapshots"
+    )
+
+
+async def _cleanup_skill_context_for_closed_tickets(
+    dispatcher: Dispatcher, open_ticket_ids: set[str]
+) -> list[tuple[str, int]]:
+    """Clean pinned tickets only after a direct status lookup confirms closure."""
+    candidate_ids = set()
+    organization_resolver = _organization_snapshot_resolver(dispatcher)
+    candidate_ids.update(organization_resolver.ticket_ids_with_source_pins())
+    from paths import SKILL_SOURCE_EPOCH_DIR
+    from providers.skills.source_epoch import SourceEpoch
+
+    candidate_ids.update(SourceEpoch.ticket_ids_with_pins(SKILL_SOURCE_EPOCH_DIR))
+    removed = []
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=_auth_headers()) as client:
+        for ticket_id in candidate_ids - open_ticket_ids:
+            try:
+                response = await client.get(
+                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                )
+                if response.status_code != 200:
+                    logger.warning(
+                        "Skipping context cleanup for %s: ticket lookup returned HTTP %s",
+                        ticket_id,
+                        response.status_code,
+                    )
+                    continue
+                ticket = response.json()
+                if not isinstance(ticket, dict):
+                    logger.warning(
+                        "Skipping context cleanup for %s: ticket lookup returned an incomplete record",
+                        ticket_id,
+                    )
+                    continue
+                status = ticket.get("status")
+                if status != "closed":
+                    logger.info(
+                        "Skipping context cleanup for %s: closure was not confirmed (status=%r)",
+                        ticket_id,
+                        status,
+                    )
+                    continue
+            except Exception:
+                logger.warning(
+                    "Skipping context cleanup for %s: ticket closure could not be verified",
+                    ticket_id,
+                    exc_info=True,
+                )
+                continue
+
+            count = await asyncio.to_thread(
+                _cleanup_ticket_skill_snapshots,
+                organization_resolver,
+                ticket_id,
+                SKILL_SOURCE_EPOCH_DIR,
+            )
+            if count:
+                removed.append((ticket_id, count))
+    return removed
+
+
+def _cleanup_ticket_skill_snapshots(
+    organization_resolver: Any, ticket_id: str, source_epoch_dir: str | Path
+) -> int:
+    from providers.skills.source_epoch import SourceEpoch
+
+    removed = organization_resolver.cleanup_ticket(ticket_id)
+    removed += SourceEpoch(
+        source_epoch_dir,
+        ticket_id=ticket_id,
+    ).cleanup_ticket()
+    return removed
+
+
 async def run_agent_task(
     dispatcher: Dispatcher,
     status: str,
@@ -1190,6 +1325,9 @@ async def run_agent_task(
 
         ticket_secrets = dispatcher._get_secrets_for_ticket(ticket_data)
         agent_type = STATUS_AGENT_MAP.get(status, "")
+        ticket_skill_provider = await dispatcher.get_skill_provider_for_ticket(
+            ticket_id, agent_type
+        )
         api_key = (
             await _resolve_api_key_secret(config, agent_type, ticket_secrets)
             if config
@@ -1210,6 +1348,7 @@ async def run_agent_task(
             llm_factory=snapshot_factory,
             iterations_factory=snapshot_iterations,
             secrets_provider=ticket_secrets,
+            skill_provider=ticket_skill_provider,
         )
         if agent is None:
             return
@@ -1508,6 +1647,23 @@ async def run_agent_task(
                             },
                         )
                         response.raise_for_status()
+        except (asyncio.CancelledError, httpx.HTTPStatusError) as exc:
+            # 409 (claim lost) and CancelledError are expected during
+            # shutdown — the agent was interrupted because the claim
+            # expired or the orchestrator lease was lost.
+            if (
+                isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code != 409
+            ):
+                logger.exception(
+                    "Failed to record cancellation guidance for ticket %s",
+                    ticket_id,
+                )
+            else:
+                logger.info(
+                    "Cancellation guidance skipped for %s (claim lost)",
+                    ticket_id,
+                )
         except Exception:
             logger.exception(
                 "Failed to record cancellation guidance for ticket %s", ticket_id
@@ -1625,13 +1781,14 @@ async def run_agent_task(
             )
 
         dispatcher.clear_agent(ticket_id)
-        await dispatcher.mark_done(ticket_id)
-        logger.info(f"mark_done completed for {ticket_id}")
         if agent is not None:
             try:
                 await agent.close()
             except Exception:
                 pass
+        await _cleanup_closed_ticket_skill_context(dispatcher, ticket_id)
+        await dispatcher.mark_done(ticket_id)
+        logger.info(f"mark_done completed for {ticket_id}")
 
 
 def _cancellation_guidance_reason(cancel_reason: str) -> str:
@@ -2385,11 +2542,11 @@ async def _record_dispatch_retry_outcome(
     *,
     claim_id: str | None,
 ) -> None:
-    """Back off repeated agent failures and stop after the configured cap."""
+    """Back off repeated no-progress dispatches and stop after the cap."""
     if (
         dispatcher.is_deposed()
         or not claim_id
-        or dispatched_status not in PLAN_AGENT_STATUS.values()
+        or dispatched_status not in DISPATCH_RETRY_STATUSES
     ):
         return
 
@@ -2435,11 +2592,11 @@ async def _record_dispatch_retry_outcome(
         if exhausted:
             comment = (
                 f"**Automatic dispatch paused:** {DISPATCH_RETRY_LIMIT} "
-                f"consecutive failures at {dispatched_status}. The "
-                "orchestrator stopped retrying this stage to protect system "
-                "resources. Review the agent failure, then clear "
-                "orchestrator_retry_state or move the ticket to another "
-                "status before resuming."
+                f"consecutive attempts did not advance the ticket from "
+                f"{dispatched_status}. The orchestrator stopped retrying this "
+                "stage to protect system resources. Review the agent result, "
+                "then clear orchestrator_retry_state or move the ticket to "
+                "another status before resuming."
             )
         await _persist_retry_state(
             dispatcher.store_url,
@@ -2451,7 +2608,7 @@ async def _record_dispatch_retry_outcome(
         )
         if exhausted:
             logger.error(
-                "Stopped dispatching %s at %s after %d consecutive failures",
+                "Stopped dispatching %s at %s after %d no-progress attempts",
                 ticket_id,
                 dispatched_status,
                 attempts,
@@ -2565,7 +2722,10 @@ async def _cancel_and_await(task: asyncio.Task | None) -> None:
         task.cancel()
     try:
         await task
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, RuntimeError):
+        # CancelledError is normal during shutdown; RuntimeError
+        # covers "orchestrator leader lease lost" which is the
+        # expected trigger for the shutdown sequence.
         pass
     except Exception:
         logger.exception("Background task failed during shutdown")
@@ -2714,6 +2874,7 @@ async def _poll_loop_after_lease(
     """
     dispatcher: Dispatcher | None = None
     trace_sweep_task: asyncio.Task | None = None
+    jumpstarter_sweep_task: asyncio.Task | None = None
     lease_renew_task: asyncio.Task | None = None
     repo_cache = RepoCache()
 
@@ -2747,26 +2908,6 @@ async def _poll_loop_after_lease(
                 )
                 arcaflow_mcp = None
             break
-
-    skills = build_skill_provider(
-        crucible_home=config.crucible_home,
-        repo_cache=repo_cache,
-        source_repo=config.raw.get("crucible_source_repo"),
-        source_url=config.harness_repos.get("crucible"),
-        zathras_home=config.zathras_home,
-        resolve_source=False,
-        catalog_only=True,
-        arcaflow_mcp_client=arcaflow_mcp,
-    )
-
-    # Collect harness-contributed directive schemas so the
-    # normalization framework knows about harness-specific keys.
-    # Provider-backed harnesses register via get_directive_schema().
-    # Standalone harnesses register at module import.
-    import providers.skills.boot_time  # noqa: F401
-    from providers.directives import collect_from_providers
-
-    collect_from_providers(skills)
 
     local_secrets = LocalSecretsProvider()
     vault_config = config.raw.get("secrets")
@@ -2811,6 +2952,65 @@ async def _poll_loop_after_lease(
             secrets = local_secrets
     else:
         secrets = local_secrets
+
+    from providers.secrets.git_reference import wrap_git_secret_references
+
+    secrets = wrap_git_secret_references(secrets)
+
+    async def make_skill_provider(ticket_id: str = "", phase: str = ""):
+        provider = await build_skill_provider_async(
+            crucible_home=config.crucible_home,
+            repo_cache=repo_cache,
+            source_repo=config.raw.get("crucible_source_repo"),
+            source_url=config.harness_repos.get("crucible"),
+            zathras_home=config.zathras_home,
+            resolve_source=False,
+            catalog_only=True,
+            arcaflow_mcp_client=arcaflow_mcp,
+            secrets_provider=secrets,
+            ticket_id=ticket_id or None,
+        )
+        if ticket_id and hasattr(provider, "bind_attempt"):
+            provider.bind_attempt(ticket_id, "initial", phase or "orchestrator")
+        return provider
+
+    skills = await make_skill_provider()
+
+    # Collect harness-contributed directive schemas so the
+    # normalization framework knows about harness-specific keys.
+    # Provider-backed harnesses register via get_directive_schema().
+    # Standalone harnesses register at module import.
+    import providers.skills.boot_time  # noqa: F401
+    from providers.directives import collect_from_providers
+
+    collect_from_providers(skills)
+
+    async def refresh_ticket_skill_provider(ticket_id: str, phase: str):
+        return await make_skill_provider(ticket_id, phase)
+
+    # Ticket source captures also cover project-local and upstream context, so
+    # the provider lifecycle must exist even when no organization package is
+    # configured.
+    skill_provider_factory = refresh_ticket_skill_provider
+
+    try:
+        jumpstarter_configured = bool(
+            await secrets.get_secret("jumpstarter/config.json")
+        )
+    except Exception:
+        logger.warning(
+            "Could not check Jumpstarter configuration; lease sweep is disabled",
+            exc_info=True,
+        )
+        jumpstarter_configured = False
+    if jumpstarter_configured:
+        if config.jumpstarter_lease_sweep_interval_seconds > 0:
+            logger.info(
+                "Jumpstarter orphan lease sweep enabled (interval=%ss)",
+                config.jumpstarter_lease_sweep_interval_seconds,
+            )
+        else:
+            logger.info("Jumpstarter orphan lease sweep disabled by configuration")
 
     has_api_key_secret_refs = config.llm_api_key_secret is not None or any(
         isinstance(agent_cfg, dict) and "api_key_secret" in agent_cfg
@@ -2896,6 +3096,7 @@ async def _poll_loop_after_lease(
             introspection_llm=config.introspection_llm,
             session_id=str(leader_lease.session_id),
             fencing_epoch=leader_lease.epoch,
+            skill_provider_factory=skill_provider_factory,
         )
         lease_loss_gate.bind(dispatcher)
 
@@ -2948,6 +3149,8 @@ async def _poll_loop_after_lease(
         status_offset = 0
         was_at_capacity = False
         last_trace_sweep = 0.0
+        last_jumpstarter_sweep = 0.0
+        last_skill_snapshot_sweep = 0.0
         repos_refreshed = False
         normalization_delivery_states: dict[str, dict[str, Any]] = {}
 
@@ -2961,13 +3164,37 @@ async def _poll_loop_after_lease(
                     try:
                         trace_sweep_task.result()
                     except Exception:
-                        logger.exception("Trace spool sweep failed")
+                        _maybe_log_sweep_failure()
                 # Network delivery may wait through an outage; never block ticket
                 # dispatch on orphan recovery.
                 trace_sweep_task = asyncio.create_task(
                     asyncio.to_thread(_sweep_trace_spools)
                 )
                 last_trace_sweep = time.monotonic()
+            if jumpstarter_sweep_task is not None and jumpstarter_sweep_task.done():
+                try:
+                    jumpstarter_sweep_task.result()
+                except Exception:
+                    logger.exception("Jumpstarter orphan lease sweep failed")
+                jumpstarter_sweep_task = None
+            now = time.monotonic()
+            if (
+                jumpstarter_configured
+                and config.jumpstarter_lease_sweep_interval_seconds > 0
+                and now - last_jumpstarter_sweep
+                >= config.jumpstarter_lease_sweep_interval_seconds
+                and jumpstarter_sweep_task is None
+            ):
+                # Sweep independently of ticket dispatch, but don't let a slow
+                # Jumpstarter control plane hold up polling or agent starts.
+                jumpstarter_sweep_task = asyncio.create_task(
+                    _sweep_orphaned_leases(
+                        config.state_store_url,
+                        auth_headers=_mutation_headers(None),
+                    ),
+                    name="jumpstarter-lease-sweep",
+                )
+                last_jumpstarter_sweep = now
             # Check system-wide budget before dispatching
             if system_budget is not None and events is not None:
                 from providers.budget import (
@@ -2993,10 +3220,37 @@ async def _poll_loop_after_lease(
 
             try:
                 all_fetched = await fetch_all_tickets(config.state_store_url)
+            except (httpx.ReadTimeout, httpx.ConnectError, ConnectionError) as exc:
+                # Transient during startup while the state store is
+                # still loading tickets.  No traceback needed.
+                logger.warning("Failed to fetch tickets: %s", exc)
+                await asyncio.sleep(config.poll_interval)
+                continue
             except Exception:
                 logger.exception("Failed to fetch tickets")
                 await asyncio.sleep(config.poll_interval)
                 continue
+
+            if time.monotonic() - last_skill_snapshot_sweep >= 60.0:
+                try:
+                    open_ticket_ids = {
+                        ticket["id"]
+                        for ticket in all_fetched
+                        if isinstance(ticket.get("id"), str)
+                        and ticket.get("status") != "closed"
+                    }
+                    removed_snapshots = await _cleanup_skill_context_for_closed_tickets(
+                        dispatcher, open_ticket_ids
+                    )
+                    for ticket_id, count in removed_snapshots:
+                        logger.info(
+                            "Removed %s ticket-owned skill gateway snapshots for %s",
+                            count,
+                            ticket_id,
+                        )
+                except Exception:
+                    logger.exception("Skill gateway snapshot sweep failed")
+                last_skill_snapshot_sweep = time.monotonic()
 
             # Clear retry limits as soon as any ticket leaves the status
             # where its failures occurred. Guidance and terminal statuses
@@ -3360,13 +3614,6 @@ async def _poll_loop_after_lease(
                 dispatched_tickets=all_fetched,
             )
 
-            # Jumpstarter: release orphaned leases whose
-            # tickets are closed or no longer active.
-            await _sweep_orphaned_leases(
-                config.state_store_url,
-                auth_headers=_mutation_headers(None),
-            )
-
             # Stale-task watchdog: cancel tasks with no events
             # for longer than the configured threshold.
             if config.stale_task_timeout > 0 and events is not None:
@@ -3384,6 +3631,7 @@ async def _poll_loop_after_lease(
             await asyncio.sleep(config.poll_interval)
     finally:
         await _cancel_and_await(trace_sweep_task)
+        await _cancel_and_await(jumpstarter_sweep_task)
         if dispatcher is not None:
             await dispatcher.shutdown()
         await _cancel_and_await(lease_renew_task)
@@ -3513,12 +3761,30 @@ def _mutation_headers(claim_id: str | None) -> dict[str, str]:
     return headers
 
 
+_SWEEP_WARN_INTERVAL = 300.0  # log sweep failures at most once per 5 min
+_last_sweep_warning: float = -_SWEEP_WARN_INTERVAL
+
+
+def _maybe_log_sweep_failure() -> None:
+    """Log a sweep failure at most once per *_SWEEP_WARN_INTERVAL*."""
+    global _last_sweep_warning
+    now = time.monotonic()
+    if now - _last_sweep_warning >= _SWEEP_WARN_INTERVAL:
+        logger.exception("Trace spool sweep failed")
+        _last_sweep_warning = now
+
+
 def _sweep_trace_spools() -> None:
     """Best-effort restart recovery for orphaned MCP producer spools."""
+    global _last_sweep_warning
     from providers.tracing import TraceClient, TraceDeliveryError
+    from providers.tracing.spool import prune_spool_directory
 
     token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
     if not token:
+        # No token means we can't deliver to the state store,
+        # but we should still prune old/oversized spool files.
+        prune_spool_directory(TRACE_SPOOL_DIR)
         return
     url, _ = resolve_state_store()
     client = TraceClient(url, token, spool_dir=TRACE_SPOOL_DIR)
@@ -3527,12 +3793,18 @@ def _sweep_trace_spools() -> None:
         if count:
             logger.info("Drained %d abandoned trace spool event(s)", count)
     except TraceDeliveryError:
-        logger.warning("Trace spool sweep deferred: state store unavailable")
+        now = time.monotonic()
+        if now - _last_sweep_warning >= _SWEEP_WARN_INTERVAL:
+            logger.warning("Trace spool sweep deferred: state store unavailable")
+            _last_sweep_warning = now
+        prune_spool_directory(TRACE_SPOOL_DIR)
     finally:
         try:
             client.close()
         except TraceDeliveryError:
             pass
+    # Always prune expired / oversized spool files, even on success.
+    prune_spool_directory(TRACE_SPOOL_DIR)
 
 
 def _handle_shutdown_signal(_signum: int, _frame: Any) -> None:
@@ -3573,6 +3845,11 @@ def main():
         asyncio.run(poll_loop(config))
     except KeyboardInterrupt:
         logger.info("Orchestrator stopped")
+    except RuntimeError as exc:
+        if "lease lost" in str(exc):
+            logger.info("Orchestrator stopped: leader lease lost")
+        else:
+            raise
     finally:
         clear_orchestrator_status()
         try:

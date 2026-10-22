@@ -28,12 +28,20 @@ if _project_root not in sys.path:
 
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
+    build_organization_skill_resolver_async,
     build_secrets_provider,
     build_ssh_from_ticket,
     get_board_selector,
 )
+from agents.skill_gateway import SKILL_GATEWAY_TOOL_DESCRIPTION, skill_context_gateway
 from paths import get_default_ssh_key
-from providers.resource.base import has_reservation_metadata, reservation_failed
+from providers.resource.base import (
+    ResourceProvider,
+    has_reservation_metadata,
+    reservation_failed,
+)
+from providers.resource.selection import ReservationSelectionError
+from providers.skills.private import PrivateSkillProvider
 from providers.tracing import (
     bind_trace_context,
     child_context,
@@ -44,12 +52,14 @@ from providers.tracing import (
 logger = logging.getLogger(__name__)
 
 mcp = create_ticket_mcp("resource-agent")
+SKILLS_DIR = Path(_project_root) / "skills"
 
 # Module-level globals -- lazily initialized by _ensure_init()
 _initialized = False
 _ssh = None
 _ticket: dict[str, Any] = {}
 _registry = None
+_skill_provider = None
 
 # Fleet: first available untested device from check_available.
 # Set by check_available_resources, read by reserve_resources.
@@ -84,11 +94,69 @@ async def _ensure_init():
     from paths import get_instance_name
     from providers.resource.registry import ResourceProviderRegistry
 
-    _registry = ResourceProviderRegistry(secrets, instance_name=get_instance_name())
+    _registry = ResourceProviderRegistry(
+        secrets,
+        instance_name=get_instance_name(),
+        organization_resolver_factory=_get_resource_organization_resolver,
+    )
     _initialized = True
     fields = _ticket.get("custom_fields", {})
     if fields.get("resource_reservation_outcome_unknown") is True:
         _latch_unknown_reservation()
+
+
+async def _get_skill_provider():
+    """Build the docs-only gateway resolver without loading AWS credentials.
+
+    The only secrets lookup this path can perform is authentication explicitly
+    configured for an organization Git source. Resource-provider secrets remain
+    exclusive to ``_ensure_init`` and are never read to retrieve guidance.
+    """
+    global _skill_provider
+    if _skill_provider is None:
+        resolver = await build_organization_skill_resolver_async(
+            ticket_id=os.environ.get("TICKET_ID") or None
+        )
+        skill_provider = PrivateSkillProvider(resolver=resolver)
+        skill_provider.bind_current_attempt("resource")
+        _skill_provider = skill_provider
+    return _skill_provider
+
+
+async def _get_resource_organization_resolver():
+    skill_provider = await _get_skill_provider()
+    return skill_provider.organization_resolver
+
+
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+    cursor: str = "",
+) -> str:
+    """Retrieve resource guidance through the subject-scoped context gateway."""
+    return await skill_context_gateway(
+        await _get_skill_provider(),
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="resource-agent",
+        phase="resource",
+        subject=subject,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+        cursor=cursor,
+        local_skills_dir=SKILLS_DIR,
+    )
 
 
 def _latch_unknown_reservation() -> None:
@@ -118,6 +186,39 @@ def _unknown_reservation_response(provider: str | None = None) -> dict[str, Any]
     if provider:
         response["provider"] = provider
     return response
+
+
+def _reservation_ticket_context(
+    ticket_id: str | None = None,
+    ticket_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the explicit ticket context passed to provider contract hooks."""
+    fields = ticket_fields if isinstance(ticket_fields, dict) else {}
+    required_hosts = fields.get("required_hosts")
+    return {
+        "ticket_id": ticket_id
+        or os.environ.get("TICKET_ID", "")
+        or _ticket.get("id", ""),
+        "required_hosts": required_hosts if isinstance(required_hosts, list) else [],
+    }
+
+
+def _resolve_quads_ticket_key(ticket_id: str | None) -> str | None:
+    """Resolve the canonical ticket key from active context, then the environment."""
+    ticket_key = None
+    for candidate in (_ticket.get("id"), os.environ.get("TICKET_ID")):
+        if isinstance(candidate, str) and (ticket_key := candidate.strip()):
+            break
+    else:
+        return None
+
+    supplied_ticket_id = ticket_id.strip() if isinstance(ticket_id, str) else ""
+    if supplied_ticket_id and supplied_ticket_id != ticket_key:
+        logger.warning(
+            "Ignoring reserve_resources ticket_id that conflicts with the "
+            "canonical QUADS ticket key."
+        )
+    return ticket_key
 
 
 def _ticket_resource_provider() -> tuple[str | None, bool]:
@@ -558,7 +659,13 @@ async def check_available_resources(
     requirements: dict | None = None,
     required_hosts: list[dict] | None = None,
 ) -> str:
-    """Check what resources are available from a specific provider. Use required_hosts (preferred) to get per-host recommendations based on the ticket's required_hosts entries with hardware specs, or requirements for a single uniform recommendation."""
+    """Check availability and return the selected provider's selection schema.
+
+    Use required_hosts (preferred) for per-host recommendations based on the
+    ticket's host requirements, or requirements for a uniform recommendation.
+    The result includes reservation_selection_schema and an example that
+    describe the fields accepted by reserve_resources for this provider.
+    """
     if _reservation_uncertain:
         return json.dumps(_unknown_reservation_response(provider))
     if _resources_allocated:
@@ -573,6 +680,12 @@ async def check_available_resources(
     if _reservation_uncertain:
         return json.dumps(_unknown_reservation_response(provider))
     prov = await _registry.get_provider(provider)
+    selection_guidance: dict[str, Any] = {}
+    if isinstance(prov, ResourceProvider):
+        selection_guidance = {
+            "reservation_selection_schema": prov.reservation_selection_schema(),
+            "reservation_selection_example": prov.reservation_selection_example(),
+        }
 
     # Code-enforce the directive's board_selector for
     # Jumpstarter. The LLM may use a wrong selector key.
@@ -611,6 +724,15 @@ async def check_available_resources(
                     fresh_cf = r.json().get("custom_fields", {})
         except Exception:
             pass
+    ticket_fields = fresh_cf if isinstance(fresh_cf, dict) else {}
+    ticket_hosts = ticket_fields.get("required_hosts")
+    ticket_context = _reservation_ticket_context(ticket_id, ticket_fields)
+    if isinstance(prov, ResourceProvider):
+        required_hosts = prov.required_hosts_for_availability(
+            required_hosts,
+            ticket_hosts if isinstance(ticket_hosts, list) else None,
+            ticket_context,
+        )
     if is_fleet_investigation(fresh_cf):
         tested_host_ids = set(get_tested_host_ids(fresh_cf))
         exclude = list(tested_host_ids)
@@ -643,13 +765,18 @@ async def check_available_resources(
                 host_req["exclude_hosts"] = list(set(exclude) | set(existing))
             result = await prov.check_available(host_req)
             availability_results.append(result)
-            rec = dict(host_req)
-            if result.get("options"):
-                rec["recommended"] = result["options"][0]
-            recommendations.append(rec)
+            if isinstance(prov, ResourceProvider):
+                recommendations.append(
+                    prov.availability_recommendation(host_req, result, ticket_context)
+                )
+            else:
+                recommendations.append(dict(host_req))
+        if isinstance(prov, ResourceProvider):
+            prov.record_availability_context(availability_results, ticket_context)
         response = {
             "provider": prov.provider_name,
             "per_host_recommendations": recommendations,
+            **selection_guidance,
         }
         if is_fleet_investigation(fresh_cf) and ticket_id:
             fleet_exhausted = bool(availability_results) and all(
@@ -665,6 +792,9 @@ async def check_available_resources(
                 )
         return json.dumps(response)
     result = await prov.check_available(requirements or {})
+    result.update(selection_guidance)
+    if isinstance(prov, ResourceProvider):
+        prov.record_availability_context([result], ticket_context)
 
     # Code-enforce: when a specific device was requested by
     # name and is unavailable, escalate to HITL immediately.
@@ -705,6 +835,93 @@ async def check_available_resources(
     return json.dumps(result)
 
 
+@mcp.tool()
+async def prepare_reservation_selection(
+    provider: str,
+    selection: dict,
+    required_hosts: list[dict] | None = None,
+    ticket_id: str | None = None,
+) -> str:
+    """Validate and prepare an automatic selection through its provider contract.
+
+    Provider hooks may perform read-only availability discovery before returning
+    a normalized selection. This tool never starts a reservation.
+    """
+    if _reservation_uncertain:
+        return json.dumps(_unknown_reservation_response(provider))
+    if _resources_allocated:
+        return json.dumps(
+            {
+                "error": "Resources already allocated. "
+                "Call submit_resource_result to complete.",
+                "already_allocated": True,
+            }
+        )
+    if not isinstance(selection, dict):
+        return json.dumps(
+            {
+                "status": "invalid_selection",
+                "provider": provider,
+                "error": "Reservation selection must be an object.",
+                "provider_call_started": False,
+            }
+        )
+    await _ensure_init()
+    if _reservation_uncertain:
+        return json.dumps(_unknown_reservation_response(provider))
+    expected_provider, user_provided_only = _ticket_resource_provider()
+    if user_provided_only or (expected_provider and provider != expected_provider):
+        return json.dumps(
+            {
+                "status": "invalid_selection",
+                "provider": provider,
+                "error": f"Ticket is configured for '{expected_provider or 'user_provided'}'.",
+                "provider_call_started": False,
+            }
+        )
+    try:
+        prov = await _registry.get_provider(provider)
+        if not isinstance(prov, ResourceProvider):
+            raise ReservationSelectionError(
+                f"Provider '{provider}' has no reservation selection contract"
+            )
+        ticket_fields = _ticket.get("custom_fields", {})
+        if not isinstance(ticket_fields, dict):
+            ticket_fields = {}
+        ticket_hosts = ticket_fields.get("required_hosts")
+        ticket_context = _reservation_ticket_context(ticket_id, ticket_fields)
+        effective_hosts = prov.required_hosts_for_availability(
+            required_hosts if isinstance(required_hosts, list) else None,
+            ticket_hosts if isinstance(ticket_hosts, list) else None,
+            ticket_context,
+        )
+        prepared = await prov.prepare_auto_reservation_selection(
+            selection,
+            required_hosts=effective_hosts,
+            ticket_context=ticket_context,
+        )
+    except (ReservationSelectionError, ValueError) as exc:
+        return json.dumps(
+            {
+                "status": "invalid_selection",
+                "provider": provider,
+                "error": str(exc),
+                "provider_call_started": False,
+            }
+        )
+    except Exception as exc:
+        logger.exception("[resource] Selection preparation failed for %s", provider)
+        return json.dumps(
+            {
+                "status": "preparation_failed",
+                "provider": provider,
+                "error": str(exc),
+                "provider_call_started": False,
+            }
+        )
+    return json.dumps({"status": "ready", "provider": provider, "selection": prepared})
+
+
 def _infer_os_from_ticket() -> str:
     """Extract the OS from the ticket's required_hosts.
 
@@ -730,7 +947,13 @@ async def reserve_resources(
     ticket_id: str | None = None,
     duration_hours: int = 36,
 ) -> str:
-    """Reserve resources from a provider. For bare-metal (quads), this creates an assignment, schedules hosts, waits for validation (~30-45 min), and sets up SSH access. For cloud (aws), this launches instances, waits until running, and verifies SSH connectivity. Pass {instance_type, count} for uniform instances or {instance_specs: [{instance_type, count, role}, ...]} for per-role instance types. For GPU cluster (psap-cc), this creates a cluster reservation -- returns cluster access info in provider_metadata (no SSH hosts). Returns a reservation ID for teardown."""
+    """Reserve resources using the active provider's selection contract.
+
+    Choose a selection from the options returned by check_available_resources
+    that conforms to its reservation_selection_schema. Provider selection
+    fields are validated before allocation is attempted. Returns the reservation
+    identity and provider metadata needed for teardown.
+    """
     global _resources_allocated, _reservation_failures, _reservation_uncertain
     if _reservation_uncertain:
         return json.dumps(_unknown_reservation_response(provider))
@@ -755,10 +978,43 @@ async def reserve_resources(
             ),
         }
         return json.dumps(result)
+    if provider == "quads":
+        ticket_id = _resolve_quads_ticket_key(ticket_id)
+        if ticket_id is None:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "provider": provider,
+                    "allocation_unknown": False,
+                    "retry_blocked": False,
+                    "provider_call_started": False,
+                    "error": (
+                        "No Agentic Perf ticket key is available from the active "
+                        "ticket or TICKET_ID."
+                    ),
+                    "message": "No provider allocation was attempted.",
+                }
+            )
+    if not isinstance(selection, dict):
+        return json.dumps(
+            {
+                "status": "invalid_selection",
+                "provider": provider,
+                "invalid_selection": True,
+                "allocation_unknown": False,
+                "retry_blocked": False,
+                "provider_call_started": False,
+                "error": "Reservation selection must be an object.",
+                "message": (
+                    "No provider allocation was attempted. Correct the provider "
+                    "selection and retry."
+                ),
+            }
+        )
     # Inject OS from ticket required_hosts when the LLM doesn't
     # include it in the selection — ensures AMI resolution fires
     # in the provider regardless of LLM behavior.
-    if not selection.get("ami") and not selection.get("os"):
+    if provider == "aws" and not selection.get("ami") and not selection.get("os"):
         os_name = _infer_os_from_ticket()
         if os_name:
             selection = dict(selection)
@@ -783,12 +1039,44 @@ async def reserve_resources(
     # we get an untested board. The name was determined
     # during check_available_resources from the filtered
     # device list.
-    if _fleet_next_device:
+    if provider == "jumpstarter" and _fleet_next_device:
         selection = dict(selection)
         selection["exporter_name"] = _fleet_next_device
         logger.info("Fleet: targeting %s", _fleet_next_device)
 
     prov = await _registry.get_provider(provider)
+    if isinstance(prov, ResourceProvider):
+        try:
+            ticket_fields = _ticket.get("custom_fields", {})
+            required_hosts = ticket_fields.get("required_hosts")
+            if not isinstance(required_hosts, list):
+                required_hosts = None
+            ticket_context = _reservation_ticket_context(
+                ticket_id,
+                ticket_fields if isinstance(ticket_fields, dict) else {},
+            )
+            selection = prov.validate_reservation_selection(
+                selection,
+                required_hosts=required_hosts,
+                ticket_context=ticket_context,
+                preflight=True,
+            )
+        except ReservationSelectionError as exc:
+            return json.dumps(
+                {
+                    "status": "invalid_selection",
+                    "provider": provider,
+                    "invalid_selection": True,
+                    "allocation_unknown": False,
+                    "retry_blocked": False,
+                    "provider_call_started": False,
+                    "error": str(exc),
+                    "message": (
+                        "No provider allocation was attempted. Correct the "
+                        "provider selection and retry."
+                    ),
+                }
+            )
     resources_allocated_before = _resources_allocated
     _latch_unknown_reservation()
     try:

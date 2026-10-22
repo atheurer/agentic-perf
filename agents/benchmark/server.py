@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import socket
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -37,12 +38,24 @@ from agents.server_utils import (
     _public_context_result,
     build_crucible_context_gateway,
     build_repo_cache,
-    build_skill_provider,
+    build_skill_provider_async,
     build_ssh_from_ticket,
     controller_context_gateway,
     is_self_host,
     read_skill_documents,
+    ticket_controller_host,
     tool_progress,
+)
+from agents.skill_gateway import (
+    SKILL_GATEWAY_TOOL_DESCRIPTION,
+    organization_manages_harness,
+    skill_config_view,
+    skill_context_gateway,
+)
+from agents.tool_ownership import (
+    ownership_metadata,
+    require_ticket_harness,
+    selected_harness_from_ticket,
 )
 from providers.execution import (
     AuditedFilesystem,
@@ -55,6 +68,8 @@ from providers.skills.crucible import crucible_runfile_contract_errors
 logger = logging.getLogger(__name__)
 
 mcp = create_ticket_mcp("benchmark-agent")
+_CRUCIBLE_TOOL_OWNER = "crucible"
+_BOOT_TIME_TOOL_OWNER = "boot-time"
 
 CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
@@ -820,13 +835,38 @@ async def _ensure_init():
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = build_skill_provider()
+    _skill_provider = await build_skill_provider_async(skill_phase="benchmark")
     _crucible_context = build_crucible_context_gateway(catalog_only=False)
     try:
         _repo_cache = await build_repo_cache()
     except Exception:
         _repo_cache = None
     _initialized = True
+
+
+async def _require_tool_owner(owner_harness: str) -> None:
+    """Initialize the authenticated ticket context and enforce tool ownership."""
+    await _ensure_init()
+    default_harness = getattr(_skill_provider, "default_harness", "")
+    require_ticket_harness(
+        _ticket,
+        owner_harness,
+        default_harness=(default_harness if isinstance(default_harness, str) else ""),
+    )
+
+
+def _supports_generic_execution(harness_name: str) -> bool:
+    """Check the selected adapter's code-declared generic execution support."""
+    # Crucible's execution adapter is implemented directly in this server;
+    # other harnesses declare support beside their provider registration.
+    if harness_name == _CRUCIBLE_TOOL_OWNER:
+        return True
+    if hasattr(_skill_provider, "supports_generic_execution_for"):
+        return _skill_provider.supports_generic_execution_for(harness_name)
+    provider = _skill_provider
+    if hasattr(_skill_provider, "get_provider"):
+        provider = _skill_provider.get_provider(harness_name)
+    return bool(getattr(provider, "generic_execution_supported", False))
 
 
 def _get_validated_runfile(
@@ -894,16 +934,7 @@ def _get_validated_runfile(
 
 def _controller_host() -> str | None:
     """Return the ticket's explicit Crucible controller host."""
-    fields = _ticket.get("custom_fields", {}) if _ticket else {}
-    context = fields.get("crucible_controller_context")
-    if isinstance(context, dict):
-        for key in ("host", "controller"):
-            if isinstance(context.get(key), str) and context[key].strip():
-                return context[key].strip()
-    assigned = fields.get("assigned_hardware_ips")
-    if isinstance(assigned, dict) and isinstance(assigned.get("controller"), str):
-        return assigned["controller"].strip() or None
-    return None
+    return ticket_controller_host(_ticket)
 
 
 async def _read_controller_file(host: str, path: str) -> str | None:
@@ -1342,17 +1373,139 @@ def _controller_snapshot_documents(
 # ---------------------------------------------------------------------------
 
 
+@mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)
+async def get_skill_context(
+    subject: str,
+    operation: str = "bootstrap",
+    ref: str = "",
+    path: str = "",
+    from_ref: str = "",
+    query: str = "",
+    max_bytes: int = 16384,
+    offset_bytes: int = 0,
+    cursor: str = "",
+) -> str:
+    """Retrieve guidance through server-owned subject and source bindings."""
+    await _ensure_init()
+    runfile_contract = (
+        _crucible_context.get_runfile_contract()
+        if subject == "harness/crucible" and _crucible_context is not None
+        else None
+    )
+    response_overhead_bytes = (
+        len(
+            json.dumps(
+                {"runfile_contract": runfile_contract},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode()
+        )
+        if runfile_contract is not None and operation in {"list", "search"}
+        else 0
+    )
+    response = await skill_context_gateway(
+        _skill_provider,
+        ticket_id=os.environ.get("TICKET_ID", ""),
+        agent_name="benchmark-agent",
+        phase="benchmark",
+        ssh=_ssh,
+        controller_host=_controller_host(),
+        subject=subject,
+        operation=operation,
+        ref=ref,
+        path=path,
+        from_ref=from_ref,
+        query=query,
+        max_bytes=max_bytes,
+        offset_bytes=offset_bytes,
+        cursor=cursor,
+        response_overhead_bytes=response_overhead_bytes,
+        local_skills_dir=SKILLS_DIR,
+        repo_cache=_repo_cache,
+    )
+    if subject == "harness/crucible":
+        if (
+            operation in {"list", "search"}
+            and type(max_bytes) is int
+            and len(response.encode("utf-8")) + response_overhead_bytes - 1 > max_bytes
+        ):
+            too_small = {
+                "found": False,
+                "operation": operation,
+                "reason": "page_too_small",
+                "message": (
+                    "max_bytes cannot fit the run-file contract and complete result envelope."
+                ),
+            }
+            error_response = json.dumps(
+                too_small, ensure_ascii=False, separators=(",", ":")
+            )
+            if len(error_response.encode("utf-8")) > max_bytes:
+                error_response = json.dumps(
+                    {"reason": "page_too_small"}, ensure_ascii=False
+                )
+            if len(error_response.encode("utf-8")) > max_bytes:
+                return "{}"
+            return error_response
+        return _with_crucible_runfile_contract(response, runfile_contract)
+    return response
+
+
 @mcp.tool()
 async def read_skills(docs: list[dict]) -> str:
     """Read local skill documents for harnesses that still use the legacy fallback."""
     await _ensure_init()
-    return json.dumps(read_skill_documents(SKILLS_DIR, docs))
+    results = []
+    for doc in docs:
+        harness = doc.get("harness") or doc.get("category", "")
+        filename = doc.get("filename") or doc.get("name", "")
+        if isinstance(harness, str) and harness.strip().lower() == "crucible":
+            results.append(
+                {
+                    "found": False,
+                    "harness": harness,
+                    "filename": filename,
+                    "message": (
+                        "Use get_skill_context(subject='harness/crucible', "
+                        "operation='bootstrap')."
+                    ),
+                }
+            )
+        elif harness in {"kube-burner", "k8s-netperf"}:
+            results.append(
+                {
+                    "found": False,
+                    "harness": harness,
+                    "filename": filename,
+                    "message": (
+                        f"Use get_skill_context(subject='harness/{harness}', "
+                        "operation='bootstrap')."
+                    ),
+                }
+            )
+        else:
+            results.extend(read_skill_documents(SKILLS_DIR, [doc]))
+    return json.dumps(results)
 
 
 @mcp.tool()
 async def list_harness_docs(harness: str) -> str:
     """List documentation files available for a benchmark harness. Returns file paths and sizes. Use this to discover what reference material is available before constructing a run file."""
     await _ensure_init()
+    if isinstance(harness, str) and harness.strip().lower() == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
+    if harness in {"kube-burner", "k8s-netperf"}:
+        return json.dumps(
+            {
+                "docs": [],
+                "message": f"Use get_skill_context(subject='harness/{harness}', operation='bootstrap').",
+            }
+        )
     if not _repo_cache:
         return json.dumps({"docs": [], "message": "No repo cache configured"})
     docs = _repo_cache.list_docs(harness, subdirs=["docs", "config"])
@@ -1371,6 +1524,20 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
         return json.dumps({"found": False, "message": "No repo cache configured"})
     if not harness and "/" in doc_path:
         harness, doc_path = doc_path.strip().lstrip("/").split("/", 1)
+    if isinstance(harness, str) and harness.strip().lower() == "crucible":
+        return json.dumps(
+            {
+                "found": False,
+                "message": "Use get_skill_context(subject='harness/crucible', operation='bootstrap').",
+            }
+        )
+    if harness in {"kube-burner", "k8s-netperf"}:
+        return json.dumps(
+            {
+                "found": False,
+                "message": f"Use get_skill_context(subject='harness/{harness}', operation='bootstrap').",
+            }
+        )
     content = _repo_cache.read_file(harness, doc_path)
     if content is None:
         return json.dumps(
@@ -1386,19 +1553,25 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
 
 @mcp.tool()
 async def get_execution_config(harness_name: str) -> str:
-    """Get the benchmark harness's execution configuration from private skills. Returns controller requirements, pre-run steps, run command, endpoint type, run file format, and defaults. The harness_name should be the harness that owns the benchmark (e.g., 'crucible' or 'zathras')."""
+    """Get execution settings for the harness that owns the benchmark. Crucible returns approved controller, endpoint, and default fields; deterministic action tools consume service-only commands. Read applicable guidance through get_skill_context. Other organization subjects require an approved view schema; unconfigured harnesses retain their legacy response."""
     await _ensure_init()
-    if harness_name == "crucible":
+    if harness_name == "crucible" or organization_manages_harness(
+        _skill_provider, harness_name
+    ):
+        try:
+            execution = await skill_config_view(
+                _skill_provider, harness_name, "execution", "benchmark"
+            )
+        except ValueError:
+            return json.dumps(
+                {
+                    "harness": harness_name,
+                    "found": False,
+                    "reason": "configuration_view_unavailable",
+                }
+            )
         return json.dumps(
-            {
-                "harness": "crucible",
-                "found": False,
-                "message": (
-                    "Crucible execution guidance is controller-sourced context. "
-                    "Use get_crucible_benchmark_context; use action tools for "
-                    "runtime discovery, validation, and execution."
-                ),
-            }
+            {"harness": harness_name, "found": bool(execution), **execution}
         )
     config = await _skill_provider.get_all_private_config(harness_name)
     execution = config.get("execution", {})
@@ -1422,18 +1595,7 @@ async def get_execution_config(harness_name: str) -> str:
         "run_file_format": execution.get("run_file_format", "json"),
         "results_dir_pattern": execution.get("results_dir_pattern", ""),
     }
-    if harness_name == "crucible":
-        # Userenv availability belongs to the running Crucible controller.
-        # Never propagate a stale/static value from private metadata.
-        result["userenv_discovery"] = execution.get(
-            "userenv_discovery",
-            {
-                "required": True,
-                "command": "crucible userenvs list",
-                "source": "running_controller",
-            },
-        )
-    elif "default_userenv" in execution:
+    if "default_userenv" in execution:
         result["default_userenv"] = execution["default_userenv"]
     return json.dumps(result)
 
@@ -1450,7 +1612,7 @@ async def get_runfile_schema(harness: str = "crucible") -> str:
                 "harness": "crucible",
                 "message": (
                     "The Crucible run-file schema is controller-sourced context. "
-                    'Use get_crucible_benchmark_context(operation="list" or '
+                    'Use get_skill_context(subject="harness/crucible", operation="bootstrap" or '
                     '"read") to retrieve it.'
                 ),
             }
@@ -1483,7 +1645,7 @@ async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str
                 "harness": "crucible",
                 "message": (
                     "Crucible benchmark metadata is controller-sourced context. "
-                    "Use get_crucible_benchmark_context to read multiplex.json "
+                    "Use get_skill_context(subject='harness/crucible') to read multiplex.json "
                     "and related files."
                 ),
             }
@@ -1510,7 +1672,6 @@ async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str
     )
 
 
-@mcp.tool(name="get_crucible_benchmark_context")
 async def _get_crucible_benchmark_context_tool(
     operation: str = "bootstrap",
     path: str = "",
@@ -1568,15 +1729,21 @@ async def _get_crucible_benchmark_context_tool(
     )
 
 
-def _with_crucible_runfile_contract(response: str) -> str:
+def _with_crucible_runfile_contract(
+    response: str, runfile_contract: dict[str, Any] | None = None
+) -> str:
     """Attach provider-owned run-file requirements to model-facing context."""
     if _crucible_context is None:
         raise RuntimeError("Crucible context provider was not initialized")
     result = json.loads(response)
     if not isinstance(result, dict):
         raise ValueError("Crucible context response must be a JSON object")
-    result["runfile_contract"] = _crucible_context.get_runfile_contract()
-    return json.dumps(result)
+    result["runfile_contract"] = (
+        runfile_contract
+        if runfile_contract is not None
+        else _crucible_context.get_runfile_contract()
+    )
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 async def _legacy_get_crucible_benchmark_context(
@@ -1598,6 +1765,7 @@ async def _legacy_get_crucible_benchmark_context(
         and _ssh is not None
         and _controller_host()
     ):
+        gateway_operation = "manifest" if operation == "list" else operation
         return await controller_context_gateway(
             ssh=_ssh,
             controller_host=_controller_host(),
@@ -1605,7 +1773,7 @@ async def _legacy_get_crucible_benchmark_context(
             agent_name="benchmark-agent",
             phase=phase,
             benchmark=benchmark,
-            operation=operation,
+            operation=gateway_operation,
             path=path,
             query=query,
             include_alternates=include_alternates,
@@ -2107,7 +2275,7 @@ async def get_crucible_benchmark_context(*args, **kwargs) -> str:
     """Compatibility wrapper for direct in-process callers only.
 
     This wrapper is intentionally not registered with MCP. Agents receive the
-    smaller generic schema from ``_get_crucible_benchmark_context_tool``.
+    subject-scoped schema from ``get_skill_context``.
     """
     return await _legacy_get_crucible_benchmark_context(*args, **kwargs)
 
@@ -2125,7 +2293,7 @@ async def get_tool_params(tool: str, harness: str = "crucible") -> str:
                 "harness": "crucible",
                 "message": (
                     "Crucible tool metadata is controller-sourced context. "
-                    "Use get_crucible_benchmark_context to read the tool "
+                    "Use get_skill_context(subject='harness/crucible') to read the tool "
                     "metadata and parameter files."
                 ),
             }
@@ -2183,7 +2351,7 @@ async def get_example_runfile(
                 "endpoint_type": ep_type,
                 "message": (
                     "Crucible examples are controller-sourced context. Use "
-                    "get_crucible_benchmark_context to discover and read them."
+                    "get_skill_context(subject='harness/crucible') to discover and read them."
                 ),
             }
         )
@@ -2349,6 +2517,52 @@ async def execute_benchmark(
     the legacy runfile argument until they gain the same validation contract.
     """
     await _ensure_init()
+    default_harness = getattr(_skill_provider, "default_harness", "")
+    harness_name = selected_harness_from_ticket(
+        _ticket,
+        default_harness=(default_harness if isinstance(default_harness, str) else ""),
+    )
+    if not harness_name:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "harness_not_selected",
+                "message": (
+                    "The ticket must select a harness or inherit the configured "
+                    "provider default before benchmark execution; use "
+                    "workflow_source for Arcaflow workflows."
+                ),
+            }
+        )
+    requested_harness = (
+        selected_harness_from_ticket(
+            {"custom_fields": {"directives": {"harness": harness}}}
+        )
+        if harness is not None
+        else harness_name
+    )
+    if requested_harness != harness_name:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "harness_mismatch",
+                "harness": harness_name,
+                "message": "Execution must use the harness selected by the ticket.",
+            }
+        )
+
+    if not _supports_generic_execution(harness_name):
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "generic_execution_unsupported",
+                "harness": harness_name,
+                "message": (
+                    f"The {harness_name!r} harness has no generic benchmark "
+                    "execution adapter. Use its owning execution tool."
+                ),
+            }
+        )
 
     from agents.server_utils import assert_ticket_active
 
@@ -2369,7 +2583,7 @@ async def execute_benchmark(
                 validation_id,
                 replay_record,
                 controller,
-                harness or "crucible",
+                harness_name,
                 replay_record.get("run_command", "crucible run"),
             )
             replay_guard = _BenchmarkOperation(
@@ -2396,7 +2610,6 @@ async def execute_benchmark(
                 await replay_guard.close()
         return json.dumps(active_check)
     run_uuid = uuid.uuid4().hex[:8]
-    harness_name = harness or "crucible"
 
     # The approval gate applies only to Crucible, which has the
     # validate_benchmark → request_approval → execute pipeline.
@@ -2851,16 +3064,84 @@ async def execute_benchmark(
             ),
         }
         if result.exit_code == 0:
-            metrics_result = await _ssh.run(
-                controller,
-                f"cat {template_dir}/collected-metrics/*.json 2>/dev/null | head -c 3000",
-                timeout=30,
-            )
-            if metrics_result.exit_code == 0 and metrics_result.stdout:
-                try:
-                    response["result_summary"] = json.loads(metrics_result.stdout)
-                except json.JSONDecodeError:
-                    response["result_summary"] = metrics_result.stdout[:3000]
+            response["output"] = (result.stdout or "")[-6000:]
+            local_indexers = [
+                endpoint["indexer"]
+                for endpoint in config.get("metricsEndpoints", [])
+                if isinstance(endpoint, dict)
+                and isinstance(endpoint.get("indexer"), dict)
+                and endpoint["indexer"].get("type") == "local"
+            ]
+            result_directories: list[str] = []
+            for indexer in local_indexers:
+                metrics_directory = indexer.get("metricsDirectory")
+                if not metrics_directory:
+                    metrics_directory = "collected-metrics-{{.UUID}}"
+                metrics_directory = str(metrics_directory).replace(
+                    "{{.UUID}}", run_uuid
+                )
+                result_directory = os.path.normpath(
+                    os.path.join(template_dir, metrics_directory)
+                )
+                if os.path.commonpath([template_dir, result_directory]) == template_dir:
+                    result_directories.append(result_directory)
+
+            response["result_directories"] = result_directories
+            result_files: list[str] = []
+            for result_directory in result_directories:
+                listing = await _ssh.run(
+                    controller,
+                    "find "
+                    f"{shlex.quote(result_directory)} "
+                    "-maxdepth 2 -type f -name '*.json' -printf '%P\\n' "
+                    "2>/dev/null | sort | head -20",
+                    timeout=30,
+                )
+                for relative_path in (listing.stdout or "").splitlines():
+                    if relative_path:
+                        result_files.append(
+                            os.path.join(result_directory, relative_path)
+                        )
+                    if len(result_files) >= 20:
+                        break
+                if len(result_files) >= 20:
+                    break
+
+            response["result_files"] = result_files
+            if result_files:
+                # Keep the model-facing payload bounded; the returned file
+                # list lets the agent retrieve individual artifacts if needed.
+                files_to_read = result_files[:20]
+                read_command = (
+                    "cat -- "
+                    + " ".join(shlex.quote(path) for path in files_to_read)
+                    + " 2>/dev/null | head -c 6000"
+                )
+                metrics_result = await _ssh.run(controller, read_command, timeout=30)
+                metrics_content = metrics_result.stdout or ""
+                if len(files_to_read) == 1 and len(metrics_content) < 6000:
+                    try:
+                        response["result_summary"] = json.loads(metrics_content)
+                    except json.JSONDecodeError:
+                        response["result_summary"] = {
+                            "files": files_to_read,
+                            "content": metrics_content,
+                            "truncated": False,
+                        }
+                else:
+                    response["result_summary"] = {
+                        "files": files_to_read,
+                        "content": metrics_content,
+                        "truncated": len(metrics_content) >= 6000,
+                    }
+            else:
+                response["result_collection"] = {
+                    "status": "empty",
+                    "message": (
+                        "kube-burner exited successfully but no local JSON result "
+                        "files were found in the configured metrics directory"
+                    ),
+                }
         if result.exit_code != 0:
             response["output"] = result.stdout[-3000:] if result.stdout else ""
             response["error"] = result.stderr[-1000:] if result.stderr else ""
@@ -3523,7 +3804,74 @@ async def execute_benchmark(
         template_dir = f"/tmp/k8s-netperf-{run_uuid}"
         config_path = f"{template_dir}/netperf.yml"
 
-        await _ssh.run(controller, f"mkdir -p {template_dir}")
+        namespace_probe = await _ssh.run(
+            controller,
+            "kubectl get namespace netperf -o name",
+            timeout=30,
+        )
+        if namespace_probe.exit_code == 0:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": 1,
+                    "harness": "k8s-netperf",
+                    "message": (
+                        "Refusing to run because namespace netperf already exists; "
+                        "the harness uses this namespace and cleanup would affect "
+                        "resources owned by another user"
+                    ),
+                }
+            )
+        if "notfound" not in (namespace_probe.stderr or "").lower():
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": namespace_probe.exit_code or 1,
+                    "harness": "k8s-netperf",
+                    "message": (
+                        "Could not verify that namespace netperf is absent; "
+                        "refusing to change the cluster"
+                    ),
+                    "error": (namespace_probe.stderr or "")[-1000:],
+                }
+            )
+
+        cluster_nodes = await _ssh.run(
+            controller,
+            "kubectl get nodes -o name",
+            timeout=60,
+        )
+        if cluster_nodes.exit_code != 0 or not (cluster_nodes.stdout or "").strip():
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": cluster_nodes.exit_code or 1,
+                    "harness": "k8s-netperf",
+                    "message": "Could not verify that the cluster has any nodes",
+                    "error": (cluster_nodes.stderr or "")[-1000:],
+                }
+            )
+
+        unlabeled_nodes = await _ssh.run(
+            controller,
+            "kubectl get nodes -l '!node-role.kubernetes.io/worker' -o name",
+            timeout=60,
+        )
+        if unlabeled_nodes.exit_code != 0:
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": unlabeled_nodes.exit_code,
+                    "harness": "k8s-netperf",
+                    "message": "Could not determine which nodes need the worker label",
+                    "error": (unlabeled_nodes.stderr or "")[-1000:],
+                }
+            )
+        nodes_to_restore = [
+            node.strip()
+            for node in (unlabeled_nodes.stdout or "").splitlines()
+            if node.strip()
+        ]
 
         # v1 flat-dict YAML: k8s-netperf's Go yaml.v3 parser
         # expects {testName: Config} not {tests: [{testName: Config}]}
@@ -3545,54 +3893,185 @@ async def execute_benchmark(
                         lines.append(f"  {k}: {json.dumps(v)}")
         config_content = "\n".join(lines)
 
-        await _ssh.run(
-            controller,
-            f"cat > {config_path} << 'NPEOF'\n{config_content}\nNPEOF",
-        )
+        created_namespace = False
+        added_worker_labels: list[str] = []
+        cleanup_errors: list[dict[str, Any]] = []
+        response: dict[str, Any] | None = None
+        try:
+            namespace_create = await _ssh.run(
+                controller,
+                "kubectl create namespace netperf",
+                timeout=60,
+            )
+            if namespace_create.exit_code != 0:
+                response = {
+                    "status": "failed",
+                    "exit_code": namespace_create.exit_code,
+                    "harness": "k8s-netperf",
+                    "message": "Could not create the netperf namespace",
+                    "error": (namespace_create.stderr or "")[-1000:],
+                }
+            else:
+                created_namespace = True
 
-        setup_cmds = [
-            "kubectl create ns netperf --dry-run=client -o yaml | kubectl apply -f -",
-            "kubectl create sa netperf -n netperf --dry-run=client -o yaml | kubectl apply -f -",
-            "kubectl label node --all node-role.kubernetes.io/worker= --overwrite",
-            "kubectl delete ns netperf --wait=true --ignore-not-found",
-            "kubectl create ns netperf",
-            "kubectl create sa netperf -n netperf",
-        ]
-        for setup_cmd in setup_cmds:
-            await _ssh.run(controller, setup_cmd, timeout=60)
+            if response is None:
+                service_account = await _ssh.run(
+                    controller,
+                    "kubectl create serviceaccount netperf -n netperf",
+                    timeout=60,
+                )
+                if service_account.exit_code != 0:
+                    response = {
+                        "status": "failed",
+                        "exit_code": service_account.exit_code,
+                        "harness": "k8s-netperf",
+                        "message": "Could not create the netperf service account",
+                        "error": (service_account.stderr or "")[-1000:],
+                    }
 
-        flags_str = " ".join(cli_flags)
-        np_cmd = run_command or "k8s-netperf"
-        cmd = f"{np_cmd} --config {config_path} {flags_str} --json 2>&1"
-        logger.info(f"[benchmark] Executing k8s-netperf: {cmd}")
-        result = await _ssh.run_with_progress(
-            controller,
-            cmd,
-            progress_callback=_benchmark_progress,
-        )
+            if response is None:
+                for node in nodes_to_restore:
+                    label_cmd = shlex.join(
+                        [
+                            "kubectl",
+                            "label",
+                            node,
+                            "node-role.kubernetes.io/worker=",
+                            "--overwrite",
+                        ]
+                    )
+                    label_result = await _ssh.run(
+                        controller,
+                        label_cmd,
+                        timeout=60,
+                    )
+                    if label_result.exit_code != 0:
+                        response = {
+                            "status": "failed",
+                            "exit_code": label_result.exit_code,
+                            "harness": "k8s-netperf",
+                            "message": f"Could not add the worker label to {node}",
+                            "error": (label_result.stderr or "")[-1000:],
+                        }
+                        break
+                    added_worker_labels.append(node)
 
-        response = {
-            "status": "completed" if result.exit_code == 0 else "failed",
-            "exit_code": result.exit_code,
-            "run_id": f"k8s-netperf-{run_uuid}",
-            "harness": "k8s-netperf",
-            "message": (
-                "Benchmark completed"
-                if result.exit_code == 0
-                else f"Benchmark failed (exit {result.exit_code})"
-            ),
-        }
-        if result.exit_code == 0 and result.stdout:
-            try:
-                response["result_summary"] = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                response["result_summary"] = result.stdout[:3000]
-        if result.exit_code != 0:
-            response["output"] = result.stdout[-3000:] if result.stdout else ""
-            response["error"] = result.stderr[-1000:] if result.stderr else ""
+            if response is None:
+                await _ssh.run(controller, f"mkdir -p {shlex.quote(template_dir)}")
+                await _ssh.run(
+                    controller,
+                    f"cat > {shlex.quote(config_path)} << 'NPEOF'\n"
+                    f"{config_content}\nNPEOF",
+                )
+
+                flags_str = shlex.join(cli_flags)
+                np_cmd = run_command or "k8s-netperf"
+                cmd = f"{np_cmd} --config {shlex.quote(config_path)} {flags_str} --json 2>&1"
+                logger.info(f"[benchmark] Executing k8s-netperf: {cmd}")
+                result = await _ssh.run_with_progress(
+                    controller,
+                    cmd,
+                    progress_callback=_benchmark_progress,
+                )
+
+                response = {
+                    "status": "completed" if result.exit_code == 0 else "failed",
+                    "exit_code": result.exit_code,
+                    "run_id": f"k8s-netperf-{run_uuid}",
+                    "harness": "k8s-netperf",
+                    "message": (
+                        "Benchmark completed"
+                        if result.exit_code == 0
+                        else f"Benchmark failed (exit {result.exit_code})"
+                    ),
+                }
+                if result.exit_code == 0 and result.stdout:
+                    try:
+                        response["result_summary"] = json.loads(result.stdout)
+                    except json.JSONDecodeError:
+                        response["result_summary"] = result.stdout[:3000]
+                if result.exit_code != 0:
+                    response["output"] = result.stdout[-3000:] if result.stdout else ""
+                    response["error"] = result.stderr[-1000:] if result.stderr else ""
+        except Exception as exc:
+            logger.exception("[benchmark] k8s-netperf execution failed")
+            response = {
+                "status": "failed",
+                "exit_code": -1,
+                "harness": "k8s-netperf",
+                "message": "k8s-netperf execution raised an exception",
+                "error": str(exc)[:1000],
+            }
+        finally:
+            for node in added_worker_labels:
+                unlabel_cmd = shlex.join(
+                    ["kubectl", "label", node, "node-role.kubernetes.io/worker-"]
+                )
+                unlabel = await _ssh.run(controller, unlabel_cmd, timeout=60)
+                if unlabel.exit_code != 0:
+                    cleanup_errors.append(
+                        {
+                            "action": f"remove worker label from {node}",
+                            "exit_code": unlabel.exit_code,
+                            "error": (unlabel.stderr or "")[-500:],
+                        }
+                    )
+            if created_namespace:
+                delete_namespace = await _ssh.run(
+                    controller,
+                    "kubectl delete namespace netperf --wait=true --ignore-not-found",
+                    timeout=120,
+                )
+                if delete_namespace.exit_code != 0:
+                    cleanup_errors.append(
+                        {
+                            "action": "delete created namespace netperf",
+                            "exit_code": delete_namespace.exit_code,
+                            "error": (delete_namespace.stderr or "")[-500:],
+                        }
+                    )
+            remove_temp = await _ssh.run(
+                controller,
+                f"rm -rf {shlex.quote(template_dir)}",
+                timeout=30,
+            )
+            if remove_temp.exit_code != 0:
+                cleanup_errors.append(
+                    {
+                        "action": "remove temporary k8s-netperf directory",
+                        "exit_code": remove_temp.exit_code,
+                        "error": (remove_temp.stderr or "")[-500:],
+                    }
+                )
+
+        if response is None:
+            response = {
+                "status": "failed",
+                "exit_code": -1,
+                "harness": "k8s-netperf",
+                "message": "k8s-netperf did not produce a result",
+            }
+        if cleanup_errors:
+            response["cleanup_errors"] = cleanup_errors
+            if response.get("status") == "completed":
+                response["status"] = "failed"
+                response["message"] = (
+                    "Benchmark completed, but cluster cleanup was incomplete"
+                )
         return json.dumps(response)
 
-    # Default: crucible (and any unknown harness that uses JSON run-files)
+    # Crucible is the only server-local default executor. All other harnesses
+    # must reach an explicit provider-owned branch above.
+    if harness_name != _CRUCIBLE_TOOL_OWNER:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "generic_execution_unsupported",
+                "harness": harness_name,
+                "message": "No generic execution adapter is registered for this harness.",
+            }
+        )
+
     ticket_id = os.environ.get("TICKET_ID", "")
     if validation_id and operation_guard is None:
         intent_key, intent_hash, immutable_intent = _benchmark_intent_identity(
@@ -3963,7 +4442,7 @@ async def execute_benchmark(
     return json.dumps(response)
 
 
-@mcp.tool()
+@mcp.tool(meta=ownership_metadata(_CRUCIBLE_TOOL_OWNER))
 async def validate_benchmark(
     controller: str,
     run_file: dict,
@@ -3976,7 +4455,7 @@ async def validate_benchmark(
     benchmark-parameter, and tool-parameter validation.  This tool never
     starts a benchmark, deploys endpoints, or starts supporting services.
     """
-    await _ensure_init()
+    await _require_tool_owner(_CRUCIBLE_TOOL_OWNER)
     run_file = _apply_runfile_safety_directives(run_file)
 
     harness_name = harness or "crucible"
@@ -4153,7 +4632,18 @@ async def get_run_logs(
 
     byte_limit = min(max_kb, 200) * 1024
 
-    if run_id.startswith("/"):
+    if run_id.startswith("/") and harness == "kube-burner":
+        match = re.fullmatch(r"/tmp/kb-([0-9a-f]{8})", run_id)
+        if not match:
+            return json.dumps(
+                {
+                    "status": "invalid_run_id",
+                    "message": "Expected a kube-burner run ID or its /tmp/kb-<uuid> directory",
+                }
+            )
+        run_uuid = match.group(1)
+        run_dir = run_id
+    elif run_id.startswith("/"):
         run_dir = run_id
     elif harness == "zathras":
         search_pattern = results_dir_pattern or "/tmp/results_*"
@@ -4162,6 +4652,17 @@ async def get_run_logs(
             f"ls -dt {search_pattern} 2>/dev/null | head -1",
         )
         run_dir = result.stdout.strip()
+    elif harness == "kube-burner":
+        match = re.fullmatch(r"kube-burner-([0-9a-f]{8})", run_id)
+        if not match:
+            return json.dumps(
+                {
+                    "status": "invalid_run_id",
+                    "message": "Expected a kube-burner run ID returned by execute_benchmark",
+                }
+            )
+        run_uuid = match.group(1)
+        run_dir = f"/tmp/kb-{run_uuid}"
     else:
         result = await _ssh.run(
             controller,
@@ -4179,6 +4680,23 @@ async def get_run_logs(
             controller,
             f"find {run_dir} -name '*.log' -o -name '*.out' | head -5 | xargs tail -50 2>/dev/null",
         )
+    elif harness == "kube-burner":
+        log_path = f"{run_dir}/kube-burner-{run_uuid}.log"
+        log_result = await _ssh.run(
+            controller,
+            f"test -f {shlex.quote(log_path)}"
+            f" && tail -c {byte_limit} {shlex.quote(log_path)}",
+            timeout=60,
+        )
+        if log_result.exit_code != 0:
+            return json.dumps(
+                {
+                    "run_dir": run_dir,
+                    "log_file": log_path,
+                    "status": "not_found",
+                    "message": "kube-burner log file was not found for this run",
+                }
+            )
     else:
         log_result = await _ssh.run(
             controller,
@@ -4246,7 +4764,7 @@ def _boot_serial_diagnostics(serial_log_path: Path) -> dict[str, Any]:
     return diagnostics
 
 
-@mcp.tool()
+@mcp.tool(meta=ownership_metadata(_BOOT_TIME_TOOL_OWNER))
 async def execute_boot_time_test(
     sut_host: str,
     samples: int = 50,
@@ -4271,7 +4789,7 @@ async def execute_boot_time_test(
         clean_journal: Delete journal before each reboot cycle.
         description: Human-readable test description.
     """
-    await _ensure_init()
+    await _require_tool_owner(_BOOT_TIME_TOOL_OWNER)
 
     # ── Guardrail: one execution per agent session ───────
     global _boot_time_executed
@@ -4572,8 +5090,10 @@ async def execute_boot_time_test(
 
     serial_proc = None
     serial_log_fh = None
+    exporter_log_fh = None
     harness_log_fh = None
     serial_log_path = output_dir / "serial-capture.log"
+    exporter_log_path = output_dir / "exporter-logs.log"
     try:
         if _ticket:
             _fields = _ticket.get("custom_fields", {})
@@ -4606,18 +5126,31 @@ async def execute_boot_time_test(
                     serial_log_fh = artifact_filesystem.open_stream(
                         "serial-capture.log", mode=artifact_file_mode
                     )
+                    # Exporter logs are best-effort — failure to open
+                    # must not prevent serial capture from starting.
+                    try:
+                        exporter_log_fh = artifact_filesystem.open_stream(
+                            "exporter-logs.log", mode=artifact_file_mode
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[boot-time] Could not open exporter-logs.log, "
+                            "using DEVNULL for exporter stderr"
+                        )
+                        exporter_log_fh = subprocess.DEVNULL
                     serial_proc = await AuditedSubprocessRunner().start(
                         [
                             "jmp",
                             "shell",
                             f"--lease={_lease_id}",
+                            "--exporter-logs",
                             "--",
                             "j",
                             "serial",
                             "pipe",
                         ],
                         stdout=serial_log_fh,
-                        stderr=_asyncio.subprocess.DEVNULL,
+                        stderr=exporter_log_fh,
                         mutating=True,
                     )
                     logger.info(
@@ -4633,6 +5166,9 @@ async def execute_boot_time_test(
                     if serial_log_fh:
                         serial_log_fh.close()
                         serial_log_fh = None
+                    if exporter_log_fh:
+                        exporter_log_fh.close()
+                        exporter_log_fh = None
 
         # ── Execute ───────────────────────────────────────────
         # Run from output_dir so boot-timings-test.sh creates
@@ -4947,6 +5483,8 @@ async def execute_boot_time_test(
         finally:
             if serial_log_fh is not None:
                 serial_log_fh.close()
+            if exporter_log_fh is not None:
+                exporter_log_fh.close()
             if harness_log_fh is not None:
                 try:
                     harness_log_fh.close()
@@ -4963,6 +5501,14 @@ async def execute_boot_time_test(
         else:
             # Remove empty log file
             artifact_filesystem.unlink("serial-capture.log", missing_ok=True)
+    if exporter_log_path.exists():
+        size = exporter_log_path.stat().st_size
+        if size > 0:
+            logger.info(
+                f"[boot-time] Exporter logs: {exporter_log_path} ({size} bytes)"
+            )
+        else:
+            artifact_filesystem.unlink("exporter-logs.log", missing_ok=True)
 
     # ── Parse results ─────────────────────────────────────────
     # Find the results folder created by boot-timings-test.sh

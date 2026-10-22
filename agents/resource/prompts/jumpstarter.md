@@ -25,6 +25,9 @@ by label selectors returned by `list_jumpstarter_targets`.
    - `jumpstarter_selector`: the EXACT SAME selector used in
      check_available_resources — do NOT change it
    - `lease_duration_seconds`: based on expected workload (default 14400 = 4h)
+   - `count`: one device per lease
+   - optional `exporter_name`: set only when discovery identifies a specific
+     available device that should be targeted
    - `ticket_id`: for lease traceability
 3. Record the `lease_id` from the reservation result.
 4. Do NOT call validate_host — the board is not yet provisioned.

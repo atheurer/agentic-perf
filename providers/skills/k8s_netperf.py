@@ -59,7 +59,7 @@ _BENCHMARKS: dict[str, dict[str, Any]] = {
             "iperf3, or uperf drivers. Supports pod network, host network, "
             "service routing, same-node, and cross-AZ scenarios."
         ),
-        "roles": ["client"],
+        "roles": [],
         "min_hosts": 1,
         "params": {
             "driver": {
@@ -125,6 +125,8 @@ _BENCHMARKS: dict[str, dict[str, Any]] = {
 
 
 class K8sNetperfSkillProvider(SkillProvider):
+    generic_execution_supported = True
+
     async def list_benchmarks(self) -> list[BenchmarkSuite]:
         results = []
         for name, info in _BENCHMARKS.items():
@@ -134,7 +136,10 @@ class K8sNetperfSkillProvider(SkillProvider):
                     description=info["description"],
                     supported_params=info.get("params", {}),
                     endpoint_types=["kube"],
-                    roles=info["roles"],
+                    # Workload client/server endpoints are Kubernetes pods, not
+                    # separately allocated bare-metal hosts. Triage adds the one
+                    # controller host needed to run k8s-netperf against the cluster.
+                    roles=[],
                     min_hosts=info["min_hosts"],
                     harness="k8s-netperf",
                 )
@@ -150,7 +155,7 @@ class K8sNetperfSkillProvider(SkillProvider):
             description=info["description"],
             supported_params=info.get("params", {}),
             endpoint_types=["kube"],
-            roles=info["roles"],
+            roles=[],
             min_hosts=info["min_hosts"],
             harness="k8s-netperf",
         )

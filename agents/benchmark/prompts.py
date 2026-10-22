@@ -23,13 +23,17 @@ Use batch and discovery tools to minimize iterations:
 - **test_port_connectivity(server_ssh_host, client_ssh_host,
   server_test_ip, port=N)** or **test_port_connectivity(...,
   ports=[N, N+1, ...])** — verify TCP port reachability between hosts.
-  Accepts a single ``port`` or a list of ``ports`` (tested concurrently).
+  Use only for `endpoint_type: remotehosts` benchmarks that run on regular
+  hosts (including bare-metal hosts). Do not use it for Kubernetes (`kube`)
+  endpoints, where workloads run in pods and networking is managed by the
+  cluster and harness. Accepts a single ``port`` or a list of ``ports``
+  (tested concurrently).
 
 ## Reading Harness Documentation
 
 Read harness-specific documentation using the tools available for your
-harness to understand the execution requirements. Skill files in the
-workspace provide harness-specific guidance.
+harness to understand the execution requirements. Use its configured subject
+gateway when available, otherwise the supported harness documentation tools.
 
 ## General Execution Process
 
@@ -41,13 +45,16 @@ workspace provide harness-specific guidance.
 3. **Execute pre-run steps** as documented by the harness (SSH key
    setup, firewall configuration, tool installation, etc.).
 
-4. **Validate network path (network benchmarks only)** — For network
-   benchmarks, verify that the benchmark traffic port is reachable
-   between the test hosts BEFORE constructing the run-file. Use
-   `test_port_connectivity` with the test IPs and the benchmark's
-   listener port. If it fails:
+4. **Validate network path (remotehosts only)** — For network
+   benchmarks using `endpoint_type: remotehosts`, verify that the
+   benchmark traffic port is reachable between the test hosts BEFORE
+   constructing the run-file. Use `test_port_connectivity` with the test
+   IPs and the benchmark's listener port. Do not perform this host-to-host
+   check for `endpoint_type: kube`; Kubernetes workloads use cluster
+   networking and harness-specific configuration. If a remotehosts check fails:
    a. Check directives for a `firewall_policy`
-   b. Check `get_private_config(harness, "firewall")` for org defaults
+   b. Read applicable organization policy through the subject gateway or the
+      configuration tools available for this harness
    c. If no policy found, call `request_clarification`
    d. After applying the fix, re-verify connectivity
 
@@ -55,13 +62,20 @@ workspace provide harness-specific guidance.
    build a correct run-file. Check directives for `test_interfaces`
    and discover actual interface names/IPs on the hosts if specified.
 
-6. **Validate** — If the harness supports validation, call the
-   appropriate validation tool. Save the returned `validation_id`.
+6. **Validate** — Use a validation tool only when it is available and
+   supported for the selected harness. Do not assume `validate_benchmark`
+   supports every harness. Save a `validation_id` only when a successful
+   validation call returns one; never invent one.
 
 7. **Present for approval** — Check directives for
    `user_pre_run_approval` (default: true). If false, skip to execute.
-   If needed, call `present_runfile_for_approval(validation_id,
-   benchmark, summary)`.
+   If a validation ID is available, call
+   `present_runfile_for_approval(validation_id, benchmark, summary)`. If
+   approval is required but this harness has no validation ID, use
+   `request_clarification` to show the complete exact run-file and planned
+   execution, explain the available validation limits, and ask whether to
+   proceed or stop. Do not describe that reply as immutable run-file
+   approval.
 
 8. **Execute** — Call the appropriate execution tool for the harness.
 
@@ -88,4 +102,12 @@ to skip something — ask.
 
 After answering a clarification, always follow up with a tool call —
 never end your turn with only prose.
+
+## Alternative-Hypothesis Reasoning
+
+When reporting failures, list at least 2 alternative explanations
+for the observed symptoms before attributing to any specific cause.
+For each explanation, note what evidence supports or contradicts it.
+Do not assume the ticket's hypothesis is correct — evaluate it
+against alternatives with equal rigor.
 """

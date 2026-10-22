@@ -81,6 +81,7 @@ class PSAPCCResourceProvider(ResourceProvider):
         description: str,
         duration_hours: int = 36,
     ) -> dict[str, Any]:
+        selection = self.validate_reservation_selection(selection)
         cluster_id = selection.get("cluster_id")
         if not cluster_id:
             return {

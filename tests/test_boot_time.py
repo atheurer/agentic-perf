@@ -54,7 +54,7 @@ async def _run_mock_benchmark(tmp_path: Path, process: MagicMock) -> dict:
     with (
         patch.object(server, "_initialized", True),
         patch.object(server, "_repo_cache", cache),
-        patch.object(server, "_ticket", None),
+        patch.object(server, "_ticket", _boot_time_ticket()),
         patch.object(server, "_BOOT_TIME_DRAIN_TIMEOUT", 0.05),
         patch("paths.create_artifact_dir", return_value=tmp_path),
         patch("socket.create_connection", return_value=MagicMock()),
@@ -63,6 +63,22 @@ async def _run_mock_benchmark(tmp_path: Path, process: MagicMock) -> dict:
         return json.loads(
             await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
         )
+
+
+def _boot_time_ticket(
+    custom_fields: dict | None = None,
+    *,
+    ticket_id: str = "PERF-BOOT-TEST",
+) -> dict:
+    fields = dict(custom_fields or {})
+    directives = dict(fields.get("directives", {}))
+    directives.setdefault("harness", "boot-time")
+    fields["directives"] = directives
+    return {
+        "id": ticket_id,
+        "status": "executing_benchmark",
+        "custom_fields": fields,
+    }
 
 
 class TestBootTimeOutputDrain:
@@ -214,11 +230,12 @@ class TestBootTimeOutputDrain:
 
 
 @pytest.fixture(autouse=True)
-def _reset_boot_time_guard():
+def _reset_boot_time_guard(monkeypatch):
     """Reset the one-execution-per-session guard between tests."""
     import agents.benchmark.server as srv
 
     srv._boot_time_executed = False
+    monkeypatch.setattr(srv, "_ticket", _boot_time_ticket())
     yield
     srv._boot_time_executed = False
 
@@ -379,12 +396,12 @@ class TestBootTimeJumpstarterRecovery:
         mock_process = _make_mock_process()
         mock_runner = MagicMock()
         mock_runner.start = AsyncMock(return_value=mock_process)
-        ticket = {
-            "custom_fields": {
+        ticket = _boot_time_ticket(
+            {
                 "resource_provider": "jumpstarter",
                 "resource_provider_metadata": {"lease_id": "lease-123"},
             }
-        }
+        )
 
         with (
             patch.object(server, "_initialized", True),
@@ -448,13 +465,13 @@ class TestBootTimePassiveSerialDefaults:
         (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
         mock_cache = MagicMock()
         mock_cache.get_path.return_value = tmp_path
-        ticket = {
-            "custom_fields": {
+        ticket = _boot_time_ticket(
+            {
                 "resource_provider": resource_provider,
                 "resource_provider_metadata": {"lease_id": "lease-123"},
                 "directives": directives,
             }
-        }
+        )
         serial_proc = MagicMock(pid=123, returncode=None)
         serial_proc.wait = AsyncMock(return_value=0)
         benchmark_proc = _make_mock_process()
@@ -483,6 +500,7 @@ class TestBootTimePassiveSerialDefaults:
                 "jmp",
                 "shell",
                 "--lease=lease-123",
+                "--exporter-logs",
                 "--",
                 "j",
                 "serial",
@@ -568,13 +586,13 @@ class TestBootTimeKPIExtraction:
         # No install script — skip install step
         (tmp_path / "boot-time-merge.py").write_text("")
 
-        mock_ticket = {
-            "id": "PERF-BOOT",
-            "custom_fields": {
+        mock_ticket = _boot_time_ticket(
+            {
                 "ssh_user": "root",
                 "ssh_password": "password",
             },
-        }
+            ticket_id="PERF-BOOT",
+        )
 
         http_response = MagicMock()
         http_response.json.return_value = {"custom_fields": {"output_dirs": []}}
@@ -709,13 +727,13 @@ class TestBootTimeSerialDiagnostics:
         (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
         mock_cache = MagicMock()
         mock_cache.get_path.return_value = tmp_path
-        ticket = {
-            "custom_fields": {
+        ticket = _boot_time_ticket(
+            {
                 "resource_provider": "jumpstarter",
                 "resource_provider_metadata": {"lease_id": "lease-123"},
                 "directives": {"serial_capture": True},
             }
-        }
+        )
         serial_proc = MagicMock(pid=123, returncode=None)
         serial_proc.wait = AsyncMock(return_value=0)
         benchmark_proc = _make_mock_process()
@@ -758,9 +776,9 @@ class TestBootTimeSerialDiagnostics:
         if failure == "cancel":
             benchmark_proc.finish_streamed_output.assert_awaited_once()
             assert benchmark_proc.finish_streamed_output.await_args.kwargs["cancelled"]
-        # open_stream is called for both serial-capture.log
+        # open_stream is called for serial-capture.log, exporter-logs.log,
         # and harness-output.log
-        assert len(opened_streams) == 2
+        assert len(opened_streams) == 3
         assert all(s.closed for s in opened_streams)
 
     async def test_serial_tail_remains_in_artifact_but_not_service_log(
@@ -772,13 +790,13 @@ class TestBootTimeSerialDiagnostics:
         (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
         mock_cache = MagicMock()
         mock_cache.get_path.return_value = tmp_path
-        ticket = {
-            "custom_fields": {
+        ticket = _boot_time_ticket(
+            {
                 "resource_provider": "jumpstarter",
                 "resource_provider_metadata": {"lease_id": "lease-123"},
                 "directives": {"serial_capture": True},
             }
-        }
+        )
         serial_proc = MagicMock(pid=123, returncode=None)
         serial_proc.wait = AsyncMock(return_value=0)
         benchmark_proc = _make_mock_process(returncode=1, stderr_data=b"failed")

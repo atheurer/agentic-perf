@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +16,16 @@ from agents.benchmark.server import _benchmark_intent_identity, _BenchmarkOperat
 class _ControllerResult:
     def __init__(self, exit_code: int = 0, stdout: str = "", stderr: str = ""):
         self.exit_code, self.stdout, self.stderr = exit_code, stdout, stderr
+
+
+def _set_crucible_context(monkeypatch, ticket):
+    """Provide the ticket-bound harness context normally loaded by init."""
+    monkeypatch.setattr(benchmark_server, "_ticket", ticket)
+    monkeypatch.setattr(
+        benchmark_server,
+        "_skill_provider",
+        SimpleNamespace(default_harness="crucible"),
+    )
 
 
 def _crucible_fixture(
@@ -46,6 +57,7 @@ def _crucible_fixture(
         "status": "executing_benchmark",
         "custom_fields": {"benchmark_validations": {"records": {"val-788": record}}},
     }
+    _set_crucible_context(monkeypatch, ticket)
     calls = []
 
     class SSH:
@@ -118,6 +130,41 @@ async def _execute():
     )
 
 
+async def _wait_for_event_or_producer(
+    event: asyncio.Event,
+    producer: asyncio.Task,
+    *,
+    operation: str,
+    timeout: float = 5.0,
+) -> None:
+    """Wait for a signal, or fail promptly if its producer returns first."""
+    event_waiter = asyncio.create_task(event.wait())
+    done, _ = await asyncio.wait(
+        {event_waiter, producer},
+        timeout=timeout,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if event.is_set():
+        await asyncio.gather(event_waiter, return_exceptions=True)
+        return
+
+    event_waiter.cancel()
+    await asyncio.gather(event_waiter, return_exceptions=True)
+    if producer in done:
+        result = await producer
+        pytest.fail(
+            f"{operation} producer completed before signaling its start event: "
+            f"{result!r}"
+        )
+
+    producer.cancel()
+    try:
+        await asyncio.wait_for(producer, timeout=timeout)
+    except asyncio.CancelledError:
+        pass
+    pytest.fail(f"{operation} did not signal its start event within {timeout}s")
+
+
 def test_execution_intent_identity_is_stable_for_replay() -> None:
     record = {"runfile_fingerprint": "abc", "attempt_id": "attempt-1"}
     first = _benchmark_intent_identity(
@@ -177,15 +224,18 @@ async def test_terminal_write_failure_is_reclassified_indeterminate(
 async def test_execute_rejects_invalid_validation_without_controller_mutation(
     monkeypatch,
 ) -> None:
+    ticket = {
+        "id": "T-4",
+        "status": "executing_benchmark",
+        "custom_fields": {"benchmark_validations": {"records": {}}},
+    }
+    _set_crucible_context(monkeypatch, ticket)
+
     async def no_init() -> None:
         benchmark_server._ssh = type("Unused", (), {})()
 
     async def active(**_kwargs: object) -> dict:
-        return {
-            "id": "T-4",
-            "status": "executing_benchmark",
-            "custom_fields": {"benchmark_validations": {"records": {}}},
-        }
+        return ticket
 
     monkeypatch.setattr(benchmark_server, "_ensure_init", no_init)
     monkeypatch.setattr(server_utils, "assert_ticket_active", active)
@@ -211,6 +261,7 @@ async def test_execute_path_duplicate_replay_does_not_launch(monkeypatch) -> Non
     }
     active = {"id": "", "status": "executing_benchmark", "custom_fields": {}}
     calls: list[str] = []
+    _set_crucible_context(monkeypatch, active)
 
     async def no_init() -> None:
         benchmark_server._ssh = object()
@@ -272,13 +323,21 @@ async def test_execute_concurrent_workers_only_one_launches(tmp_path, monkeypatc
     _, calls = _crucible_fixture(tmp_path, monkeypatch, launch=launch)
     monkeypatch.setenv("AGENTIC_PERF_INSTANCE_NAME", "worker-1")
     first_task = asyncio.create_task(_execute())
-    await entered.wait()
-    monkeypatch.setenv("AGENTIC_PERF_INSTANCE_NAME", "worker-2")
-    second = await _execute()
-    assert second["status"] == "rejected"
-    assert second["reason_code"] == "existing_operation"
-    release.set()
-    first = await first_task
+    try:
+        await _wait_for_event_or_producer(
+            entered, first_task, operation="benchmark launch"
+        )
+        monkeypatch.setenv("AGENTIC_PERF_INSTANCE_NAME", "worker-2")
+        second = await _execute()
+        assert second["status"] == "rejected"
+        assert second["reason_code"] == "existing_operation"
+        release.set()
+        first = await first_task
+    finally:
+        release.set()
+        if not first_task.done():
+            first_task.cancel()
+        await asyncio.gather(first_task, return_exceptions=True)
     assert first["status"] == "completed"
     assert len([c for c in calls if c[0] == "launch"]) == 1
 

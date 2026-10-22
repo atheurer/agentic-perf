@@ -22,6 +22,15 @@ class _WorkflowMCP:
         self.exported_payload = exported_payload
         self.output_error = output_error
         self.calls: list[tuple[str, dict]] = []
+        self.selected_harness: str | None = None
+
+    def set_harness_context(self, harness: str) -> None:
+        self.selected_harness = harness
+
+    async def call_internal_tool(self, name: str, arguments: dict) -> str:
+        if self.selected_harness != "arcaflow-workflows":
+            raise AssertionError("workflow dispatch requires its selected harness")
+        return await self.call_tool(name, arguments)
 
     async def call_tool(self, name: str, arguments: dict) -> str:
         self.calls.append((name, arguments))
@@ -40,13 +49,56 @@ class _WorkflowMCP:
         raise AssertionError(f"unexpected MCP tool: {name}")
 
 
+def _workflow_agent(mcp: _WorkflowMCP) -> BenchmarkAgent:
+    """Build the authenticated workflow context normally set by ``run``."""
+    agent = BenchmarkAgent.__new__(BenchmarkAgent)
+    agent._mcp = mcp
+    agent._selected_harness = "arcaflow-workflows"
+    mcp.set_harness_context("arcaflow-workflows")
+    return agent
+
+
+async def _wait_for_event_or_producer(
+    event: asyncio.Event,
+    producer: asyncio.Task,
+    *,
+    operation: str,
+    timeout: float = 5.0,
+) -> None:
+    """Wait for a signal, or report promptly if its producer returns first."""
+    event_waiter = asyncio.create_task(event.wait())
+    done, _ = await asyncio.wait(
+        {event_waiter, producer},
+        timeout=timeout,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if event.is_set():
+        await asyncio.gather(event_waiter, return_exceptions=True)
+        return
+
+    event_waiter.cancel()
+    await asyncio.gather(event_waiter, return_exceptions=True)
+    if producer in done:
+        result = await producer
+        pytest.fail(
+            f"{operation} producer completed before signaling its start event: "
+            f"{result!r}"
+        )
+
+    producer.cancel()
+    try:
+        await asyncio.wait_for(producer, timeout=timeout)
+    except asyncio.CancelledError:
+        pass
+    pytest.fail(f"{operation} did not signal its start event within {timeout}s")
+
+
 @pytest.mark.asyncio
 async def test_arcaflow_execution_passes_exported_input_to_engine():
-    agent = BenchmarkAgent.__new__(BenchmarkAgent)
     original_input = {"duration": "5m"}
     exported_payload = '{"duration":300}'
     mcp = _WorkflowMCP(exported_payload=exported_payload)
-    agent._mcp = mcp
+    agent = _workflow_agent(mcp)
 
     result = json.loads(
         await agent._execute_arcaflow_workflow(
@@ -190,9 +242,8 @@ async def test_arcaflow_cancellation_cancels_engine_execution_before_reraising()
                 return json.dumps({"cancelled": True})
             return await super().call_tool(name, arguments)
 
-    agent = BenchmarkAgent.__new__(BenchmarkAgent)
     mcp = _BlockingWorkflowMCP()
-    agent._mcp = mcp
+    agent = _workflow_agent(mcp)
     execution = asyncio.create_task(
         agent._execute_arcaflow_workflow(
             "https://example.test/workflow.yaml",
@@ -201,7 +252,9 @@ async def test_arcaflow_cancellation_cancels_engine_execution_before_reraising()
         )
     )
 
-    await mcp.status_started.wait()
+    await _wait_for_event_or_producer(
+        mcp.status_started, execution, operation="workflow status poll"
+    )
     execution.cancel()
     with pytest.raises(asyncio.CancelledError):
         await execution
@@ -231,9 +284,8 @@ async def test_arcaflow_late_launch_response_is_cancelled_after_caller_cancellat
                 return json.dumps({"cancelled": True})
             return await super().call_tool(name, arguments)
 
-    agent = BenchmarkAgent.__new__(BenchmarkAgent)
     mcp = _LateLaunchWorkflowMCP()
-    agent._mcp = mcp
+    agent = _workflow_agent(mcp)
     execution = asyncio.create_task(
         agent._execute_arcaflow_workflow(
             "https://example.test/workflow.yaml",
@@ -242,7 +294,9 @@ async def test_arcaflow_late_launch_response_is_cancelled_after_caller_cancellat
         )
     )
 
-    await mcp.launch_started.wait()
+    await _wait_for_event_or_producer(
+        mcp.launch_started, execution, operation="workflow launch"
+    )
     execution.cancel()
     await asyncio.sleep(0)
     mcp.finish_launch.set()
@@ -312,9 +366,8 @@ async def test_arcaflow_late_launch_during_stop_grace_dispatches_cancel_before_d
         "_ARCAFLOW_CANCELLATION_LAUNCH_CANCEL_RESERVE_SECONDS",
         launch_cancel_reserve,
     )
-    agent = BenchmarkAgent.__new__(BenchmarkAgent)
     mcp = _SharedDeadlineWorkflowMCP()
-    agent._mcp = mcp
+    agent = _workflow_agent(mcp)
     execution = asyncio.create_task(
         agent._execute_arcaflow_workflow(
             "https://example.test/workflow.yaml",
@@ -327,7 +380,9 @@ async def test_arcaflow_late_launch_during_stop_grace_dispatches_cancel_before_d
         await asyncio.sleep(0.105)
         mcp.release_launch.set()
 
-    await mcp.launch_started.wait()
+    await _wait_for_event_or_producer(
+        mcp.launch_started, execution, operation="workflow launch"
+    )
     release_task = asyncio.create_task(release_late_launch())
     cancellation_started = asyncio.get_running_loop().time()
     execution.cancel()
@@ -382,9 +437,8 @@ async def test_arcaflow_hung_launch_does_not_block_caller_cancellation(
         "_ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS",
         0.01,
     )
-    agent = BenchmarkAgent.__new__(BenchmarkAgent)
     mcp = _HungLaunchWorkflowMCP()
-    agent._mcp = mcp
+    agent = _workflow_agent(mcp)
     execution = asyncio.create_task(
         agent._execute_arcaflow_workflow(
             "https://example.test/workflow.yaml",
@@ -393,7 +447,9 @@ async def test_arcaflow_hung_launch_does_not_block_caller_cancellation(
         )
     )
 
-    await mcp.launch_started.wait()
+    await _wait_for_event_or_producer(
+        mcp.launch_started, execution, operation="workflow launch"
+    )
     execution.cancel()
     try:
         with pytest.raises(asyncio.CancelledError):
@@ -445,9 +501,8 @@ async def test_arcaflow_hung_cancel_does_not_block_caller_cancellation(
         "_ARCAFLOW_CANCELLATION_TASK_STOP_GRACE_SECONDS",
         0.01,
     )
-    agent = BenchmarkAgent.__new__(BenchmarkAgent)
     mcp = _HungCancelWorkflowMCP()
-    agent._mcp = mcp
+    agent = _workflow_agent(mcp)
     execution = asyncio.create_task(
         agent._execute_arcaflow_workflow(
             "https://example.test/workflow.yaml",
@@ -456,7 +511,9 @@ async def test_arcaflow_hung_cancel_does_not_block_caller_cancellation(
         )
     )
 
-    await mcp.status_started.wait()
+    await _wait_for_event_or_producer(
+        mcp.status_started, execution, operation="workflow status poll"
+    )
     execution.cancel()
     try:
         with pytest.raises(asyncio.CancelledError):
@@ -470,12 +527,11 @@ async def test_arcaflow_hung_cancel_does_not_block_caller_cancellation(
 
 @pytest.mark.asyncio
 async def test_arcaflow_output_retrieval_failure_is_not_reported_as_completed():
-    agent = BenchmarkAgent.__new__(BenchmarkAgent)
     mcp = _WorkflowMCP(
         exported_payload='{"duration":300}',
         output_error=RuntimeError("engine output unavailable"),
     )
-    agent._mcp = mcp
+    agent = _workflow_agent(mcp)
 
     result = json.loads(
         await agent._execute_arcaflow_workflow(

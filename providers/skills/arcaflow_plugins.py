@@ -662,7 +662,9 @@ class ArcaflowPluginSkillProvider(SkillProvider):
         plugins.
         """
         try:
-            raw = await self._mcp_client.call_tool("plugin_list", {})
+            from providers.skills.arcaflow_mcp import PLUGIN_LIST
+
+            raw = await self._mcp_client.call_tool(PLUGIN_LIST, {})
             data = json.loads(raw) if isinstance(raw, str) else raw
             plugins = data.get("plugins", [])
         except Exception:

@@ -42,6 +42,14 @@ async def test_native_type_error_after_entry_is_not_replayed(agent):
         calls += 1
         raise TypeError("handler failed after entry")
 
+    agent.tools.append(
+        ToolDefinition(
+            name="mutate",
+            description="",
+            input_schema={},
+            owner_harness=None,
+        )
+    )
     agent._tool_handlers["mutate"] = handler
     result = await agent._execute_tool(ToolCall(id="call-1", name="mutate", input={}))
 
@@ -58,6 +66,14 @@ async def test_local_handler_runs_under_supplied_tool_trace_context(agent):
         observed = current_trace_context()
         return "ok"
 
+    agent.tools.append(
+        ToolDefinition(
+            name="observe",
+            description="",
+            input_schema={},
+            owner_harness=None,
+        )
+    )
     agent._tool_handlers["observe"] = handler
     context = new_trace_context(ticket_id="PERF-context", agent_id="test-agent")
     context = context.model_copy(update={"tool_call_id": "call-context"})
@@ -75,6 +91,14 @@ async def test_mcp_failure_after_call_is_not_replayed(agent):
     mcp = MagicMock()
     mcp.call_tool = AsyncMock(side_effect=RuntimeError("connection lost"))
     agent._mcp = mcp
+    agent.tools.append(
+        ToolDefinition(
+            name="mutate",
+            description="",
+            input_schema={},
+            owner_harness=None,
+        )
+    )
 
     result = await agent._execute_tool(ToolCall(id="call-1", name="mutate", input={}))
 
@@ -161,11 +185,13 @@ async def test_jq_filter_is_stripped_only_when_schema_omits_it(agent):
             name="without_filter",
             description="",
             input_schema={"properties": {}},
+            owner_harness=None,
         ),
         ToolDefinition(
             name="with_filter",
             description="",
             input_schema={"properties": {"jq_filter": {"type": "string"}}},
+            owner_harness=None,
         ),
     ]
     agent._tool_handlers.update(
@@ -199,6 +225,14 @@ async def test_signature_mismatch_is_rejected_before_handler_entry(agent):
         calls += 1
         return required
 
+    agent.tools.append(
+        ToolDefinition(
+            name="needs_argument",
+            description="",
+            input_schema={"type": "object"},
+            owner_harness=None,
+        )
+    )
     agent._tool_handlers["needs_argument"] = handler
     result = await agent._execute_tool(
         ToolCall(id="call-1", name="needs_argument", input={})

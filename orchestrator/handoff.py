@@ -120,13 +120,18 @@ def _check_awaiting_provision(ticket: dict[str, Any]) -> tuple[bool, str]:
     if controller_canonical:
         unique_targets.discard(controller_canonical)
 
+    endpoint_type = cf.get("directives", {}).get("endpoint_type", "remotehosts")
+    no_separate_endpoint_host = (
+        cf.get("execution_model") == "direct" or endpoint_type == "kube"
+    )
     endpoint_only_count = 0
-    if required_hosts:
-        endpoint_only_count = sum(
-            1 for h in required_hosts if "controller" not in h.get("roles", [])
-        )
-    elif len(roles) > 1:
-        endpoint_only_count = 1
+    if not no_separate_endpoint_host:
+        if required_hosts:
+            endpoint_only_count = sum(
+                1 for h in required_hosts if "controller" not in h.get("roles", [])
+            )
+        elif len(roles) > 1:
+            endpoint_only_count = 1
 
     if endpoint_only_count > 0 and len(unique_targets) < endpoint_only_count:
         return (

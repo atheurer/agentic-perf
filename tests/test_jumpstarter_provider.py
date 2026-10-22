@@ -352,7 +352,11 @@ class TestReserve:
         mock_svc.GetExporter = AsyncMock(return_value=mock_exporter)
         provider._service = mock_svc
 
-        result = await provider.reserve({}, description="test", ticket_id="PERF-TEST")
+        result = await provider.reserve(
+            {"jumpstarter_selector": "target=myboard"},
+            description="test",
+            ticket_id="PERF-TEST",
+        )
         assert result["provider"] == "jumpstarter"
         assert result["lease_id"] == "lease-abc123"
         assert result["board_target"] == "ride4_sa8775p_sx_r3"

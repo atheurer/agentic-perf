@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,8 @@ import httpx
 from providers.execution import AuditedAsyncHTTPClient, AuditedSubprocessRunner
 
 logger = logging.getLogger(__name__)
+
+QUADS_ASSIGNMENT_DESCRIPTION_MAX_LENGTH = 32
 
 
 class QuadsAPIError(Exception):
@@ -33,6 +36,7 @@ class QuadsClient:
         ssh_key_path: str,
         default_root_password: str,
         api_scheme: str = "https",
+        ca_bundle: str | None = None,
     ) -> None:
         self.api_host = api_host
         self._base_url = f"{api_scheme}://{api_host}"
@@ -41,18 +45,44 @@ class QuadsClient:
         self.owner = owner
         self.ssh_key_path = str(Path(ssh_key_path).expanduser())
         self.default_root_password = default_root_password
-        self._client = AuditedAsyncHTTPClient(timeout=30.0)
+        client_kwargs: dict[str, Any] = {"timeout": 30.0}
+        if api_scheme == "https":
+            ca_file = str(Path(ca_bundle).expanduser()) if ca_bundle else None
+            client_kwargs["verify"] = ssl.create_default_context(cafile=ca_file)
+        self._client = AuditedAsyncHTTPClient(**client_kwargs)
         if api_scheme == "http":
             logger.warning(
                 "QUADS API using plaintext HTTP — credentials are not encrypted in transit"
             )
 
     @classmethod
-    async def from_secrets(cls, secrets_provider) -> QuadsClient:
+    async def from_secrets(
+        cls,
+        secrets_provider,
+        *,
+        organization_config: dict[str, Any] | None = None,
+    ) -> QuadsClient:
         raw = await secrets_provider.get_secret("quads/config.json")
         if not raw:
             raise ValueError("QUADS config not found at secrets/quads/config.json")
         config = json.loads(raw)
+        if not isinstance(config, dict):
+            raise ValueError("QUADS secrets configuration must be an object")
+
+        connection = {}
+        if organization_config is not None:
+            connection = organization_config.get("connection", {})
+            if not isinstance(connection, dict):
+                raise ValueError("QUADS organization connection config is invalid")
+            connection = dict(connection)
+        # Keep existing local settings as per-install overrides during the
+        # migration. Null optional values mean "not set" and leave the shared
+        # organization default in place.
+        for key in ("api_host", "api_scheme", "ca_bundle"):
+            value = config.pop(key, None)
+            if value is not None:
+                connection[key] = value
+        config = {**config, **connection}
         required = [
             "api_host",
             "email",
@@ -64,6 +94,12 @@ class QuadsClient:
         missing = [k for k in required if k not in config]
         if missing:
             raise ValueError(f"QUADS secrets missing required fields: {missing}")
+        if not isinstance(config["api_host"], str) or not config["api_host"].strip():
+            raise ValueError("QUADS API host must be a nonempty string")
+        if config.get("api_scheme", "https") not in {"http", "https"}:
+            raise ValueError("QUADS API scheme must be http or https")
+        if "ca_bundle" in config and config["ca_bundle"] == "":
+            raise ValueError("QUADS CA bundle path must not be empty")
         return cls(
             api_host=config["api_host"],
             email=config["email"],
@@ -72,6 +108,7 @@ class QuadsClient:
             ssh_key_path=config["ssh_key_path"],
             default_root_password=config["default_root_password"],
             api_scheme=config.get("api_scheme", "https"),
+            ca_bundle=config.get("ca_bundle"),
         )
 
     async def close(self) -> None:
@@ -205,6 +242,14 @@ class QuadsClient:
     async def create_assignment(
         self, description: str, owner: str | None = None
     ) -> dict[str, Any]:
+        description = " ".join(description.split())
+        # QUADS uses this field as a Jira title; bound arbitrary caller text.
+        if len(description) > QUADS_ASSIGNMENT_DESCRIPTION_MAX_LENGTH:
+            description = description[: QUADS_ASSIGNMENT_DESCRIPTION_MAX_LENGTH - 1]
+            word_boundary = description.rfind(" ")
+            if word_boundary > QUADS_ASSIGNMENT_DESCRIPTION_MAX_LENGTH // 2:
+                description = description[:word_boundary]
+            description = f"{description.rstrip()}…"
         r = await self._authed_request(
             "POST",
             "/api/v3/assignments/self",

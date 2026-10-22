@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import posixpath
 import shlex
 import sys
 import weakref
@@ -93,6 +94,9 @@ def build_skill_provider(
     resolve_source: bool = True,
     catalog_only: bool = False,
     arcaflow_mcp_client: Any | None = None,
+    skill_phase: str = "",
+    organization_resolver: Any | None = None,
+    ticket_id: str | None = None,
 ):
     """Construct a MultiHarnessSkillProvider from environment variables.
 
@@ -106,8 +110,10 @@ def build_skill_provider(
     from providers.skills.ioscale import IoscaleSkillProvider
     from providers.skills.k8s_netperf import K8sNetperfSkillProvider
     from providers.skills.kube_burner import KubeBurnerSkillProvider
+    from providers.skills.local_context import LocalContextSource
     from providers.skills.multi import MultiHarnessSkillProvider
     from providers.skills.private import PrivateSkillProvider
+    from providers.skills.source_epoch import SourceEpoch
     from providers.skills.vstorm import VstormSkillProvider
     from providers.skills.zathras import ZathrasSkillProvider
 
@@ -132,21 +138,112 @@ def build_skill_provider(
     # workflow engine instead of direct podman execution.
     harnesses["arcaflow-workflows"] = harnesses["arcaflow-plugins"]
 
+    trusted_ticket_id = ticket_id or os.environ.get("TICKET_ID", "")
+    source_epoch = None
+    if trusted_ticket_id:
+        from paths import SKILL_SOURCE_EPOCH_DIR
+
+        source_epoch = SourceEpoch(
+            SKILL_SOURCE_EPOCH_DIR,
+            ticket_id=trusted_ticket_id,
+        )
+
     if catalog_only:
         harnesses["crucible"] = CrucibleCatalogSkillProvider(
-            build_crucible_context_gateway(catalog_only=True)
+            build_crucible_context_gateway(
+                catalog_only=True,
+                source_url=source_url,
+                source_epoch=source_epoch,
+            )
         )
+
+    private = PrivateSkillProvider(resolver=organization_resolver)
+    phase = skill_phase or os.environ.get("AGENT_NAME", "").removesuffix("-agent")
+    private.bind_current_attempt(phase)
 
     if zathras_home:
         harnesses["zathras"] = ZathrasSkillProvider(zathras_home)
     else:
-        private = PrivateSkillProvider()
         zathras_tests = private._load_config("zathras").get("tests")
         if zathras_tests:
             harnesses["zathras"] = ZathrasSkillProvider(fallback_tests=zathras_tests)
 
+    project_root = Path(__file__).resolve().parents[1]
+    manifest = project_root / "skills" / "context-manifest.json"
+    project_context_source = (
+        LocalContextSource(manifest, root=project_root) if manifest.is_file() else None
+    )
     return MultiHarnessSkillProvider(
-        harnesses, PrivateSkillProvider(), default_harness="crucible"
+        harnesses,
+        private,
+        default_harness="crucible",
+        project_context_source=project_context_source,
+        source_epoch=source_epoch,
+    )
+
+
+async def build_organization_skill_resolver_async(
+    *, secrets_provider: Any | None = None, ticket_id: str | None = None
+):
+    """Resolve only organization skill sources, loading Git auth if required.
+
+    This narrow path is suitable for context-only callers such as the resource
+    gateway. Its secrets provider is used solely by configured organization
+    Git sources; it does not construct resource providers or load their service
+    credentials (for example ``aws/config.json``).
+    """
+    from paths import CONFIG_PATH
+    from providers.skills.gateway import (
+        OrganizationSkillResolver,
+        organization_source_descriptors,
+    )
+
+    ticket_id = ticket_id or os.environ.get("TICKET_ID") or None
+    raw_config = None
+    try:
+        if CONFIG_PATH.exists():
+            raw_config = json.loads(CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    gateway = raw_config.get("skill_gateway") if isinstance(raw_config, dict) else None
+    organization = gateway.get("organization") if isinstance(gateway, dict) else None
+    try:
+        sources = organization_source_descriptors(organization or {})
+    except (TypeError, ValueError):
+        sources = []
+    needs_secret_provider = any(
+        item["source"].get("kind") == "git"
+        and isinstance(item["source"].get("auth", {}), dict)
+        and item["source"].get("auth", {}).get("kind", "default")
+        in {"https-token", "ssh-key-secret"}
+        for item in sources
+    )
+    if secrets_provider is None and needs_secret_provider:
+        secrets_provider = build_secrets_provider()
+    resolver = await OrganizationSkillResolver.from_instance_config_async(
+        raw_config=raw_config,
+        secrets_provider=secrets_provider,
+        ticket_id=ticket_id,
+    )
+    return resolver
+
+
+async def build_skill_provider_async(
+    *,
+    secrets_provider: Any | None = None,
+    ticket_id: str | None = None,
+    **kwargs: Any,
+):
+    """Build skills after resolving authenticated organization Git sources."""
+    trusted_ticket_id = ticket_id or os.environ.get("TICKET_ID") or None
+    resolver = await build_organization_skill_resolver_async(
+        secrets_provider=secrets_provider,
+        ticket_id=trusted_ticket_id,
+    )
+    return build_skill_provider(
+        organization_resolver=resolver,
+        ticket_id=trusted_ticket_id,
+        **kwargs,
     )
 
 
@@ -158,6 +255,7 @@ def build_crucible_context_gateway(
     source_url: str | None = None,
     resolve_source: bool = False,
     catalog_only: bool = False,
+    source_epoch: Any | None = None,
 ):
     """Build the internal Crucible context/catalog adapter.
 
@@ -171,6 +269,22 @@ def build_crucible_context_gateway(
 
     home = crucible_home or os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
     cache = repo_cache or RepoCache()
+    trusted_ticket_id = os.environ.get("TICKET_ID", "")
+    if source_epoch is None and trusted_ticket_id:
+        from paths import SKILL_SOURCE_EPOCH_DIR
+        from providers.skills.source_epoch import SourceEpoch
+
+        source_epoch = SourceEpoch(
+            SKILL_SOURCE_EPOCH_DIR,
+            ticket_id=trusted_ticket_id,
+        )
+    core_repository = source_url or (
+        cache.get_origin("crucible") if hasattr(cache, "get_origin") else None
+    )
+    core_repository = core_repository or os.environ.get(
+        "CRUCIBLE_SOURCE_REPO_URL",
+        "https://github.com/perftool-incubator/crucible.git",
+    )
     if resolve_source:
         logger.warning(
             "resolve_source is ignored; Crucible repositories are not cloned"
@@ -180,6 +294,8 @@ def build_crucible_context_gateway(
         source_repo=source_repo,
         repo_cache=cache,
         catalog_only=catalog_only,
+        source_epoch=source_epoch,
+        core_repository=core_repository,
     )
 
 
@@ -362,7 +478,7 @@ def _emit_context_audit_event(
     emit_private_tool_audit_event(
         ticket_id,
         agent_name=agent_name,
-        tool_name="get_crucible_benchmark_context",
+        tool_name="get_skill_context",
         event_type="context_resolution",
         data={key: value for key, value in data.items() if value is not None},
     )
@@ -377,6 +493,11 @@ def ticket_controller_host(ticket: dict[str, Any]) -> str | None:
             value = context.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+    ssh_addresses = fields.get("ssh_hardware_ips")
+    if isinstance(ssh_addresses, dict):
+        value = ssh_addresses.get("controller")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     assigned = fields.get("assigned_hardware_ips")
     if isinstance(assigned, dict):
         value = assigned.get("controller")
@@ -484,27 +605,51 @@ def _controller_relative_path(path: str) -> str | None:
     """
     value = str(path or "").strip().removeprefix("crucible://")
     value = value.removeprefix("/opt/crucible/")
-    if not value or value.startswith("/"):
+    if (
+        not value
+        or value.startswith("/")
+        or "\\" in value
+        or any(character in value for character in ("\x00", "\t", "\n", "\r"))
+    ):
         return None
     candidate = Path(value)
     if any(
-        part in {"", ".", ".."} or part.startswith(".git") for part in candidate.parts
-    ):
-        return None
-    lowered = value.lower()
-    if any(
-        marker in lowered
-        for marker in (
-            "/secrets/",
-            "/.ssh/",
+        part in {"", ".", ".."}
+        or part.lower()
+        in {
+            ".ssh",
+            ".env",
+            "secrets",
+            "credential",
+            "credentials",
             "authorized_keys",
-            ".pem",
-            ".key",
-            "token",
-        )
+            "id_rsa",
+            "id_ed25519",
+            "known_hosts",
+            "private_key",
+        }
+        or part.lower().startswith(".git")
+        or part.lower().endswith((".pem", ".key"))
+        or "token" in part.lower()
+        for part in candidate.parts
     ):
         return None
     return candidate.as_posix()
+
+
+def _controller_relative_pointer(base: str, pointer: str) -> str | None:
+    """Resolve an in-root relative pointer before applying the path validator."""
+    if (
+        not pointer
+        or pointer.startswith(("/", "\\"))
+        or "\\" in pointer
+        or any(character in pointer for character in ("\x00", "\t", "\n", "\r"))
+    ):
+        return None
+    normalized = posixpath.normpath(posixpath.join(base, pointer))
+    if normalized in {"", "."}:
+        return ""
+    return _controller_relative_path(normalized)
 
 
 async def _search_controller_source(
@@ -512,8 +657,9 @@ async def _search_controller_source(
     ssh: Any,
     controller_host: str,
     query: str,
-    max_results: int = 100,
-    max_bytes: int = 65536,
+    scope_path: str = "",
+    max_results: int = 500,
+    max_bytes: int = 131072,
 ) -> dict[str, Any]:
     """Find candidate documents in the installed controller tree.
 
@@ -523,7 +669,7 @@ async def _search_controller_source(
     """
     if not query.strip():
         return {"found": False, "operation": "search", "reason": "empty_query"}
-    max_results = max(1, min(int(max_results), 100))
+    max_results = max(1, min(int(max_results), 500))
     max_bytes = max(1024, min(int(max_bytes), 131072))
     search_script = r"""
 import os
@@ -531,7 +677,10 @@ import re
 import sys
 
 VISIBLE_ROOT = "/opt/crucible"
-EXCLUDED_PARTS = {".git", ".ssh", "secrets"}
+EXCLUDED_PARTS = {
+    ".ssh", ".env", "secrets", "credential", "credentials", "id_rsa",
+    "id_ed25519", "known_hosts", "private_key",
+}
 EXCLUDED_FILES = {"authorized_keys"}
 MAX_DIRECTORIES = 20000
 MAX_FILES = 200000
@@ -541,6 +690,7 @@ MAX_TOTAL_FILE_BYTES = 16777216
 query = sys.argv[1]
 max_results = int(sys.argv[2])
 max_output_bytes = int(sys.argv[3])
+scope = sys.argv[4]
 real_root = os.path.realpath(VISIBLE_ROOT)
 root_prefix = real_root.rstrip(os.sep) + os.sep
 
@@ -554,11 +704,19 @@ def is_within_root(path):
     return resolved == real_root or resolved.startswith(root_prefix)
 
 def is_excluded(path):
-    parts = set(os.path.normpath(path).split(os.sep))
-    if parts & EXCLUDED_PARTS:
+    parts = [part.lower() for part in os.path.normpath(path).split(os.sep)]
+    if any(
+        part in EXCLUDED_PARTS
+        or part.startswith(".git")
+        or "token" in part
+        for part in parts
+    ):
         return True
     name = os.path.basename(path)
-    return name in EXCLUDED_FILES or name.endswith((".pem", ".key"))
+    return (
+        name.lower() in EXCLUDED_FILES
+        or name.lower().endswith((".pem", ".key"))
+    )
 
 def main():
     output = []
@@ -568,7 +726,27 @@ def main():
     visited_directories = 0
     visited_files = 0
     total_file_bytes = 0
-    stack = [(VISIBLE_ROOT, ())]
+    scan_root = VISIBLE_ROOT
+    if scope:
+        requested = os.path.join(VISIBLE_ROOT, scope)
+        resolved = os.path.realpath(requested)
+        if not is_within_root(requested):
+            sys.stdout.write("ERROR\toutside_root\n")
+            return
+        if is_excluded(requested) or is_excluded(resolved):
+            sys.stdout.write("ERROR\texcluded\n")
+            return
+        if not os.path.exists(resolved):
+            sys.stdout.write("ERROR\tmissing\n")
+            return
+        if os.path.isdir(resolved):
+            scan_root = requested
+        elif os.path.isfile(resolved):
+            scan_root = os.path.dirname(requested)
+        else:
+            sys.stdout.write("ERROR\tnot_searchable\n")
+            return
+    stack = [(scan_root, ())]
 
     def emit(record):
         nonlocal output_bytes, truncated
@@ -600,19 +778,17 @@ def main():
         try:
             entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
         except OSError:
+            incomplete = True
             continue
 
         child_directories = []
         next_ancestors = ancestors + (real_directory,)
         for entry in entries:
             path = entry.path
-            if (
-                "\t" in path
-                or "\n" in path
-                or "\r" in path
-                or is_excluded(path)
-                or not is_within_root(path)
-            ):
+            if "\t" in path or "\n" in path or "\r" in path:
+                incomplete = True
+                continue
+            if is_excluded(path) or not is_within_root(path):
                 continue
             real_path = os.path.realpath(path)
             if is_excluded(real_path):
@@ -653,6 +829,7 @@ def main():
                         ):
                             break
             except OSError:
+                incomplete = True
                 continue
             if truncated:
                 break
@@ -670,13 +847,31 @@ main()
     command = (
         "python3 -c "
         f"{shlex.quote(search_script)} "
-        f"{shlex.quote(query)} {max_results} {max_bytes}"
+        f"{shlex.quote(query)} {max_results} {max_bytes} "
+        f"{shlex.quote(scope_path)}"
     )
-    result = await ssh.run(controller_host, command, timeout=30)
+    try:
+        result = await ssh.run(controller_host, command, timeout=30)
+    except Exception:
+        return {
+            "found": False,
+            "operation": "search",
+            "reason": "controller_transport_error",
+            "message": "The controller search request failed.",
+            "next_action": "Retry after controller connectivity is restored.",
+        }
+    if result.exit_code != 0:
+        return {
+            "found": False,
+            "operation": "search",
+            "reason": "controller_transport_error",
+            "message": "The controller search request failed.",
+            "next_action": "Retry after controller connectivity is restored.",
+        }
     raw_output = result.stdout.encode("utf-8", errors="replace")
     grouped: dict[str, dict[str, Any]] = {}
     total_matches = 0
-    remote_truncated = False
+    remote_truncated = len(raw_output) > max_bytes
     for line in raw_output[:max_bytes].decode("utf-8", errors="replace").splitlines():
         fields = line.split("\t", 3)
         if not fields:
@@ -685,6 +880,44 @@ main()
         if kind == "TRUNCATED":
             remote_truncated = True
             continue
+        if kind == "ERROR":
+            code = fields[1] if len(fields) == 2 else "not_searchable"
+            reason = {
+                "outside_root": "controller_path_outside_root",
+                "excluded": "controller_path_excluded",
+                "missing": "controller_document_not_found",
+                "not_searchable": "controller_path_not_searchable",
+            }.get(code, "controller_path_not_searchable")
+            messages = {
+                "controller_path_outside_root": (
+                    "The resolved search scope leaves the installed controller root.",
+                    "Use an in-root file or directory ref.",
+                ),
+                "controller_path_excluded": (
+                    "The search scope resolves to a credential or VCS path.",
+                    "Use a returned software reference outside excluded paths.",
+                ),
+                "controller_document_not_found": (
+                    "The search origin does not exist.",
+                    "Use a current ref returned by this gateway.",
+                ),
+                "controller_path_not_searchable": (
+                    "The search origin is not a file or directory.",
+                    "Use operation='list' to choose a file or directory ref.",
+                ),
+            }
+            message, next_action = messages.get(
+                reason,
+                ("The search origin cannot be resolved.", "Use a current in-root ref."),
+            )
+            return {
+                "found": False,
+                "operation": "search",
+                "reason": reason,
+                "message": message,
+                "next_action": next_action,
+                "requested_ref": scope_path,
+            }
         raw_size = ""
         if kind == "NAME":
             if len(fields) != 4:
@@ -740,13 +973,16 @@ main()
         match_kind = "name" if kind == "NAME" else "content"
         if match_kind not in entry["match_kinds"]:
             entry["match_kinds"].append(match_kind)
-        entry["matches"].append(
-            {
-                "kind": match_kind,
-                "line_number": int(line_number) if line_number.isdigit() else None,
-                "content": content[:1000] if content else None,
-            }
-        )
+        if len(entry["matches"]) < 3:
+            entry["matches"].append(
+                {
+                    "kind": match_kind,
+                    "line_number": int(line_number) if line_number.isdigit() else None,
+                    "content": content[:512] if content else None,
+                }
+            )
+        else:
+            entry["matches_truncated"] = True
     files = list(grouped.values())
     missing_sizes = [
         "/opt/crucible/" + entry["ref"]
@@ -768,6 +1004,8 @@ main()
                 entry["size_bytes"] = sizes_by_path.get(entry["ref"])
     for entry in files:
         entry["match_count"] = len(entry["matches"])
+        entry.setdefault("matches_truncated", False)
+    truncated = remote_truncated or total_matches >= max_results
     return {
         "found": bool(files),
         "operation": "search",
@@ -776,11 +1014,10 @@ main()
         "results": files,
         "total_files": len(files),
         "total_matches": total_matches,
-        "truncated": (
-            remote_truncated
-            or total_matches >= max_results
-            or len(raw_output) > max_bytes
-        ),
+        "truncated": truncated,
+        "complete": not truncated,
+        "scan_scope": scope_path or ".",
+        "scope_semantics": "recursive subtree; file origins use their parent directory",
     }
 
 
@@ -800,13 +1037,155 @@ async def _read_controller_document(
     remote_path = f"/opt/crucible/{relative}"
     quoted_path = shlex.quote(remote_path)
     command = (
-        "root=$(realpath -e -- /opt/crucible) && "
-        f"candidate=$(realpath -e -- {quoted_path}) && "
-        'case "$candidate" in "$root"/*) '
-        'test -f "$candidate" && cat -- "$candidate";; '
-        "*) exit 2;; esac"
+        "root=$(realpath -e -- /opt/crucible 2>/dev/null) || exit 20; "
+        f"target={quoted_path}; "
+        'candidate=$(LC_ALL=C realpath -e -- "$target" 2>&1) || '
+        '{ case "$candidate" in *"Permission denied"*) exit 25;; *) exit 21;; esac; }; '
+        'case "$candidate" in "$root"/*) ;; *) exit 22;; esac; '
+        'case "$candidate" in */.ssh|*/.ssh/*|*/.env|*/.env/*|*/.git*/*|*/.git*|*/secrets|*/secrets/*|*/credential|*/credential/*|*/credentials|*/credentials/*|*/authorized_keys|*/id_rsa|*/id_ed25519|*/known_hosts|*/private_key|*token*|*.pem|*.key) exit 27;; esac; '
+        'if [ -d "$candidate" ]; then exit 23; fi; '
+        'if [ ! -f "$candidate" ]; then exit 24; fi; '
+        'if [ ! -r "$candidate" ]; then exit 25; fi; '
+        'printf "resolved_ref=%s\\n" "${candidate#"$root"/}" >&2; '
+        'cat -- "$candidate" || exit 26'
     )
     return await ssh.run(controller_host, command, timeout=30)
+
+
+async def _inspect_controller_path(
+    *,
+    ssh: Any,
+    controller_host: str,
+    relative: str,
+) -> Any:
+    """Return the safe remote type of one controller-relative path."""
+    remote_path = f"/opt/crucible/{relative}"
+    command = (
+        "root=$(realpath -e -- /opt/crucible 2>/dev/null) || exit 20; "
+        f"target={shlex.quote(remote_path)}; "
+        'candidate=$(LC_ALL=C realpath -e -- "$target" 2>&1) || '
+        '{ case "$candidate" in *"Permission denied"*) exit 25;; *) exit 21;; esac; }; '
+        'case "$candidate" in "$root"/*) ;; *) exit 22;; esac; '
+        'case "$candidate" in */.ssh|*/.ssh/*|*/.env|*/.env/*|*/.git*/*|*/.git*|*/secrets|*/secrets/*|*/credential|*/credential/*|*/credentials|*/credentials/*|*/authorized_keys|*/id_rsa|*/id_ed25519|*/known_hosts|*/private_key|*token*|*.pem|*.key) exit 27;; esac; '
+        'if [ -d "$candidate" ]; then printf directory; exit 0; fi; '
+        'if [ -f "$candidate" ]; then printf file; exit 0; fi; '
+        "exit 24"
+    )
+    return await ssh.run(controller_host, command, timeout=15)
+
+
+async def _list_controller_directory(
+    *,
+    ssh: Any,
+    controller_host: str,
+    relative: str,
+    max_entries: int = 4096,
+    max_output_bytes: int = 2 * 1024 * 1024,
+) -> dict[str, Any]:
+    """List bounded immediate children and follow only in-root symlinks."""
+    script = r"""
+import json, os, sys
+root = os.path.realpath('/opt/crucible')
+requested = os.path.join('/opt/crucible', sys.argv[1])
+max_entries, max_output = int(sys.argv[2]), int(sys.argv[3])
+prefix = root.rstrip(os.sep) + os.sep
+def inside(path):
+    resolved = os.path.realpath(path)
+    return resolved == root or resolved.startswith(prefix)
+def excluded(path):
+    return any(
+        part.lower() in {
+            '.ssh', '.env', 'secrets', 'credential', 'credentials',
+            'authorized_keys', 'id_rsa', 'id_ed25519', 'known_hosts',
+            'private_key',
+        }
+        or part.lower().startswith('.git')
+        or part.lower().endswith(('.pem', '.key'))
+        or 'token' in part.lower()
+        for part in os.path.normpath(path).split(os.sep)
+    )
+def fail(code):
+    print(json.dumps({'error': code}, separators=(',', ':')))
+if not os.path.isdir(root):
+    fail('root_unavailable')
+elif not inside(requested):
+    fail('outside_root')
+elif excluded(requested) or excluded(os.path.realpath(requested)):
+    fail('excluded')
+elif not os.path.exists(os.path.realpath(requested)):
+    fail('missing')
+elif not os.path.isdir(os.path.realpath(requested)):
+    fail('not_directory')
+else:
+    entries, incomplete = [], False
+    encoded_bytes = 0
+    try:
+        children = sorted(os.scandir(requested), key=lambda item: item.name)
+    except OSError:
+        fail('inaccessible')
+        raise SystemExit
+    for entry in children:
+        child = entry.path
+        if "\t" in child or "\n" in child or "\r" in child:
+            incomplete = True
+            continue
+        resolved_child = os.path.realpath(child)
+        if excluded(child) or excluded(resolved_child) or not inside(child):
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=True):
+                kind, size = 'directory', None
+            elif entry.is_file(follow_symlinks=True):
+                kind, size = 'file', entry.stat(follow_symlinks=True).st_size
+            else:
+                continue
+            relative = os.path.relpath(child, '/opt/crucible')
+            if excluded(relative):
+                continue
+            item = {'path': relative, 'type': kind, 'size_bytes': size}
+            if len(json.dumps(item, separators=(',', ':')).encode()) > 2048:
+                incomplete = True
+                continue
+            item_size = len(json.dumps(item, separators=(',', ':')).encode()) + 1
+            if encoded_bytes + item_size >= max_output:
+                incomplete = True
+                break
+            entries.append(item)
+            encoded_bytes += item_size
+            if len(entries) >= max_entries:
+                incomplete = True
+                break
+        except OSError:
+            incomplete = True
+    entries.sort(key=lambda item: item['path'])
+    print(json.dumps(
+        {
+            'entries': entries,
+            'complete': not incomplete,
+            'resolved_path': os.path.relpath(os.path.realpath(requested), root),
+        }, separators=(',', ':')
+    ))
+"""
+    command = (
+        "python3 -c "
+        f"{shlex.quote(script)} {shlex.quote(relative)} "
+        f"{max_entries} {max_output_bytes}"
+    )
+    try:
+        result = await ssh.run(controller_host, command, timeout=30)
+    except Exception:
+        return {"error": "controller_transport_error"}
+    if result.exit_code != 0:
+        return {"error": "controller_transport_error"}
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return {"error": "controller_transport_error"}
+    return (
+        payload
+        if isinstance(payload, dict)
+        else {"error": "controller_transport_error"}
+    )
 
 
 async def controller_context_gateway(
@@ -819,24 +1198,78 @@ async def controller_context_gateway(
     benchmark: str = "",
     operation: str = "read",
     path: str = "",
+    from_ref: str = "",
+    scope_path: str = "",
     query: str = "",
     include_alternates: bool = False,
     max_bytes: int = 16 * 1024,
     offset_bytes: int = 0,
 ) -> str:
-    """Read controller context by following paths supplied by AGENTS.md.
-
-    The controller filesystem is the source of truth.  This function does not
-    parse repos.json, resolve benchmark repositories, or construct a document
-    inventory.  Agents bootstrap with AGENTS.md and then request the paths it
-    points to, just as a coding agent would.
-    """
+    """Read, list, or search controller context under its installed root."""
     from providers.workspace.manager import WorkspaceManager
 
     manager = WorkspaceManager(ticket_id=ticket_id, agent_name=agent_name, phase=phase)
+
+    def finish(payload: dict[str, Any]) -> str:
+        reason = payload.get("reason")
+        emit_private_tool_audit_event(
+            ticket_id,
+            agent_name=agent_name,
+            tool_name="get_skill_context",
+            event_type="context_gateway",
+            data={
+                "phase": phase,
+                "operation": operation,
+                "outcome": "rejected" if reason else "success",
+                "reason": reason,
+                "requested_ref": payload.get("requested_ref"),
+                "resolved_ref": payload.get("resolved_ref"),
+                "path_type": payload.get("path_type"),
+                "result_count": len(payload.get("results", []))
+                if isinstance(payload.get("results"), list)
+                else None,
+            },
+        )
+        return json.dumps(
+            _public_context_result(
+                payload,
+                phase=phase,
+                audience=manager.audience,
+                benchmark=benchmark,
+                namespace="controller",
+                subject_area="all",
+            )
+        )
+
+    def failure(
+        reason: str,
+        message: str,
+        *,
+        requested_ref: str = "",
+        resolved_ref: str = "",
+        path_type: str = "",
+        next_action: str = "",
+    ) -> str:
+        payload: dict[str, Any] = {
+            "found": False,
+            "operation": operation,
+            "reason": reason,
+            "message": message,
+        }
+        if requested_ref:
+            payload["requested_ref"] = requested_ref
+            payload["path"] = requested_ref
+        if resolved_ref:
+            payload["resolved_ref"] = resolved_ref
+        if path_type:
+            payload["path_type"] = path_type
+        if next_action:
+            payload["next_action"] = next_action
+        return finish(payload)
+
     if operation == "bootstrap":
         path = "AGENTS.md"
-    if operation == "read":
+    if operation == "read" and not from_ref:
         cached = manager.read_document(
             path,
             include_alternates=include_alternates,
@@ -844,78 +1277,210 @@ async def controller_context_gateway(
             offset_bytes=offset_bytes,
         )
         if cached.get("status") == "ok":
-            result = {
-                "found": True,
-                "operation": operation,
-                "document": cached,
-                "documents": [cached],
-            }
-            return json.dumps(
-                _public_context_result(
-                    result,
-                    phase=phase,
-                    audience=manager.audience,
-                    benchmark=benchmark,
-                    namespace="controller",
-                    subject_area="all",
-                )
+            return finish(
+                {
+                    "found": True,
+                    "operation": operation,
+                    "document": cached,
+                    "documents": [cached],
+                    "requested_ref": path,
+                    "resolved_ref": cached.get("ref"),
+                }
             )
-    if operation == "list":
+    if operation == "manifest":
         documents = manager.context_manifest("controller").get("documents", [])
-        result = {
-            "found": bool(documents),
-            "operation": operation,
-            "documents": documents,
-        }
-        return json.dumps(
-            _public_context_result(
-                result,
-                phase=phase,
-                audience=manager.audience,
-                benchmark=benchmark,
-                namespace="controller",
-                subject_area="all",
-                manifest_documents=documents,
-            )
-        )
-    relative = _controller_relative_path(path)
-    if not controller_host or ssh is None:
-        return json.dumps(
+        return finish(
             {
-                "found": False,
+                "found": bool(documents),
                 "operation": operation,
-                "reason": "controller_not_identified",
+                "documents": documents,
             }
         )
+    if not controller_host or ssh is None:
+        return failure(
+            "controller_not_identified",
+            "The ticket has no usable controller connection.",
+            requested_ref=path,
+            next_action="Use the configured controller-backed context source.",
+        )
+
+    relative: str | None
+    if from_ref:
+        origin = _controller_relative_path(from_ref)
+        if not origin:
+            return failure(
+                "invalid_origin",
+                "The origin must be a returned controller reference.",
+                next_action="Use a controller ref from bootstrap, list, or search.",
+            )
+        try:
+            origin_result = await _inspect_controller_path(
+                ssh=ssh, controller_host=controller_host, relative=origin
+            )
+        except Exception:
+            return failure(
+                "controller_transport_error",
+                "The controller could not be reached while checking the origin.",
+                requested_ref=origin,
+                next_action="Retry the context request after controller connectivity is restored.",
+            )
+        if origin_result.exit_code not in {0, 20, 21, 22, 24, 25, 27}:
+            return failure(
+                "controller_transport_error",
+                "The controller could not confirm the origin's path type.",
+                requested_ref=origin,
+                next_action=(
+                    "Retry the context request after controller connectivity is "
+                    "restored."
+                ),
+            )
+        if origin_result.exit_code != 0:
+            return failure(
+                {
+                    20: "controller_root_unavailable",
+                    21: "controller_origin_not_found",
+                    22: "controller_path_outside_root",
+                    24: "controller_origin_invalid",
+                    25: "controller_path_inaccessible",
+                    27: "controller_path_excluded",
+                }[origin_result.exit_code],
+                "The origin could not be resolved safely on the controller.",
+                requested_ref=origin,
+                path_type={
+                    21: "missing",
+                    22: "outside_root",
+                    24: "unsupported",
+                    25: "inaccessible",
+                    27: "excluded",
+                }.get(origin_result.exit_code, "unknown"),
+                next_action="Use a current ref returned by this gateway.",
+            )
+        origin_is_directory = origin_result.stdout.strip() == "directory"
+        if operation == "read" and path:
+            base = origin if origin_is_directory else posixpath.dirname(origin)
+            relative = _controller_relative_pointer(base, path)
+        elif operation == "list" and path:
+            base = origin if origin_is_directory else posixpath.dirname(origin)
+            relative = _controller_relative_pointer(base, path)
+        elif operation == "list":
+            relative = origin if origin_is_directory else posixpath.dirname(origin)
+        elif operation == "search" and path:
+            base = origin if origin_is_directory else posixpath.dirname(origin)
+            relative = _controller_relative_pointer(base, path)
+        elif operation == "search":
+            base = origin if origin_is_directory else posixpath.dirname(origin)
+            relative = _controller_relative_path(base) if base else ""
+        else:
+            relative = origin
+    elif operation == "list" and not path:
+        relative = ""
+    else:
+        relative = _controller_relative_path(path)
+
     if operation in {"bootstrap", "read"}:
         if not relative:
-            return json.dumps(
-                {
-                    "found": False,
-                    "operation": operation,
-                    "reason": "invalid_controller_path",
-                    "path": path,
-                }
+            return failure(
+                "invalid_controller_path",
+                "The controller path must be relative and remain inside the installed root.",
+                requested_ref=origin if from_ref else "",
+                path_type="invalid_pointer" if from_ref and path else "invalid_path",
+                next_action="Use a returned controller ref or a documented relative path.",
             )
-        result = await _read_controller_document(
-            ssh=ssh,
-            controller_host=controller_host,
-            relative=relative,
-        )
+        try:
+            result = await _read_controller_document(
+                ssh=ssh,
+                controller_host=controller_host,
+                relative=relative,
+            )
+        except Exception:
+            return failure(
+                "controller_transport_error",
+                "The controller could not be reached while reading the document.",
+                requested_ref=relative,
+                next_action="Retry after controller connectivity is restored.",
+            )
         if result.exit_code != 0:
-            return json.dumps(
-                {
-                    "found": False,
-                    "operation": operation,
-                    "reason": "controller_document_not_found",
-                    "path": relative,
-                }
+            reason, message, next_action = {
+                20: (
+                    "controller_root_unavailable",
+                    "The installed controller root could not be resolved.",
+                    "Check the Crucible installation on the controller.",
+                ),
+                21: (
+                    "controller_document_not_found",
+                    "The requested controller ref does not exist.",
+                    "Check the exact ref or list its parent directory.",
+                ),
+                22: (
+                    "controller_path_outside_root",
+                    "The resolved ref leaves the installed controller root.",
+                    "Use a ref whose resolved target stays inside the installation.",
+                ),
+                23: (
+                    "controller_path_is_directory",
+                    "The requested ref names a directory, not a document.",
+                    "Call get_skill_context with operation='list' on this ref.",
+                ),
+                24: (
+                    "controller_path_not_file",
+                    "The requested ref is not a regular file.",
+                    "Call operation='list' on its parent to choose a document ref.",
+                ),
+                25: (
+                    "controller_path_inaccessible",
+                    "The requested controller ref cannot be resolved or read.",
+                    "Check controller permissions and retry with an accessible ref.",
+                ),
+                27: (
+                    "controller_path_excluded",
+                    "The resolved ref is inside a credential or VCS path.",
+                    "Use a returned software reference outside excluded paths.",
+                ),
+                26: (
+                    "controller_read_failed",
+                    "The controller could not finish reading this document.",
+                    "Retry the read; the gateway does not expose controller stderr.",
+                ),
+            }.get(
+                result.exit_code,
+                (
+                    "controller_transport_error",
+                    "The controller request failed.",
+                    "Retry after controller connectivity is restored.",
+                ),
             )
+            return failure(
+                reason,
+                message,
+                requested_ref=relative,
+                path_type={
+                    21: "missing",
+                    22: "outside_root",
+                    23: "directory",
+                    24: "unsupported",
+                    25: "inaccessible",
+                    26: "file",
+                    27: "excluded",
+                }.get(result.exit_code, "unknown"),
+                next_action=next_action,
+            )
+        resolved_relative = relative
+        raw_stderr = getattr(result, "stderr", "")
+        if isinstance(raw_stderr, str):
+            for line in raw_stderr.splitlines():
+                if line.startswith("resolved_ref="):
+                    candidate = _controller_relative_path(
+                        line.removeprefix("resolved_ref=")
+                    )
+                    if candidate:
+                        resolved_relative = candidate
+                    break
         content = result.stdout
         provenance = {
             "effective_source": "controller",
             "controller": controller_host,
             "path": relative,
+            "resolved_path": resolved_relative,
         }
         saved = manager.save_source_snapshot(
             "controller", provenance, {relative: content}
@@ -930,6 +1495,7 @@ async def controller_context_gateway(
             "authority": "effective",
             "provenance": provenance,
             "entrypoint": relative == "AGENTS.md",
+            "type": "file",
             "content": content,
             "size_bytes": len(content.encode("utf-8")),
             "workspace_ref": saved.get("files", {}).get(relative),
@@ -943,59 +1509,169 @@ async def controller_context_gateway(
                 "documents": [_public_context_document(document)],
             }
         )
-        result = {
+        document_result = {
             "found": True,
             "operation": operation,
             "document": document,
             "documents": [document],
         }
-        if operation in {"bootstrap", "read"}:
-            page = manager.read_document(
-                relative,
-                include_alternates=include_alternates,
-                max_bytes=max_bytes,
-                offset_bytes=offset_bytes,
+        page = manager.read_document(
+            relative,
+            include_alternates=include_alternates,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
+        )
+        if page.get("status") != "ok":
+            return failure(
+                "controller_snapshot_unavailable",
+                "The controller document was read but could not be paged from its ticket snapshot.",
+                requested_ref=relative,
+                next_action="Retry the document read to refresh its ticket snapshot.",
             )
-            if page.get("status") != "ok":
-                return json.dumps(
-                    {
-                        "found": False,
-                        "operation": operation,
-                        **page,
-                    }
-                )
-            result["document"] = {**document, **page}
+        document_result["document"] = {**document, **page}
+        document_result["requested_ref"] = relative
+        document_result["resolved_ref"] = resolved_relative
+        document_result["path_type"] = "file"
+        return finish(document_result)
+    if operation == "list":
+        if relative is None:
+            return failure(
+                "invalid_controller_path",
+                "The directory path must stay inside the installed controller root.",
+                requested_ref=origin if from_ref else "",
+                path_type="invalid_pointer" if from_ref and path else "invalid_path",
+                next_action="Use a returned controller directory ref.",
+            )
+        try:
+            listing = await _list_controller_directory(
+                ssh=ssh,
+                controller_host=controller_host,
+                relative=relative,
+            )
+        except Exception:
+            listing = {"error": "controller_transport_error"}
+        if listing.get("error"):
+            reason = {
+                "root_unavailable": "controller_root_unavailable",
+                "outside_root": "controller_path_outside_root",
+                "excluded": "controller_path_excluded",
+                "missing": "controller_document_not_found",
+                "not_directory": "controller_path_not_directory",
+                "inaccessible": "controller_path_inaccessible",
+            }.get(listing["error"], "controller_transport_error")
+            next_action = (
+                "Use a returned software reference outside excluded paths."
+                if reason == "controller_path_excluded"
+                else "Retry after controller connectivity is restored."
+                if reason == "controller_transport_error"
+                else "Use operation='list' only with a directory ref."
+                if reason == "controller_path_not_directory"
+                else "Use a current in-root directory ref and retry."
+            )
+            return failure(
+                reason,
+                "The requested controller directory could not be listed safely.",
+                requested_ref=relative,
+                path_type={
+                    "missing": "missing",
+                    "outside_root": "outside_root",
+                    "not_directory": "file_or_special",
+                    "inaccessible": "inaccessible",
+                    "excluded": "excluded",
+                }.get(listing["error"], "unknown"),
+                next_action=next_action,
+            )
+        entries = []
+        for item in listing.get("entries", []):
+            child_path = item.get("path")
+            if not isinstance(child_path, str):
+                continue
+            child_ref = _controller_relative_path(child_path)
+            if (
+                not child_ref
+                or posixpath.dirname(child_ref) != relative
+                or item.get("type") not in {"file", "directory"}
+            ):
+                continue
+            size = item.get("size_bytes")
+            if type(size) is not int or size < 0:
+                size = None
+            entries.append(
+                {
+                    "ref": child_ref,
+                    "uri": f"crucible://{child_ref}",
+                    "path": child_ref,
+                    "type": item["type"],
+                    "size_bytes": size,
+                }
+            )
+        resolved_relative = (
+            _controller_relative_path(str(listing.get("resolved_path", relative)))
+            or relative
+        )
+        return finish(
+            {
+                "found": bool(entries),
+                "operation": operation,
+                "requested_ref": relative,
+                "resolved_ref": resolved_relative,
+                "path_type": "directory",
+                "results": entries,
+                "total_entries": len(entries),
+                "complete": listing.get("complete") is True,
+                "scope": "immediate_children",
+                "recursive": False,
+            }
+        )
     elif operation == "search":
-        result = await _search_controller_source(
-            ssh=ssh,
-            controller_host=controller_host,
-            query=query,
+        if path and not from_ref:
+            return failure(
+                "invalid_origin",
+                "A relative search path requires a returned from_ref.",
+                path_type="invalid_pointer",
+                next_action="Use from_ref with a relative path or search an explicit scope.",
+            )
+        invalid_scope = (from_ref and relative is None) or (
+            scope_path and _controller_relative_path(scope_path) is None
         )
+        requested_scope = relative if from_ref else scope_path
+        checked_scope = (
+            _controller_relative_path(requested_scope) if requested_scope else ""
+        )
+        if invalid_scope:
+            return failure(
+                "invalid_origin",
+                "The search scope must be a returned controller ref.",
+                requested_ref=origin if from_ref else "",
+                path_type="invalid_pointer" if from_ref and path else "invalid_scope",
+                next_action="Use a current ref returned by bootstrap, list, or search.",
+            )
+        try:
+            result = await _search_controller_source(
+                ssh=ssh,
+                controller_host=controller_host,
+                query=query,
+                scope_path=checked_scope or "",
+                max_bytes=max_bytes,
+            )
+        except Exception:
+            return failure(
+                "controller_transport_error",
+                "The controller search request failed.",
+                requested_ref=checked_scope or ".",
+                next_action="Retry after controller connectivity is restored.",
+            )
+        if result.get("reason"):
+            return finish(result)
+        result["requested_ref"] = checked_scope or "."
+        result["scope"] = "recursive_subtree" if checked_scope else "installation"
     else:
-        result = {
-            "found": False,
-            "operation": operation,
-            "reason": "unsupported_operation",
-        }
-    _emit_context_audit_event(
-        ticket_id,
-        agent_name=agent_name,
-        phase=phase,
-        benchmark=benchmark,
-        operation=operation,
-        namespace="controller",
-        result=result,
-    )
-    return json.dumps(
-        _public_context_result(
-            result,
-            phase=phase,
-            audience=manager.audience,
-            benchmark=benchmark,
-            namespace="controller",
-            subject_area="all",
+        return failure(
+            "unsupported_operation",
+            "Use bootstrap, read, list, search, or the internal manifest operation.",
+            next_action="Use one of the supported context operations.",
         )
-    )
+    return finish(result)
 
 
 async def crucible_context_gateway(
@@ -1273,6 +1949,7 @@ def build_secrets_provider():
     """
     from providers.redaction import get_shared_redactor
     from providers.secrets.factory import create_secrets_provider
+    from providers.secrets.git_reference import wrap_git_secret_references
     from providers.secrets.recording import RecordingSecretsProvider
 
     backend = os.environ.get("SECRETS_BACKEND", "local")
@@ -1302,22 +1979,20 @@ def build_secrets_provider():
                     ("vault:shared", vault),
                 ]
             )
-            ticket_id = os.environ.get("TICKET_ID")
-            return (
-                RecordingSecretsProvider(provider, get_shared_redactor(), ticket_id)
-                if ticket_id
-                else provider
-            )
         except ImportError:
             logger.info(
                 "bitwarden-sdk not installed; using local secrets only",
             )
+            provider = local
+    else:
+        provider = local
 
+    provider = wrap_git_secret_references(provider)
     ticket_id = os.environ.get("TICKET_ID")
     return (
-        RecordingSecretsProvider(local, get_shared_redactor(), ticket_id)
+        RecordingSecretsProvider(provider, get_shared_redactor(), ticket_id)
         if ticket_id
-        else local
+        else provider
     )
 
 
@@ -1457,7 +2132,7 @@ async def build_repo_cache():
 
     for name, url in default_repos.items():
         if name == "crucible":
-            # Crucible is never cloned or refreshed by agentic-perf.
+            # The no-ticket cache skips Crucible; ticket-bound captures use SourceEpoch.
             continue
         try:
             await cache.ensure_repo(name, url)
@@ -1889,6 +2564,15 @@ def read_skill_document(skills_dir: Path, harness: str, filename: str) -> dict:
                 "harness": harness,
                 "filename": filename,
                 "message": "Invalid path",
+            }
+        if resolved.is_relative_to((skills_dir / "crucible").resolve()):
+            return {
+                "found": False,
+                "harness": "crucible",
+                "message": (
+                    "Use get_skill_context(subject='harness/crucible') for "
+                    "organization guidance and authoritative software references."
+                ),
             }
     except (OSError, ValueError):
         return {

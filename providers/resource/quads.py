@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
 
 from .base import ResourceProvider
@@ -20,12 +22,129 @@ class QuadsResourceProvider(ResourceProvider):
         from providers.quads import QuadsClient
 
         self._client: QuadsClient = client
+        self._eligible_hostnames_by_requirement: list[set[str]] | None = None
+        self._availability_context_key: str | None = None
+
+    @staticmethod
+    def _context_key(ticket_context: dict[str, Any]) -> str:
+        return json.dumps(
+            ticket_context, sort_keys=True, separators=(",", ":"), default=str
+        )
+
+    def required_hosts_for_availability(
+        self,
+        requested_hosts: list[dict[str, Any]] | None,
+        ticket_hosts: list[dict[str, Any]] | None,
+        ticket_context: dict[str, Any],
+    ) -> list[dict[str, Any]] | None:
+        if isinstance(ticket_hosts, list):
+            managed = [
+                host
+                for host in ticket_hosts
+                if isinstance(host, dict) and not host.get("host")
+            ]
+            if managed:
+                return managed
+        return requested_hosts
+
+    def availability_recommendation(
+        self,
+        requirement: dict[str, Any],
+        result: dict[str, Any],
+        ticket_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        recommendation = super().availability_recommendation(
+            requirement, result, ticket_context
+        )
+        recommendation["options"] = result.get("options", [])
+        return recommendation
+
+    def record_availability_context(
+        self,
+        results: list[dict[str, Any]],
+        ticket_context: dict[str, Any],
+    ) -> None:
+        self._eligible_hostnames_by_requirement = [
+            {
+                str(option.get("hostname") or option.get("host")).casefold()
+                for option in result.get("options", [])
+                if isinstance(option, dict)
+                and (option.get("hostname") or option.get("host"))
+            }
+            for result in results
+        ]
+        self._availability_context_key = self._context_key(ticket_context)
+
+    def validate_reservation_selection(
+        self,
+        selection: Any,
+        *,
+        required_hosts: list[dict[str, Any]] | None = None,
+        eligible_hostnames_by_requirement: list[set[str]] | None = None,
+        require_eligible_hostnames: bool = False,
+        ticket_context: dict[str, Any] | None = None,
+        preflight: bool = False,
+    ) -> dict[str, Any]:
+        eligible = eligible_hostnames_by_requirement
+        require_eligible = require_eligible_hostnames or preflight
+        if preflight:
+            context_key = (
+                self._context_key(ticket_context)
+                if ticket_context is not None
+                else None
+            )
+            eligible = (
+                self._eligible_hostnames_by_requirement
+                if context_key == self._availability_context_key
+                else None
+            )
+        return super().validate_reservation_selection(
+            selection,
+            required_hosts=required_hosts,
+            eligible_hostnames_by_requirement=eligible,
+            require_eligible_hostnames=require_eligible,
+            ticket_context=ticket_context,
+            preflight=False,
+        )
+
+    async def prepare_auto_reservation_selection(
+        self,
+        selection: Any,
+        *,
+        required_hosts: list[dict[str, Any]] | None,
+        ticket_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        host_requirements = [
+            host
+            for host in (required_hosts or [])
+            if isinstance(host, dict) and not host.get("host")
+        ]
+        discovery_requirements = host_requirements or [{}]
+        results = [
+            await self.check_available(requirement)
+            for requirement in discovery_requirements
+        ]
+        self.record_availability_context(results, ticket_context)
+        return self.validate_reservation_selection(
+            selection,
+            required_hosts=required_hosts,
+            ticket_context=ticket_context,
+            preflight=True,
+        )
 
     @classmethod
-    async def from_secrets(cls, secrets_provider) -> QuadsResourceProvider:
+    async def from_secrets(
+        cls,
+        secrets_provider,
+        *,
+        organization_config: dict[str, Any] | None = None,
+    ) -> QuadsResourceProvider:
         from providers.quads import QuadsClient
 
-        client = await QuadsClient.from_secrets(secrets_provider)
+        client = await QuadsClient.from_secrets(
+            secrets_provider,
+            organization_config=organization_config,
+        )
         return cls(client)
 
     async def check_available(self, requirements: dict[str, Any]) -> dict[str, Any]:
@@ -39,12 +158,59 @@ class QuadsResourceProvider(ResourceProvider):
             or requirements.get("disk_type_filter"),
             duration_hours=requirements.get("duration_hours", 36),
         )
+        min_cores = self._numeric_requirement(requirements, "min_cores")
+        min_memory_gb = self._numeric_requirement(
+            requirements,
+            "min_memory_gb",
+            "min_ram_gb",
+        )
+        if min_cores is not None:
+            hosts = [
+                host
+                for host in hosts
+                if self._numeric_value(host.get("cores")) is not None
+                and self._numeric_value(host.get("cores")) >= min_cores
+            ]
+        if min_memory_gb is not None:
+            hosts = [
+                host
+                for host in hosts
+                if self._numeric_value(host.get("memory_gb")) is not None
+                and self._numeric_value(host.get("memory_gb")) >= min_memory_gb
+            ]
         return {
             "provider": self.provider_name,
             "available_count": len(hosts),
             "options": hosts,
             "message": f"{len(hosts)} bare-metal hosts available from Scale Lab QUADS",
         }
+
+    @staticmethod
+    def _numeric_value(value: Any) -> float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if isinstance(value, str):
+            match = re.match(r"\s*(\d+(?:\.\d+)?)", value)
+            if match:
+                return float(match.group(1))
+        return None
+
+    @classmethod
+    def _numeric_requirement(
+        cls,
+        requirements: dict[str, Any],
+        key: str,
+        alias: str | None = None,
+    ) -> float | None:
+        value = requirements.get(key)
+        if value is None and alias:
+            value = requirements.get(alias)
+        if value is None:
+            return None
+        parsed = cls._numeric_value(value)
+        if parsed is None:
+            raise ValueError(f"QUADS {key} requirement must be numeric")
+        return parsed
 
     async def reserve(
         self,
@@ -53,22 +219,14 @@ class QuadsResourceProvider(ResourceProvider):
         duration_hours: int = 36,
         ticket_id: str | None = None,
     ) -> dict[str, Any]:
+        selection = self.validate_reservation_selection(selection)
         hostnames = selection["hostnames"]
-        if len(hostnames) > 10:
-            return {
-                "status": "failed",
-                "reservation_id": "",
-                "hosts": [],
-                "ssh_user": "root",
-                "ssh_key_path": self._client.ssh_key_path,
-                "lease_expiration": None,
-                "provider": self.provider_name,
-                "provider_metadata": {},
-                "message": "Max 10 hosts per QUADS assignment",
-            }
 
-        logger.info(f"[quads-provider] Creating assignment: {description}")
-        assignment = await self._client.create_assignment(description)
+        ticket_key = ticket_id.strip() if isinstance(ticket_id, str) else ""
+        if not ticket_key:
+            raise ValueError("QUADS reservation requires an Agentic Perf ticket key")
+        logger.info("[quads-provider] Creating assignment for ticket: %s", ticket_key)
+        assignment = await self._client.create_assignment(ticket_key)
         logger.info(
             f"[quads-provider] Assignment created: id={assignment['id']} "
             f"cloud={assignment['cloud_name']}"

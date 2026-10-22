@@ -523,6 +523,7 @@ class JumpstarterResourceProvider(ResourceProvider):
                 (converted to seconds).
             ticket_id: Ticket ID for lease naming.
         """
+        selection = self.validate_reservation_selection(selection)
         await self._ensure_connected()
         assert self._service is not None
 

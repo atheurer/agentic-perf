@@ -756,6 +756,29 @@ class TicketStore:
                 except Exception as e:
                     logger.exception(f"[store] Failed to emit status_change event: {e}")
 
+                # A transition out of the HITL paused state is a human
+                # reply resuming the pipeline. Mark the boundary so the
+                # agents' per-agent (and global) iteration counters
+                # restart: the budget guards autonomous operation
+                # between human touchpoints, and without the reset a
+                # chatty agent is locked out on every resume after its
+                # first max-iterations pause (#1231).
+                if (
+                    current == TicketStatus.AWAITING_CUSTOMER_GUIDANCE
+                    and new_status != TicketStatus.AWAITING_CUSTOMER_GUIDANCE
+                ):
+                    try:
+                        self._event_bus.emit(
+                            ticket_id,
+                            triggered_by,
+                            "hitl_resume_epoch",
+                            {"from": old_status, "to": new_status.value},
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            f"[store] Failed to emit hitl_resume_epoch event: {e}"
+                        )
+
             if new_status == TicketStatus.CLOSED and self._trace_store is not None:
                 try:
                     self._trace_store.migrate_ticket_traces(ticket_id)
