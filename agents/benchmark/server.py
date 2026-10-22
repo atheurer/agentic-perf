@@ -2499,6 +2499,166 @@ async def setup_passwordless_ssh(
     )
 
 
+async def _autoconsume_runfile_approval(
+    ticket: dict[str, Any], validation_id: str | None
+) -> dict[str, Any]:
+    """Create, approve, and consume a run-file approval without a pause.
+
+    Honors the ``user_pre_run_approval=false`` directive (#1232): the
+    prompt promises a run without a human pause, while the durable
+    validation work (#788) requires every execution to carry a bound,
+    auditable approval. This produces the identical create → approve →
+    consume trail a human decision would, marked as automatic.
+
+    Returns ``{"status": "ok", "approval_request_id"}`` on success,
+    ``{"status": "not_eligible"}`` when the directive does not opt
+    out of the pause, and ``{"status": "rejected", "detail"}`` when
+    the opt-out is set but the durable approval could not be produced
+    (the caller keeps its hard gate in that case). The approval is left
+    approved-and-unconsumed: ``execute_benchmark`` performs the single
+    atomic consume on its normal path, preserving the exactly-once
+    invariant.
+    """
+    ticket_id = ticket.get("id") or os.environ.get("TICKET_ID", "")
+    if not ticket_id:
+        return {"status": "not_eligible"}
+    directives = (ticket.get("custom_fields") or {}).get("directives") or {}
+    if directives.get("user_pre_run_approval") is not False:
+        return {"status": "not_eligible"}
+
+    cf = ticket.get("custom_fields") or {}
+    manifest = cf.get("benchmark_validations") or {}
+    records = manifest.get("records") if isinstance(manifest, dict) else {}
+    record = records.get(validation_id) if validation_id and records else None
+    if not isinstance(record, dict):
+        return {
+            "status": "rejected",
+            "detail": (
+                "no validation record for automatic approval; call "
+                "validate_benchmark first"
+            ),
+        }
+
+    from providers.tracing import current_trace_context
+
+    context = current_trace_context()
+    # Inside this MCP tool call the trace context carries the invocation
+    # identity but usually no tool-call id (that lives in the agent's
+    # per-call child context). The approvals API requires both in the
+    # trusted fence headers, so a synthetic id marks the auto-approval —
+    # the same pattern the deterministic kernel runner uses.
+    invocation_id = (
+        str(context.invocation_id) if context and context.invocation_id else ""
+    )
+    tool_call_id = (
+        context.tool_call_id
+        if context and context.tool_call_id
+        else "execute-benchmark-autoapproval"
+    )
+    claim_id = (
+        os.environ.get("AGENTIC_PERF_CLAIM_ID")
+        or (cf.get("claim") or {}).get("claim_id")
+        or ""
+    )
+
+    from agents.server_utils import ticket_state_headers
+
+    headers = ticket_state_headers()
+    if invocation_id:
+        headers["X-Agentic-Perf-Invocation-Id"] = invocation_id
+    if tool_call_id:
+        headers["X-Agentic-Perf-Tool-Call-Id"] = tool_call_id
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    try:
+        from providers.execution import AuditedAsyncHTTPClient
+
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+            created = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/approvals",
+                json={
+                    "kind": "benchmark_run_file",
+                    "validation_id": validation_id,
+                    "presented_run_file_digest": record.get("runfile_fingerprint"),
+                    "execution_intent_digest": record.get("execution_intent_digest"),
+                    "execution_intent_id": record.get("execution_intent_id"),
+                    "attempt_id": record.get("attempt_id"),
+                    "summary": (
+                        "Automatic run-file approval (user_pre_run_approval=false)"
+                    ),
+                    "invocation_id": invocation_id or None,
+                    "tool_call_id": tool_call_id or None,
+                    "session_id": os.environ.get(
+                        "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"
+                    ),
+                    "session_epoch": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH"),
+                    "waiter_owner": invocation_id or None,
+                    "ticket_attempt": claim_id or None,
+                    "claim_id": claim_id or None,
+                },
+            )
+            if created.status_code >= 300:
+                return {
+                    "status": "rejected",
+                    "detail": (
+                        f"approval creation failed ({created.status_code}): "
+                        f"{created.text[:200]}"
+                    ),
+                }
+            approval_id = created.json()["approval_request_id"]
+
+            resolved = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}"
+                f"/approvals/{approval_id}/resolve",
+                json={
+                    "decision": "approved",
+                    "reason": ("automatic approval per user_pre_run_approval=false"),
+                    "validation_id": validation_id,
+                    "presented_run_file_digest": record.get("runfile_fingerprint"),
+                    "execution_intent_digest": record.get("execution_intent_digest"),
+                },
+            )
+            if resolved.status_code >= 300:
+                return {
+                    "status": "rejected",
+                    "detail": (
+                        f"approval resolution failed ({resolved.status_code}): "
+                        f"{resolved.text[:200]}"
+                    ),
+                }
+    except Exception as exc:
+        return {
+            "status": "rejected",
+            "detail": f"automatic approval failed: {exc}",
+        }
+
+    try:
+        await _add_execution_note(
+            ticket_id,
+            f"**Run-file approval granted automatically** "
+            f"(user_pre_run_approval=false): {approval_id} "
+            f"for validation {validation_id}.",
+        )
+    except Exception:
+        logger.warning("[benchmark] auto-approval comment failed for %s", ticket_id)
+    return {"status": "ok", "approval_request_id": approval_id}
+
+
+async def _add_execution_note(ticket_id: str, body: str) -> None:
+    """Best-effort audit comment for automatic approvals."""
+    from agents.server_utils import ticket_state_headers
+    from providers.execution import AuditedAsyncHTTPClient
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    headers = ticket_state_headers()
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+        response = await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+            json={"body": body},
+        )
+        response.raise_for_status()
+
+
 @mcp.tool()
 async def execute_benchmark(
     controller: str,
@@ -2620,13 +2780,26 @@ async def execute_benchmark(
         and (active_check.get("id") or os.environ.get("TICKET_ID"))
         and not approval_request_id
     ):
-        return json.dumps(
-            {
+        # user_pre_run_approval=false promises a run without a human
+        # pause, and the durable-approval invariant (#788) demands that
+        # every execution carry a bound, auditable approval. Satisfy
+        # both: create + resolve + consume the same benchmark_run_file
+        # approval the human flow would produce, without waiting (#1232).
+        autoapproval = await _autoconsume_runfile_approval(active_check, validation_id)
+        if autoapproval.get("status") == "ok":
+            approval_request_id = autoapproval["approval_request_id"]
+        else:
+            rejection = {
                 "status": "rejected",
                 "reason_code": "approval_required",
-                "message": "ticket-scoped benchmark execution requires approval_request_id",
+                "message": (
+                    "ticket-scoped benchmark execution requires approval_request_id"
+                ),
             }
-        )
+            if autoapproval.get("detail"):
+                rejection["auto_approval_error"] = autoapproval["detail"]
+                rejection["message"] += "; automatic approval was attempted and failed"
+            return json.dumps(rejection)
 
     async def pause_for_reconciliation(reason: str) -> None:
         """Put ambiguous executions in the canonical human-guidance state."""
