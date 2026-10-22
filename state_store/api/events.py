@@ -100,8 +100,15 @@ def get_events(
     event_bus = getattr(request.app.state, "event_bus", None)
     if event_bus is None:
         return {"events": [], "latest_seq": 0, "terminal_events": []}
-    events = _get_visible_events(event_bus, ticket_id, view, since=since, limit=limit)
-    latest_seq = max((event["seq"] for event in events), default=since)
+    # Preserve cursor-then-sort pagination: select by seq, then sort
+    # for display, then filter invisible events. This maintains the
+    # original pagination contract (latest_seq advances the cursor).
+    raw = event_bus.get_events(ticket_id, since=since, limit=limit)
+    if view == "activity":
+        events = [e for e in raw if _is_visible(e, view)]
+    else:
+        events = raw
+    latest_seq = max((event["seq"] for event in raw), default=since)
     terminal_events = event_bus.get_terminal_events(ticket_id)
     return {
         "events": events,
