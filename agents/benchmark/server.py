@@ -32,6 +32,7 @@ if _project_root not in sys.path:
 
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
+    FORBIDDEN_REBOOT_HOSTS,
     _emit_context_audit_event,
     _public_context_document,
     _public_context_result,
@@ -40,6 +41,7 @@ from agents.server_utils import (
     build_skill_provider_async,
     build_ssh_from_ticket,
     controller_context_gateway,
+    is_self_host,
     read_skill_documents,
     ticket_controller_host,
     tool_progress,
@@ -407,28 +409,8 @@ def _validate_run_command(
     return True, "OK"
 
 
-# Hosts that must never be passed as a reboot target.
-# boot-timings-test.sh reboots the SUT — hitting localhost
-# would kill the orchestrator.
-_FORBIDDEN_REBOOT_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
-
-
-def _is_self_host(host: str) -> bool:
-    """Return True if *host* resolves to the orchestrator itself."""
-    import socket
-
-    if host.lower() in _FORBIDDEN_REBOOT_HOSTS:
-        return True
-    try:
-        own_hostname = socket.gethostname()
-        if host.lower() == own_hostname.lower():
-            return True
-        own_fqdn = socket.getfqdn()
-        if host.lower() == own_fqdn.lower():
-            return True
-    except Exception:
-        pass
-    return False
+_FORBIDDEN_REBOOT_HOSTS = FORBIDDEN_REBOOT_HOSTS
+_is_self_host = is_self_host
 
 
 SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
@@ -2517,6 +2499,294 @@ async def setup_passwordless_ssh(
     )
 
 
+async def _autoconsume_runfile_approval(
+    ticket: dict[str, Any], validation_id: str | None
+) -> dict[str, Any]:
+    """Create, approve, and consume a run-file approval without a pause.
+
+    Honors the ``user_pre_run_approval=false`` directive (#1232): the
+    prompt promises a run without a human pause, while the durable
+    validation work (#788) requires every execution to carry a bound,
+    auditable approval. This produces the identical create → approve →
+    consume trail a human decision would, marked as automatic.
+
+    Returns ``{"status": "ok", "approval_request_id"}`` on success,
+    ``{"status": "not_eligible"}`` when the directive does not opt
+    out of the pause, and ``{"status": "rejected", "detail"}`` when
+    the opt-out is set but the durable approval could not be produced
+    (the caller keeps its hard gate in that case). The approval is left
+    approved-and-unconsumed: ``execute_benchmark`` performs the single
+    atomic consume on its normal path, preserving the exactly-once
+    invariant.
+    """
+    ticket_id = ticket.get("id") or os.environ.get("TICKET_ID", "")
+    if not ticket_id:
+        return {"status": "not_eligible"}
+    directives = (ticket.get("custom_fields") or {}).get("directives") or {}
+    if directives.get("user_pre_run_approval") is not False:
+        return {"status": "not_eligible"}
+
+    cf = ticket.get("custom_fields") or {}
+    manifest = cf.get("benchmark_validations") or {}
+    records = manifest.get("records") if isinstance(manifest, dict) else {}
+    record = records.get(validation_id) if validation_id and records else None
+    if not isinstance(record, dict):
+        return {
+            "status": "rejected",
+            "detail": (
+                "no validation record for automatic approval; call "
+                "validate_benchmark first"
+            ),
+        }
+
+    from providers.tracing import current_trace_context
+
+    context = current_trace_context()
+    # Inside this MCP tool call the trace context carries the invocation
+    # identity but usually no tool-call id (that lives in the agent's
+    # per-call child context). The approvals API requires both in the
+    # trusted fence headers, so a synthetic id marks the auto-approval —
+    # the same pattern the deterministic kernel runner uses.
+    invocation_id = (
+        str(context.invocation_id) if context and context.invocation_id else ""
+    )
+    tool_call_id = (
+        context.tool_call_id
+        if context and context.tool_call_id
+        else "execute-benchmark-autoapproval"
+    )
+    claim_id = (
+        os.environ.get("AGENTIC_PERF_CLAIM_ID")
+        or (cf.get("claim") or {}).get("claim_id")
+        or ""
+    )
+
+    from agents.server_utils import ticket_state_headers
+
+    headers = ticket_state_headers()
+    if invocation_id:
+        headers["X-Agentic-Perf-Invocation-Id"] = invocation_id
+    if tool_call_id:
+        headers["X-Agentic-Perf-Tool-Call-Id"] = tool_call_id
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    try:
+        from providers.execution import AuditedAsyncHTTPClient
+
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+            created = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/approvals",
+                json={
+                    "kind": "benchmark_run_file",
+                    "validation_id": validation_id,
+                    "presented_run_file_digest": record.get("runfile_fingerprint"),
+                    "execution_intent_digest": record.get("execution_intent_digest"),
+                    "execution_intent_id": record.get("execution_intent_id"),
+                    "attempt_id": record.get("attempt_id"),
+                    "summary": (
+                        "Automatic run-file approval (user_pre_run_approval=false)"
+                    ),
+                    "invocation_id": invocation_id or None,
+                    "tool_call_id": tool_call_id or None,
+                    "session_id": os.environ.get(
+                        "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"
+                    ),
+                    "session_epoch": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH"),
+                    "waiter_owner": invocation_id or None,
+                    "ticket_attempt": claim_id or None,
+                    "claim_id": claim_id or None,
+                },
+            )
+            if created.status_code >= 300:
+                return {
+                    "status": "rejected",
+                    "detail": (
+                        f"approval creation failed ({created.status_code}): "
+                        f"{created.text[:200]}"
+                    ),
+                }
+            approval_id = created.json()["approval_request_id"]
+
+            resolved = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}"
+                f"/approvals/{approval_id}/resolve",
+                json={
+                    "decision": "approved",
+                    "reason": ("automatic approval per user_pre_run_approval=false"),
+                    "validation_id": validation_id,
+                    "presented_run_file_digest": record.get("runfile_fingerprint"),
+                    "execution_intent_digest": record.get("execution_intent_digest"),
+                },
+            )
+            if resolved.status_code >= 300:
+                return {
+                    "status": "rejected",
+                    "detail": (
+                        f"approval resolution failed ({resolved.status_code}): "
+                        f"{resolved.text[:200]}"
+                    ),
+                }
+    except Exception as exc:
+        return {
+            "status": "rejected",
+            "detail": f"automatic approval failed: {exc}",
+        }
+
+    try:
+        await _add_execution_note(
+            ticket_id,
+            f"**Run-file approval granted automatically** "
+            f"(user_pre_run_approval=false): {approval_id} "
+            f"for validation {validation_id}.",
+        )
+    except Exception:
+        logger.warning("[benchmark] auto-approval comment failed for %s", ticket_id)
+    return {"status": "ok", "approval_request_id": approval_id}
+
+
+def plan_step_params(ticket: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the current plan step's params when the step is knowable."""
+    cf = ticket.get("custom_fields") or {}
+    plan = cf.get("execution_plan") or {}
+    step_id_env = os.environ.get("EXECUTION_PLAN_STEP_ID", "")
+    if not step_id_env:
+        return None
+    try:
+        current_id = int(step_id_env)
+    except ValueError:
+        return None
+    steps = plan.get("steps") or []
+    step = next(
+        (s for s in steps if isinstance(s, dict) and s.get("id") == current_id), None
+    )
+    return (step or {}).get("params") or None
+
+
+def _check_plan_mv_params(
+    ticket: dict[str, Any],
+    validation_id: str | None,
+    plan_mv_params: dict[str, Any] | None,
+) -> str:
+    """Return a reason when the validated runfile does not match the plan's mv_params.
+
+    The plan step's ``mv_params`` is the deterministic statement of what the
+    benchmark must vary; the LLM-built run file must carry them verbatim in
+    its ``mv-params.sets[0].params``. This is the enforcement behind "the
+    plan is the intent" — it is what catches a dropped ``seconds`` value
+    that would otherwise silently run the harness default (600s instead of
+    the planned 30s in PERF-E47D0F45).
+    """
+    cf = ticket.get("custom_fields") or {}
+    manifest = cf.get("benchmark_validations") or {}
+    records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
+    record = records.get(validation_id) if validation_id else None
+    if not isinstance(record, dict):
+        return ""
+    if not plan_mv_params:
+        return ""
+    run_file = record.get("run_file") or {}
+    benchmarks = run_file.get("benchmarks") or []
+    mv_params = benchmarks[0].get("mv-params") if benchmarks else None
+    if not isinstance(mv_params, dict):
+        return (
+            "run file carries no mv-params but the plan step requires "
+            f"mv_params={plan_mv_params!r}; set the benchmark's mv-params to "
+            "the plan's values"
+        )
+    sets = mv_params.get("sets") or []
+    first_set = sets[0] if sets else {}
+    runfile_params = {
+        str(p.get("arg")): p.get("vals")
+        for p in (first_set.get("params") or [])
+        if isinstance(p, dict) and p.get("arg")
+    }
+    for key, expected in plan_mv_params.items():
+        expected_vals = expected if isinstance(expected, list) else [str(expected)]
+        actual = runfile_params.get(str(key))
+        if actual != [str(v) for v in expected_vals]:
+            return (
+                f"run file mv-params does not match the plan: plan requires "
+                f"{key}={expected_vals!r}, run file has {actual!r} (or omits it)"
+            )
+    return ""
+
+
+def _check_workload_group_drift(
+    ticket: dict[str, Any], validation_id: str | None
+) -> str:
+    """Return a drift reason when this execution would break group identity.
+
+    Benchmark steps carrying the same ``params.workload_group`` must run
+    an identical runfile: earlier completed steps in the group record the
+    runfile fingerprint their execution used (written by the orchestrator's
+    step-results capture), and this execution's validated runfile must
+    match. Returns "" when the check passes or does not apply.
+    """
+    cf = ticket.get("custom_fields") or {}
+    plan = cf.get("execution_plan") or {}
+    step_id_env = os.environ.get("EXECUTION_PLAN_STEP_ID", "")
+    current_id: int | None
+    try:
+        current_id = int(step_id_env) if step_id_env else None
+    except ValueError:
+        current_id = None
+    if current_id is None:
+        return ""
+    steps = plan.get("steps") or []
+    current = next((s for s in steps if s.get("id") == current_id), None)
+    if not isinstance(current, dict):
+        return ""
+    group = (current.get("params") or {}).get("workload_group")
+    if not group:
+        return ""
+
+    manifest = cf.get("benchmark_validations") or {}
+    records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
+    record = records.get(validation_id) if validation_id else None
+    if not isinstance(record, dict):
+        return ""
+    this_fingerprint = record.get("runfile_fingerprint", "")
+    if not this_fingerprint:
+        return ""
+
+    for step in steps:
+        if not isinstance(step, dict) or step.get("id", -1) >= current_id:
+            continue
+        if (step.get("params") or {}).get("workload_group") != group:
+            continue
+        results = step.get("results") or {}
+        prior = results.get("runfile_fingerprint")
+        if not prior:
+            # Nothing recorded (older ticket or capture not yet deployed)
+            # — nothing to compare against.
+            continue
+        if prior != this_fingerprint:
+            return (
+                f"step {current_id} runfile fingerprint {this_fingerprint[:12]}... "
+                f"differs from step {step.get('id')} in workload group "
+                f"{group!r} ({prior[:12]}...); benchmark steps in the same "
+                "group must execute an identical run file. Re-validate with "
+                "the exact runfile the group's earlier steps used (same "
+                "benchmark parameters, e.g. mv-params)."
+            )
+    return ""
+
+
+async def _add_execution_note(ticket_id: str, body: str) -> None:
+    """Best-effort audit comment for automatic approvals."""
+    from agents.server_utils import ticket_state_headers
+    from providers.execution import AuditedAsyncHTTPClient
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    headers = ticket_state_headers()
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+        response = await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+            json={"body": body},
+        )
+        response.raise_for_status()
+
+
 @mcp.tool()
 async def execute_benchmark(
     controller: str,
@@ -2638,13 +2908,56 @@ async def execute_benchmark(
         and (active_check.get("id") or os.environ.get("TICKET_ID"))
         and not approval_request_id
     ):
+        # user_pre_run_approval=false promises a run without a human
+        # pause, and the durable-approval invariant (#788) demands that
+        # every execution carry a bound, auditable approval. Satisfy
+        # both: create + resolve + consume the same benchmark_run_file
+        # approval the human flow would produce, without waiting (#1232).
+        autoapproval = await _autoconsume_runfile_approval(active_check, validation_id)
+        if autoapproval.get("status") == "ok":
+            approval_request_id = autoapproval["approval_request_id"]
+        else:
+            rejection = {
+                "status": "rejected",
+                "reason_code": "approval_required",
+                "message": (
+                    "ticket-scoped benchmark execution requires approval_request_id"
+                ),
+            }
+            if autoapproval.get("detail"):
+                rejection["auto_approval_error"] = autoapproval["detail"]
+                rejection["message"] += "; automatic approval was attempted and failed"
+            return json.dumps(rejection)
+
+    # Workload-group immutability (#998): benchmark steps in the same
+    # workload_group must execute an identical runfile. Earlier steps'
+    # results record what actually ran; a drift here means the LLM
+    # rebuilt the run file differently (e.g. dropped the mv-params that
+    # selected a non-default duration — observed in PERF-E47D0F45 where
+    # one run silently executed 600s instead of 30s), which would make
+    # the comparison invalid. Additionally, if the plan step names
+    # mv_params, the validated runfile must carry them verbatim — the
+    # plan is the intent; the LLM only transcribes it into the run file.
+    drift = _check_workload_group_drift(active_check, validation_id)
+    if drift:
         return json.dumps(
             {
                 "status": "rejected",
-                "reason_code": "approval_required",
-                "message": "ticket-scoped benchmark execution requires approval_request_id",
+                "reason_code": "workload_drift",
+                "detail": drift,
             }
         )
+    plan_mv = ((plan_step_params(active_check) or {}).get("mv_params")) or None
+    if plan_mv:
+        mv_error = _check_plan_mv_params(active_check, validation_id, plan_mv)
+        if mv_error:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "reason_code": "runfile_params_mismatch",
+                    "detail": mv_error,
+                }
+            )
 
     async def pause_for_reconciliation(reason: str) -> None:
         """Put ambiguous executions in the canonical human-guidance state."""

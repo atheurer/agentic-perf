@@ -68,8 +68,10 @@ gateway when available, otherwise the supported harness documentation tools.
    validation call returns one; never invent one.
 
 7. **Present for approval** — Check directives for
-   `user_pre_run_approval` (default: true). If false, skip to execute.
-   If a validation ID is available, call
+   `user_pre_run_approval` (default: true). If false, go straight to
+   execute: `execute_benchmark` creates and consumes the durable
+   run-file approval automatically (no human pause). If true (or
+   unset), a validation ID is available, call
    `present_runfile_for_approval(validation_id, benchmark, summary)`. If
    approval is required but this harness has no validation ID, use
    `request_clarification` to show the complete exact run-file and planned

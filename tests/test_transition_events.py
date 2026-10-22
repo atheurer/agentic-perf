@@ -323,3 +323,78 @@ async def test_store_no_double_emit_on_consecutive_transitions(
     assert transition_events[0]["data"]["to"] == "triage_pending"
     assert transition_events[1]["data"]["to"] == "awaiting_hardware"
     assert transition_events[2]["data"]["to"] == "awaiting_provision"
+
+
+async def test_hitl_resume_emits_epoch_event(
+    event_bus: EventBus,
+    tmp_path: Path,
+) -> None:
+    """A transition out of awaiting_customer_guidance is a human reply
+    resuming the pipeline; it must emit hitl_resume_epoch so the agents'
+    iteration budgets restart (#1231)."""
+    store = TicketStore(event_bus=event_bus, persist_dir=tmp_path)
+    ticket = store.create_ticket(
+        CreateTicketRequest(summary="Test ticket", description="test"),
+    )
+    tid = ticket.id
+
+    store.transition_ticket(
+        tid,
+        TransitionRequest(status=TicketStatus.TRIAGE_PENDING),
+    )
+    store.transition_ticket(
+        tid,
+        TransitionRequest(status=TicketStatus.AWAITING_CUSTOMER_GUIDANCE),
+    )
+
+    events = event_bus.get_events(tid)
+    assert [e for e in events if e.get("event_type") == "hitl_resume_epoch"] == []
+
+    # The user replies: the ticket resumes into the pipeline.
+    store.transition_ticket(
+        tid,
+        TransitionRequest(
+            status=TicketStatus.AWAITING_HARDWARE,
+            comment="User responded, resuming pipeline",
+        ),
+    )
+
+    events = event_bus.get_events(tid)
+    epochs = [e for e in events if e.get("event_type") == "hitl_resume_epoch"]
+    assert len(epochs) == 1
+    assert epochs[0]["data"]["from"] == "awaiting_customer_guidance"
+    assert epochs[0]["data"]["to"] == "awaiting_hardware".replace(
+        "hardware", "hardware"
+    )
+
+
+async def test_hitl_resume_epoch_not_emitted_for_normal_transitions(
+    event_bus: EventBus,
+    tmp_path: Path,
+) -> None:
+    """Ordinary forward transitions never emit the epoch — only exits
+    from the HITL paused state do."""
+    store = TicketStore(event_bus=event_bus, persist_dir=tmp_path)
+    ticket = store.create_ticket(
+        CreateTicketRequest(summary="Test ticket", description="test"),
+    )
+    tid = ticket.id
+
+    store.transition_ticket(tid, TransitionRequest(status=TicketStatus.TRIAGE_PENDING))
+    store.transition_ticket(
+        tid, TransitionRequest(status=TicketStatus.AWAITING_HARDWARE)
+    )
+
+    events = event_bus.get_events(tid)
+    assert [e for e in events if e.get("event_type") == "hitl_resume_epoch"] == []
+
+    # Pause, then abort (teardown): still an exit from the paused state.
+    store.transition_ticket(
+        tid, TransitionRequest(status=TicketStatus.AWAITING_CUSTOMER_GUIDANCE)
+    )
+    store.transition_ticket(
+        tid, TransitionRequest(status=TicketStatus.AWAITING_TEARDOWN)
+    )
+    events = event_bus.get_events(tid)
+    epochs = [e for e in events if e.get("event_type") == "hitl_resume_epoch"]
+    assert len(epochs) == 1

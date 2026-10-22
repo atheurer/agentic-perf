@@ -373,3 +373,69 @@ async def test_tool_rate_limit_zero_disables():
     await agent._throttle_tool_call()
     elapsed = time.monotonic() - start
     assert elapsed < 0.05
+
+
+def _emit_events(bus, ticket_id, events):
+    for agent, event_type in events:
+        bus.emit(ticket_id, agent, event_type, {})
+
+
+def test_hitl_resume_epoch_resets_iteration_counts(tmp_path):
+    """A hitl_resume_epoch event (human reply resuming the ticket)
+    restarts both the per-agent and global iteration budgets, so a
+    pause-and-approve cycle does not consume the budget (#1231)."""
+    bus = EventBus(log_dir=tmp_path / "logs")
+    llm = _CountingLLM()
+    agent = _StubAgent(
+        agent_name="benchmark-agent",
+        llm_provider=llm,
+        state_store_url="http://localhost:8090",
+        event_bus=bus,
+    )
+    tid = "PERF-EPOCH"
+    try:
+        _emit_events(
+            bus,
+            tid,
+            [
+                ("benchmark-agent", "llm_request"),
+                ("benchmark-agent", "llm_request"),
+                ("review-agent", "llm_request"),
+            ],
+        )
+        agent_iters, global_iters = agent._get_previous_iteration_counts(tid)
+        assert (agent_iters, global_iters) == (2, 3)
+
+        # The human replies; the store emits the resume epoch boundary.
+        _emit_events(bus, tid, [("user", "hitl_resume_epoch")])
+
+        agent_iters, global_iters = agent._get_previous_iteration_counts(tid)
+        assert (agent_iters, global_iters) == (0, 0)
+
+        # Work done after the resume counts from zero again.
+        _emit_events(bus, tid, [("benchmark-agent", "llm_request")])
+        agent_iters, global_iters = agent._get_previous_iteration_counts(tid)
+        assert (agent_iters, global_iters) == (1, 1)
+    finally:
+        bus.close()
+
+
+def test_fleet_epoch_still_resets_counts(tmp_path):
+    """The existing fleet_iteration_epoch reset is unchanged."""
+    bus = EventBus(log_dir=tmp_path / "logs")
+    llm = _CountingLLM()
+    agent = _StubAgent(
+        agent_name="benchmark-agent",
+        llm_provider=llm,
+        state_store_url="http://localhost:8090",
+        event_bus=bus,
+    )
+    tid = "PERF-FLEET"
+    try:
+        _emit_events(bus, tid, [("benchmark-agent", "llm_request")])
+        _emit_events(bus, tid, [("system", "fleet_iteration_epoch")])
+        _emit_events(bus, tid, [("benchmark-agent", "llm_request")])
+        agent_iters, global_iters = agent._get_previous_iteration_counts(tid)
+        assert (agent_iters, global_iters) == (1, 1)
+    finally:
+        bus.close()

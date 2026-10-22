@@ -756,6 +756,29 @@ class TicketStore:
                 except Exception as e:
                     logger.exception(f"[store] Failed to emit status_change event: {e}")
 
+                # A transition out of the HITL paused state is a human
+                # reply resuming the pipeline. Mark the boundary so the
+                # agents' per-agent (and global) iteration counters
+                # restart: the budget guards autonomous operation
+                # between human touchpoints, and without the reset a
+                # chatty agent is locked out on every resume after its
+                # first max-iterations pause (#1231).
+                if (
+                    current == TicketStatus.AWAITING_CUSTOMER_GUIDANCE
+                    and new_status != TicketStatus.AWAITING_CUSTOMER_GUIDANCE
+                ):
+                    try:
+                        self._event_bus.emit(
+                            ticket_id,
+                            triggered_by,
+                            "hitl_resume_epoch",
+                            {"from": old_status, "to": new_status.value},
+                        )
+                    except Exception as e:
+                        logger.exception(
+                            f"[store] Failed to emit hitl_resume_epoch event: {e}"
+                        )
+
             if new_status == TicketStatus.CLOSED and self._trace_store is not None:
                 try:
                     self._trace_store.migrate_ticket_traces(ticket_id)
@@ -1192,24 +1215,46 @@ class TicketStore:
                 )
                 raise ValueError(f"approval rejected: {rejection_reason}")
             fields = ticket.custom_fields
-            manifest = fields.get("benchmark_validations", {})
-            records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
-            validation = records.get(request.validation_id)
-            if not isinstance(validation, dict):
-                legacy = fields.get("validated_run_file", {})
-                validation = legacy if isinstance(legacy, dict) else None
-            if (
-                not isinstance(validation, dict)
-                or validation.get("validation_id") != request.validation_id
-                or validation.get("state", "executable") != "executable"
-                or validation.get("runfile_fingerprint")
-                != request.presented_run_file_digest
-                or validation.get("execution_intent_digest")
-                != request.execution_intent_digest
-            ):
-                raise ValueError(
-                    "approval does not match an executable validation record"
+            if request.kind == "kernel_change":
+                # A kernel change binds to the immutable intent record the
+                # provisioning server persisted; both digests carry the
+                # intent digest so the shared resolve/consume paths work
+                # unchanged.
+                intents = fields.get("kernel_change_intents", {})
+                intent_records = (
+                    intents.get("records", {}) if isinstance(intents, dict) else {}
                 )
+                intent = intent_records.get(request.validation_id)
+                if (
+                    not isinstance(intent, dict)
+                    or intent.get("intent_id") != request.validation_id
+                    or intent.get("intent_digest") != request.presented_run_file_digest
+                    or intent.get("intent_digest") != request.execution_intent_digest
+                ):
+                    raise ValueError(
+                        "approval does not match a persisted kernel change intent"
+                    )
+            else:
+                manifest = fields.get("benchmark_validations", {})
+                records = (
+                    manifest.get("records", {}) if isinstance(manifest, dict) else {}
+                )
+                validation = records.get(request.validation_id)
+                if not isinstance(validation, dict):
+                    legacy = fields.get("validated_run_file", {})
+                    validation = legacy if isinstance(legacy, dict) else None
+                if (
+                    not isinstance(validation, dict)
+                    or validation.get("validation_id") != request.validation_id
+                    or validation.get("state", "executable") != "executable"
+                    or validation.get("runfile_fingerprint")
+                    != request.presented_run_file_digest
+                    or validation.get("execution_intent_digest")
+                    != request.execution_intent_digest
+                ):
+                    raise ValueError(
+                        "approval does not match an executable validation record"
+                    )
             raw = ticket.custom_fields.setdefault("approval_requests", {})
             if not isinstance(raw, dict):
                 raise ValueError("approval request state is malformed")
@@ -1220,6 +1265,7 @@ class TicketStore:
                 existing = ApprovalRequest.model_validate(value)
                 if (
                     existing.status == "pending"
+                    and existing.kind == request.kind
                     and existing.validation_id == request.validation_id
                     and existing.presented_run_file_digest
                     == request.presented_run_file_digest
@@ -1375,6 +1421,14 @@ class TicketStore:
                 raise ValueError("approval request is not approved")
             if current.consumed_at is not None:
                 raise ValueError("approval request was already consumed")
+            if current.kind != request.kind:
+                raise ValueError(
+                    f"approval kind mismatch: {current.kind} != {request.kind}"
+                )
+            if current.expires_at is not None and current.expires_at <= datetime.now(
+                timezone.utc
+            ):
+                raise ValueError("approval request expired")
             for key in (
                 "validation_id",
                 "presented_run_file_digest",

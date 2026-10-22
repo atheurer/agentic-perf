@@ -7,16 +7,27 @@
       "harness": "crucible",
       "phase": "analyze",
       "agent": "analyze-agent",
-      "subjects": ["analysis", "results"],
+      "subjects": [
+        "analysis",
+        "results"
+      ],
       "entrypoint": true
     },
     {
       "id": "crucible-benchmark-discovery",
       "path": "skills/crucible/benchmark-discovery.md",
       "harness": "crucible",
-      "phases": ["triage", "benchmark"],
-      "agents": ["triage-agent", "benchmark-agent"],
-      "subjects": ["benchmark-discovery"],
+      "phases": [
+        "triage",
+        "benchmark"
+      ],
+      "agents": [
+        "triage-agent",
+        "benchmark-agent"
+      ],
+      "subjects": [
+        "benchmark-discovery"
+      ],
       "entrypoint": true
     },
     {
@@ -25,7 +36,10 @@
       "harness": "crucible",
       "phase": "review",
       "agent": "review-agent",
-      "subjects": ["cdm", "results"],
+      "subjects": [
+        "cdm",
+        "results"
+      ],
       "entrypoint": true
     },
     {
@@ -34,7 +48,10 @@
       "harness": "crucible",
       "phase": "benchmark",
       "agent": "benchmark-agent",
-      "subjects": ["endpoints", "kube"],
+      "subjects": [
+        "endpoints",
+        "kube"
+      ],
       "entrypoint": true
     },
     {
@@ -43,7 +60,10 @@
       "harness": "crucible",
       "phase": "review",
       "agent": "review-agent",
-      "subjects": ["results", "cdm"],
+      "subjects": [
+        "results",
+        "cdm"
+      ],
       "entrypoint": true
     },
     {
@@ -52,7 +72,10 @@
       "harness": "crucible",
       "phase": "review",
       "agent": "review-agent",
-      "subjects": ["review", "results"],
+      "subjects": [
+        "review",
+        "results"
+      ],
       "entrypoint": true
     },
     {
@@ -61,16 +84,28 @@
       "harness": "crucible",
       "phase": "benchmark",
       "agent": "benchmark-agent",
-      "subjects": ["run-file", "endpoints"],
+      "subjects": [
+        "run-file",
+        "endpoints"
+      ],
       "entrypoint": true
     },
     {
       "id": "crucible-tool-params",
       "path": "skills/crucible/tool-params.md",
       "harness": "crucible",
-      "phases": ["benchmark", "review"],
-      "agents": ["benchmark-agent", "review-agent"],
-      "subjects": ["tools", "results"],
+      "phases": [
+        "benchmark",
+        "review"
+      ],
+      "agents": [
+        "benchmark-agent",
+        "review-agent"
+      ],
+      "subjects": [
+        "tools",
+        "results"
+      ],
       "entrypoint": true
     },
     {
@@ -79,7 +114,30 @@
       "harness": "crucible",
       "phase": "benchmark",
       "agent": "benchmark-agent",
-      "subjects": ["userenv", "environment"],
+      "subjects": [
+        "userenv",
+        "environment"
+      ],
+      "entrypoint": true
+    },
+    {
+      "id": "crucible-lab-host-known-errors",
+      "path": "skills/crucible/lab-host-known-errors.md",
+      "harness": "crucible",
+      "phases": [
+        "provision",
+        "benchmark"
+      ],
+      "agents": [
+        "provisioning-agent",
+        "benchmark-agent"
+      ],
+      "subjects": [
+        "lab-hosts",
+        "host-keys",
+        "firewall",
+        "identity"
+      ],
       "entrypoint": true
     }
   ]
