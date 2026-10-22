@@ -725,6 +725,35 @@ class EventBus:
         except Exception:
             logger.exception("Failed to write ledger entry for %s", ticket_id)
 
+    def get_event_count(self, ticket_id: str) -> int:
+        """Return total number of events for a ticket.
+
+        Tries the SQL trace store first (cheap), then falls back
+        to the merged event list for legacy JSONL-only tickets.
+        """
+        if self._trace_store is not None:
+            count = self._trace_store.count_events(ticket_id)
+            if count > 0:
+                return count
+        # Fall back to merged events (includes JSONL) for tickets
+        # that predate the trace DB.
+        return len(self._get_merged_events(ticket_id))
+
+    def get_latest_seq(self, ticket_id: str) -> int:
+        """Return the highest seq number for a ticket.
+
+        Tries the SQL trace store first (cheap), then falls back
+        to the merged event list for legacy JSONL-only tickets.
+        """
+        if self._trace_store is not None:
+            seq = self._trace_store.latest_ticket_seq(ticket_id)
+            if seq > 0:
+                return seq
+        merged = self._get_merged_events(ticket_id)
+        if not merged:
+            return 0
+        return max(item["seq"] for item in merged)
+
     def close(self) -> None:
         if self._usage_ledger is not None:
             self._usage_ledger.close()

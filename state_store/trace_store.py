@@ -522,16 +522,43 @@ class TraceStore:
                     .fetchone()
                 )
                 active_count = row[0] if row else 0
-                if active_count > 0:
-                    return active_count
                 history_conn = self._open_history_connection()
+                hist_count = 0
                 if history_conn is not None:
                     hist_row = history_conn.execute(
                         "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
                         (ticket_id,),
                     ).fetchone()
-                    return hist_row[0] if hist_row else 0
+                    hist_count = hist_row[0] if hist_row else 0
+                return active_count + hist_count
+            except (sqlite3.Error, OSError):
                 return 0
+
+    def latest_ticket_seq(self, ticket_id: str) -> int:
+        """Return the highest ticket_seq for a ticket.
+
+        Uses a SQL MAX query — cheaper than loading all events.
+        """
+        with self._lock:
+            try:
+                row = (
+                    self._open_connection()
+                    .execute(
+                        "SELECT COALESCE(MAX(ticket_seq), 0) FROM trace_events WHERE ticket_id = ?",
+                        (ticket_id,),
+                    )
+                    .fetchone()
+                )
+                active_max = row[0] if row else 0
+                history_conn = self._open_history_connection()
+                hist_max = 0
+                if history_conn is not None:
+                    hist_row = history_conn.execute(
+                        "SELECT COALESCE(MAX(ticket_seq), 0) FROM trace_events WHERE ticket_id = ?",
+                        (ticket_id,),
+                    ).fetchone()
+                    hist_max = hist_row[0] if hist_row else 0
+                return max(active_max, hist_max)
             except (sqlite3.Error, OSError):
                 return 0
 
@@ -581,12 +608,12 @@ class TraceStore:
                 if history_conn is not None:
                     hist_rows: list[tuple[int, str]] = []
                     if ticket_id is not None:
-                        # For a single ticket, if not in active, query history
-                        if not raw_rows:
-                            hist_rows = [
-                                (row["global_seq"], row["event_json"])
-                                for row in history_conn.execute(query, tuple(values))
-                            ]
+                        # Always check history — a migrated ticket may
+                        # have events in both active and history DBs.
+                        hist_rows = [
+                            (row["global_seq"], row["event_json"])
+                            for row in history_conn.execute(query, tuple(values))
+                        ]
                     elif ticket_ids is not None:
                         # Find which tickets had rows in active DB
                         found_tickets = {
