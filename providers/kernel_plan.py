@@ -115,6 +115,11 @@ def _benchmark_copy(
     base_label = str(params.get("label") or "benchmark")
     params["label"] = f"{base_label}-kernel-{role}"
     params["kernel_role"] = role
+    # One workload group across every benchmark copy: the group is the
+    # marker the execution path uses to enforce the epic's immutability
+    # requirement — later steps in the group must present an identical
+    # runfile fingerprint to the first one's recorded result.
+    params["workload_group"] = "kernel-ab"
     copy["params"] = params
     return copy
 
