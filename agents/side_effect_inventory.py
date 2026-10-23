@@ -761,6 +761,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/api/users.py", "revoke_admin", "mutating_http_state"),
     ("state_store/api/users.py", "rotate_token", "mutating_http_state"),
     ("state_store/api/users.py", "set_user_quota", "mutating_http_state"),
+    ("state_store/api/users.py", "update_user", "mutating_http_state"),
     ("state_store/api/validations.py", "create_validation", "mutating_http_state"),
     ("state_store/api/validations.py", "issue_capability", "mutating_http_state"),
     ("state_store/api/validations.py", "supersede_validation", "mutating_http_state"),
@@ -4261,6 +4262,12 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/api/webhooks.py:receive_webhook",
+        "2027-12-31",
+    ),
+    ("state_store/api/users.py", "update_user", "mutating_http_state"): (
+        "audited",
+        "platform-maintainers",
+        "state_store/api/users.py:update_user",
         "2027-12-31",
     ),
     ("state_store/audit.py", "_recover_seq", "filesystem"): (
