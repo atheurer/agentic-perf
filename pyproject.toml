@@ -29,6 +29,12 @@ dependencies = [
     "dnspython>=2.9.0",
 ]
 
+[project.scripts]
+agentic-perf = "cli:main"
+
+[tool.setuptools]
+py-modules = ["cli", "paths"]
+
 [tool.setuptools.packages.find]
 include = ["agents*", "orchestrator*", "providers*", "state_store*"]
 
