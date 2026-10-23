@@ -243,6 +243,21 @@ Service accounts differ from regular users:
 | Rate limiting | No | Optional |
 | Dashboard access | Yes | No (token only) |
 
+To update a service account's allowed sources or rate limit without
+rotating its token:
+
+```bash
+curl -X PATCH \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"allowed_sources": ["10.128.0.0/14", "192.168.1.0/24"]}' \
+  $AP_URL/api/v1/users/webhook-horreum
+```
+
+`allowed_sources` is a full replacement (not append). Omitted fields
+are left unchanged. Set `max_requests_per_hour` to `null` to remove
+the rate limit.
+
 See [Webhook Ingestion](webhook-ingestion.md) for full details.
 
 ## Anonymous Read-Only Access
