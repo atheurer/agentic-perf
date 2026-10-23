@@ -4838,6 +4838,65 @@ function updateChatCost(usage, elId) {
   el.innerHTML = parts.join(' &middot; ');
 }
 
+async function _streamChatRequest(msg, ticketContext, containerId, costElId) {
+  /**
+   * Send a chat message via the SSE streaming endpoint.
+   * Buffers incomplete SSE lines across chunk boundaries to
+   * handle network splitting of large JSON payloads.
+   * Returns true if streaming succeeded, false on failure.
+   */
+  try {
+    var r = await fetch(API + '/chat/message/stream', {
+      method: 'POST',
+      headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()),
+      body: JSON.stringify({ message: msg, ticket_context: ticketContext || undefined })
+    });
+    if (!r.ok || !r.body) return false;
+
+    var container = document.getElementById(containerId);
+    var thinking = container ? container.querySelector('.chat-msg.system:last-child') : null;
+    if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
+
+    var reader = r.body.getReader();
+    var decoder = new TextDecoder();
+    var fullText = '';
+    var buffer = '';
+    while (true) {
+      var result = await reader.read();
+      if (result.done) break;
+      buffer += decoder.decode(result.value, { stream: true });
+      var parts = buffer.split('\n');
+      buffer = parts.pop();
+      for (var i = 0; i < parts.length; i++) {
+        var line = parts[i];
+        if (line.startsWith('data: ')) {
+          try {
+            var data = JSON.parse(line.slice(6));
+            if (data.done) {
+              updateChatCost(data.usage || {}, costElId);
+            } else if (data.text) {
+              fullText = data.text;
+            }
+          } catch(pe) { /* wait for complete line */ }
+        }
+      }
+    }
+    if (buffer.startsWith('data: ')) {
+      try {
+        var data = JSON.parse(buffer.slice(6));
+        if (data.text) fullText = data.text;
+        if (data.done) updateChatCost(data.usage || {}, costElId);
+      } catch(pe) {}
+    }
+    if (fullText) {
+      appendChatMessage(containerId, 'assistant', fullText);
+    }
+    return true;
+  } catch(e) {
+    return false;
+  }
+}
+
 async function sendChatMessage() {
   var input = document.getElementById('chat-input');
   var btn = document.getElementById('chat-send');
@@ -4851,32 +4910,13 @@ async function sendChatMessage() {
   appendChatMessage('chat-messages', 'system', 'Thinking...');
 
   try {
-    var r = await fetch(API + '/chat/message', {
-      method: 'POST',
-      headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()),
-      body: JSON.stringify({ message: msg })
-    });
-    // Remove 'Thinking...' indicator
-    var container = document.getElementById('chat-messages');
-    var thinking = container.querySelector('.chat-msg.system:last-child');
-    if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
-
-    if (r.ok) {
-      var data = await r.json();
-      appendChatMessage('chat-messages', 'assistant', data.response || '');
-      updateChatCost(data.usage || {});
-    } else {
-      var errMsg = 'Something went wrong (HTTP ' + r.status + '). ';
-      if (r.status === 504 || r.status === 408) {
-        errMsg = 'The request took longer than expected. Please try again — the chat will pick up where it left off.';
-      } else if (r.status === 503) {
-        errMsg = 'Chat agent is not available. Check that chat is enabled in the configuration.';
-      } else if (r.status === 401) {
-        errMsg = 'Authentication required. Please log in to use the chat.';
-      } else if (r.status === 429) {
-        errMsg = 'Rate limit reached. Please wait a moment and try again.';
-      }
-      appendChatMessage('chat-messages', 'system', errMsg);
+    var streamOk = await _streamChatRequest(msg, undefined, 'chat-messages', 'chat-cost');
+    if (!streamOk) {
+      var container = document.getElementById('chat-messages');
+      var thinking = container.querySelector('.chat-msg.system:last-child');
+      if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
+      appendChatMessage('chat-messages', 'system',
+        'The request took longer than expected. Please try again \u2014 the chat will pick up where it left off.');
     }
   } catch(e) {
     var container = document.getElementById('chat-messages');
@@ -4899,24 +4939,13 @@ async function sendTicketChatMessage() {
   appendChatMessage('ticket-chat-messages', 'system', 'Thinking...');
 
   try {
-    var r = await fetch(API + '/chat/message', {
-      method: 'POST',
-      headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()),
-      body: JSON.stringify({ message: msg, ticket_context: currentTicketForChat })
-    });
-    var container = document.getElementById('ticket-chat-messages');
-    var thinking = container.querySelector('.chat-msg.system:last-child');
-    if (thinking && thinking.textContent === 'Thinking...') thinking.remove();
-
-    if (r.ok) {
-      var data = await r.json();
-      appendChatMessage('ticket-chat-messages', 'assistant', data.response || '');
-      updateChatCost(data.usage || {}, 'ticket-chat-cost');
-    } else {
-      var tErr = r.status === 504 || r.status === 408
-        ? 'The request took longer than expected. Please try again.'
-        : 'Something went wrong (HTTP ' + r.status + ')';
-      appendChatMessage('ticket-chat-messages', 'system', tErr);
+    var streamOk = await _streamChatRequest(msg, currentTicketForChat, 'ticket-chat-messages', 'ticket-chat-cost');
+    if (!streamOk) {
+      var tcontainer = document.getElementById('ticket-chat-messages');
+      var tthinking = tcontainer ? tcontainer.querySelector('.chat-msg.system:last-child') : null;
+      if (tthinking && tthinking.textContent === 'Thinking...') tthinking.remove();
+      appendChatMessage('ticket-chat-messages', 'system',
+        'The request took longer than expected. Please try again \u2014 the chat will pick up where it left off.');
     }
   } catch(e) {
     var container = document.getElementById('ticket-chat-messages');

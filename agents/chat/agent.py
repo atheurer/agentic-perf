@@ -276,6 +276,30 @@ class ChatAgent:
         finally:
             reset_trace_context(token)
 
+    async def handle_message_stream(
+        self,
+        user: str,
+        message: str,
+        auth_token: str,
+        ticket_context: str | None = None,
+        readonly: bool = False,
+    ):
+        """Yield response chunks for SSE streaming.
+
+        Currently wraps the synchronous ``handle_message`` call and
+        yields the complete response as a single chunk.  This keeps
+        the SSE connection alive and prevents reverse-proxy timeouts.
+        True token-level streaming can be layered in later.
+        """
+        response = await self.handle_message(
+            user=user,
+            message=message,
+            auth_token=auth_token,
+            ticket_context=ticket_context,
+            readonly=readonly,
+        )
+        yield response
+
     async def _handle_message(
         self,
         user: str,
