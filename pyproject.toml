@@ -22,6 +22,12 @@ dependencies = [
     "fastmcp~=3.4.2",
 ]
 
+[project.scripts]
+agentic-perf = "cli:main"
+
+[tool.setuptools]
+py-modules = ["cli", "paths"]
+
 [tool.setuptools.packages.find]
 include = ["agents*", "orchestrator*", "providers*", "state_store*"]
 
