@@ -115,6 +115,8 @@ TOOL_AUDIT_POLICY = (
         "agents/benchmark/server.py:get_tool_params",
         "agents/benchmark/server.py:get_example_runfile",
         "agents/benchmark/server.py:get_run_logs",
+        "agents/benchmark/server.py:read_artifact_file",
+        "agents/platform/server.py:read_artifact_file",
         "agents/benchmark/arcaflow_plugin_server.py:get_plugin_schema",
         "agents/benchmark/arcaflow_plugin_server.py:execute_arcaflow_plugin",
     ),

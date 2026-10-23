@@ -2551,6 +2551,15 @@ class AgentBase(ABC):
             f"{self.store_url}/api/v1/tickets/{ticket_id}/fields",
             json={"fields": fields},
         )
+        if r.status_code == 409:
+            logger.warning(
+                "[%s] Field update rejected (409) for %s — claim may have "
+                "expired. Fields: %s",
+                self.agent_name,
+                ticket_id,
+                list(fields.keys()),
+            )
+            return {}
         r.raise_for_status()
         return r.json()
 
@@ -2560,6 +2569,13 @@ class AgentBase(ABC):
             f"{self.store_url}/api/v1/tickets/{ticket_id}/comments",
             json={"author": self.agent_name, "body": body},
         )
+        if r.status_code == 409:
+            logger.warning(
+                "[%s] Comment rejected (409) for %s — claim may have expired",
+                self.agent_name,
+                ticket_id,
+            )
+            return {}
         r.raise_for_status()
         return r.json()
 

@@ -97,8 +97,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/mcp_audit.py", "create_ticket_mcp", "mcp"),
     ("agents/mcp_client.py", "call_internal_tool", "mcp"),
     ("agents/mcp_client.py", "_dispatch_mcp_request", "mcp"),
-    ("agents/platform/server.py", "_provision_jumpstarter", "filesystem"),
     ("agents/provisioning/agent.py", "_apply_system_config", "filesystem"),
+    ("agents/server_utils.py", "read_artifact_file_impl", "filesystem"),
     ("agents/provisioning/agent.py", "_ssh_run", "subprocess"),
     ("agents/provisioning/server.py", "_check_existing_install_one", "ssh"),
     ("agents/provisioning/server.py", "_check_host_prerequisites_one", "ssh"),
@@ -414,6 +414,13 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/resource/jumpstarter.py", "_check_named_device", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "check_available", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "close", "cloud_resource"),
+    ("providers/resource/jumpstarter.py", "_device_matches_selector", "cloud_resource"),
+    ("providers/resource/jumpstarter.py", "_parse_selector_terms", "cloud_resource"),
+    (
+        "providers/resource/jumpstarter.py",
+        "strip_board_selector_hosts",
+        "cloud_resource",
+    ),
     ("providers/resource/jumpstarter.py", "from_secrets", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "get_reservation_status", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "list_targets", "cloud_resource"),
@@ -445,6 +452,11 @@ INVENTORIED_SIDE_EFFECTS = (
         "resolve_image_urls",
         "cloud_resource",
     ),
+    (
+        "providers/resource/jumpstarter_images.py",
+        "_normalize_server_url",
+        "cloud_resource",
+    ),
     ("providers/resource/jumpstarter_lifecycle.py", "<module>", "cloud_resource"),
     (
         "providers/resource/jumpstarter_lifecycle.py",
@@ -473,6 +485,11 @@ INVENTORIED_SIDE_EFFECTS = (
         "cloud_resource",
     ),
     ("providers/resource/jumpstarter_provision.py", "<module>", "cloud_resource"),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_probe_board_after_flash_failure",
+        "cloud_resource",
+    ),
     (
         "providers/resource/jumpstarter_provision.py",
         "ProvisionResult",
@@ -521,6 +538,21 @@ INVENTORIED_SIDE_EFFECTS = (
     (
         "providers/resource/jumpstarter_provision.py",
         "_parse_exporter_address",
+        "cloud_resource",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_format_exception_chain",
+        "cloud_resource",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "prepare_and_provision",
+        "cloud_resource",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "to_tool_response",
         "cloud_resource",
     ),
     ("providers/resource/jumpstarter_provision.py", "_run_provision_steps", "ssh"),
@@ -797,6 +829,78 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "orchestration-maintainers",
         "cli.py:_emit_user_reply",
+        "2027-12-31",
+    ),
+    ("agents/server_utils.py", "read_artifact_file_impl", "filesystem"): (
+        "audited",
+        "platform-maintainers",
+        "agents/server_utils.py:read_artifact_file_impl",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter.py",
+        "_device_matches_selector",
+        "cloud_resource",
+    ): (
+        "audited",
+        "platform-maintainers",
+        "providers/resource/jumpstarter.py:_device_matches_selector",
+        "2027-12-31",
+    ),
+    ("providers/resource/jumpstarter.py", "_parse_selector_terms", "cloud_resource"): (
+        "audited",
+        "platform-maintainers",
+        "providers/resource/jumpstarter.py:_parse_selector_terms",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter.py",
+        "strip_board_selector_hosts",
+        "cloud_resource",
+    ): (
+        "audited",
+        "platform-maintainers",
+        "providers/resource/jumpstarter.py:strip_board_selector_hosts",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_images.py",
+        "_normalize_server_url",
+        "cloud_resource",
+    ): (
+        "audited",
+        "platform-maintainers",
+        "providers/resource/jumpstarter_images.py:_normalize_server_url",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_format_exception_chain",
+        "cloud_resource",
+    ): (
+        "audited",
+        "platform-maintainers",
+        "providers/resource/jumpstarter_provision.py:_format_exception_chain",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "prepare_and_provision",
+        "cloud_resource",
+    ): (
+        "audited",
+        "platform-maintainers",
+        "providers/resource/jumpstarter_provision.py:prepare_and_provision",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "to_tool_response",
+        "cloud_resource",
+    ): (
+        "audited",
+        "platform-maintainers",
+        "providers/resource/jumpstarter_provision.py:to_tool_response",
         "2027-12-31",
     ),
     ("agents/analyze/agent.py", "_prefetch_cited_runs", "mcp"): (
@@ -1355,12 +1459,6 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/mcp_client.py:_dispatch_mcp_request",
-        "2027-12-31",
-    ),
-    ("agents/platform/server.py", "_provision_jumpstarter", "filesystem"): (
-        "audited",
-        "observability-maintainers",
-        "agents/platform/server.py:_provision_jumpstarter",
         "2027-12-31",
     ),
     ("agents/provisioning/agent.py", "_apply_system_config", "filesystem"): (
@@ -3025,6 +3123,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/resource/jumpstarter_provision.py:<module>",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter_provision.py",
+        "_probe_board_after_flash_failure",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter_provision.py:_probe_board_after_flash_failure",
         "2027-12-31",
     ),
     (
