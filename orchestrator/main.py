@@ -1235,10 +1235,15 @@ async def run_agent_task(
     config: OrchestratorConfig | None = None,
     agent_task_timeout: float = 0,
     ticket_data: dict | None = None,
+    dispatched_claim_id: str | None = None,
 ):
     agent = None
     success = False
-    raw_claim_id = dispatcher._claim_ids.get(ticket_id)
+    # Use the claim_id captured at dispatch time rather than reading
+    # from the shared dict, which can be cleared by mark_done if
+    # a previous task for this ticket completes between dispatch
+    # and task start.
+    raw_claim_id = dispatched_claim_id or dispatcher._claim_ids.get(ticket_id)
     claim_id = raw_claim_id if isinstance(raw_claim_id, str) and raw_claim_id else None
     mutation_headers = _mutation_headers(claim_id)
 
@@ -1635,32 +1640,99 @@ async def run_agent_task(
             f"{ticket_id} (status={status}) — no transition needed"
         )
     except Exception as e:
-        logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
+        # Trace delivery failures are transient infrastructure issues
+        # that should not abort the agent's work or send to HITL.
+        from providers.tracing import TraceDeliveryError
+
+        if isinstance(e, TraceDeliveryError):
+            logger.warning(
+                "Trace delivery failed for %s (non-fatal): %s",
+                ticket_id,
+                e,
+            )
+            success = True  # the agent's work succeeded
+        else:
+            logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
         err_msg = str(e).lower()
-        if (
+        if isinstance(e, TraceDeliveryError):
+            pass  # non-fatal, skip HITL transition
+        elif (
             "resource_exhausted" in err_msg
             or "rate limit" in err_msg
             or "429" in err_msg
         ):
             reason = "Agent encountered sustained API rate limits (RESOURCE_EXHAUSTED). Pausing ticket for guidance."
+            try:
+                await _transition_to_guidance(
+                    dispatcher.store_url,
+                    ticket_id,
+                    reason,
+                    event_bus=dispatcher.events,
+                    claim_id=claim_id,
+                )
+            except Exception:
+                logger.exception(
+                    f"Failed to transition failed ticket {ticket_id} to guidance"
+                )
         else:
             reason = f"Agent failed with an unhandled exception: {e}"
-        try:
-            await _transition_to_guidance(
-                dispatcher.store_url,
-                ticket_id,
-                reason,
-                event_bus=dispatcher.events,
-                claim_id=claim_id,
-            )
-        except Exception:
-            logger.exception(
-                f"Failed to transition failed ticket {ticket_id} to guidance"
-            )
+            # Fleet investigations: route crashes to the fleet coordinator
+            # instead of HITL so the fleet records a partial result and
+            # continues to the next board.
+            _fleet_routed = False
+            if status in (
+                "preparing_platform",
+                "awaiting_provision",
+                "executing_benchmark",
+            ):
+                try:
+                    from providers.fleet import is_fleet_investigation
+
+                    async with AuditedAsyncHTTPClient(
+                        timeout=10.0, headers=mutation_headers
+                    ) as _fc:
+                        _fr = await _fc.get(
+                            f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                        )
+                        if _fr.status_code == 200:
+                            _fcf = _fr.json().get("custom_fields", {})
+                            if is_fleet_investigation(_fcf):
+                                await _fc.post(
+                                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/comments",
+                                    json={"author": "system", "body": reason},
+                                )
+                                await _fc.post(
+                                    f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
+                                    json={"status": "coordinating_fleet"},
+                                )
+                                _fleet_routed = True
+                                logger.info(
+                                    "Fleet crash recovery: routed %s to coordinator",
+                                    ticket_id,
+                                )
+                except Exception:
+                    logger.debug(
+                        "Fleet crash routing failed for %s, falling back to HITL",
+                        ticket_id,
+                        exc_info=True,
+                    )
+            if not _fleet_routed:
+                try:
+                    await _transition_to_guidance(
+                        dispatcher.store_url,
+                        ticket_id,
+                        reason,
+                        event_bus=dispatcher.events,
+                        claim_id=claim_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        f"Failed to transition failed ticket {ticket_id} to guidance"
+                    )
     finally:
         logger.info(f"run_agent_task finally block for {ticket_id}")
 
-        deposed = dispatcher.is_deposed()
+        deposed = dispatcher.is_deposed(ticket_id)
         plan_managed = status in PLAN_AGENT_STATUS.values()
         logger.info(
             "Completion gate for %s: success=%s deposed=%s plan_managed=%s status=%s",
@@ -1679,8 +1751,14 @@ async def run_agent_task(
                     event_bus=dispatcher.events,
                     claim_id=dispatcher._claim_ids.get(ticket_id),
                 )
-            except Exception:
-                logger.exception(f"_advance_plan failed for {ticket_id}")
+            except Exception as plan_exc:
+                detail = ""
+                if hasattr(plan_exc, "response"):
+                    try:
+                        detail = f" — HTTP {plan_exc.response.status_code}: {plan_exc.response.text[:300]}"
+                    except Exception:
+                        pass
+                logger.exception("_advance_plan failed for %s%s", ticket_id, detail)
 
         # Debug halt for triage: triage_pending is not in
         # PLAN_AGENT_STATUS, so _advance_plan never runs for it.
@@ -2496,7 +2574,7 @@ async def _record_dispatch_retry_outcome(
 ) -> None:
     """Back off repeated no-progress dispatches and stop after the cap."""
     if (
-        dispatcher.is_deposed()
+        dispatcher.is_deposed(ticket_id)
         or not claim_id
         or dispatched_status not in DISPATCH_RETRY_STATUSES
     ):
@@ -3547,7 +3625,13 @@ async def _poll_loop_after_lease(
 
                     if lease_renew_task is not None and lease_renew_task.done():
                         lease_renew_task.result()
-                    logger.info(f"Dispatching {status} agent for ticket {tid}")
+                    _dispatch_claim = dispatcher._claim_ids.get(tid)
+                    logger.info(
+                        "Dispatching %s agent for ticket %s (claim=%s)",
+                        status,
+                        tid,
+                        _dispatch_claim,
+                    )
                     task = asyncio.create_task(
                         run_agent_task(
                             dispatcher,
@@ -3556,6 +3640,7 @@ async def _poll_loop_after_lease(
                             config=snapshot,
                             agent_task_timeout=snapshot.agent_task_timeout,
                             ticket_data=ticket,
+                            dispatched_claim_id=_dispatch_claim,
                         )
                     )
                     dispatcher.set_task(tid, task, status=status)
