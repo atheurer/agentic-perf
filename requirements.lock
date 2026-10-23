@@ -539,8 +539,8 @@ openapi-pydantic==0.5.1 \
     --hash=sha256:a3a09ef4586f5bd760a8df7f43028b60cafb6d9f61de2acba9574766255ab146 \
     --hash=sha256:ff6835af6bde7a459fb93eb93bb92b8749b754fc6e51b2f1590a19dc3005ee0d
     # via fastmcp-slim
-opentelemetry-api==1.43.0 \
-    --hash=sha256:107d0d03857ea8fc7c5fcbbbd83f800c281f0d560553d61c1d675fccfd1761c1 \
+opentelemetry-api==1.45.1 \
+    --hash=sha256:b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb \
     --hash=sha256:20acf45e9b21851926835292e4045d290acade1edd2ff3de86d2f069687ba1fd
     # via fastmcp-slim
 packaging==26.2 \
