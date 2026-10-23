@@ -121,6 +121,12 @@ class OrchestratorConfig:
                 ),
             )
         )
+        self.leader_lease_max_attempts = int(
+            os.environ.get(
+                "ORCHESTRATOR_LEASE_MAX_ATTEMPTS",
+                lease_cfg.get("max_attempts", 12),
+            )
+        )
         self.llm_provider = (
             llm_provider
             or os.environ.get("LLM_PROVIDER")
@@ -757,6 +763,7 @@ def build_redacted_config(
             "skip_teardown": config.skip_teardown,
             "leader_lease_ttl_seconds": config.leader_lease_ttl_seconds,
             "leader_lease_renew_interval": config.leader_lease_renew_interval,
+            "leader_lease_max_attempts": config.leader_lease_max_attempts,
         },
         "harness": {
             "crucible_home": config.crucible_home,

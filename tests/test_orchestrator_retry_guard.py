@@ -609,7 +609,7 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
         ),
     )
 
-    async def acquire():
+    async def acquire(**kwargs):
         lease.epoch = 7
         lease.confirmed_deadline = asyncio.get_running_loop().time() + lease.ttl_seconds
 
@@ -813,7 +813,7 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
         ),
     )
 
-    async def acquire():
+    async def acquire(**kwargs):
         lease.epoch = 7
 
     lease.acquire = acquire

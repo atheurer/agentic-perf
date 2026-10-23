@@ -317,7 +317,7 @@ class _PollLoopLease:
         self.ttl_seconds = 30
         self.confirmed_deadline = asyncio.get_running_loop().time() + self.ttl_seconds
 
-    async def acquire(self):
+    async def acquire(self, **kwargs):
         self.epoch = 7
         self.confirmed_deadline = asyncio.get_running_loop().time() + self.ttl_seconds
         return {"epoch": self.epoch}
