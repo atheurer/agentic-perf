@@ -216,9 +216,13 @@ class OrchestratorConfig:
                 100,
             )
         )
-        self._openai_api_key = os.environ.get("OPENAI_API_KEY")
-        self._openai_base_url = os.environ.get("OPENAI_BASE_URL") or llm_cfg.get(
-            "base_url"
+        self._openai_api_key = os.environ.get("ENMAAS_API_KEY") or os.environ.get(
+            "OPENAI_API_KEY"
+        )
+        self._openai_base_url = (
+            os.environ.get("ENMAAS_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+            or llm_cfg.get("base_url")
         )
         self.llm_api = os.environ.get("OPENAI_API") or llm_cfg.get(
             "api", "chat_completions"
