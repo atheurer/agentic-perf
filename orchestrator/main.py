@@ -299,7 +299,7 @@ def _make_llm_provider(
     if api_key is None:
         if provider_name in ("claude", "anthropic"):
             api_key = config.anthropic_api_key
-        elif provider_name == "openai":
+        elif provider_name in ("openai", "enmaas"):
             api_key = config._openai_api_key
         elif provider_name in ("gemini", "google"):
             api_key = config._gemini_api_key
