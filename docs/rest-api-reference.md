@@ -75,6 +75,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 | POST | `/webhooks/{source}` | webhook payload |
 | POST | `/users` | `CreateUserRequest` |
 | GET | `/users` | — |
+| PATCH | `/users/{username}` | `UpdateUserRequest`: `allowed_sources`, `max_requests_per_hour` (partial; omitted fields unchanged; `allowed_sources` is full replacement) |
 | POST | `/users/{username}/disable` | — |
 | POST | `/users/{username}/enable` | — |
 | POST | `/users/{username}/rotate-token` | — |
