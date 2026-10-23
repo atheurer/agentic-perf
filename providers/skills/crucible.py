@@ -356,6 +356,10 @@ class CrucibleCatalogSkillProvider(SkillProvider):
                 "workflow_source",
             },
             "aliases": {},
+            "descriptions": {
+                "workflow_name": "Crucible workflow/benchmark name to execute",
+                "workflow_source": "Source repository or path for the workflow",
+            },
         }
 
 

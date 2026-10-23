@@ -711,6 +711,20 @@ class BenchmarkAgent(AgentBase):
         # are in the messages context.
         if fragments:
             prompt += f"\n\n{fragments}"
+
+        # Include the directive schema so the LLM uses canonical
+        # key names and can map user variants via reasoning.
+        from providers.directives import (
+            format_directive_schema_for_prompt,
+            get_recognized_directives,
+        )
+
+        directive_schema = format_directive_schema_for_prompt(
+            get_recognized_directives()
+        )
+        if directive_schema:
+            prompt += f"\n\n{directive_schema}"
+
         return prompt
 
     async def _execute_arcaflow_workflow(
