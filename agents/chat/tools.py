@@ -924,6 +924,34 @@ async def _search_tickets(
     return json.dumps({"tickets": results, "count": len(results)})
 
 
+def _trim_fleet_investigation(
+    fleet: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Trim fleet_investigation to essential fields.
+
+    The ``tested_hosts`` list can be very large; keep only the
+    fields the chat agent needs for summarisation.
+    """
+    if not fleet or not isinstance(fleet, dict):
+        return fleet
+    trimmed = dict(fleet)
+    hosts = trimmed.get("tested_hosts")
+    if isinstance(hosts, list):
+        trimmed["tested_hosts"] = [
+            {
+                "host_id": h.get("host_id"),
+                "status": h.get("status"),
+                "failure_reason": (h.get("failure_reason") or "")[:500],
+                "samples_collected": (h.get("iteration_data", {}) or {}).get(
+                    "samples_collected"
+                ),
+            }
+            for h in hosts
+            if isinstance(h, dict)
+        ]
+    return trimmed
+
+
 async def _get_ticket(
     client: httpx.AsyncClient,
     store_url: str,
@@ -944,7 +972,7 @@ async def _get_ticket(
     # Return a trimmed view
     cf = ticket.get("custom_fields", {})
     comments = ticket.get("comments", [])
-    last_comments = comments[-5:] if comments else []
+    last_comments = comments[-10:] if comments else []
 
     directives = cf.get("directives", {})
     result = {
@@ -966,10 +994,15 @@ async def _get_ticket(
         "benchmark_status": cf.get("benchmark_status"),
         "image_build_result": cf.get("image_build_result"),
         "hypothesis": cf.get("hypothesis"),
+        "synthesis_result": cf.get("synthesis_result"),
+        "fleet_investigation": _trim_fleet_investigation(cf.get("fleet_investigation")),
+        "root_cause_summary": cf.get("root_cause_summary"),
+        "result_summary": cf.get("result_summary"),
+        "evaluation_result": cf.get("evaluation_result"),
         "last_comments": [
             {
                 "author": c.get("author", ""),
-                "body": c.get("body", "")[:500],
+                "body": c.get("body", "")[:2000],
             }
             for c in last_comments
         ],
