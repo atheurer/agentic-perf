@@ -3066,7 +3066,7 @@ async def _poll_loop_after_lease(
         # complete.  The TTL clock starts here, not during the
         # 30+ seconds of model checks and MCP connections.
         record_orchestrator_status("acquiring_lease")
-        await leader_lease.acquire()
+        await leader_lease.acquire(max_attempts=config.leader_lease_max_attempts)
         if leader_lease.epoch is None:
             raise RuntimeError("state store returned no leader fencing epoch")
         os.environ["AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"] = str(
