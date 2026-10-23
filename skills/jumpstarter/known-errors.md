@@ -34,13 +34,21 @@ board.
 
 ## Boot Failure Diagnosis via Serial Capture
 
-When `serial_capture: true` is set in ticket directives,
-the platform agent captures serial output during the
-flash→boot→verify sequence. On provisioning failure,
-the last 2000 characters of serial output are included
-in the diagnostics.
+Serial capture during the **benchmark phase** is handled
+by the benchmark agent.  When a Jumpstarter lease is
+active, the benchmark agent runs `j serial pipe` in the
+background, saving output to `serial-capture.log` in the
+run artifact directory.
 
-Common serial output patterns:
+**Note:** Serial capture is NOT available during the
+**flash/provisioning phase**.  The flash tool requires
+exclusive serial port access through the gRPC tunnel;
+a concurrent serial pipe causes pexpect EOF.  Flash
+diagnostics come from `flash-diagnostics.json` and the
+exception chain in the tool result.
+
+Common serial output patterns (from benchmark-phase
+capture):
 
 - **`ApplyOverlay: ufdt apply overlay failed`** — DTB
   overlay incompatibility. The kernel or DTB in the
@@ -52,10 +60,15 @@ Common serial output patterns:
   stage. May indicate a flash failure or power issue.
 - **Output stops at U-Boot** — Kernel failed to load.
   Check image format and partition layout.
+- **`reboot: Power down`** — Sysboot health check
+  failed, board powered itself off (see "Board Powers
+  Off Shortly After Successful Provisioning" below).
 
-Serial logs are saved as artifacts at
-`platform-provision/serial-capture.log` and can be
-downloaded from the ticket's artifact list.
+Serial logs from the benchmark phase are saved as
+artifacts in the run directory (e.g.
+`PERF-XXXX/<run-id>/serial-capture.log`).  Flash-phase
+diagnostics are at
+`PERF-XXXX/platform-provision/flash-diagnostics.json`.
 
 ## Board Powers Off Shortly After Successful Provisioning
 
@@ -86,10 +99,12 @@ sysboot detects the unhealthy initramfs and triggers the
 A/B rollback mechanism. With a fresh flash there is no
 slot B to fall back to, so it powers off.
 
-**Diagnosis:** Check the provisioning serial capture
-(`platform-provision/serial-capture.log`) for
+**Diagnosis:** Check the benchmark-phase serial capture
+(`serial-capture.log` in the run artifact directory) for
 `Initramfs unpacking failed`. If present, the OS image
-is corrupted or incompatible with this board.
+is corrupted or incompatible with this board.  For first-
+boot failures before the benchmark runs, check
+`flash-diagnostics.json` for the exception chain.
 
 **This is NOT an agentic-perf or Jumpstarter issue.** The
 problem is in the OS image build. Report to the image
@@ -98,12 +113,53 @@ build team with:
 - The board type and firmware version from serial output
 - The full provisioning serial log as evidence
 
-**Timing signature:** The consistent ~170s kernel timestamp
+**Timing signature:** The consistent ~170-260s kernel timestamp
 on the shutdown (across different boards) is the sysboot
-health check timeout + ukiboot retry exhaustion. If you
-see `Power down` at roughly the same kernel time on
-multiple boards with the same image, it confirms an image
-problem rather than a board-specific hardware issue.
+health check timeout + ukiboot retry exhaustion.
+
+## Cold Reboot Fails on First Cycle (power_off_delay too short)
+
+**Symptom:** Cold reboot test collects 0 samples. The board
+powers off, powers on, but sysboot immediately detects an
+unhealthy state and shuts down. Serial shows `reboot: Power
+down` within the first boot after the power cycle.
+
+**Cause:** The `power_off_delay` (time between power off and
+power on) is too short for the board to fully discharge its
+capacitors and reset its boot ROM. With insufficient delay,
+the board enters a dirty boot state where sysboot's health
+check fails.
+
+**Evidence from testing:**
+- `power_off_delay=2` (script default): 0 samples on every
+  S32G board — fails on first cold reboot
+- `power_off_delay=45`: 18-22 samples before unrelated
+  failure (soft lockup) — cold reboot works reliably
+- Warm SSH reboot (no power cycling): works consistently
+
+**Fix:** Set `power_off_delay` to at least 20 seconds for
+NXP S32G boards. 45 seconds is recommended for reliability.
+The required delay may vary by board type and lab power
+supply configuration (SNMP PDU response time, capacitor
+discharge rate, etc.).
+
+**IMPORTANT for agents:** When setting up a cold reboot
+test on Jumpstarter boards, check that `power_off_delay`
+is set in the ticket directives. If it is not set, the
+boot-time script defaults to 2 seconds which is too short
+for many board types. If `reboot_method` is `cold` (or
+defaulting to cold because a Jumpstarter lease is active)
+and `power_off_delay` is not set, escalate to the user
+via HITL before running the benchmark. Ask them to confirm
+an appropriate `power_off_delay` for their board type, or
+whether they intended warm SSH reboot instead.
+
+**Differentiation from image corruption:** If cold reboot
+works with `power_off_delay=45` but fails with
+`power_off_delay=2`, the image is fine — the board just
+needs more time to reset. If cold reboot fails even with
+a long delay, check for the initramfs corruption pattern
+described above.
 
 ## Lease Cannot Be Satisfied
 
@@ -161,6 +217,45 @@ a U-Boot prompt error, retry with an extended power-off
 delay (180s) before the next flash attempt. Do not
 immediately retry with the default short delay.
 
+## pexpect EOF During Flash (U-Boot Serial Connection Lost)
+
+**Error:** `pexpect.exceptions.EOF: End Of File (EOF).
+Empty string style platform.` with `searcher_string: 0: b'=>'`
+
+**Cause:** The flash tool connects to the board's serial
+console via a TCP port-forwarded gRPC tunnel.  During
+`reboot_to_console()`, it sends ESC to interrupt U-Boot
+autoboot and waits for the `=>` prompt.  EOF means the
+serial TCP socket closed before the prompt appeared.
+
+This is typically a **transient gRPC tunnel instability**,
+not a board hardware problem.  When benchmark-phase
+serial capture is available, U-Boot output usually shows
+the autoboot countdown completing normally.
+
+**Diagnosis:**
+- Check `flash-diagnostics.json` for the unwrapped
+  exception chain showing the full error path.
+- If benchmark-phase `serial-capture.log` exists, check
+  whether U-Boot reaches "Hit any key to stop autoboot"
+  — if so, the board is healthy; the issue is the tunnel.
+- Check `flash-diagnostics.json` — the unwrapped
+  exception chain shows the full error path.
+- The `BrokenResourceError` and `InvalidStateError:
+  RPC already finished` messages in pod logs confirm
+  gRPC tunnel drops.
+
+**Fix:** Retry.  Transient gRPC instability usually
+resolves on the next attempt.  If the error persists
+across multiple boards and multiple attempts, escalate
+to the Jumpstarter infrastructure team — the controller
+or exporter networking may be degraded.
+
+**This error is RETRYABLE** — do not treat it as
+unrecoverable.  The flash tool's internal 4 retries may
+not be enough if the gRPC tunnel is consistently
+unstable during that window.
+
 ## ExceptionGroup / TaskGroup Errors
 
 **Error:** `ExceptionGroup: unhandled errors in a TaskGroup
@@ -176,3 +271,23 @@ errors include:
 **Diagnosis:** Check the full exception chain in the pod
 logs or diagnostics. The sub-exception contains the
 actionable information.
+
+## Capturing Exporter-Side Logs
+
+When diagnosing flash or benchmark failures where the root cause
+may be on the exporter side (process crash, OOM, USB-serial
+disconnect, gRPC endpoint hang), use `--exporter-logs` with
+`jmp shell`:
+
+```
+jmp shell --lease <id> --exporter-logs -- j storage flash <url>
+jmp shell --lease <id> --exporter-logs -- j serial pipe
+```
+
+This streams the exporter process's own logs to stderr alongside
+the command output. Without `--exporter-logs`, only client-side
+evidence is available, making it impossible to distinguish between
+gRPC tunnel failure, exporter crash, and hardware disconnect.
+
+The boot-time test script can also pass `--exporter-logs` via
+the `jumpstarter_exec` wrapper in `boot-timings-test.sh`.

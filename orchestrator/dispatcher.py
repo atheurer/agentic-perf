@@ -98,6 +98,7 @@ class Dispatcher:
         self._session_id = session_id
         self._fencing_epoch = fencing_epoch
         self._deposed = False
+        self._deposed_tickets: set[str] = set()
         self._claim_lost = False
         self._stopped_tickets: set[str] = set()
         self.lease_seconds = lease_seconds
@@ -278,7 +279,7 @@ class Dispatcher:
                             phase="claim_renewal",
                             duration_ms=0,
                         )
-                    self.mark_deposed()
+                    self._deposed_tickets.add(ticket_id)
                     break
         except asyncio.CancelledError:
             pass
@@ -354,6 +355,7 @@ class Dispatcher:
         self._agents.clear()
         self._introspection_agents.clear()
         self._claim_ids.clear()
+        self._deposed_tickets.clear()
         self._trace_contexts.clear()
         self._stopped_tickets.clear()
         self._previous_invocations.clear()
@@ -368,8 +370,12 @@ class Dispatcher:
                 logger.exception("Failed to close dispatcher trace client")
             self._trace.client = None
 
-    def is_deposed(self) -> bool:
-        return self._deposed
+    def is_deposed(self, ticket_id: str | None = None) -> bool:
+        if self._deposed:
+            return True
+        if ticket_id is not None:
+            return ticket_id in self._deposed_tickets
+        return False
 
     def has_lost_claim(self) -> bool:
         """Return whether work stopped because its orchestration claim was lost."""
@@ -488,6 +494,7 @@ class Dispatcher:
         self.stop_renewal(ticket_id)
         await self.release_claim(ticket_id)
         getattr(self, "_claim_ids", {}).pop(ticket_id, None)
+        getattr(self, "_deposed_tickets", set()).discard(ticket_id)
         self.clear_handoff_blocked(ticket_id)
         if self._redactor:
             self._redactor.deregister_ticket(ticket_id)

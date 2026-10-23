@@ -1061,13 +1061,26 @@ class ResourceAgent(AgentBase):
                         "cloud_name": fields.get("quads_cloud_name"),
                     }
             if not reservation_id:
-                return await pause(
-                    "**Resource provider change paused:** The previous managed "
-                    f"provider ({current_provider}) has no verifiable reservation "
-                    "ID. Its allocation details were retained, and no new provider "
-                    "was selected. Reconcile the old allocation before retrying.",
+                # Distinguish between a directive hint (resource_provider
+                # set by triage with no prior allocation) and a stale
+                # allocation (resource_provider set by a previous
+                # reservation that wasn't cleaned up).  A directive hint
+                # has no metadata; a real allocation always does.
+                if metadata:
+                    return await pause(
+                        "**Resource provider change paused:** The previous managed "
+                        f"provider ({current_provider}) has no verifiable reservation "
+                        "ID. Its allocation details were retained, and no new provider "
+                        "was selected. Reconcile the old allocation before retrying.",
+                    )
+                # No metadata means this is just a directive hint — the
+                # user or triage indicated which provider to use.  Clear
+                # the ticket-level field and proceed with fresh allocation.
+                current_provider = None
+            else:
+                allocations.append(
+                    (str(current_provider), str(reservation_id), metadata)
                 )
-            allocations.append((str(current_provider), str(reservation_id), metadata))
         elif not current_provider and (
             fields.get("resource_reservation_id")
             or any(
@@ -1353,6 +1366,19 @@ class ResourceAgent(AgentBase):
                 str(provider_name), provider_metadata
             )
             if not reservation_id:
+                # Fleet investigations clear reservation fields between
+                # iterations (the lease was already released by the fleet
+                # coordinator).  If an abort arrives after that cleanup,
+                # there is nothing left to tear down.
+                from providers.fleet import is_fleet_investigation
+
+                if is_fleet_investigation(fields):
+                    await self._add_comment(
+                        ticket_id,
+                        f"Resources released ({provider_name} lease already "
+                        "cleaned up by fleet coordinator).",
+                    )
+                    return True
                 await self._add_comment(
                     ticket_id,
                     f"Cannot confirm teardown for {provider_name}: no reservation "

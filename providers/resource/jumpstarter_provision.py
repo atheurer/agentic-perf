@@ -23,7 +23,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from providers.execution import AuditedSubprocessRunner, FilesystemAuditError
+from providers.execution import FilesystemAuditError
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +88,102 @@ class ProvisionResult:
     serial_log_path: str = ""
     infrastructure_error: bool = False
 
+    def to_tool_response(self, artifact_dir: str = "") -> dict[str, Any]:
+        """Build a provider-agnostic tool response dict.
+
+        Keeps Jumpstarter-specific field names (flash_duration_s,
+        board_name, infrastructure_error) in the Jumpstarter module
+        instead of the generic platform server.
+        """
+        response: dict[str, Any] = {
+            "success": self.success,
+            "ip": self.ip,
+            "board_name": self.board_name,
+            "ssh_user": self.ssh_user,
+            "ssh_key_path": self.ssh_key_path,
+            "diagnostics": self.diagnostics,
+            "flash_duration_s": self.flash_duration_s,
+            "boot_duration_s": self.boot_duration_s,
+            "infrastructure_error": self.infrastructure_error,
+        }
+        if artifact_dir:
+            artifact_files = []
+            _ad = Path(artifact_dir)
+            for name in ("flash-diagnostics.json", "serial-capture.log"):
+                if (_ad / name).exists():
+                    artifact_files.append(str(_ad / name))
+            if artifact_files:
+                response["full_output_hint"] = (
+                    "Full diagnostics available via read_artifact_file(): "
+                    + ", ".join(artifact_files)
+                )
+        return response
+
 
 _DEFAULT_PROVISION_LEASE_DURATION_SECONDS = 14_400
+
+
+async def _probe_board_after_flash_failure(
+    client: Any,
+    diag: list[str],
+) -> None:
+    """Best-effort board state probe after flash failure.
+
+    Captures power and serial state so the synthesis agent can
+    distinguish power control, serial/USB, and firmware issues
+    instead of just reporting 'U-Boot prompt timeout'.
+    """
+    from anyio import to_thread
+
+    # Power off/on to see if power control works
+    try:
+        await to_thread.run_sync(client.power.off)
+        diag.append("Post-flash probe: power off OK")
+    except Exception as exc:
+        diag.append(f"Post-flash probe: power off failed: {exc}")
+        return  # No point continuing if we can't control power
+
+    await asyncio.sleep(20)
+
+    try:
+        await to_thread.run_sync(client.power.on)
+        diag.append("Post-flash probe: power on OK")
+    except Exception as exc:
+        diag.append(f"Post-flash probe: power on failed: {exc}")
+        return
+
+    # Brief serial read to see if the board outputs anything
+    console = getattr(client, "console", None)
+    if console is None:
+        diag.append("Post-flash probe: no console driver available")
+        return
+    try:
+        serial_data = await asyncio.wait_for(
+            to_thread.run_sync(
+                lambda: console.read(4096),
+                abandon_on_cancel=True,
+            ),
+            timeout=10,
+        )
+        if serial_data:
+            preview = (
+                serial_data[:500]
+                if isinstance(serial_data, bytes)
+                else str(serial_data)[:500]
+            )
+            diag.append(
+                f"Post-flash probe: serial output ({len(serial_data)} bytes): "
+                f"{preview!r}"
+            )
+        else:
+            diag.append("Post-flash probe: no serial output in 10s")
+    except TimeoutError:
+        diag.append(
+            "Post-flash probe: serial read timed out (10s) "
+            "\u2014 board may not be outputting"
+        )
+    except Exception as exc:
+        diag.append(f"Post-flash probe: serial read failed: {exc}")
 
 
 def _write_flash_diagnostics(
@@ -145,6 +239,34 @@ def _write_flash_diagnostics(
             "[platform] Flash diagnostics written to %s",
             f"{artifact_dir}/flash-diagnostics.json",
         )
+
+
+def _format_exception_chain(exc: BaseException) -> str:
+    """Recursively unwrap exception chains and ExceptionGroups.
+
+    FlashError wraps ExceptionGroup whose str() hides
+    sub-exceptions.  This produces a flat, readable summary
+    of the full chain.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    queue: list[BaseException] = [exc]
+    while queue:
+        e = queue.pop(0)
+        if id(e) in seen:
+            continue
+        seen.add(id(e))
+        parts.append(f"{type(e).__name__}: {e}")
+        # Unwrap ExceptionGroup sub-exceptions
+        if isinstance(e, BaseExceptionGroup):
+            for sub in e.exceptions:
+                queue.append(sub)
+        # Follow the cause/context chain
+        if e.__cause__ is not None:
+            queue.append(e.__cause__)
+        elif e.__context__ is not None:
+            queue.append(e.__context__)
+    return "; ".join(parts)
 
 
 def _redact_flash_detail(
@@ -224,82 +346,29 @@ async def provision_jumpstarter(
         ssh_key_path=ssh_key_path,
     )
 
-    # ── Serial capture during provisioning ────────────
-    # Capture firmware, bootloader, and kernel messages
-    # during flash/boot/verify. Non-blocking: if serial
-    # fails to start, provisioning continues normally.
-    serial_proc = None
-    serial_log_fh = None
-    serial_log_path = ""
-    serial_filesystem = None
-
+    # NOTE: serial capture (j serial pipe) is intentionally NOT
+    # started during provisioning.  The serial pipe subprocess
+    # opens a gRPC tunnel to the board's serial port, which
+    # conflicts with the flash tool's own serial/pexpect
+    # connection inside reboot_to_console().  Running both
+    # concurrently on the same lease causes pexpect EOF — the
+    # flash tool's TCP port-forward gets closed because the
+    # serial port is already held by the pipe subprocess.
+    #
+    # Diagnosed by reproducing: "jmp shell -- j storage flash"
+    # succeeds from the pod when no serial pipe is running, but
+    # provision code that started serial pipe first failed
+    # consistently with pexpect EOF on the U-Boot '=>' prompt.
+    #
+    # Flash diagnostics come from _format_exception_chain() and
+    # flash-diagnostics.json.  Boot-phase serial capture is the
+    # benchmark agent's responsibility.
     if serial_capture and lease_name:
-        if artifact_dir:
-            if ticket_id:
-                from providers.execution import (
-                    AuditedFilesystem,
-                    RootedPath,
-                    durable_filesystem_emitter,
-                )
-
-                serial_filesystem = AuditedFilesystem(
-                    RootedPath(
-                        artifact_dir, "artifact", logical_prefix="platform-provision"
-                    ),
-                    ticket_id=ticket_id,
-                    emit=durable_filesystem_emitter(),
-                    critical=True,
-                )
-            else:
-                from providers.execution import AuditedFilesystem
-
-                serial_filesystem = AuditedFilesystem.system(artifact_dir)
-            serial_log_path = str(Path(artifact_dir) / "serial-capture.log")
-            serial_log_relative = "serial-capture.log"
-        else:
-            import tempfile
-
-            from providers.execution import AuditedFilesystem
-
-            serial_filesystem = AuditedFilesystem.system(Path(tempfile.gettempdir()))
-            serial_log_path = str(
-                serial_filesystem.temporary_file(
-                    prefix="serial-capture-", suffix=".log", mode=0o644
-                )
-            )
-            serial_log_relative = serial_log_path
-        try:
-            serial_log_fh = serial_filesystem.open_stream(
-                serial_log_relative, mode=0o644 if not ticket_id else 0o600
-            )
-            serial_proc = await AuditedSubprocessRunner().start(
-                [
-                    "jmp",
-                    "shell",
-                    f"--lease={lease_name}",
-                    "--",
-                    "j",
-                    "serial",
-                    "pipe",
-                ],
-                stdout=serial_log_fh,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            logger.info(
-                "[platform] Serial capture started (lease=%s, pid=%s, log=%s)",
-                lease_name,
-                serial_proc.pid,
-                serial_log_path,
-            )
-        except Exception as e:
-            logger.warning(
-                "[platform] Failed to start serial capture: %s",
-                e,
-            )
-            serial_proc = None
-            if serial_log_fh:
-                serial_log_fh.close()
-                serial_log_fh = None
+        logger.info(
+            "[platform] Skipping pre-flash serial capture (conflicts "
+            "with flash tool serial access); boot-phase capture is "
+            "handled by the benchmark agent"
+        )
 
     try:
         # Run the blocking Jumpstarter SDK calls in a
@@ -355,40 +424,7 @@ async def provision_jumpstarter(
             exc_info=True,
         )
     finally:
-        # ── Stop serial capture ──────────────────────
-        if serial_proc:
-            try:
-                serial_proc.terminate()
-                await serial_proc.wait(timeout=5)
-            except Exception:
-                # The tracked wait has already escalated to kill.
-                pass
-        if serial_log_fh:
-            serial_log_fh.close()
-
-    # ── Process serial output ─────────────────────
-    if serial_proc and serial_log_path:
-        result.serial_log_path = serial_log_path
-        logger.info(
-            "[platform] Serial capture saved to %s",
-            serial_log_path,
-        )
-        if not result.success:
-            try:
-                log_text = Path(serial_log_path).read_text(
-                    encoding="utf-8", errors="replace"
-                )
-                if log_text.strip():
-                    tail = log_text[-2000:]
-                    result.diagnostics.append(
-                        f"Serial output (last 2000 chars):\n{tail}"
-                    )
-                else:
-                    result.diagnostics.append(
-                        "Serial: no output captured (board may not have booted)"
-                    )
-            except Exception:
-                pass
+        pass
 
     if diag:
         result.diagnostics.extend(diag)
@@ -523,24 +559,15 @@ async def _run_provision_steps(
     """Execute the deterministic provision steps."""
     # ── Step 1: Flash ────────────────────────────────
     # Ensure the board is in a known power state before
-    # flashing.  After a lease expiry mid-benchmark the
-    # board may be mid-boot or hung — flashing without a
-    # clean power cycle fails with "Failed to get U-Boot
-    # prompt."
-    import asyncio as _asyncio
-
+    # The flash tool (client.storage.flash) does its own
+    # internal power cycle via reboot_to_console().  A
+    # pre-flash power cycle through the same client session
+    # leaves stale serial/port-forward state that causes
+    # the flash tool's pexpect to get EOF on the U-Boot
+    # prompt.  Diagnosed by comparing pod SDK calls (fail)
+    # vs separate jmp shell sessions (succeed) — the latter
+    # get fresh gRPC connections with no carried-over state.
     from anyio import to_thread
-
-    logger.info("[platform] Power cycling %s before flash", result.board_name)
-    try:
-        await to_thread.run_sync(lambda: client.power.off())
-        await _asyncio.sleep(5)
-        await to_thread.run_sync(lambda: client.power.on())
-        await _asyncio.sleep(10)
-        diag.append("Pre-flash power cycle OK")
-    except Exception as exc:
-        diag.append(f"Pre-flash power cycle warning: {exc}")
-        logger.warning("[platform] Pre-flash power cycle failed: %s", exc)
 
     if isinstance(flash_url, dict):
         logger.info(
@@ -560,7 +587,7 @@ async def _run_provision_steps(
         result.flash_duration_s = time.monotonic() - t0
         # Use repr() for ExceptionGroup/TaskGroup so sub-exception
         # messages are visible in diagnostics, not just the group label.
-        safe_exc = _redact_flash_detail(ticket_id, repr(exc))
+        safe_exc = _redact_flash_detail(ticket_id, _format_exception_chain(exc))
         diag.append(f"Flash failed ({result.flash_duration_s:.0f}s): {safe_exc}")
         logger.error(
             "[platform] Flash failed for %s (%s) after %.0fs: %s",
@@ -579,7 +606,7 @@ async def _run_provision_steps(
             diag.append(f"Flash retry succeeded in {result.flash_duration_s:.0f}s")
         except Exception as exc2:
             retry_duration = time.monotonic() - t0
-            safe_exc2 = _redact_flash_detail(ticket_id, repr(exc2))
+            safe_exc2 = _redact_flash_detail(ticket_id, _format_exception_chain(exc2))
             diag.append(f"Flash retry failed ({retry_duration:.0f}s): {safe_exc2}")
             logger.error(
                 "[platform] Flash retry failed for %s (%s) after %.0fs: %s",
@@ -591,6 +618,9 @@ async def _run_provision_steps(
             if is_infrastructure_error(exc) or is_infrastructure_error(exc2):
                 result.infrastructure_error = True
                 diag.append(_INFRASTRUCTURE_ERROR_DIAGNOSTIC)
+            # Probe board state after flash failure so the synthesis
+            # agent can distinguish power, serial, and firmware issues.
+            await _probe_board_after_flash_failure(client, diag)
             # Write diagnostics directly to artifact so they
             # survive even if the LLM is unavailable to process
             # the tool result.
@@ -758,3 +788,107 @@ async def _run_provision_steps(
         ip,
     )
     return result
+
+
+async def prepare_and_provision(
+    custom_fields: dict[str, Any],
+    ticket_id: str = "",
+) -> tuple[ProvisionResult, str]:
+    """Prepare arguments from ticket fields and run provisioning.
+
+    Maps Jumpstarter ticket metadata (jumpstarter_flash,
+    resource_provider_metadata, directives) to provision_jumpstarter()
+    parameters.  This keeps ticket-field parsing in the Jumpstarter
+    module instead of the generic platform server.
+
+    Returns:
+        (ProvisionResult, artifact_dir) tuple.
+    """
+    flash_info = custom_fields.get("jumpstarter_flash") or {}
+    metadata = custom_fields.get("resource_provider_metadata") or {}
+
+    if flash_info.get("error"):
+        return (
+            ProvisionResult(
+                diagnostics=[
+                    f"Flash resolution error: {flash_info['error']}",
+                    f"Available variants: {flash_info.get('available_variants', [])}",
+                ],
+            ),
+            "",
+        )
+
+    # Resolve flash URL(s) from structured targets or legacy command string.
+    flash_targets = flash_info.get("flash_targets", [])
+    if flash_targets:
+        if len(flash_targets) == 1:
+            flash_url: str | dict[str, str] = flash_targets[0].get("url", "")
+        else:
+            flash_url = {
+                t["partition"]: t["url"]
+                for t in flash_targets
+                if t.get("partition") and t.get("url")
+            }
+    else:
+        flash_command = flash_info.get("flash_command", "")
+        if not flash_command:
+            return (
+                ProvisionResult(
+                    diagnostics=[
+                        "No flash_targets or flash_command in jumpstarter_flash"
+                    ],
+                ),
+                "",
+            )
+        flash_url = ""
+        for part in flash_command.split():
+            if part.startswith("http"):
+                flash_url = part
+                break
+        if not flash_url:
+            flash_url = flash_command.replace("j storage flash ", "").strip()
+
+    ssh_public_key = flash_info.get("ssh_public_key", "")
+    ssh_key_path = flash_info.get("ssh_key_path", "") or custom_fields.get(
+        "ssh_key_path", ""
+    )
+
+    if not ssh_public_key and ssh_key_path:
+        pub_path = (
+            Path(ssh_key_path)
+            .expanduser()
+            .with_suffix(Path(ssh_key_path).suffix + ".pub")
+        )
+        if pub_path.exists():
+            ssh_public_key = pub_path.read_text().strip()
+
+    board_name = metadata.get("exporter_name", "")
+    lease_id = metadata.get("lease_id", "")
+    selector = metadata.get("selector", "")
+    lease_duration_seconds = metadata.get("duration_seconds")
+
+    directives = custom_fields.get("directives") or {}
+    serial_enabled = directives.get("serial_capture", False)
+
+    artifact_dir = ""
+    if ticket_id:
+        from paths import create_artifact_dir
+
+        artifact_dir = str(create_artifact_dir(ticket_id, "platform-provision"))
+
+    provision_kwargs: dict[str, Any] = {
+        "lease_name": lease_id,
+        "flash_url": flash_url,
+        "ssh_public_key": ssh_public_key,
+        "ssh_key_path": ssh_key_path,
+        "board_name": board_name,
+        "selector": selector,
+        "serial_capture": serial_enabled,
+        "artifact_dir": artifact_dir,
+        "ticket_id": ticket_id,
+    }
+    if isinstance(lease_duration_seconds, int) and lease_duration_seconds > 0:
+        provision_kwargs["lease_duration_seconds"] = lease_duration_seconds
+
+    result = await provision_jumpstarter(**provision_kwargs)
+    return result, artifact_dir

@@ -170,7 +170,7 @@ def test_failed_insert_rolls_back_sequence_allocation(tmp_path: Path) -> None:
 def test_busy_database_is_an_explicit_write_error(tmp_path: Path) -> None:
     path = tmp_path / "trace.db"
     with TraceStore(path):
-        blocked = TraceStore(path, busy_timeout_ms=1)
+        blocked = TraceStore(path, busy_timeout_ms=1, trace_retention_days=0)
         blocker = sqlite3.connect(path, isolation_level=None)
         try:
             blocker.execute("BEGIN EXCLUSIVE")
