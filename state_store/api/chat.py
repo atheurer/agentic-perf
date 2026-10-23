@@ -7,12 +7,17 @@ chat agent uses it for all downstream API calls.
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+from starlette.responses import StreamingResponse
 
 from ..auth import Principal
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -185,6 +190,79 @@ async def send_message(
 
     usage = agent.get_usage(user)
     return ChatMessageResponse(response=response_text, usage=usage)
+
+
+@router.post("/message/stream")
+async def send_message_stream(
+    body: ChatMessageRequest,
+    request: Request,
+):
+    """Stream chat response as Server-Sent Events.
+
+    Keeps the HTTP connection alive with SSE chunks, preventing
+    reverse-proxy timeouts (e.g. OpenShift route 504s).
+    """
+    agent = _get_chat_agent(request)
+    principal = _get_principal(request)
+    user = _get_user(request)
+    token = _get_token(request)
+    is_anonymous = principal.kind == "anonymous"
+
+    if is_anonymous:
+        anonymous_read = getattr(request.app.state, "anonymous_read", False)
+        if not anonymous_read:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required for chat",
+            )
+        token = getattr(request.app.state, "api_token", "")
+        if not token:
+            raise HTTPException(
+                status_code=503,
+                detail="Chat unavailable for anonymous users",
+            )
+
+    async def event_generator():
+        import asyncio
+
+        # Run the LLM call in a task so we can send heartbeats
+        # while it processes.  SSE comments (": heartbeat\n\n")
+        # are ignored by browsers but keep the reverse-proxy
+        # connection alive past its idle timeout.
+        task = asyncio.create_task(
+            agent.handle_message(
+                user=user,
+                message=body.message,
+                auth_token=token,
+                ticket_context=body.ticket_context,
+                readonly=is_anonymous,
+            )
+        )
+        try:
+            while not task.done():
+                yield ": heartbeat\n\n"
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=15)
+                except asyncio.TimeoutError:
+                    pass  # task still running, send another heartbeat
+            response_text = task.result()
+        except Exception:
+            logger.exception("Chat streaming failed")
+            if not task.done():
+                task.cancel()
+            response_text = (
+                "Sorry, I encountered an error processing your "
+                "message. Please try again or rephrase your request."
+            )
+        yield f"data: {json.dumps({'text': response_text})}\n\n"
+        usage = agent.get_usage(user)
+        yield f"data: {json.dumps({'done': True, 'usage': usage})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/history", response_model=ChatHistoryResponse)
