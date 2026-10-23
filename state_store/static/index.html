@@ -1805,12 +1805,16 @@ let autoScroll = true;
 let maxRenderedSeq = 0;
 let renderedEventCount = 0;
 var eventRecords = [];
+let earliestLoadedSeq = Infinity;
+let historyLoadInFlight = false;
+let snapshotTotalEvents = 0;
+let eventPageSize = 50;
 var eventView = 'activity';
 var eventSearch = '';
 var condenseEvents = true;
 var _chartInstances = {};
 
-const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
+const TERMINAL_STATUSES = new Set(['closed']);
 function isTerminalStatus(s) { return TERMINAL_STATUSES.has(s); }
 
 // Ticket-level terminal statuses from the state machine.
@@ -2365,7 +2369,13 @@ async function loadTickets() {
 
 async function renderDetail(ticketId) {
   const app = document.getElementById('app');
-  app.innerHTML = '<div class="spinner"></div> Loading ticket...';
+  app.innerHTML =
+    '<div class="detail-toolbar">' +
+      '<div class="breadcrumb">' +
+        '<a href="#/">Dashboard</a> / ' + escHtml(ticketId) +
+      '</div>' +
+    '</div>' +
+    '<div class="spinner"></div> Loading ticket...';
 
   // Clear event state immediately to prevent stale events
   // from a previous ticket showing during the async fetch.
@@ -2373,6 +2383,13 @@ async function renderDetail(ticketId) {
   maxRenderedSeq = 0;
   renderedEventCount = 0;
   eventRecords = [];
+  autoScroll = true;
+  earliestLoadedSeq = Infinity;
+  historyLoadInFlight = false;
+  snapshotTotalEvents = 0;
+  eventPageSize = 50;
+  earliestLoadedSeq = Infinity;
+  historyLoadInFlight = false;
 
   try {
     const ticket = await api('/tickets/' + ticketId);
@@ -2384,8 +2401,6 @@ async function renderDetail(ticketId) {
     trailStates = (ticket.status_trail && ticket.status_trail.length > 0)
       ? ticket.status_trail.slice()
       : [ticket.status];
-    rebuildTrail();
-
     var ownershipHtml = '';
     if (_isMultiUser) {
       var owners = ticket.owners || [];
@@ -2404,6 +2419,7 @@ async function renderDetail(ticketId) {
       '</div>';
     }
     _currentDetailTicket = ticket;
+    document.title = ticket.id + ' — Agentic Perf';
 
     app.innerHTML =
       '<div class="detail-view">' +
@@ -2476,6 +2492,7 @@ async function renderDetail(ticketId) {
           '<div class="panel-divider" id="panel-divider"></div>' +
           '<div class="detail-right-panel">' +
             '<div class="transition-trail" id="transition-trail"></div>' +
+            '<div id="load-history-container"></div>' +
             '<div class="event-stream-scroll" id="event-stream"></div>' +
           '</div>' +
         '</div>' +
@@ -2520,18 +2537,83 @@ async function renderDetail(ticketId) {
     });
     bindActionButtons(ticketId);
     initPanelDivider();
+    rebuildTrail();
+    rebuildTrail();
 
-    // Initial load: fetch ALL events at once for complete
-    // breadcrumbs and history. Only poll for NEW events after.
+    // Initial load: fetch snapshot for efficient single-call loading.
+    var _snapshotTicketTerminal = false;
     try {
-      var initData = await api('/tickets/' + ticketId + '/transcript');
-      var initEvents = initData.events || [];
-      if (initEvents.length > 0) {
-        lastSeq = maxEventSeq(initEvents);
-        renderNewEvents(initEvents);
+      // Calculate how many visible events to load based on pane height.
+      // Each event row is ~35px; load 3x the visible area for smooth scrolling.
+      var streamEl = document.getElementById('event-stream');
+      var paneHeight = (streamEl && streamEl.clientHeight) || 500;
+      var eventsPerScreen = Math.max(15, Math.ceil(paneHeight / 35));
+      var targetEvents = eventsPerScreen * 3;
+      eventPageSize = eventsPerScreen;
+      var viewParam = eventView === 'audit' ? 'all' : 'activity';
+      var snapshot = await api('/tickets/' + ticketId + '/snapshot?recent=' + targetEvents + '&view=' + viewParam);
+      lastSeq = snapshot.latest_seq;
+      var rawCountEl = document.getElementById('raw-event-count');
+      if (rawCountEl) rawCountEl.textContent = snapshot.total_events + ' total events';
+      var countEl = document.getElementById('event-count');
+      if (countEl) countEl.textContent = snapshot.total_events;
+      var recentEvents = snapshot.recent_events || [];
+      snapshotTotalEvents = snapshot.total_events || 0;
+      if (recentEvents.length > 0) {
+        earliestLoadedSeq = recentEvents[0].seq;
+        renderNewEvents(recentEvents);
       }
+      // Check if rendered content overflows the pane. If not,
+      // trigger an immediate lazy load — scroll events won't fire
+      // on a non-overflowing container. Use actual DOM height, not
+      // event count, because grouped/collapsed events render smaller
+      // than individual rows.
+      var _stream = document.getElementById('event-stream');
+      var _needsMore = snapshotTotalEvents > recentEvents.length && earliestLoadedSeq > 1;
+      if (_needsMore) {
+        if (recentEvents.length === 0) {
+          earliestLoadedSeq = snapshot.latest_seq || 0;
+        }
+        // Defer to next frame so the DOM has rendered
+        requestAnimationFrame(function() {
+          var s = document.getElementById('event-stream');
+          if (s && s.scrollHeight <= s.clientHeight) {
+            loadEarlierEvents(ticketId);
+          }
+        });
+      }
+      // Scroll to bottom after initial render
+      requestAnimationFrame(function() {
+        var s = document.getElementById('event-stream');
+        if (s) s.scrollTop = s.scrollHeight;
+      });
+      // Populate usage sidebar from snapshot data
+      renderUsageData(snapshot);
+      // Scroll hint is shown conditionally after the overflow check.
+      // Don't show it upfront — loadEarlierEvents will determine
+      // if there's actually more visible content to load.
+      var stream = document.getElementById('event-stream');
+      if (stream) {
+        stream.addEventListener('scroll', function() {
+          if (stream.scrollTop < 50 && earliestLoadedSeq > 1 && !historyLoadInFlight) {
+            loadEarlierEvents(currentTicketId);
+          }
+        });
+      }
+      // Check if ticket is terminal — skip polling if so
+      _snapshotTicketTerminal = isTerminalStatus(ticket.status);
     } catch (e) {
-      console.warn('Initial event load failed:', e);
+      console.warn('Snapshot load failed, falling back to transcript:', e);
+      try {
+        var initData = await api('/tickets/' + ticketId + '/transcript');
+        var initEvents = initData.events || [];
+        if (initEvents.length > 0) {
+          lastSeq = maxEventSeq(initEvents);
+          renderNewEvents(initEvents);
+        }
+      } catch (e2) {
+        console.warn('Transcript load also failed:', e2);
+      }
     }
 
     // Load artifacts
@@ -2550,7 +2632,15 @@ async function renderDetail(ticketId) {
       if (globalChat) globalChat.style.display = 'none';
     }
 
-    pollTimer = setInterval(function() { pollEvents(ticketId); }, 2000);
+    // Always update introspection card once on load (for closed
+    // tickets where polling is skipped, this is the only chance).
+    updateIntrospectionCard(ticketId, ticket);
+    updateUsageSidebar(ticketId);
+
+    // Only start polling if ticket is not in a terminal state
+    if (!_snapshotTicketTerminal) {
+      pollTimer = setInterval(function() { pollEvents(ticketId); }, 2000);
+    }
     // Re-check artifacts periodically (created during ticket run)
     artifactTimer = setInterval(function() { loadArtifacts(ticketId); }, 10000);
   } catch (err) {
@@ -3247,7 +3337,8 @@ async function pollEvents(ticketId) {
     // discard the response to prevent stale event injection.
     if (ticketId !== currentTicketId) return;
     var newEvents = data.events || [];
-    if (newEvents.length > 0) {
+    var hasNewEvents = newEvents.length > 0;
+    if (hasNewEvents) {
       lastSeq = data.latest_seq;
       renderNewEvents(newEvents);
     }
@@ -3268,7 +3359,9 @@ async function pollEvents(ticketId) {
       bindActionButtons(ticketId);
     }
     refreshResultSection(ticketId, ticket);
-    updateUsageSidebar(ticketId);
+    if (hasNewEvents) {
+      updateUsageSidebar(ticketId);
+    }
     updateIntrospectionCard(ticketId, ticket);
 
     // Proactive HITL: notify chat when ticket needs guidance
@@ -3563,11 +3656,7 @@ function _attachNarrativeOpenClick(container) {
   });
 }
 
-async function updateUsageSidebar(ticketId) {
-  if (usageSidebarPollInFlight) return;
-  usageSidebarPollInFlight = true;
-  try {
-    var data = await api('/tickets/' + ticketId + '/usage');
+function renderUsageData(data) {
     var el = document.getElementById('llm-usage');
     if (!el || !data.usage) return;
     var u = data.usage;
@@ -3636,6 +3725,14 @@ async function updateUsageSidebar(ticketId) {
       agentHtml += '</div>';
       el.innerHTML += agentHtml;
     }
+}
+
+async function updateUsageSidebar(ticketId) {
+  if (usageSidebarPollInFlight) return;
+  usageSidebarPollInFlight = true;
+  try {
+    var data = await api('/tickets/' + ticketId + '/usage');
+    renderUsageData(data);
   } catch {} finally {
     usageSidebarPollInFlight = false;
   }
@@ -3809,7 +3906,9 @@ function renderEventStream() {
 
   renderedEventCount = visible.length;
   var countEl = document.getElementById('event-count');
-  if (countEl) countEl.textContent = renderedEventCount;
+  if (countEl) countEl.textContent = snapshotTotalEvents > 0
+    ? renderedEventCount + ' / ' + snapshotTotalEvents
+    : renderedEventCount;
   var rawCountEl = document.getElementById('raw-event-count');
   if (rawCountEl) rawCountEl.textContent = eventRecords.length + ' raw records loaded';
   var countLabel = document.getElementById('event-count-label');
@@ -3819,6 +3918,48 @@ function renderEventStream() {
       : 'activity records shown';
   }
   if (autoScroll) container.scrollTop = container.scrollHeight;
+}
+
+async function loadEarlierEvents(ticketId) {
+  if (historyLoadInFlight || earliestLoadedSeq <= 1) return;
+  if (!isFinite(earliestLoadedSeq)) return;
+  historyLoadInFlight = true;
+  var container = document.getElementById('load-history-container');
+  if (container) container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:4px;font-size:12px">Loading earlier events...</div>';
+  try {
+    var fetchFrom = Math.max(0, earliestLoadedSeq - 200);
+    var data = await api('/tickets/' + ticketId + '/events?since=' + fetchFrom + '&limit=' + eventPageSize + '&view=' + (eventView === 'audit' ? 'all' : 'activity'));
+    var olderEvents = (data.events || []).filter(function(e) { return e.seq < earliestLoadedSeq; });
+    var stream = document.getElementById('event-stream');
+    var prevHeight = stream ? stream.scrollHeight : 0;
+    var prevScroll = stream ? stream.scrollTop : 0;
+    if (olderEvents.length > 0) {
+      earliestLoadedSeq = Math.min.apply(null, olderEvents.map(function(e) { return e.seq; }));
+      for (var i = 0; i < olderEvents.length; i++) {
+        eventRecords.push(olderEvents[i]);
+      }
+      eventRecords.sort(function(a, b) { return a.seq - b.seq; });
+      autoScroll = false;
+      renderEventStream();
+      if (stream) {
+        stream.scrollTop = prevScroll + (stream.scrollHeight - prevHeight);
+      }
+    } else {
+      earliestLoadedSeq = 1;
+    }
+    if (container) {
+      if (earliestLoadedSeq <= 1) {
+        container.innerHTML = '';
+      } else {
+        container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:6px;font-size:11px;cursor:default">&uarr; Scroll up for earlier events</div>';
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load earlier events:', err);
+    if (container) container.innerHTML = '<div style="text-align:center;color:var(--red);padding:4px;font-size:12px">Failed to load &mdash; scroll up to retry</div>';
+  } finally {
+    historyLoadInFlight = false;
+  }
 }
 
 function renderNewEvents(events) {
