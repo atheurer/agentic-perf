@@ -48,6 +48,7 @@ class _FakeApprovalsAPI:
         *,
         fail_create: bool = False,
         resolve_lost: bool = False,
+        resolve_http_409: bool = False,
         apply_resolution: bool = True,
         fail_list: bool = False,
         mismatched_binding: bool = False,
@@ -55,12 +56,17 @@ class _FakeApprovalsAPI:
         apply_create: bool = True,
         create_status: str = "pending",
         create_returns_manual: bool = False,
+        create_http_5xx: bool = False,
         seed_unrelated: bool = False,
         seed_duplicate: bool = False,
+        consume_lost: bool = False,
+        consume_cancel: bool = False,
+        fail_list_after_consume: bool = False,
     ) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.fail_create = fail_create
         self.resolve_lost = resolve_lost
+        self.resolve_http_409 = resolve_http_409
         self.apply_resolution = apply_resolution
         self.fail_list = fail_list
         self.mismatched_binding = mismatched_binding
@@ -68,15 +74,22 @@ class _FakeApprovalsAPI:
         self.apply_create = apply_create
         self.create_status = create_status
         self.create_returns_manual = create_returns_manual
+        self.create_http_5xx = create_http_5xx
         self.seed_unrelated = seed_unrelated
         self.seed_duplicate = seed_duplicate
+        self.consume_lost = consume_lost
+        self.consume_cancel = consume_cancel
+        self.fail_list_after_consume = fail_list_after_consume
         self.approval_seq = 0
         self.approvals: list[dict] = []
 
     async def get(self, url: str, **kwargs) -> _Response:
         self.calls.append((str(url), {}))
         if str(url).endswith("/approvals"):
-            if self.fail_list:
+            if self.fail_list or (
+                self.fail_list_after_consume
+                and any(item.get("consumed_at") for item in self.approvals)
+            ):
                 return _Response(503, {"detail": "listing unavailable"})
             return _Response(200, {"approvals": self.approvals})
         return _Response(404, {"detail": "unexpected url"})
@@ -130,6 +143,8 @@ class _FakeApprovalsAPI:
                 )
             if self.create_lost:
                 raise ConnectionError("create response lost")
+            if self.create_http_5xx:
+                return _Response(503, {"detail": "create committed, response failed"})
             return _Response(200, approval)
         if "/resolve" in str(url):
             approval_id = str(url).split("/approvals/", 1)[1].split("/", 1)[0]
@@ -149,9 +164,27 @@ class _FakeApprovalsAPI:
                     approval["execution_intent_digest"] = "wrong"
             if self.resolve_lost:
                 raise ConnectionError("resolve response lost")
+            if self.resolve_http_409:
+                return _Response(409, {"detail": "approval already resolved"})
             return _Response(200, approval)
         if "/consume" in str(url):
-            return _Response(200, {"approval_request_id": "apr-auto"})
+            approval_id = str(url).split("/approvals/", 1)[1].split("/", 1)[0]
+            approval = next(
+                (
+                    item
+                    for item in self.approvals
+                    if item["approval_request_id"] == approval_id
+                ),
+                None,
+            )
+            if approval is None or approval.get("consumed_at"):
+                return _Response(409, {"detail": "approval unavailable"})
+            approval["consumed_at"] = datetime.now(timezone.utc).isoformat()
+            if self.consume_cancel:
+                raise asyncio.CancelledError()
+            if self.consume_lost:
+                raise ConnectionError("consume response lost")
+            return _Response(200, approval)
         if "/comments" in str(url):
             if not json.get("author"):
                 return _Response(422, {"detail": "author required"})
@@ -287,6 +320,26 @@ async def test_lost_resolve_response_reconciles_approved_binding(tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_resolve_409_after_commit_reconciles_approved_binding(
+    tmp_path, monkeypatch
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        resolve_http_409=True,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["status"] == "completed", result
+    assert len(_approval_calls(api, "/resolve")) == 1
+    assert len(_approval_calls(api, "/approvals/apr-auto1/consume")) == 1
+    assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("create_status", ["pending", "approved"])
 async def test_lost_create_response_reconciles_exact_binding(
     tmp_path, monkeypatch, create_status
@@ -309,6 +362,142 @@ async def test_lost_create_response_reconciles_exact_binding(
     )
     assert api.approvals[0]["status"] == "approved"
     assert api.approvals[1]["status"] == "pending"
+    assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_commits_but_returns_5xx_reuses_exact_approval(
+    tmp_path, monkeypatch
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        create_http_5xx=True,
+        seed_unrelated=True,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["status"] == "completed", result
+    assert (
+        len([url for url, body in api.calls if url.endswith("/approvals") and body])
+        == 1
+    )
+    assert [item["approval_request_id"] for item in api.approvals] == [
+        "apr-auto1",
+        "apr-unrelated",
+    ]
+    assert api.approvals[0]["consumed_at"]
+    assert api.approvals[1]["status"] == "pending"
+    assert len(_approval_calls(api, "/approvals/apr-auto1/consume")) == 1
+    assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_consume_commits_but_response_is_lost_launches_once(
+    tmp_path, monkeypatch
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        consume_lost=True,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["status"] == "completed", result
+    assert [item["approval_request_id"] for item in api.approvals] == ["apr-auto1"]
+    assert api.approvals[0]["consumed_at"]
+    assert len(_approval_calls(api, "/approvals/apr-auto1/consume")) == 1
+    assert len([call for call in calls if call[0] == "launch"]) == 1
+    store = TraceStore(tmp_path / "trace.db")
+    try:
+        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        assert operation.external_ids["approval_request_id"] == "apr-auto1"
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_consumed_approval_replays_without_second_consume(
+    tmp_path, monkeypatch
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        consume_cancel=True,
+    )
+    monkeypatch.setattr(benchmark_server, "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS", 0.3)
+
+    first_task = asyncio.create_task(
+        benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await first_task
+    assert not [call for call in calls if call[0] == "launch"]
+    store = TraceStore(tmp_path / "trace.db")
+    try:
+        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        assert operation.state == "prepared"
+        assert operation.external_ids["approval_request_id"] == "apr-auto1"
+        expiry = datetime.fromisoformat(operation.lease_expires_at)
+    finally:
+        store.close()
+    await asyncio.sleep(
+        max(0.0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.05
+    )
+    api.consume_cancel = False
+
+    replay = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert replay["status"] == "completed", replay
+    assert [item["approval_request_id"] for item in api.approvals] == ["apr-auto1"]
+    assert len(_approval_calls(api, "/approvals/apr-auto1/consume")) == 1
+    assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_uncertain_consume_readback_leaves_prepared_operation_reclaimable(
+    tmp_path, monkeypatch
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        consume_lost=True,
+        fail_list_after_consume=True,
+    )
+    monkeypatch.setattr(benchmark_server, "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS", 0.3)
+
+    first = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert first["reason_code"] == "approval_check_failed"
+    store = TraceStore(tmp_path / "trace.db")
+    try:
+        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        assert operation.state == "prepared"
+        assert operation.external_ids["approval_request_id"] == "apr-auto1"
+        expiry = datetime.fromisoformat(operation.lease_expires_at)
+    finally:
+        store.close()
+    await asyncio.sleep(
+        max(0.0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.05
+    )
+    api.fail_list_after_consume = False
+
+    replay = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert replay["status"] == "completed", replay
+    assert [item["approval_request_id"] for item in api.approvals] == ["apr-auto1"]
+    assert len(_approval_calls(api, "/approvals/apr-auto1/consume")) == 1
     assert len([call for call in calls if call[0] == "launch"]) == 1
 
 
@@ -518,6 +707,39 @@ async def test_preexisting_automatic_approval_is_reused_without_touching_manual_
     assert not _approval_calls(api, "/approvals/apr-manual/resolve")
     assert api.approvals[1]["status"] == "pending"
     assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_unrelated_consumed_automatic_approval_cannot_authorize_launch(
+    tmp_path, monkeypatch
+):
+    record, calls, api = _wire(
+        monkeypatch, tmp_path, directives={"user_pre_run_approval": False}
+    )
+    api.approvals.append(
+        {
+            "approval_request_id": "apr-unrelated-consumed",
+            "ticket_id": "T-788",
+            "kind": "benchmark_run_file",
+            "validation_id": "val-788",
+            "presented_run_file_digest": record["runfile_fingerprint"],
+            "execution_intent_digest": record["execution_intent_digest"],
+            "summary": "Automatic run-file approval (user_pre_run_approval=false)",
+            "session_id": "session-788",
+            "session_epoch": "epoch-1",
+            "claim_id": "claim-788",
+            "ticket_attempt": "claim-788",
+            "status": "approved",
+            "consumed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["reason_code"] == "approval_required"
+    assert not _approval_calls(api, "/consume")
+    assert not [call for call in calls if call[0] == "launch"]
 
 
 @pytest.mark.asyncio
