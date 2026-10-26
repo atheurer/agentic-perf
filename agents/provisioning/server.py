@@ -932,11 +932,19 @@ async def _verify_harness_install_one(
         # starts valkey/opensearch/cdm with the run), so they are not
         # probed here — the skill doc covers the preflight instead.
         identity_probe = _crucible_identity_probe_command()
-        identity_result = await _ssh.run(host, identity_probe, timeout=15)
-        if identity_result.exit_code == 0:
-            probe_lines = (identity_result.stdout or "").strip().splitlines()
-            if probe_lines and probe_lines[-1] in {"identity=0", "identity=1"}:
-                identity_ready = probe_lines[-1] == "identity=1"
+        try:
+            identity_result = await _ssh.run(host, identity_probe, timeout=15)
+        except Exception:
+            logger.warning(
+                "Read-only Crucible identity probe failed for %s",
+                host,
+                exc_info=True,
+            )
+        else:
+            if identity_result.exit_code == 0:
+                probe_lines = (identity_result.stdout or "").strip().splitlines()
+                if probe_lines and probe_lines[-1] in {"identity=0", "identity=1"}:
+                    identity_ready = probe_lines[-1] == "identity=1"
 
     context_ready = context is None or context["ready"]
     verified = harness_verified and context_ready

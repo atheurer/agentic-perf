@@ -1066,6 +1066,34 @@ async def test_identity_probe_failure_is_not_reported_as_missing_email(
     assert "missing CRUCIBLE_EMAIL" not in result["message"]
 
 
+@pytest.mark.asyncio
+async def test_identity_probe_spawn_exception_leaves_readiness_unknown(
+    mock_ssh, monkeypatch
+):
+    from agents.provisioning import server
+
+    original_run = mock_ssh.run
+
+    async def fail_identity_probe(host, command, timeout=300):
+        if "/root/.crucible/identity" in command:
+            raise OSError("could not create SSH subprocess")
+        return await original_run(host, command, timeout=timeout)
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    monkeypatch.setattr(mock_ssh, "run", fail_identity_probe)
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is True
+    assert result["identity_ready"] is None
+    assert "identity probe did not complete" in result["message"]
+    assert "missing CRUCIBLE_EMAIL" not in result["message"]
+
+
 @pytest.mark.parametrize(
     ("identity_contents", "expected"),
     [
