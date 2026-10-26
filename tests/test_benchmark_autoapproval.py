@@ -11,13 +11,17 @@ automatic) and lets its normal path perform the single atomic consume
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
 
 import agents.benchmark.server as benchmark_server
 import agents.server_utils as server_utils
-from tests.test_benchmark_idempotency import _crucible_fixture
+from tests.test_benchmark_idempotency import (
+    _crucible_fixture,
+    _wait_for_event_or_producer,
+)
 
 
 class _Response:
@@ -29,14 +33,39 @@ class _Response:
     def json(self) -> dict:
         return self._payload
 
+    def raise_for_status(self) -> None:
+        if self.status_code >= 300:
+            raise RuntimeError(self.text)
+
 
 class _FakeApprovalsAPI:
     """Records approval-API calls; create/resolve/comment succeed."""
 
-    def __init__(self, *, fail_create: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_create: bool = False,
+        resolve_lost: bool = False,
+        apply_resolution: bool = True,
+        fail_list: bool = False,
+        mismatched_binding: bool = False,
+    ) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.fail_create = fail_create
+        self.resolve_lost = resolve_lost
+        self.apply_resolution = apply_resolution
+        self.fail_list = fail_list
+        self.mismatched_binding = mismatched_binding
         self.approval_seq = 0
+        self.approvals: list[dict] = []
+
+    async def get(self, url: str, **kwargs) -> _Response:
+        self.calls.append((str(url), {}))
+        if str(url).endswith("/approvals"):
+            if self.fail_list:
+                return _Response(503, {"detail": "listing unavailable"})
+            return _Response(200, {"approvals": self.approvals})
+        return _Response(404, {"detail": "unexpected url"})
 
     async def post(self, url: str, json: dict | None = None, **kwargs) -> _Response:
         self.calls.append((str(url), dict(json or {})))
@@ -44,16 +73,32 @@ class _FakeApprovalsAPI:
             if self.fail_create:
                 return _Response(409, {"detail": "approval rejected: claim_expired"})
             self.approval_seq += 1
-            return _Response(
-                200, {"approval_request_id": f"apr-auto{self.approval_seq}"}
+            approval_id = f"apr-auto{self.approval_seq}"
+            self.approvals.append(
+                {
+                    "approval_request_id": approval_id,
+                    "ticket_id": "T-788",
+                    "kind": "benchmark_run_file",
+                    "status": "pending",
+                    "validation_id": json["validation_id"],
+                    "presented_run_file_digest": json["presented_run_file_digest"],
+                    "execution_intent_digest": json.get("execution_intent_digest"),
+                }
             )
+            return _Response(200, {"approval_request_id": approval_id})
         if "/resolve" in str(url):
-            return _Response(
-                200, {"approval_request_id": "apr-auto", "status": "approved"}
-            )
+            if self.apply_resolution:
+                self.approvals[-1]["status"] = "approved"
+                if self.mismatched_binding:
+                    self.approvals[-1]["execution_intent_digest"] = "wrong"
+            if self.resolve_lost:
+                raise ConnectionError("resolve response lost")
+            return _Response(200, self.approvals[-1])
         if "/consume" in str(url):
             return _Response(200, {"approval_request_id": "apr-auto"})
         if "/comments" in str(url):
+            if not json.get("author"):
+                return _Response(422, {"detail": "author required"})
             return _Response(200, {})
         return _Response(404, {"detail": "unexpected url"})
 
@@ -73,10 +118,18 @@ class _FakeClient:
         return None
 
 
-def _wire(monkeypatch, tmp_path, *, directives: dict | None, fail_create=False):
+def _wire(
+    monkeypatch,
+    tmp_path,
+    *,
+    directives: dict | None,
+    launch=None,
+    **api_options,
+):
     """Reuse the deterministic crucible fixture, then add directives and
     the fake approvals API."""
-    record, calls = _crucible_fixture(tmp_path, monkeypatch)
+    record, calls = _crucible_fixture(tmp_path, monkeypatch, launch=launch)
+    record["execution_intent_digest"] = "e" * 64
     # A ticket-owned MCP server receives its causal context at launch;
     # restore the same environment so the trace context resolves.
     monkeypatch.setenv("AGENTIC_PERF_TRACE_ID", "a" * 32)
@@ -97,7 +150,7 @@ def _wire(monkeypatch, tmp_path, *, directives: dict | None, fail_create=False):
         return ticket
 
     monkeypatch.setattr(server_utils, "assert_ticket_active", active_check)
-    api = _FakeApprovalsAPI(fail_create=fail_create)
+    api = _FakeApprovalsAPI(**api_options)
     _FakeClient.api = api
     monkeypatch.setattr("providers.execution.AuditedAsyncHTTPClient", _FakeClient)
     return record, calls, api
@@ -133,12 +186,119 @@ async def test_autoapproval_runs_the_benchmark_without_a_pause(tmp_path, monkeyp
     assert create_bodies[0]["kind"] == "benchmark_run_file"
     assert create_bodies[0]["summary"].startswith("Automatic run-file approval")
     assert create_bodies[0]["validation_id"] == "val-788"
+    assert create_bodies[0]["execution_intent_digest"] == "e" * 64
     assert create_bodies[0]["invocation_id"]
     assert create_bodies[0]["tool_call_id"] == "execute-benchmark-autoapproval"
     # The single consume happens on execute_benchmark's normal path.
     assert any("/consume" in u for u in urls)
     # The ticket carries the audit note.
     assert any("/comments" in u for u in urls)
+    comment_bodies = [body for url, body in api.calls if "/comments" in url]
+    assert comment_bodies[0]["author"] == "benchmark-agent/execute_benchmark"
+    assert "apr-auto1" in comment_bodies[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_lost_resolve_response_reconciles_approved_binding(tmp_path, monkeypatch):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        resolve_lost=True,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["status"] == "completed"
+    assert len(_approval_calls(api, "/resolve")) == 1
+    assert (
+        len(
+            [
+                url
+                for url, body in api.calls
+                if url.endswith("/approvals") and body == {}
+            ]
+        )
+        == 1
+    )
+    assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api_options",
+    [
+        {"resolve_lost": True, "apply_resolution": False},
+        {"resolve_lost": True, "fail_list": True},
+        {"resolve_lost": True, "mismatched_binding": True},
+    ],
+)
+async def test_unconfirmed_resolution_fails_closed(tmp_path, monkeypatch, api_options):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        **api_options,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["status"] == "rejected"
+    assert result["reason_code"] == "approval_required"
+    assert not _approval_calls(api, "/consume")
+    assert not [call for call in calls if call[0] == "launch"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_and_terminal_replay_create_one_approval(
+    tmp_path, monkeypatch
+):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def launch():
+        entered.set()
+        await release.wait()
+
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        launch=launch,
+    )
+    first_task = asyncio.create_task(
+        benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    try:
+        await _wait_for_event_or_producer(
+            entered, first_task, operation="benchmark launch"
+        )
+        concurrent = json.loads(
+            await benchmark_server.execute_benchmark(
+                "controller", validation_id="val-788"
+            )
+        )
+        assert concurrent["reason_code"] == "existing_operation"
+        release.set()
+        first = json.loads(await first_task)
+    finally:
+        release.set()
+        if not first_task.done():
+            first_task.cancel()
+        await asyncio.gather(first_task, return_exceptions=True)
+    replay = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert first["status"] == replay["status"] == "completed"
+    assert replay["existing_operation"] is True
+    assert (
+        len([url for url, body in api.calls if url.endswith("/approvals") and body])
+        == 1
+    )
+    assert len(_approval_calls(api, "/resolve")) == 1
+    assert len([call for call in calls if call[0] == "launch"]) == 1
 
 
 @pytest.mark.asyncio
@@ -195,3 +355,14 @@ async def test_autoapproval_creation_failure_rejected(tmp_path, monkeypatch):
     assert result["reason_code"] == "approval_required"
     assert "claim_expired" in result["auto_approval_error"]
     assert not [c for c in calls if c[0] == "launch"]
+
+    replay = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert replay["status"] == "rejected"
+    assert replay["reason_code"] == "approval_required"
+    assert replay["existing_operation"] is True
+    assert (
+        len([url for url, body in api.calls if url.endswith("/approvals") and body])
+        == 1
+    )
