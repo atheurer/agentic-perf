@@ -1039,6 +1039,33 @@ async def test_verify_crucible_warns_when_identity_is_missing(mock_ssh, monkeypa
     assert "CRUCIBLE_EMAIL" in result["message"]
 
 
+@pytest.mark.asyncio
+async def test_identity_probe_failure_is_not_reported_as_missing_email(
+    mock_ssh, monkeypatch
+):
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
+        "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+        "/root/.crucible/identity": SSHResult(
+            stdout="", stderr="SSH probe failed", exit_code=255
+        ),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is True
+    assert result["identity_ready"] is None
+    assert "identity probe did not complete" in result["message"]
+    assert "missing CRUCIBLE_EMAIL" not in result["message"]
+
+
 @pytest.mark.parametrize(
     ("identity_contents", "expected"),
     [

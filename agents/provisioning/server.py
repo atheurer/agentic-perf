@@ -893,6 +893,7 @@ async def _verify_harness_install_one(
     )
     harness_verified = result.exit_code == 0 or zathras_help_succeeded
     context: dict[str, Any] | None = None
+    identity_ready: bool | None = None
 
     # The context gateway bootstraps Crucible from the controller's installed
     # tree.  Keep this harness-specific detail in the provisioning result, not
@@ -932,7 +933,10 @@ async def _verify_harness_install_one(
         # probed here — the skill doc covers the preflight instead.
         identity_probe = _crucible_identity_probe_command()
         identity_result = await _ssh.run(host, identity_probe, timeout=15)
-        identity_ready = "identity=1" in (identity_result.stdout or "")
+        if identity_result.exit_code == 0:
+            probe_lines = (identity_result.stdout or "").strip().splitlines()
+            if probe_lines and probe_lines[-1] in {"identity=0", "identity=1"}:
+                identity_ready = probe_lines[-1] == "identity=1"
 
     context_ready = context is None or context["ready"]
     verified = harness_verified and context_ready
@@ -949,11 +953,17 @@ async def _verify_harness_install_one(
             else f"Verification failed: {error_output[:200]}"
         )
     )
-    if harness_name == "crucible" and verified and not identity_ready:
-        message += (
-            " (warning: /root/.crucible/identity is missing CRUCIBLE_EMAIL — "
-            "run-file validation will fail until it is set)"
-        )
+    if harness_name == "crucible" and verified:
+        if identity_ready is False:
+            message += (
+                " (warning: /root/.crucible/identity is missing CRUCIBLE_EMAIL — "
+                "run-file validation will fail until it is set)"
+            )
+        elif identity_ready is None:
+            message += (
+                " (warning: the read-only Crucible identity probe did not "
+                "complete successfully, so CRUCIBLE_EMAIL could not be checked)"
+            )
     return {
         "host": host,
         "harness": harness_name,
