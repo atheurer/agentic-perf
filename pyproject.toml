@@ -19,7 +19,8 @@ dependencies = [
     # constrained instead of accepting an incompatible future SDK release.
     # mcp 1.30.0 is the first patched release for CVE-2026-59951.
     "mcp~=1.30.0",
-    "fastmcp~=3.4.2",
+    # FastMCP 3.4.10 fixes the component authorization bypass GHSA-7xgj-8392-5q4r.
+    "fastmcp~=3.4.10",
 ]
 
 [tool.setuptools.packages.find]
