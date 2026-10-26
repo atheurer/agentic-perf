@@ -988,7 +988,7 @@ def _crucible_identity_probe_command(
         'substr(value, length(value), 1) == sprintf("%c", 39))) '
         "value = substr(value, 2, length(value) - 2); "
         'gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); '
-        'if (value != "" && value !~ /^#/) found = 1 '
+        'found = (value != "" && value !~ /^#/) '
         f"}} END {{ exit !found }}' {quoted_path}; "
         "then printf 'identity=1'; else printf 'identity=0'; fi"
     )

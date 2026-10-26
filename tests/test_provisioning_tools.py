@@ -1048,6 +1048,14 @@ async def test_verify_crucible_warns_when_identity_is_missing(mock_ssh, monkeypa
         ("CRUCIBLE_EMAIL=''\n", "identity=0"),
         ("# CRUCIBLE_EMAIL=person@example.com\n", "identity=0"),
         ("CRUCIBLE_EMAIL= # not configured\n", "identity=0"),
+        (
+            'CRUCIBLE_EMAIL="person@example.com"\nCRUCIBLE_EMAIL=""\n',
+            "identity=0",
+        ),
+        (
+            'CRUCIBLE_EMAIL=""\nCRUCIBLE_EMAIL="person@example.com"\n',
+            "identity=1",
+        ),
     ],
     ids=[
         "double-quoted",
@@ -1056,6 +1064,8 @@ async def test_verify_crucible_warns_when_identity_is_missing(mock_ssh, monkeypa
         "empty-single",
         "commented",
         "empty-with-comment",
+        "last-empty-wins",
+        "last-nonempty-wins",
     ],
 )
 def test_crucible_identity_probe_requires_active_nonempty_email(
