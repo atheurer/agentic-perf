@@ -3441,13 +3441,19 @@ async def execute_benchmark(
                         if not approval_already_consumed:
                             raise
                     else:
-                        if consumed.status_code >= 500:
+                        if consumed.status_code >= 500 or consumed.status_code == 409:
                             approval_already_consumed = await read_consumed(client)
-                            if not approval_already_consumed:
+                            if (
+                                consumed.status_code >= 500
+                                and not approval_already_consumed
+                            ):
                                 raise RuntimeError(
                                     "approval consume could not be confirmed"
                                 )
-                        elif consumed.status_code >= 300:
+                        if (
+                            300 <= consumed.status_code < 500
+                            and not approval_already_consumed
+                        ):
                             if operation_guard and operation_owned:
                                 await operation_guard.terminalize(
                                     operation_record, "fail", {"outcome": "rejected"}

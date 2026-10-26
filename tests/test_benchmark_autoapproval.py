@@ -60,6 +60,10 @@ class _FakeApprovalsAPI:
         seed_unrelated: bool = False,
         seed_duplicate: bool = False,
         consume_lost: bool = False,
+        consume_http_409: bool = False,
+        consume_http_422: bool = False,
+        apply_consume: bool = True,
+        mismatched_consume_binding: bool = False,
         consume_cancel: bool = False,
         fail_list_after_consume: bool = False,
     ) -> None:
@@ -78,6 +82,10 @@ class _FakeApprovalsAPI:
         self.seed_unrelated = seed_unrelated
         self.seed_duplicate = seed_duplicate
         self.consume_lost = consume_lost
+        self.consume_http_409 = consume_http_409
+        self.consume_http_422 = consume_http_422
+        self.apply_consume = apply_consume
+        self.mismatched_consume_binding = mismatched_consume_binding
         self.consume_cancel = consume_cancel
         self.fail_list_after_consume = fail_list_after_consume
         self.approval_seq = 0
@@ -179,11 +187,18 @@ class _FakeApprovalsAPI:
             )
             if approval is None or approval.get("consumed_at"):
                 return _Response(409, {"detail": "approval unavailable"})
-            approval["consumed_at"] = datetime.now(timezone.utc).isoformat()
+            if self.consume_http_422:
+                return _Response(422, {"detail": "invalid consume request"})
+            if self.apply_consume:
+                approval["consumed_at"] = datetime.now(timezone.utc).isoformat()
+            if self.mismatched_consume_binding:
+                approval["claim_id"] = "other-claim"
             if self.consume_cancel:
                 raise asyncio.CancelledError()
             if self.consume_lost:
                 raise ConnectionError("consume response lost")
+            if self.consume_http_409:
+                return _Response(409, {"detail": "approval already consumed"})
             return _Response(200, approval)
         if "/comments" in str(url):
             if not json.get("author"):
@@ -423,6 +438,82 @@ async def test_consume_commits_but_response_is_lost_launches_once(
 
 
 @pytest.mark.asyncio
+async def test_consume_409_after_exact_bound_commit_launches_once(
+    tmp_path, monkeypatch
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        consume_http_409=True,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["status"] == "completed", result
+    assert api.approvals[0]["consumed_at"]
+    assert len(_approval_calls(api, "/approvals/apr-auto1/consume")) == 1
+    assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api_options",
+    [
+        {"apply_consume": False},
+        {"mismatched_consume_binding": True},
+    ],
+)
+async def test_consume_409_without_bound_consumed_readback_rejects(
+    tmp_path, monkeypatch, api_options
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        consume_http_409=True,
+        **api_options,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result == {"status": "rejected", "reason_code": "approval_not_approved"}
+    assert len(_approval_calls(api, "/approvals/apr-auto1/consume")) == 1
+    assert not [call for call in calls if call[0] == "launch"]
+    store = TraceStore(tmp_path / "trace.db")
+    try:
+        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        assert operation.state == "terminal"
+        assert operation.terminal_outcome == "failure"
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_consume_definite_4xx_rejects_without_readback(tmp_path, monkeypatch):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        consume_http_422=True,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result == {"status": "rejected", "reason_code": "approval_not_approved"}
+    consume_index = next(
+        index for index, (url, _) in enumerate(api.calls) if url.endswith("/consume")
+    )
+    assert not any(
+        url.endswith("/approvals") for url, _ in api.calls[consume_index + 1 :]
+    )
+    assert not [call for call in calls if call[0] == "launch"]
+
+
+@pytest.mark.asyncio
 async def test_cancel_after_consumed_approval_replays_without_second_consume(
     tmp_path, monkeypatch
 ):
@@ -463,15 +554,16 @@ async def test_cancel_after_consumed_approval_replays_without_second_consume(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("consume_response", ["consume_lost", "consume_http_409"])
 async def test_uncertain_consume_readback_leaves_prepared_operation_reclaimable(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, consume_response
 ):
     _, calls, api = _wire(
         monkeypatch,
         tmp_path,
         directives={"user_pre_run_approval": False},
-        consume_lost=True,
         fail_list_after_consume=True,
+        **{consume_response: True},
     )
     monkeypatch.setattr(benchmark_server, "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS", 0.3)
 
