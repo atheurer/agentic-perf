@@ -40,6 +40,11 @@ class _Response:
             raise RuntimeError(self.text)
 
 
+class _BrokenJSONResponse(_Response):
+    def json(self) -> dict:
+        raise ValueError("malformed create response")
+
+
 class _FakeApprovalsAPI:
     """Records approval-API calls; create/resolve/comment succeed."""
 
@@ -57,6 +62,9 @@ class _FakeApprovalsAPI:
         create_status: str = "pending",
         create_returns_manual: bool = False,
         create_http_5xx: bool = False,
+        create_response_mode: str | None = None,
+        fail_list_after_create: bool = False,
+        hide_first_created_list: bool = False,
         seed_unrelated: bool = False,
         seed_duplicate: bool = False,
         consume_lost: bool = False,
@@ -79,6 +87,9 @@ class _FakeApprovalsAPI:
         self.create_status = create_status
         self.create_returns_manual = create_returns_manual
         self.create_http_5xx = create_http_5xx
+        self.create_response_mode = create_response_mode
+        self.fail_list_after_create = fail_list_after_create
+        self.hide_first_created_list = hide_first_created_list
         self.seed_unrelated = seed_unrelated
         self.seed_duplicate = seed_duplicate
         self.consume_lost = consume_lost
@@ -94,11 +105,18 @@ class _FakeApprovalsAPI:
     async def get(self, url: str, **kwargs) -> _Response:
         self.calls.append((str(url), {}))
         if str(url).endswith("/approvals"):
-            if self.fail_list or (
-                self.fail_list_after_consume
-                and any(item.get("consumed_at") for item in self.approvals)
+            if (
+                self.fail_list
+                or (self.fail_list_after_create and self.approval_seq)
+                or (
+                    self.fail_list_after_consume
+                    and any(item.get("consumed_at") for item in self.approvals)
+                )
             ):
                 return _Response(503, {"detail": "listing unavailable"})
+            if self.hide_first_created_list and self.approval_seq:
+                self.hide_first_created_list = False
+                return _Response(200, {"approvals": []})
             return _Response(200, {"approvals": self.approvals})
         return _Response(404, {"detail": "unexpected url"})
 
@@ -153,6 +171,10 @@ class _FakeApprovalsAPI:
                 raise ConnectionError("create response lost")
             if self.create_http_5xx:
                 return _Response(503, {"detail": "create committed, response failed"})
+            if self.create_response_mode == "invalid_json":
+                return _BrokenJSONResponse(200, approval)
+            if self.create_response_mode == "unbound":
+                return _Response(200, {"approval_request_id": approval_id})
             return _Response(200, approval)
         if "/resolve" in str(url):
             approval_id = str(url).split("/approvals/", 1)[1].split("/", 1)[0]
@@ -407,6 +429,86 @@ async def test_create_commits_but_returns_5xx_reuses_exact_approval(
     assert api.approvals[0]["consumed_at"]
     assert api.approvals[1]["status"] == "pending"
     assert len(_approval_calls(api, "/approvals/apr-auto1/consume")) == 1
+    assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_response_mode", ["invalid_json", "unbound"])
+async def test_create_commits_with_malformed_2xx_body_reuses_exact_approval(
+    tmp_path, monkeypatch, create_response_mode
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        create_response_mode=create_response_mode,
+        seed_unrelated=True,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["status"] == "completed", result
+    assert (
+        len([url for url, body in api.calls if url.endswith("/approvals") and body])
+        == 1
+    )
+    assert len(_approval_calls(api, "/approvals/apr-auto1/resolve")) == 1
+    assert not _approval_calls(api, "/approvals/apr-unrelated/resolve")
+    assert api.approvals[0]["consumed_at"]
+    assert api.approvals[1]["status"] == "pending"
+    assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "readback_option", ["fail_list_after_create", "hide_first_created_list"]
+)
+async def test_malformed_2xx_create_without_readback_stays_reclaimable(
+    tmp_path, monkeypatch, readback_option
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        create_response_mode="invalid_json",
+        seed_unrelated=True,
+        **{readback_option: True},
+    )
+    monkeypatch.setattr(benchmark_server, "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS", 0.3)
+
+    first = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert first["reason_code"] == "approval_required"
+    assert not _approval_calls(api, "/resolve")
+    assert not [call for call in calls if call[0] == "launch"]
+    store = TraceStore(tmp_path / "trace.db")
+    try:
+        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        assert operation.state == "prepared"
+        expiry = datetime.fromisoformat(operation.lease_expires_at)
+    finally:
+        store.close()
+    api.fail_list_after_create = False
+    await asyncio.sleep(
+        max(0.0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.05
+    )
+
+    replay = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert replay["status"] == "completed", replay
+    assert [item["approval_request_id"] for item in api.approvals] == [
+        "apr-auto1",
+        "apr-unrelated",
+    ]
+    assert (
+        len([url for url, body in api.calls if url.endswith("/approvals") and body])
+        == 1
+    )
+    assert not _approval_calls(api, "/approvals/apr-unrelated/resolve")
+    assert api.approvals[1]["status"] == "pending"
     assert len([call for call in calls if call[0] == "launch"]) == 1
 
 

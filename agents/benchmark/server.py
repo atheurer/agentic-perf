@@ -2715,6 +2715,7 @@ async def _autoconsume_runfile_approval(
                         "detail": "operation approval ID was not found",
                         "retryable": True,
                     }
+                creation_error = ""
                 try:
                     created = await client.post(
                         f"{store_url}/api/v1/tickets/{ticket_id}/approvals",
@@ -2723,20 +2724,6 @@ async def _autoconsume_runfile_approval(
                 except Exception as exc:
                     # Creation may have committed before its response was lost.
                     creation_error = f"approval creation response lost: {exc}"
-                    try:
-                        matched, match_error = await read_existing(client)
-                    except Exception as readback_exc:
-                        return {
-                            "status": "rejected",
-                            "detail": f"{creation_error}; reconciliation failed: {readback_exc}",
-                            "retryable": True,
-                        }
-                    if match_error or matched is None:
-                        return {
-                            "status": "rejected",
-                            "detail": f"{creation_error}; {match_error or 'no bound approval found'}",
-                            "retryable": match_error is None,
-                        }
                 else:
                     if 300 <= created.status_code < 500:
                         return {
@@ -2750,28 +2737,34 @@ async def _autoconsume_runfile_approval(
                         creation_error = (
                             f"approval creation failed ({created.status_code})"
                         )
-                        try:
-                            matched, match_error = await read_existing(client)
-                        except Exception as readback_exc:
-                            return {
-                                "status": "rejected",
-                                "detail": f"{creation_error}; reconciliation failed: {readback_exc}",
-                                "retryable": True,
-                            }
-                        if match_error or matched is None:
-                            return {
-                                "status": "rejected",
-                                "detail": f"{creation_error}; {match_error or 'no bound approval found'}",
-                                "retryable": match_error is None,
-                            }
                     else:
-                        matched, match_error = reusable_approval([created.json()])
-                        if match_error or matched is None:
-                            return {
-                                "status": "rejected",
-                                "detail": match_error
-                                or "approval creation returned an unrelated request",
-                            }
+                        try:
+                            matched, match_error = reusable_approval([created.json()])
+                        except Exception as exc:
+                            creation_error = (
+                                f"approval creation response was malformed: {exc}"
+                            )
+                        else:
+                            if match_error or matched is None:
+                                creation_error = (
+                                    match_error
+                                    or "approval creation returned an unrelated request"
+                                )
+                if creation_error:
+                    try:
+                        matched, match_error = await read_existing(client)
+                    except Exception as readback_exc:
+                        return {
+                            "status": "rejected",
+                            "detail": f"{creation_error}; reconciliation failed: {readback_exc}",
+                            "retryable": True,
+                        }
+                    if match_error or matched is None:
+                        return {
+                            "status": "rejected",
+                            "detail": f"{creation_error}; {match_error or 'no bound approval found'}",
+                            "retryable": True,
+                        }
             if matched is not None:
                 approval_id = matched["approval_request_id"]
             if matched is not None and matched.get("consumed_at") is not None:
