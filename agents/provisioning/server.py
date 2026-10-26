@@ -930,11 +930,7 @@ async def _verify_harness_install_one(
         # time (#1233). The services themselves are run-dynamic (crucible
         # starts valkey/opensearch/cdm with the run), so they are not
         # probed here — the skill doc covers the preflight instead.
-        identity_probe = (
-            "test -r /root/.crucible/identity"
-            " && grep -q CRUCIBLE_EMAIL /root/.crucible/identity"
-            " && printf 'identity=1' || printf 'identity=0'"
-        )
+        identity_probe = _crucible_identity_probe_command()
         identity_result = await _ssh.run(host, identity_probe, timeout=15)
         identity_ready = "identity=1" in (identity_result.stdout or "")
 
@@ -971,6 +967,31 @@ async def _verify_harness_install_one(
         "context": context,
         "message": message,
     }
+
+
+def _crucible_identity_probe_command(
+    identity_path: str = "/root/.crucible/identity",
+) -> str:
+    """Build a read-only shell probe for a non-empty Crucible email value."""
+    quoted_path = shlex.quote(identity_path)
+    return (
+        f"if test -r {quoted_path} && "
+        "awk -F= '"
+        "/^[[:space:]]*#/ { next } "
+        "$1 ~ /^[[:space:]]*(export[[:space:]]+)?CRUCIBLE_EMAIL[[:space:]]*$/ { "
+        "value = $2; "
+        'sub(/[[:space:]]+#.*/, "", value); '
+        'gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); '
+        'if ((substr(value, 1, 1) == "\\"" && '
+        'substr(value, length(value), 1) == "\\"") || '
+        '(substr(value, 1, 1) == sprintf("%c", 39) && '
+        'substr(value, length(value), 1) == sprintf("%c", 39))) '
+        "value = substr(value, 2, length(value) - 2); "
+        'gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); '
+        'if (value != "" && value !~ /^#/) found = 1 '
+        f"}} END {{ exit !found }}' {quoted_path}; "
+        "then printf 'identity=1'; else printf 'identity=0'; fi"
+    )
 
 
 async def _check_existing_install_one(
@@ -1163,11 +1184,17 @@ async def _ensure_harness_one(
         if not verify_result.get("verified"):
             verify_result["status"] = "installed_verify_failed"
             return verify_result
+        verification_warning = verify_result.get("message", "").partition(
+            " (warning: "
+        )[2]
+        message = f"{harness_name} already installed and verified on {host}"
+        if verification_warning:
+            message += f" (warning: {verification_warning}"
         verify_result.update(
             {
                 "status": "already_installed",
                 "version": existing.get("version", "unknown"),
-                "message": f"{harness_name} already installed and verified on {host}",
+                "message": message,
             }
         )
         return verify_result

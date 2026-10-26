@@ -13,22 +13,41 @@ below).
 
 **Cause:** the host was reimaged and presents new keys.
 
-**Fix (on the orchestrator host):** refresh BOTH forms of the address —
-tools connect by resolved IP, humans test with hostnames:
+**Fix (on the orchestrator host):** remove the stale entry for the changed
+identifier and for its other form (hostname or IP). Then collect candidate
+keys without trusting them:
+
+Replace both address placeholders with the values from the current
+reservation before running these commands.
 
 ```bash
-ssh-keygen -R <hostname> ; ssh-keygen -R <ip>
-ssh-keyscan -T 5 -t ecdsa,ed25519 <hostname> <ip> >> ~/.ssh/known_hosts
+CHANGED_HOST='REPLACE_WITH_CHANGED_HOST_OR_IP'
+OTHER_HOST='REPLACE_WITH_OTHER_HOSTNAME_OR_IP'
+ssh-keygen -R "$CHANGED_HOST"
+ssh-keygen -R "$OTHER_HOST"
+candidate_keys=$(mktemp)
+ssh-keyscan -T 5 -t ecdsa,ed25519 "$CHANGED_HOST" "$OTHER_HOST" > "$candidate_keys"
+ssh-keygen -lf "$candidate_keys"
 ```
 
-Verify the new key fingerprint with the host owner before accepting it.
+Compare each fingerprint against an independently confirmed fingerprint
+from the host owner. Only after that comparison succeeds, append the candidate
+keys to `~/.ssh/known_hosts` and remove the temporary file:
+
+```bash
+cat "$candidate_keys" >> ~/.ssh/known_hosts
+rm -f "$candidate_keys"
+```
+
+Do not append scanned keys before fingerprint verification.
 
 Also re-establish the trust the workflow needs after a reimage:
 
 - the orchestrator host's key in each lab host's `/root/.ssh/authorized_keys`
 - the controller's key in the SUT's `authorized_keys` (crucible SSHes
-  controller → SUT; a fresh controller has no keypair at all — generate one
-  with `ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519`)
+  controller → SUT). Reuse the existing `~/.ssh/id_ed25519` identity and
+  install only its public key. If either key file is missing, report the
+  missing path; do not generate a replacement identity.
 
 ## 2. Controller firewall blocks crucible coordination
 
@@ -41,11 +60,16 @@ host.`
 and rejects everything else (`REJECT --reject-with icmp-host-prohibited`,
 which the client sees as "no route to host").
 
-**Fix (on the controller):** allow the crucible coordination ports and
-persist the rules:
+**Fix (on the controller):** allow the crucible coordination ports only from
+the assigned SUT IPs, then persist the rules. Set `SUT_IP` to an IP from the
+current reservation and repeat the rules for each SUT; do not use an
+unrestricted source or a broader subnet:
 
 ```bash
-for port in 6379 9200 8000 8001; do iptables -I INPUT -p tcp --dport $port -j ACCEPT; done
+SUT_IP='REPLACE_WITH_RESERVED_SUT_IP'
+for port in 6379 9200 8000 8001; do
+  iptables -I INPUT -p tcp -s "${SUT_IP}/32" --dport "$port" -j ACCEPT
+done
 iptables-save > /etc/sysconfig/iptables
 ```
 

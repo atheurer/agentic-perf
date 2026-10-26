@@ -1,9 +1,8 @@
 """The SSH host-key error annotation (lab-host robustness #1233).
 
 Fresh lab allocations present new host keys; every SSH step fails closed.
-The annotation turns the raw refused-connection noise into an operator
-recipe that names the offending known_hosts entry and warns that BOTH the
-hostname and the resolved-IP entries need refreshing.
+The annotation turns the refusal into an operator recipe that targets the
+changed host and explains how to refresh both address forms safely.
 """
 
 from __future__ import annotations
@@ -32,11 +31,11 @@ def test_unrelated_stderr_passes_through_unchanged():
     assert annotate_host_key_error(stderr) == stderr
 
 
-def test_annotation_names_the_offending_entry_and_both_forms():
+def test_annotation_targets_changed_host_and_other_form():
     annotated = annotate_host_key_error(_CHANGED)
-    assert "Offending ED25519 key in /root/.ssh/known_hosts:61" in annotated
-    assert "ssh-keygen -R /root/.ssh/known_hosts" in annotated
-    assert "resolved IP" in annotated
+    assert "ssh-keygen -R 10.6.60.88" in annotated
+    assert "ssh-keygen -R REPLACE_WITH_OTHER_HOSTNAME_OR_IP" in annotated
+    assert "ssh-keygen -R /root/.ssh/known_hosts" not in annotated
     assert "ssh-keyscan" in annotated
 
 
@@ -45,7 +44,7 @@ def test_annotation_drops_the_banner_noise():
     assert "REMOTE HOST IDENTIFICATION" not in annotated
     assert set(annotated.splitlines()[0].strip()) != {"@"}
     # Compact enough for a tool-result error field.
-    assert len(annotated) < 800
+    assert len(annotated) < 500
 
 
 def test_annotation_without_offending_line_still_gives_the_recipe():
@@ -54,16 +53,36 @@ def test_annotation_without_offending_line_still_gives_the_recipe():
         "Host key verification failed.\n"
     )
     annotated = annotate_host_key_error(stderr)
-    assert "ssh-keygen -R <host-or-ip>" in annotated
+    assert "ssh-keygen -R REPLACE_WITH_HOST_OR_IP" in annotated
     assert "ssh-keyscan" in annotated
 
 
-def test_offending_entry_is_named_verbatim():
+def test_fingerprint_is_checked_before_scanned_keys_are_trusted():
+    annotated = annotate_host_key_error(_CHANGED)
+    scan = annotated.index("ssh-keyscan")
+    fingerprint = annotated.index("ssh-keygen -lf")
+    verification = annotated.index("Compare to an independently confirmed")
+    append = annotated.index('cat "$candidate_keys" >> ~/.ssh/known_hosts')
+
+    assert scan < fingerprint < verification < append
+    assert "untrusted scan results" in annotated
+
+
+def test_removal_target_comes_from_the_changed_host_not_known_hosts_path():
     stderr = _CHANGED.replace(
         "Offending ED25519 key in /root/.ssh/known_hosts:61",
         "Offending ED25519 key in /root/.ssh/known_hosts:12",
     )
     annotated = annotate_host_key_error(stderr)
-    # The recipe references the known_hosts file from the offending line.
-    assert "ssh-keygen -R /root/.ssh/known_hosts" in annotated
-    assert "Offending ED25519 key in /root/.ssh/known_hosts:12" in annotated
+    assert "ssh-keygen -R 10.6.60.88" in annotated
+    assert "ssh-keygen -R /root/.ssh/known_hosts" not in annotated
+
+
+def test_changed_host_is_shell_quoted_before_use_in_recipe():
+    stderr = _CHANGED.replace(
+        "Host key for 10.6.60.88 has changed",
+        "Host key for bad;touch has changed",
+    )
+    annotated = annotate_host_key_error(stderr)
+    assert "ssh-keygen -R 'bad;touch'" in annotated
+    assert "ssh-keygen -R bad;touch" not in annotated
