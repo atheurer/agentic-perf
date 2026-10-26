@@ -2578,6 +2578,7 @@ async def _autoconsume_runfile_approval(
         or (cf.get("claim") or {}).get("claim_id")
         or ""
     )
+    automatic_summary = "Automatic run-file approval (user_pre_run_approval=false)"
     create_body = {
         "kind": "benchmark_run_file",
         "validation_id": validation_id,
@@ -2585,7 +2586,7 @@ async def _autoconsume_runfile_approval(
         "execution_intent_digest": record.get("execution_intent_digest"),
         "execution_intent_id": record.get("execution_intent_id"),
         "attempt_id": record.get("attempt_id"),
-        "summary": "Automatic run-file approval (user_pre_run_approval=false)",
+        "summary": automatic_summary,
         "invocation_id": invocation_id or None,
         "tool_call_id": tool_call_id or None,
         "session_id": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"),
@@ -2594,8 +2595,8 @@ async def _autoconsume_runfile_approval(
         "ticket_attempt": claim_id or None,
         "claim_id": claim_id or None,
     }
-    binding = {"ticket_id": ticket_id}
-    binding.update(
+    intent_binding = {"ticket_id": ticket_id}
+    intent_binding.update(
         {
             key: create_body[key]
             for key in (
@@ -2603,27 +2604,50 @@ async def _autoconsume_runfile_approval(
                 "validation_id",
                 "presented_run_file_digest",
                 "execution_intent_digest",
-                "invocation_id",
-                "tool_call_id",
-                "session_id",
-                "session_epoch",
-                "waiter_owner",
-                "claim_id",
-                "ticket_attempt",
+                "summary",
             )
         }
     )
+    fence_binding = {
+        key: create_body[key]
+        for key in ("session_id", "session_epoch", "claim_id", "ticket_attempt")
+    }
 
-    def bound_to_creation(item: Any) -> bool:
+    def same_automatic_intent(item: Any) -> bool:
         return isinstance(item, dict) and all(
-            item.get(key) == value for key, value in binding.items()
+            item.get(key) == value for key, value in intent_binding.items()
         )
+
+    def reusable_approval(approvals: Any) -> tuple[dict[str, Any] | None, str | None]:
+        if not isinstance(approvals, list):
+            return None, "approval list is malformed"
+        matches = [item for item in approvals if same_automatic_intent(item)]
+        if not matches:
+            return None, None
+        if len(matches) != 1:
+            return None, f"expected one automatic approval, found {len(matches)}"
+        matched = matches[0]
+        if any(matched.get(key) != value for key, value in fence_binding.items()):
+            return (
+                None,
+                "existing automatic approval has a stale session or claim fence",
+            )
+        if matched.get("status") not in {"pending", "approved"}:
+            return None, "existing automatic approval is not pending or approved"
+        if matched.get("consumed_at") is not None:
+            return None, "existing automatic approval was already consumed"
+        approval_id = matched.get("approval_request_id")
+        if not isinstance(approval_id, str) or not approval_id:
+            return None, "existing automatic approval has no ID"
+        return matched, None
 
     def bound_approved(item: Any, approval_id: str) -> bool:
         return (
-            bound_to_creation(item)
+            same_automatic_intent(item)
             and item.get("approval_request_id") == approval_id
             and item.get("status") == "approved"
+            and item.get("consumed_at") is None
+            and all(item.get(key) == value for key, value in fence_binding.items())
         )
 
     from agents.server_utils import ticket_state_headers
@@ -2635,70 +2659,79 @@ async def _autoconsume_runfile_approval(
         headers["X-Agentic-Perf-Tool-Call-Id"] = tool_call_id
 
     store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    if any(
+        not isinstance(value, str) or not value
+        for value in (
+            *intent_binding.values(),
+            *fence_binding.values(),
+            invocation_id,
+            tool_call_id,
+        )
+    ):
+        return {
+            "status": "rejected",
+            "detail": "automatic approval requires complete intent and fence identity",
+        }
+
+    async def read_existing(client: Any) -> tuple[dict[str, Any] | None, str | None]:
+        listed = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}/approvals")
+        if listed.status_code >= 300:
+            raise RuntimeError(f"listing failed ({listed.status_code})")
+        return reusable_approval(listed.json().get("approvals"))
+
     try:
         from providers.execution import AuditedAsyncHTTPClient
 
         async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
-            already_approved = False
             try:
-                created = await client.post(
-                    f"{store_url}/api/v1/tickets/{ticket_id}/approvals",
-                    json=create_body,
-                )
+                matched, match_error = await read_existing(client)
             except Exception as exc:
-                # The response may be lost after creation. Only a unique,
-                # fully fenced request can be safely selected for resolution.
-                creation_error = f"approval creation response lost: {exc}"
-                if any(
-                    not isinstance(value, str) or not value
-                    for value in binding.values()
-                ):
-                    return {"status": "rejected", "detail": creation_error}
+                return {
+                    "status": "rejected",
+                    "detail": f"approval lookup failed: {exc}",
+                }
+            if match_error:
+                return {"status": "rejected", "detail": match_error}
+            if matched is None:
                 try:
-                    listed = await client.get(
-                        f"{store_url}/api/v1/tickets/{ticket_id}/approvals"
+                    created = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/approvals",
+                        json=create_body,
                     )
-                    if listed.status_code >= 300:
-                        raise RuntimeError(f"listing failed ({listed.status_code})")
-                    matches = [
-                        item
-                        for item in listed.json().get("approvals", [])
-                        if bound_to_creation(item)
-                    ]
-                except Exception as readback_exc:
-                    return {
-                        "status": "rejected",
-                        "detail": f"{creation_error}; reconciliation failed: {readback_exc}",
-                    }
-                if len(matches) != 1:
-                    return {
-                        "status": "rejected",
-                        "detail": f"{creation_error}; expected one bound approval, found {len(matches)}",
-                    }
-                matched = matches[0]
-                approval_id = matched.get("approval_request_id")
-                if not isinstance(approval_id, str) or not approval_id:
-                    return {
-                        "status": "rejected",
-                        "detail": f"{creation_error}; missing approval ID",
-                    }
-                if matched.get("status") == "approved":
-                    already_approved = True
-                elif matched.get("status") != "pending":
-                    return {
-                        "status": "rejected",
-                        "detail": f"{creation_error}; approval is not pending or approved",
-                    }
-            else:
-                if created.status_code >= 300:
-                    return {
-                        "status": "rejected",
-                        "detail": (
-                            f"approval creation failed ({created.status_code}): "
-                            f"{created.text[:200]}"
-                        ),
-                    }
-                approval_id = created.json()["approval_request_id"]
+                except Exception as exc:
+                    # Creation may have committed before its response was lost.
+                    creation_error = f"approval creation response lost: {exc}"
+                    try:
+                        matched, match_error = await read_existing(client)
+                    except Exception as readback_exc:
+                        return {
+                            "status": "rejected",
+                            "detail": f"{creation_error}; reconciliation failed: {readback_exc}",
+                        }
+                    if match_error or matched is None:
+                        return {
+                            "status": "rejected",
+                            "detail": f"{creation_error}; {match_error or 'no bound approval found'}",
+                        }
+                else:
+                    if created.status_code >= 300:
+                        return {
+                            "status": "rejected",
+                            "detail": (
+                                f"approval creation failed ({created.status_code}): "
+                                f"{created.text[:200]}"
+                            ),
+                        }
+                    matched, match_error = reusable_approval([created.json()])
+                    if match_error or matched is None:
+                        return {
+                            "status": "rejected",
+                            "detail": match_error
+                            or "approval creation returned an unrelated request",
+                        }
+            if matched is not None:
+                approval_id = matched["approval_request_id"]
+            already_approved = matched is not None and matched["status"] == "approved"
 
             resolution_error = ""
             try:
