@@ -552,6 +552,19 @@ class EventBus:
         page = [dict(item) for item in merged if item["seq"] > since][:limit]
         return sorted(page, key=event_order_key)
 
+    def get_events_before(
+        self,
+        ticket_id: str,
+        before: int,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return the closest cursor page strictly before ``before``."""
+        if limit <= 0:
+            return []
+        merged = self._get_merged_events(ticket_id)
+        page = [dict(item) for item in merged if item["seq"] < before][-limit:]
+        return sorted(page, key=event_order_key)
+
     def get_usage_events(
         self,
         ticket_id: str | None = None,
@@ -728,31 +741,20 @@ class EventBus:
     def get_event_count(self, ticket_id: str) -> int:
         """Return total number of events for a ticket.
 
-        Tries the SQL trace store first (cheap), then falls back
-        to the merged event list for legacy JSONL-only tickets.
+        The public cursor is assigned to the merged JSONL and trace view, so
+        count that same view rather than returning an underlying DB row count.
+        The merged list is cached per ticket.
         """
-        if self._trace_store is not None:
-            count = self._trace_store.count_events(ticket_id)
-            if count > 0:
-                return count
-        # Fall back to merged events (includes JSONL) for tickets
-        # that predate the trace DB.
         return len(self._get_merged_events(ticket_id))
 
     def get_latest_seq(self, ticket_id: str) -> int:
         """Return the highest seq number for a ticket.
 
-        Tries the SQL trace store first (cheap), then falls back
-        to the merged event list for legacy JSONL-only tickets.
+        Sequence values are assigned after merging JSONL and trace events;
+        the last public sequence is therefore the merged list length.
         """
-        if self._trace_store is not None:
-            seq = self._trace_store.latest_ticket_seq(ticket_id)
-            if seq > 0:
-                return seq
         merged = self._get_merged_events(ticket_id)
-        if not merged:
-            return 0
-        return max(item["seq"] for item in merged)
+        return merged[-1]["seq"] if merged else 0
 
     def close(self) -> None:
         if self._usage_ledger is not None:

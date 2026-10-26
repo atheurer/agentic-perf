@@ -94,6 +94,85 @@ def test_migrate_ticket_traces_moves_events(tmp_path: Path) -> None:
         ]
 
 
+def test_active_history_overlap_is_deduplicated_and_sequence_continues(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "trace.db"
+    history_db_path = tmp_path / "trace-history.db"
+
+    with TraceStore(db_path, history_db_path=history_db_path) as store:
+        first = store.insert_event(make_event("PERF-OVERLAP"))
+        active = store._open_connection()
+        history = store._open_history_connection()
+        row = active.execute(
+            "SELECT * FROM trace_events WHERE event_id = ?",
+            (str(first.event_id),),
+        ).fetchone()
+
+        # Model a process crash after copying into history but before
+        # deleting the active row.
+        history.execute(
+            "INSERT OR IGNORE INTO trace_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            tuple(row),
+        )
+        history.commit()
+
+        assert store.count_events("PERF-OVERLAP") == 1
+        assert [event.event_id for event in store.list_events("PERF-OVERLAP")] == [
+            first.event_id
+        ]
+
+        # A post-migration write must continue the historical ticket sequence.
+        store.migrate_ticket_traces("PERF-OVERLAP")
+        second = store.insert_event(make_event("PERF-OVERLAP"))
+        assert second.global_seq > first.global_seq
+        assert second.ticket_seq == first.ticket_seq + 1
+        assert store.count_events("PERF-OVERLAP") == 2
+        assert len(store.list_events("PERF-OVERLAP")) == 2
+
+
+def test_event_bus_snapshot_cursors_match_merged_legacy_and_trace_events(
+    tmp_path: Path,
+) -> None:
+    ticket_id = "PERF-MERGED"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / f"{ticket_id}.jsonl").write_text(
+        json.dumps(
+            {
+                "ticket_id": ticket_id,
+                "agent": "legacy",
+                "event_type": "agent_started",
+                "data": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    trace_store = TraceStore(
+        tmp_path / "trace.db",
+        history_db_path=tmp_path / "trace-history.db",
+    )
+    event_bus = EventBus(log_dir=log_dir, trace_store=trace_store)
+    try:
+        event_bus.emit(ticket_id, "trace", "tool_called", {"tool": "first"})
+        assert event_bus.get_event_count(ticket_id) == 2
+        assert event_bus.get_latest_seq(ticket_id) == 2
+
+        trace_store.migrate_ticket_traces(ticket_id)
+        event_bus.emit(ticket_id, "trace", "tool_called", {"tool": "second"})
+        assert event_bus.get_event_count(ticket_id) == 3
+        assert event_bus.get_latest_seq(ticket_id) == 3
+        assert sorted(event["seq"] for event in event_bus.get_events(ticket_id)) == [
+            1,
+            2,
+            3,
+        ]
+    finally:
+        event_bus.close()
+        trace_store.close()
+
+
 def test_transition_ticket_to_closed_triggers_migration(tmp_path: Path) -> None:
     db_path = tmp_path / "trace.db"
     history_db_path = tmp_path / "trace-history.db"
