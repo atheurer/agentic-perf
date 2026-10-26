@@ -552,6 +552,19 @@ class EventBus:
         page = [dict(item) for item in merged if item["seq"] > since][:limit]
         return sorted(page, key=event_order_key)
 
+    def get_events_before(
+        self,
+        ticket_id: str,
+        before: int,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return the closest cursor page strictly before ``before``."""
+        if limit <= 0:
+            return []
+        merged = self._get_merged_events(ticket_id)
+        page = [dict(item) for item in merged if item["seq"] < before][-limit:]
+        return sorted(page, key=event_order_key)
+
     def get_usage_events(
         self,
         ticket_id: str | None = None,
@@ -724,6 +737,24 @@ class EventBus:
             self._usage_ledger.append(entry)
         except Exception:
             logger.exception("Failed to write ledger entry for %s", ticket_id)
+
+    def get_event_count(self, ticket_id: str) -> int:
+        """Return total number of events for a ticket.
+
+        The public cursor is assigned to the merged JSONL and trace view, so
+        count that same view rather than returning an underlying DB row count.
+        The merged list is cached per ticket.
+        """
+        return len(self._get_merged_events(ticket_id))
+
+    def get_latest_seq(self, ticket_id: str) -> int:
+        """Return the highest seq number for a ticket.
+
+        Sequence values are assigned after merging JSONL and trace events;
+        the last public sequence is therefore the merged list length.
+        """
+        merged = self._get_merged_events(ticket_id)
+        return merged[-1]["seq"] if merged else 0
 
     def close(self) -> None:
         if self._usage_ledger is not None:

@@ -116,12 +116,30 @@ class TraceStore:
         self._lock = threading.RLock()
         self._connection: sqlite3.Connection | None = None
         self._history_connection: sqlite3.Connection | None = None
+        self._count_connection: sqlite3.Connection | None = None
         try:
             self._connection = self._init_db_connection(self.db_path, busy_timeout_ms)
             if self.history_db_path != self.db_path:
                 self._history_connection = self._init_db_connection(
                     self.history_db_path, busy_timeout_ms
                 )
+                self._count_connection = sqlite3.connect(
+                    ":memory:",
+                    timeout=busy_timeout_ms / 1000,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                self._count_connection.execute(
+                    f"PRAGMA busy_timeout = {busy_timeout_ms}"
+                )
+                self._count_connection.execute(
+                    "ATTACH DATABASE ? AS trace_active", (str(self.db_path),)
+                )
+                self._count_connection.execute(
+                    "ATTACH DATABASE ? AS trace_history",
+                    (str(self.history_db_path),),
+                )
+                self._count_connection.execute("PRAGMA query_only = ON")
         except TraceStoreMigrationError:
             self.close()
             raise
@@ -373,6 +391,10 @@ class TraceStore:
     def close(self) -> None:
         """Close the connections; safe to call after a failed initialization."""
         with self._lock:
+            count_connection = getattr(self, "_count_connection", None)
+            if count_connection is not None:
+                count_connection.close()
+                self._count_connection = None
             connection = getattr(self, "_connection", None)
             if connection is not None:
                 connection.close()
@@ -468,14 +490,42 @@ class TraceStore:
                     f"event {event.event_id} already exists with different content"
                 )
             return TraceEventV1.model_validate_json(existing["event_json"]), True
-        global_seq = connection.execute(
-            "SELECT COALESCE(MAX(global_seq), 0) + 1 FROM trace_events"
+        history_conn = self._open_history_connection()
+        if history_conn is not None:
+            history_existing = history_conn.execute(
+                "SELECT content_hash, event_json FROM trace_events WHERE event_id = ?",
+                (str(event.event_id),),
+            ).fetchone()
+            if history_existing:
+                if history_existing["content_hash"] != content_hash:
+                    raise TraceEventConflictError(
+                        f"event {event.event_id} already exists with different content"
+                    )
+                return TraceEventV1.model_validate_json(
+                    history_existing["event_json"]
+                ), True
+        active_global_seq = connection.execute(
+            "SELECT COALESCE(MAX(global_seq), 0) FROM trace_events"
         ).fetchone()[0]
-        ticket_seq = connection.execute(
+        history_global_seq = 0
+        if history_conn is not None:
+            history_global_seq = history_conn.execute(
+                "SELECT COALESCE(MAX(global_seq), 0) FROM trace_events"
+            ).fetchone()[0]
+        global_seq = max(active_global_seq, history_global_seq) + 1
+        active_ticket_seq = connection.execute(
             "SELECT COALESCE(MAX(ticket_seq), 0) + 1 FROM trace_events "
             "WHERE ticket_id = ?",
             (event.ticket_id,),
         ).fetchone()[0]
+        history_ticket_seq = 1
+        if history_conn is not None:
+            history_ticket_seq = history_conn.execute(
+                "SELECT COALESCE(MAX(ticket_seq), 0) + 1 FROM trace_events "
+                "WHERE ticket_id = ?",
+                (event.ticket_id,),
+            ).fetchone()[0]
+        ticket_seq = max(active_ticket_seq, history_ticket_seq)
         stored = event.model_copy(
             update={
                 "global_seq": global_seq,
@@ -513,25 +563,59 @@ class TraceStore:
         """
         with self._lock:
             try:
+                active_conn = self._open_connection()
+                history_conn = self._open_history_connection()
+                if history_conn is None:
+                    return active_conn.execute(
+                        "SELECT COUNT(DISTINCT event_id) FROM trace_events "
+                        "WHERE ticket_id = ?",
+                        (ticket_id,),
+                    ).fetchone()[0]
+                count_conn = self._count_connection
+                if count_conn is None:
+                    return active_conn.execute(
+                        "SELECT COUNT(DISTINCT event_id) FROM trace_events "
+                        "WHERE ticket_id = ?",
+                        (ticket_id,),
+                    ).fetchone()[0]
+                return count_conn.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "SELECT event_id FROM trace_active.trace_events "
+                    "WHERE ticket_id = ? "
+                    "UNION "
+                    "SELECT event_id FROM trace_history.trace_events "
+                    "WHERE ticket_id = ?"
+                    ")",
+                    (ticket_id, ticket_id),
+                ).fetchone()[0]
+            except (sqlite3.Error, OSError):
+                return 0
+
+    def latest_ticket_seq(self, ticket_id: str) -> int:
+        """Return the highest ticket_seq for a ticket.
+
+        Uses a SQL MAX query — cheaper than loading all events.
+        """
+        with self._lock:
+            try:
                 row = (
                     self._open_connection()
                     .execute(
-                        "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                        "SELECT COALESCE(MAX(ticket_seq), 0) FROM trace_events WHERE ticket_id = ?",
                         (ticket_id,),
                     )
                     .fetchone()
                 )
-                active_count = row[0] if row else 0
-                if active_count > 0:
-                    return active_count
+                active_max = row[0] if row else 0
                 history_conn = self._open_history_connection()
+                hist_max = 0
                 if history_conn is not None:
                     hist_row = history_conn.execute(
-                        "SELECT COUNT(*) FROM trace_events WHERE ticket_id = ?",
+                        "SELECT COALESCE(MAX(ticket_seq), 0) FROM trace_events WHERE ticket_id = ?",
                         (ticket_id,),
                     ).fetchone()
-                    return hist_row[0] if hist_row else 0
-                return 0
+                    hist_max = hist_row[0] if hist_row else 0
+                return max(active_max, hist_max)
             except (sqlite3.Error, OSError):
                 return 0
 
@@ -581,12 +665,12 @@ class TraceStore:
                 if history_conn is not None:
                     hist_rows: list[tuple[int, str]] = []
                     if ticket_id is not None:
-                        # For a single ticket, if not in active, query history
-                        if not raw_rows:
-                            hist_rows = [
-                                (row["global_seq"], row["event_json"])
-                                for row in history_conn.execute(query, tuple(values))
-                            ]
+                        # Always check history — a migrated ticket may
+                        # have events in both active and history DBs.
+                        hist_rows = [
+                            (row["global_seq"], row["event_json"])
+                            for row in history_conn.execute(query, tuple(values))
+                        ]
                     elif ticket_ids is not None:
                         # Find which tickets had rows in active DB
                         found_tickets = {
@@ -620,10 +704,16 @@ class TraceStore:
                         raw_rows.extend(hist_rows)
                         raw_rows.sort(key=lambda item: item[0])
 
-                return [
-                    TraceEventV1.model_validate_json(event_json)
-                    for _, event_json in raw_rows
-                ]
+                events: list[TraceEventV1] = []
+                seen_event_ids: set[str] = set()
+                for _, event_json in raw_rows:
+                    event = TraceEventV1.model_validate_json(event_json)
+                    event_id = str(event.event_id)
+                    if event_id in seen_event_ids:
+                        continue
+                    seen_event_ids.add(event_id)
+                    events.append(event)
+                return events
             except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
                 raise TraceStoreWriteError("could not read trace events") from exc
 

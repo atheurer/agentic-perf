@@ -9,6 +9,7 @@ from datetime import timedelta
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from providers.cost import estimate_cost
+from providers.event_projection import event_order_key
 from providers.usage import summarize_usage_events
 
 from ..models import TicketStatus
@@ -19,19 +20,193 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tickets", tags=["events"])
 usage_router = APIRouter(prefix="/usage", tags=["usage"])
 
+_AUDIT_FAILED_STATES = {"failed", "cancelled", "timed_out", "rejected", "indeterminate"}
+
+
+def _is_visible(event: dict, view: str) -> bool:
+    """Return True if *event* should be shown in the given view."""
+    if view == "audit":
+        return event.get("event_source") == "audit"
+    if view != "activity":
+        return True
+    if event.get("event_source") != "audit":
+        return True
+    audit = event.get("audit", {})
+    return (
+        audit.get("lifecycle_state") in _AUDIT_FAILED_STATES
+        or audit.get("outcome") in _AUDIT_FAILED_STATES
+    )
+
+
+def _get_visible_events(
+    event_bus: object,
+    ticket_id: str,
+    view: str,
+    *,
+    since: int = 0,
+    limit: int = 100,
+    tail: bool = False,
+) -> list[dict]:
+    """Return exactly *limit* visible events for *view*.
+
+    Progressively widens the fetch window until enough visible
+    events are collected.  When *tail* is True, returns the
+    LAST *limit* visible events (for snapshot loading).
+    """
+    if limit <= 0:
+        return []
+    collected: list[dict] = []
+    batch = max(limit * 2, 1)
+    cursor = since
+
+    if tail:
+        latest = event_bus.get_latest_seq(ticket_id)
+        if latest <= 0:
+            return []
+        cursor = latest + 1
+        while cursor > 0 and len(collected) < limit:
+            raw = event_bus.get_events_before(ticket_id, before=cursor, limit=batch)
+            if not raw:
+                break
+            raw = sorted(raw, key=lambda event: event["seq"])
+            visible = [event for event in raw if _is_visible(event, view)]
+            collected = visible + collected
+            cursor = min(event["seq"] for event in raw)
+            if cursor <= 1 or len(raw) < batch:
+                break
+            batch = min(batch * 2, 10000)
+        return sorted(collected[-limit:], key=event_order_key)
+
+    # Forward: collect visible events after `since`
+    while len(collected) < limit:
+        raw = event_bus.get_events(ticket_id, since=cursor, limit=batch)
+        if not raw:
+            break
+        raw = sorted(raw, key=lambda event: event["seq"])
+        visible = [event for event in raw if _is_visible(event, view)]
+        collected.extend(visible)
+        if len(collected) >= limit:
+            break
+        cursor = max(e["seq"] for e in raw)
+        batch = min(batch * 2, 10000)
+    return sorted(collected[:limit], key=event_order_key)
+
+
+def _get_visible_event_page(
+    event_bus: object,
+    ticket_id: str,
+    *,
+    since: int,
+    limit: int,
+    view: str,
+) -> tuple[list[dict], int]:
+    """Return a forward page and the safe cursor after its scanned records."""
+    if limit <= 0:
+        return [], since
+
+    events: list[dict] = []
+    cursor = since
+    latest_seq = since
+    batch = max(limit * 2, 1)
+    while len(events) < limit:
+        raw = event_bus.get_events(ticket_id, since=cursor, limit=batch)
+        if not raw:
+            break
+        raw = sorted(raw, key=lambda event: event["seq"])
+        visible = [event for event in raw if _is_visible(event, view)]
+        remaining = limit - len(events)
+        if len(visible) >= remaining:
+            # Do not advance past visible events that did not fit in this page.
+            events.extend(visible[:remaining])
+            latest_seq = max(event["seq"] for event in events)
+            return sorted(events, key=event_order_key), latest_seq
+
+        events.extend(visible)
+        latest_seq = max(event["seq"] for event in raw)
+        cursor = latest_seq
+        if len(raw) < batch:
+            break
+        batch = min(batch * 2, 10000)
+
+    return sorted(events, key=event_order_key), latest_seq
+
+
+def _get_visible_events_before(
+    event_bus: object,
+    ticket_id: str,
+    view: str,
+    *,
+    before: int,
+    limit: int,
+) -> list[dict]:
+    """Return the closest visible page before ``before``.
+
+    The raw scan widens as needed so audit-dominated ranges do not appear to
+    have exhausted the ticket's history.
+    """
+    if limit <= 0:
+        return []
+
+    collected: list[dict] = []
+    cursor = before
+    batch = max(limit * 2, 1)
+    while cursor > 0 and len(collected) < limit:
+        raw = event_bus.get_events_before(ticket_id, before=cursor, limit=batch)
+        if not raw:
+            break
+        raw = sorted(raw, key=lambda event: event["seq"])
+        visible = [event for event in raw if _is_visible(event, view)]
+        collected = visible + collected
+        cursor = min(event["seq"] for event in raw)
+        if len(collected) >= limit or cursor <= 1 or len(raw) < batch:
+            break
+        batch = min(batch * 2, 10000)
+
+    return sorted(collected[-limit:], key=event_order_key)
+
 
 @router.get("/{ticket_id}/events")
 def get_events(
     ticket_id: str,
     request: Request,
     since: int = Query(0, description="Return events with seq > this value"),
-    limit: int = Query(200, description="Max events to return", ge=1, le=1000),
+    limit: int = Query(200, description="Max visible events to return", ge=1, le=1000),
+    before: int | None = Query(
+        None,
+        ge=0,
+        description="Return the closest events with seq < this value",
+    ),
+    view: str = Query(
+        "all",
+        description=(
+            "'activity' excludes successful audit events, 'audit' includes only audit events, "
+            "'all' includes everything"
+        ),
+    ),
 ):
     event_bus = getattr(request.app.state, "event_bus", None)
     if event_bus is None:
         return {"events": [], "latest_seq": 0, "terminal_events": []}
-    events = event_bus.get_events(ticket_id, since=since, limit=limit)
-    latest_seq = max((event["seq"] for event in events), default=since)
+    if before is not None:
+        events = _get_visible_events_before(
+            event_bus,
+            ticket_id,
+            view,
+            before=before,
+            limit=limit,
+        )
+        latest_seq = max((event["seq"] for event in events), default=0)
+    elif view in {"activity", "audit"}:
+        events, latest_seq = _get_visible_event_page(
+            event_bus,
+            ticket_id,
+            since=since,
+            limit=limit,
+            view=view,
+        )
+    else:
+        events = event_bus.get_events(ticket_id, since=since, limit=limit)
+        latest_seq = max((event["seq"] for event in events), default=since)
     terminal_events = event_bus.get_terminal_events(ticket_id)
     return {
         "events": events,
@@ -77,28 +252,12 @@ def get_transcript(
     }
 
 
-@router.get("/{ticket_id}/usage")
-def get_usage(ticket_id: str, request: Request):
-    """Get cumulative LLM token usage and estimated cost.
+def _compute_usage_with_agents(events: list[dict]) -> dict:
+    """Compute usage summary with per-agent breakdown from raw events.
 
-    Computes usage from stored llm_usage events emitted by
-    the OTLP span processor. This works across process
-    boundaries since events are persisted to JSONL files.
+    Returns a dict with ``usage``, ``estimated_cost_usd``, and ``by_agent``
+    keys matching the ``GET /{ticket_id}/usage`` response shape.
     """
-    event_bus = getattr(request.app.state, "event_bus", None)
-    if event_bus is None:
-        return {
-            "ticket_id": ticket_id,
-            "usage": {},
-            "estimated_cost_usd": 0.0,
-            "by_agent": {},
-        }
-
-    # Compute usage from stored events rather than
-    # in-memory accumulators, since the state store
-    # and orchestrator are separate processes.
-    events = event_bus.get_events(ticket_id, since=0, limit=10000)
-
     total_in = 0
     total_out = 0
     total_cache_read = 0
@@ -191,10 +350,92 @@ def get_usage(ticket_id: str, request: Request):
         }
 
     return {
-        "ticket_id": ticket_id,
         "usage": usage,
         "estimated_cost_usd": round(total_cost, 6),
         "by_agent": agent_costs,
+    }
+
+
+@router.get("/{ticket_id}/usage")
+def get_usage(ticket_id: str, request: Request):
+    """Get cumulative LLM token usage and estimated cost.
+
+    Computes usage from stored llm_usage events emitted by
+    the OTLP span processor. This works across process
+    boundaries since events are persisted to JSONL files.
+    """
+    event_bus = getattr(request.app.state, "event_bus", None)
+    if event_bus is None:
+        return {
+            "ticket_id": ticket_id,
+            "usage": {},
+            "estimated_cost_usd": 0.0,
+            "by_agent": {},
+        }
+
+    # Compute usage from stored events rather than
+    # in-memory accumulators, since the state store
+    # and orchestrator are separate processes.
+    events = event_bus.get_events(ticket_id, since=0, limit=10000)
+    result = _compute_usage_with_agents(events)
+    return {"ticket_id": ticket_id, **result}
+
+
+@router.get("/{ticket_id}/snapshot")
+def get_ticket_snapshot(
+    ticket_id: str,
+    request: Request,
+    recent: int = Query(100, ge=0, le=500),
+    view: str = Query(
+        "activity",
+        description=(
+            "View filter: 'activity' excludes successful audit events, "
+            "'audit' includes only audit events, 'all' includes everything"
+        ),
+    ),
+):
+    """Return everything the dashboard needs for initial load in one call.
+
+    The selected view is filtered server-side so ``recent_events`` contains
+    only records from that view. The server progressively scans raw records
+    when a page contains hidden events.
+    """
+    event_bus = getattr(request.app.state, "event_bus", None)
+    if event_bus is None:
+        return {
+            "ticket_id": ticket_id,
+            "total_events": 0,
+            "latest_seq": 0,
+            "recent_events": [],
+            "usage": {},
+            "estimated_cost_usd": 0.0,
+            "by_agent": {},
+        }
+
+    total_events = event_bus.get_event_count(ticket_id)
+    latest_seq = event_bus.get_latest_seq(ticket_id)
+
+    # Over-fetch when filtering so we return enough visible events
+    recent_events = _get_visible_events(
+        event_bus,
+        ticket_id,
+        view,
+        since=0,
+        limit=recent,
+        tail=True,
+    )
+
+    # Usage from dedicated usage-event stream (avoids full
+    # event scan when only llm_usage records are needed).
+    usage_events = event_bus.get_usage_events(ticket_id)
+    usage_result = _compute_usage_with_agents(usage_events)
+
+    return {
+        "ticket_id": ticket_id,
+        "total_events": total_events,
+        "latest_seq": latest_seq,
+        "recent_events": recent_events,
+        **usage_result,
     }
 
 

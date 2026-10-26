@@ -1800,17 +1800,30 @@ let artifactPollInFlight = false;
 let resultPollInFlight = false;
 let usageSidebarPollInFlight = false;
 let introspectionPollInFlight = false;
+let introspectionRetryTimer = null;
+let introspectionRetryDeadline = 0;
+let introspectionRetryAttempts = 0;
+let introspectionTerminalRetryTicketId = null;
 let lastSeq = 0;
 let autoScroll = true;
 let maxRenderedSeq = 0;
 let renderedEventCount = 0;
 var eventRecords = [];
+let earliestLoadedSeq = Infinity;
+let historyLoadInFlight = false;
+let historyLoadRequestId = 0;
+let snapshotTotalEvents = 0;
+let eventPageSize = 50;
+let eventSnapshotRecent = 150;
+let eventSnapshotRequestId = 0;
+let autoHistoryPagesLoaded = 0;
+const MAX_AUTO_HISTORY_PAGES = 3;
 var eventView = 'activity';
 var eventSearch = '';
 var condenseEvents = true;
 var _chartInstances = {};
 
-const TERMINAL_STATUSES = new Set(['closed', 'awaiting_customer_guidance']);
+const TERMINAL_STATUSES = new Set(['closed']);
 function isTerminalStatus(s) { return TERMINAL_STATUSES.has(s); }
 
 // Ticket-level terminal statuses from the state machine.
@@ -2363,9 +2376,47 @@ async function loadTickets() {
 
 // ── Ticket Detail ──
 
+function applyInitialEventSnapshot(snapshot, ticketId, requestId, requestedView) {
+  if (ticketId !== currentTicketId || requestId !== eventSnapshotRequestId || requestedView !== eventView) {
+    return null;
+  }
+  lastSeq = snapshot.latest_seq || 0;
+  var rawCountEl = document.getElementById('raw-event-count');
+  if (rawCountEl) rawCountEl.textContent = snapshot.total_events + ' total events';
+  var countEl = document.getElementById('event-count');
+  if (countEl) countEl.textContent = snapshot.total_events;
+  var recentEvents = snapshot.recent_events || [];
+  snapshotTotalEvents = snapshot.total_events || 0;
+  if (recentEvents.length > 0) {
+    earliestLoadedSeq = Math.min.apply(null, recentEvents.map(function(evt) { return evt.seq; }));
+    renderNewEvents(recentEvents);
+  } else {
+    earliestLoadedSeq = snapshot.latest_seq || 0;
+  }
+  renderUsageData(snapshot);
+  return recentEvents;
+}
+
 async function renderDetail(ticketId) {
   const app = document.getElementById('app');
-  app.innerHTML = '<div class="spinner"></div> Loading ticket...';
+  eventSnapshotRequestId++;
+  historyLoadRequestId++;
+  historyLoadInFlight = false;
+  autoHistoryPagesLoaded = 0;
+  if (introspectionRetryTimer) {
+    clearTimeout(introspectionRetryTimer);
+    introspectionRetryTimer = null;
+  }
+  introspectionRetryDeadline = 0;
+  introspectionRetryAttempts = 0;
+  introspectionTerminalRetryTicketId = null;
+  app.innerHTML =
+    '<div class="detail-toolbar">' +
+      '<div class="breadcrumb">' +
+        '<a href="#/">Dashboard</a> / ' + escHtml(ticketId) +
+      '</div>' +
+    '</div>' +
+    '<div class="spinner"></div> Loading ticket...';
 
   // Clear event state immediately to prevent stale events
   // from a previous ticket showing during the async fetch.
@@ -2373,6 +2424,12 @@ async function renderDetail(ticketId) {
   maxRenderedSeq = 0;
   renderedEventCount = 0;
   eventRecords = [];
+  autoScroll = true;
+  earliestLoadedSeq = Infinity;
+  historyLoadInFlight = false;
+  snapshotTotalEvents = 0;
+  eventPageSize = 50;
+  eventSnapshotRecent = 150;
 
   try {
     const ticket = await api('/tickets/' + ticketId);
@@ -2384,8 +2441,6 @@ async function renderDetail(ticketId) {
     trailStates = (ticket.status_trail && ticket.status_trail.length > 0)
       ? ticket.status_trail.slice()
       : [ticket.status];
-    rebuildTrail();
-
     var ownershipHtml = '';
     if (_isMultiUser) {
       var owners = ticket.owners || [];
@@ -2404,6 +2459,7 @@ async function renderDetail(ticketId) {
       '</div>';
     }
     _currentDetailTicket = ticket;
+    document.title = ticket.id + ' — Agentic Perf';
 
     app.innerHTML =
       '<div class="detail-view">' +
@@ -2476,6 +2532,7 @@ async function renderDetail(ticketId) {
           '<div class="panel-divider" id="panel-divider"></div>' +
           '<div class="detail-right-panel">' +
             '<div class="transition-trail" id="transition-trail"></div>' +
+            '<div id="load-history-container"></div>' +
             '<div class="event-stream-scroll" id="event-stream"></div>' +
           '</div>' +
         '</div>' +
@@ -2498,7 +2555,7 @@ async function renderDetail(ticketId) {
     });
     document.getElementById('event-view-select').addEventListener('change', function() {
       eventView = this.value;
-      renderEventStream();
+      reloadEventSnapshot(ticketId);
     });
     document.getElementById('event-search').addEventListener('input', function() {
       eventSearch = this.value || '';
@@ -2520,18 +2577,66 @@ async function renderDetail(ticketId) {
     });
     bindActionButtons(ticketId);
     initPanelDivider();
+    rebuildTrail();
 
-    // Initial load: fetch ALL events at once for complete
-    // breadcrumbs and history. Only poll for NEW events after.
+    // Initial load: fetch snapshot for efficient single-call loading.
+    var _snapshotTicketTerminal = false;
+    var snapshotLoaded = false;
+    var initialSnapshotRequestId = eventSnapshotRequestId;
+    var initialSnapshotView = eventView;
     try {
-      var initData = await api('/tickets/' + ticketId + '/transcript');
-      var initEvents = initData.events || [];
-      if (initEvents.length > 0) {
-        lastSeq = maxEventSeq(initEvents);
-        renderNewEvents(initEvents);
+      // Calculate how many visible events to load based on pane height.
+      // Each event row is ~35px; load 3x the visible area for smooth scrolling.
+      var streamEl = document.getElementById('event-stream');
+      var paneHeight = (streamEl && streamEl.clientHeight) || 500;
+      var eventsPerScreen = Math.max(15, Math.ceil(paneHeight / 35));
+      var targetEvents = eventsPerScreen * 3;
+      eventPageSize = eventsPerScreen;
+      eventSnapshotRecent = targetEvents;
+      var viewParam = eventView === 'audit' ? 'audit' : 'activity';
+      var snapshot = await api('/tickets/' + ticketId + '/snapshot?recent=' + targetEvents + '&view=' + viewParam);
+      var recentEvents = applyInitialEventSnapshot(
+        snapshot,
+        ticketId,
+        initialSnapshotRequestId,
+        initialSnapshotView,
+      );
+      snapshotLoaded = recentEvents !== null;
+      if (snapshotLoaded && earliestLoadedSeq > 1) {
+        showLoadEarlierButton(ticketId);
       }
+      if (snapshotLoaded && snapshotTotalEvents > recentEvents.length && earliestLoadedSeq > 1) {
+        scheduleEarlierEventsIfUnderfilled(ticketId);
+      }
+      // Scroll to bottom after initial render
+      if (snapshotLoaded) requestAnimationFrame(function() {
+        var s = document.getElementById('event-stream');
+        if (s) s.scrollTop = s.scrollHeight;
+      });
+      // Check if ticket is terminal — skip polling if so
+      _snapshotTicketTerminal = isTerminalStatus(ticket.status);
     } catch (e) {
-      console.warn('Initial event load failed:', e);
+      console.warn('Snapshot load failed, falling back to transcript:', e);
+      if (initialSnapshotRequestId === eventSnapshotRequestId && initialSnapshotView === eventView && ticketId === currentTicketId) {
+        try {
+          var initData = await api('/tickets/' + ticketId + '/transcript');
+          var initEvents = initData.events || [];
+          if (initEvents.length > 0 && initialSnapshotRequestId === eventSnapshotRequestId && initialSnapshotView === eventView && ticketId === currentTicketId) {
+            lastSeq = maxEventSeq(initEvents);
+            renderNewEvents(initEvents);
+          }
+        } catch (e2) {
+          console.warn('Transcript load also failed:', e2);
+        }
+      }
+    }
+    var stream = document.getElementById('event-stream');
+    if (stream) {
+      stream.addEventListener('scroll', function() {
+        if (stream.scrollTop < 50 && earliestLoadedSeq > 1 && !historyLoadInFlight) {
+          loadEarlierEvents(currentTicketId);
+        }
+      });
     }
 
     // Load artifacts
@@ -2550,7 +2655,15 @@ async function renderDetail(ticketId) {
       if (globalChat) globalChat.style.display = 'none';
     }
 
-    pollTimer = setInterval(function() { pollEvents(ticketId); }, 2000);
+    // Always update introspection card once on load (for closed
+    // tickets where polling is skipped, this is the only chance).
+    updateIntrospectionCard(ticketId, ticket);
+    if (!snapshotLoaded) updateUsageSidebar(ticketId);
+
+    // Only start polling if ticket is not in a terminal state
+    if (!_snapshotTicketTerminal) {
+      pollTimer = setInterval(function() { pollEvents(ticketId); }, 2000);
+    }
     // Re-check artifacts periodically (created during ticket run)
     artifactTimer = setInterval(function() { loadArtifacts(ticketId); }, 10000);
   } catch (err) {
@@ -3242,13 +3355,19 @@ async function pollEvents(ticketId) {
   if (eventPollInFlight) return;
   eventPollInFlight = true;
   try {
-    var data = await api('/tickets/' + ticketId + '/events?since=' + lastSeq + '&limit=500');
+    var pollView = eventView === 'audit' ? 'audit' : 'activity';
+    var data = await api('/tickets/' + ticketId + '/events?since=' + lastSeq + '&limit=500&view=' + pollView);
     // Guard: if the user navigated away during the fetch,
     // discard the response to prevent stale event injection.
     if (ticketId !== currentTicketId) return;
     var newEvents = data.events || [];
-    if (newEvents.length > 0) {
-      lastSeq = data.latest_seq;
+    var hasNewEvents = newEvents.length > 0;
+    var latestSeq = Number(data.latest_seq || lastSeq);
+    if (latestSeq > lastSeq) {
+      snapshotTotalEvents += latestSeq - lastSeq;
+      lastSeq = latestSeq;
+    }
+    if (hasNewEvents) {
       renderNewEvents(newEvents);
     }
     // Refresh trail and status badge from the ticket
@@ -3268,7 +3387,9 @@ async function pollEvents(ticketId) {
       bindActionButtons(ticketId);
     }
     refreshResultSection(ticketId, ticket);
-    updateUsageSidebar(ticketId);
+    if (hasNewEvents) {
+      updateUsageSidebar(ticketId);
+    }
     updateIntrospectionCard(ticketId, ticket);
 
     // Proactive HITL: notify chat when ticket needs guidance
@@ -3301,6 +3422,33 @@ async function pollEvents(ticketId) {
   }
 }
 
+function clearIntrospectionSummaryRetry() {
+  if (introspectionRetryTimer) {
+    clearTimeout(introspectionRetryTimer);
+    introspectionRetryTimer = null;
+  }
+  introspectionRetryDeadline = 0;
+  introspectionRetryAttempts = 0;
+  introspectionTerminalRetryTicketId = null;
+}
+
+function scheduleIntrospectionSummaryRetry(ticketId) {
+  if (ticketId !== currentTicketId || introspectionTerminalRetryTicketId !== ticketId) return;
+  var now = Date.now();
+  if (!introspectionRetryDeadline) introspectionRetryDeadline = now + 5 * 60 * 1000;
+  if (now >= introspectionRetryDeadline) {
+    introspectionRetryTimer = null;
+    return;
+  }
+  if (introspectionRetryTimer) clearTimeout(introspectionRetryTimer);
+  var delay = Math.min(2000 * Math.pow(2, introspectionRetryAttempts), 30000);
+  introspectionRetryAttempts++;
+  introspectionRetryTimer = setTimeout(function() {
+    introspectionRetryTimer = null;
+    updateIntrospectionCard(ticketId);
+  }, delay);
+}
+
 function updateIntrospectionCard(ticketId, cachedTicket) {
   if (!ticketId) return;
   var card = document.getElementById('introspection-card');
@@ -3308,19 +3456,29 @@ function updateIntrospectionCard(ticketId, cachedTicket) {
   if (!card || !content) return;
   if (introspectionPollInFlight) return;
   introspectionPollInFlight = true;
+  var retryForFinalSummary = introspectionTerminalRetryTicketId === ticketId;
+  if (cachedTicket) {
+    retryForFinalSummary = isTicketTerminal(cachedTicket.status || '');
+    introspectionTerminalRetryTicketId = retryForFinalSummary ? ticketId : null;
+  }
 
   var ticketPromise = cachedTicket
     ? Promise.resolve(cachedTicket)
     : api('/tickets/' + ticketId);
   ticketPromise.then(function(ticket) {
+    if (ticketId !== currentTicketId) return;
     var cf = ticket.custom_fields || {};
     var summary = cf.introspection_summary;
     var intro = cf.introspection;
+    retryForFinalSummary = isTicketTerminal(ticket.status || '');
+    introspectionTerminalRetryTicketId = retryForFinalSummary ? ticketId : null;
 
     // Final summary takes precedence when present.
     // Once rendered, skip re-renders — closed tickets are
     // static and re-rendering collapses open <details>.
     if (summary) {
+      retryForFinalSummary = false;
+      clearIntrospectionSummaryRetry();
       card.classList.remove('introspection-hidden');
       if (!content.dataset.summaryRendered) {
         content.innerHTML = renderIntrospectionSummary(summary);
@@ -3337,9 +3495,8 @@ function updateIntrospectionCard(ticketId, cachedTicket) {
 
     // Terminal status but no summary yet — the introspection
     // agent is writing its final summary. Show an indicator.
-    var status = ticket.status || '';
     var pendingHtml = '';
-    if (isTicketTerminal(status)) {
+    if (retryForFinalSummary) {
       pendingHtml = '<div style="margin-top:8px; font-size:12px; color:var(--purple);">' +
         '<span class="spinner" style="width:12px; height:12px; border-width:1.5px; margin-right:4px;"></span>' +
         'Final summary pending…</div>';
@@ -3360,6 +3517,9 @@ function updateIntrospectionCard(ticketId, cachedTicket) {
     _attachNarrativeOpenClick(content);
   }).catch(function() {}).finally(function() {
     introspectionPollInFlight = false;
+    if (retryForFinalSummary && ticketId === currentTicketId) {
+      scheduleIntrospectionSummaryRetry(ticketId);
+    }
   });
 }
 
@@ -3563,11 +3723,7 @@ function _attachNarrativeOpenClick(container) {
   });
 }
 
-async function updateUsageSidebar(ticketId) {
-  if (usageSidebarPollInFlight) return;
-  usageSidebarPollInFlight = true;
-  try {
-    var data = await api('/tickets/' + ticketId + '/usage');
+function renderUsageData(data) {
     var el = document.getElementById('llm-usage');
     if (!el || !data.usage) return;
     var u = data.usage;
@@ -3636,6 +3792,14 @@ async function updateUsageSidebar(ticketId) {
       agentHtml += '</div>';
       el.innerHTML += agentHtml;
     }
+}
+
+async function updateUsageSidebar(ticketId) {
+  if (usageSidebarPollInFlight) return;
+  usageSidebarPollInFlight = true;
+  try {
+    var data = await api('/tickets/' + ticketId + '/usage');
+    renderUsageData(data);
   } catch {} finally {
     usageSidebarPollInFlight = false;
   }
@@ -3809,7 +3973,9 @@ function renderEventStream() {
 
   renderedEventCount = visible.length;
   var countEl = document.getElementById('event-count');
-  if (countEl) countEl.textContent = renderedEventCount;
+  if (countEl) countEl.textContent = snapshotTotalEvents > 0
+    ? renderedEventCount + ' / ' + snapshotTotalEvents
+    : renderedEventCount;
   var rawCountEl = document.getElementById('raw-event-count');
   if (rawCountEl) rawCountEl.textContent = eventRecords.length + ' raw records loaded';
   var countLabel = document.getElementById('event-count-label');
@@ -3819,6 +3985,129 @@ function renderEventStream() {
       : 'activity records shown';
   }
   if (autoScroll) container.scrollTop = container.scrollHeight;
+}
+
+function showLoadEarlierButton(ticketId, label) {
+  var container = document.getElementById('load-history-container');
+  if (!container) return;
+  container.innerHTML = '<button type="button" class="toolbar-btn" style="margin:4px auto;display:block">' +
+    escHtml(label || 'Load earlier events') + '</button>';
+  var button = container.querySelector('button');
+  if (button) button.addEventListener('click', function() { loadEarlierEvents(ticketId, false); });
+}
+
+function scheduleEarlierEventsIfUnderfilled(ticketId) {
+  var requestId = eventSnapshotRequestId;
+  var requestedView = eventView;
+  requestAnimationFrame(function() {
+    if (ticketId !== currentTicketId || requestId !== eventSnapshotRequestId ||
+        requestedView !== eventView) return;
+    var stream = document.getElementById('event-stream');
+    if (stream && stream.scrollHeight <= stream.clientHeight &&
+        earliestLoadedSeq > 1 && !historyLoadInFlight) {
+      if (autoHistoryPagesLoaded >= MAX_AUTO_HISTORY_PAGES) {
+        showLoadEarlierButton(ticketId);
+      } else {
+        loadEarlierEvents(ticketId, true);
+      }
+    }
+  });
+}
+
+async function reloadEventSnapshot(ticketId) {
+  if (ticketId !== currentTicketId) return;
+  var requestId = ++eventSnapshotRequestId;
+  historyLoadRequestId++;
+  historyLoadInFlight = false;
+  autoHistoryPagesLoaded = 0;
+  try {
+    var viewParam = eventView === 'audit' ? 'audit' : 'activity';
+    var snapshot = await api('/tickets/' + ticketId + '/snapshot?recent=' + eventSnapshotRecent + '&view=' + viewParam);
+    if (requestId !== eventSnapshotRequestId || ticketId !== currentTicketId) return;
+
+    eventRecords = [];
+    maxRenderedSeq = 0;
+    renderedEventCount = 0;
+    autoScroll = true;
+    lastSeq = snapshot.latest_seq || 0;
+    snapshotTotalEvents = snapshot.total_events || 0;
+    var recentEvents = snapshot.recent_events || [];
+    earliestLoadedSeq = recentEvents.length
+      ? Math.min.apply(null, recentEvents.map(function(evt) { return evt.seq; }))
+      : lastSeq;
+    renderNewEvents(recentEvents);
+    if (recentEvents.length === 0) renderEventStream();
+
+    var rawCountEl = document.getElementById('raw-event-count');
+    if (rawCountEl) rawCountEl.textContent = snapshotTotalEvents + ' total events';
+    renderUsageData(snapshot);
+    var history = document.getElementById('load-history-container');
+    if (history && earliestLoadedSeq > 1) showLoadEarlierButton(ticketId);
+    else if (history) history.innerHTML = '';
+    requestAnimationFrame(function() {
+      var stream = document.getElementById('event-stream');
+      if (stream) stream.scrollTop = stream.scrollHeight;
+    });
+    if (snapshotTotalEvents > recentEvents.length && earliestLoadedSeq > 1) {
+      scheduleEarlierEventsIfUnderfilled(ticketId);
+    }
+  } catch (err) {
+    console.error('Failed to reload ticket events for the selected view:', err);
+  }
+}
+
+async function loadEarlierEvents(ticketId, autoFill) {
+  if (historyLoadInFlight || earliestLoadedSeq <= 1) return;
+  if (!isFinite(earliestLoadedSeq)) return;
+  autoFill = autoFill === true;
+  var requestId = ++historyLoadRequestId;
+  var snapshotRequestId = eventSnapshotRequestId;
+  var requestedView = eventView;
+  var canAutoLoadMore = false;
+  historyLoadInFlight = true;
+  var container = document.getElementById('load-history-container');
+  if (container) container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:4px;font-size:12px">Loading earlier events...</div>';
+  try {
+    var data = await api('/tickets/' + ticketId + '/events?before=' + earliestLoadedSeq + '&limit=' + eventPageSize + '&view=' + (requestedView === 'audit' ? 'audit' : 'activity'));
+    if (ticketId !== currentTicketId || snapshotRequestId !== eventSnapshotRequestId || requestedView !== eventView) return;
+    var olderEvents = data.events || [];
+    var stream = document.getElementById('event-stream');
+    var prevHeight = stream ? stream.scrollHeight : 0;
+    var prevScroll = stream ? stream.scrollTop : 0;
+    if (olderEvents.length > 0) {
+      canAutoLoadMore = true;
+      if (autoFill) autoHistoryPagesLoaded++;
+      earliestLoadedSeq = Math.min.apply(null, olderEvents.map(function(e) { return e.seq; }));
+      for (var i = 0; i < olderEvents.length; i++) {
+        eventRecords.push(olderEvents[i]);
+      }
+      eventRecords.sort(function(a, b) { return a.seq - b.seq; });
+      autoScroll = false;
+      renderEventStream();
+      if (stream) {
+        stream.scrollTop = prevScroll + (stream.scrollHeight - prevHeight);
+      }
+    } else {
+      earliestLoadedSeq = 1;
+    }
+    if (container) {
+      if (earliestLoadedSeq <= 1) {
+        container.innerHTML = '';
+      } else {
+        showLoadEarlierButton(ticketId);
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load earlier events:', err);
+    if (container) showLoadEarlierButton(ticketId, 'Retry loading earlier events');
+  } finally {
+    if (requestId === historyLoadRequestId) {
+      historyLoadInFlight = false;
+      if (canAutoLoadMore && earliestLoadedSeq > 1) {
+        scheduleEarlierEventsIfUnderfilled(ticketId);
+      }
+    }
+  }
 }
 
 function renderNewEvents(events) {
