@@ -49,6 +49,11 @@ class _FakeApprovalsAPI:
         apply_resolution: bool = True,
         fail_list: bool = False,
         mismatched_binding: bool = False,
+        create_lost: bool = False,
+        apply_create: bool = True,
+        create_status: str = "pending",
+        seed_unrelated: bool = False,
+        seed_duplicate: bool = False,
     ) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.fail_create = fail_create
@@ -56,6 +61,11 @@ class _FakeApprovalsAPI:
         self.apply_resolution = apply_resolution
         self.fail_list = fail_list
         self.mismatched_binding = mismatched_binding
+        self.create_lost = create_lost
+        self.apply_create = apply_create
+        self.create_status = create_status
+        self.seed_unrelated = seed_unrelated
+        self.seed_duplicate = seed_duplicate
         self.approval_seq = 0
         self.approvals: list[dict] = []
 
@@ -74,26 +84,64 @@ class _FakeApprovalsAPI:
                 return _Response(409, {"detail": "approval rejected: claim_expired"})
             self.approval_seq += 1
             approval_id = f"apr-auto{self.approval_seq}"
-            self.approvals.append(
-                {
-                    "approval_request_id": approval_id,
-                    "ticket_id": "T-788",
-                    "kind": "benchmark_run_file",
-                    "status": "pending",
-                    "validation_id": json["validation_id"],
-                    "presented_run_file_digest": json["presented_run_file_digest"],
-                    "execution_intent_digest": json.get("execution_intent_digest"),
-                }
-            )
+            approval = {
+                "approval_request_id": approval_id,
+                "ticket_id": "T-788",
+                "status": self.create_status,
+                **{
+                    key: json[key]
+                    for key in (
+                        "kind",
+                        "validation_id",
+                        "presented_run_file_digest",
+                        "execution_intent_digest",
+                        "invocation_id",
+                        "tool_call_id",
+                        "session_id",
+                        "session_epoch",
+                        "waiter_owner",
+                        "claim_id",
+                        "ticket_attempt",
+                    )
+                },
+            }
+            if self.apply_create:
+                self.approvals.append(approval)
+            if self.seed_unrelated:
+                self.approvals.append(
+                    {
+                        **approval,
+                        "approval_request_id": "apr-unrelated",
+                        "tool_call_id": "other-tool",
+                        "status": "pending",
+                    }
+                )
+            if self.seed_duplicate:
+                self.approvals.append(
+                    {**approval, "approval_request_id": "apr-duplicate"}
+                )
+            if self.create_lost:
+                raise ConnectionError("create response lost")
             return _Response(200, {"approval_request_id": approval_id})
         if "/resolve" in str(url):
+            approval_id = str(url).split("/approvals/", 1)[1].split("/", 1)[0]
+            approval = next(
+                (
+                    item
+                    for item in self.approvals
+                    if item["approval_request_id"] == approval_id
+                ),
+                None,
+            )
+            if approval is None:
+                return _Response(404, {"detail": "approval not found"})
             if self.apply_resolution:
-                self.approvals[-1]["status"] = "approved"
+                approval["status"] = "approved"
                 if self.mismatched_binding:
-                    self.approvals[-1]["execution_intent_digest"] = "wrong"
+                    approval["execution_intent_digest"] = "wrong"
             if self.resolve_lost:
                 raise ConnectionError("resolve response lost")
-            return _Response(200, self.approvals[-1])
+            return _Response(200, approval)
         if "/consume" in str(url):
             return _Response(200, {"approval_request_id": "apr-auto"})
         if "/comments" in str(url):
@@ -137,12 +185,15 @@ def _wire(
         "AGENTIC_PERF_TRACE_INVOCATION_ID", "0123456789abcdef0123456789abcdef"
     )
     monkeypatch.setenv("AGENTIC_PERF_TRACE_ACTION_ID", "b" * 16)
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "session-788")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "epoch-1")
+    monkeypatch.setenv("AGENTIC_PERF_CLAIM_ID", "claim-788")
     ticket = {
         "id": "T-788",
         "status": "executing_benchmark",
         "custom_fields": {
             "benchmark_validations": {"records": {"val-788": record}},
-            "directives": directives or {},
+            "directives": directives,
         },
     }
 
@@ -223,6 +274,62 @@ async def test_lost_resolve_response_reconciles_approved_binding(tmp_path, monke
         == 1
     )
     assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_status", ["pending", "approved"])
+async def test_lost_create_response_reconciles_exact_binding(
+    tmp_path, monkeypatch, create_status
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        create_lost=True,
+        create_status=create_status,
+        seed_unrelated=True,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["status"] == "completed"
+    assert len(_approval_calls(api, "/resolve")) == (
+        1 if create_status == "pending" else 0
+    )
+    assert api.approvals[0]["status"] == "approved"
+    assert api.approvals[1]["status"] == "pending"
+    assert len([call for call in calls if call[0] == "launch"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api_options",
+    [
+        {"create_lost": True, "fail_list": True},
+        {"create_lost": True, "apply_create": False},
+        {"create_lost": True, "apply_create": False, "seed_unrelated": True},
+        {"create_lost": True, "seed_duplicate": True},
+    ],
+)
+async def test_lost_create_without_unique_bound_request_fails_closed(
+    tmp_path, monkeypatch, api_options
+):
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        **api_options,
+    )
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["status"] == "rejected"
+    assert result["reason_code"] == "approval_required"
+    assert not _approval_calls(api, "/resolve")
+    assert not _approval_calls(api, "/consume")
+    assert not [call for call in calls if call[0] == "launch"]
 
 
 @pytest.mark.asyncio
@@ -318,6 +425,19 @@ async def test_default_directive_keeps_the_hard_gate(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_null_directives_keep_the_hard_gate(tmp_path, monkeypatch):
+    _, calls, api = _wire(monkeypatch, tmp_path, directives=None)
+
+    result = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert result["status"] == "rejected"
+    assert result["reason_code"] == "approval_required"
+    assert api.calls == []
+    assert not [call for call in calls if call[0] == "launch"]
+
+
+@pytest.mark.asyncio
 async def test_autoapproval_with_unknown_validation_rejected(tmp_path, monkeypatch):
     """The opt-out with no validation record fails closed with the
     reason surfaced in the rejection."""
@@ -354,6 +474,9 @@ async def test_autoapproval_creation_failure_rejected(tmp_path, monkeypatch):
     assert result["status"] == "rejected"
     assert result["reason_code"] == "approval_required"
     assert "claim_expired" in result["auto_approval_error"]
+    assert not [
+        url for url, body in api.calls if url.endswith("/approvals") and not body
+    ]
     assert not [c for c in calls if c[0] == "launch"]
 
     replay = json.loads(

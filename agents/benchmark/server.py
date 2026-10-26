@@ -2557,20 +2557,6 @@ async def _autoconsume_runfile_approval(
             ),
         }
 
-    def bound_approved(item: Any) -> bool:
-        return (
-            isinstance(item, dict)
-            and item.get("approval_request_id") == approval_id
-            and item.get("ticket_id") == ticket_id
-            and item.get("kind") == "benchmark_run_file"
-            and item.get("status") == "approved"
-            and item.get("validation_id") == validation_id
-            and item.get("presented_run_file_digest")
-            == record.get("runfile_fingerprint")
-            and item.get("execution_intent_digest")
-            == record.get("execution_intent_digest")
-        )
-
     from providers.tracing import current_trace_context
 
     context = current_trace_context()
@@ -2592,6 +2578,53 @@ async def _autoconsume_runfile_approval(
         or (cf.get("claim") or {}).get("claim_id")
         or ""
     )
+    create_body = {
+        "kind": "benchmark_run_file",
+        "validation_id": validation_id,
+        "presented_run_file_digest": record.get("runfile_fingerprint"),
+        "execution_intent_digest": record.get("execution_intent_digest"),
+        "execution_intent_id": record.get("execution_intent_id"),
+        "attempt_id": record.get("attempt_id"),
+        "summary": "Automatic run-file approval (user_pre_run_approval=false)",
+        "invocation_id": invocation_id or None,
+        "tool_call_id": tool_call_id or None,
+        "session_id": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"),
+        "session_epoch": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH"),
+        "waiter_owner": invocation_id or None,
+        "ticket_attempt": claim_id or None,
+        "claim_id": claim_id or None,
+    }
+    binding = {"ticket_id": ticket_id}
+    binding.update(
+        {
+            key: create_body[key]
+            for key in (
+                "kind",
+                "validation_id",
+                "presented_run_file_digest",
+                "execution_intent_digest",
+                "invocation_id",
+                "tool_call_id",
+                "session_id",
+                "session_epoch",
+                "waiter_owner",
+                "claim_id",
+                "ticket_attempt",
+            )
+        }
+    )
+
+    def bound_to_creation(item: Any) -> bool:
+        return isinstance(item, dict) and all(
+            item.get(key) == value for key, value in binding.items()
+        )
+
+    def bound_approved(item: Any, approval_id: str) -> bool:
+        return (
+            bound_to_creation(item)
+            and item.get("approval_request_id") == approval_id
+            and item.get("status") == "approved"
+        )
 
     from agents.server_utils import ticket_state_headers
 
@@ -2606,60 +2639,95 @@ async def _autoconsume_runfile_approval(
         from providers.execution import AuditedAsyncHTTPClient
 
         async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
-            created = await client.post(
-                f"{store_url}/api/v1/tickets/{ticket_id}/approvals",
-                json={
-                    "kind": "benchmark_run_file",
-                    "validation_id": validation_id,
-                    "presented_run_file_digest": record.get("runfile_fingerprint"),
-                    "execution_intent_digest": record.get("execution_intent_digest"),
-                    "execution_intent_id": record.get("execution_intent_id"),
-                    "attempt_id": record.get("attempt_id"),
-                    "summary": (
-                        "Automatic run-file approval (user_pre_run_approval=false)"
-                    ),
-                    "invocation_id": invocation_id or None,
-                    "tool_call_id": tool_call_id or None,
-                    "session_id": os.environ.get(
-                        "AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"
-                    ),
-                    "session_epoch": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH"),
-                    "waiter_owner": invocation_id or None,
-                    "ticket_attempt": claim_id or None,
-                    "claim_id": claim_id or None,
-                },
-            )
-            if created.status_code >= 300:
-                return {
-                    "status": "rejected",
-                    "detail": (
-                        f"approval creation failed ({created.status_code}): "
-                        f"{created.text[:200]}"
-                    ),
-                }
-            approval_id = created.json()["approval_request_id"]
+            already_approved = False
+            try:
+                created = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/approvals",
+                    json=create_body,
+                )
+            except Exception as exc:
+                # The response may be lost after creation. Only a unique,
+                # fully fenced request can be safely selected for resolution.
+                creation_error = f"approval creation response lost: {exc}"
+                if any(
+                    not isinstance(value, str) or not value
+                    for value in binding.values()
+                ):
+                    return {"status": "rejected", "detail": creation_error}
+                try:
+                    listed = await client.get(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/approvals"
+                    )
+                    if listed.status_code >= 300:
+                        raise RuntimeError(f"listing failed ({listed.status_code})")
+                    matches = [
+                        item
+                        for item in listed.json().get("approvals", [])
+                        if bound_to_creation(item)
+                    ]
+                except Exception as readback_exc:
+                    return {
+                        "status": "rejected",
+                        "detail": f"{creation_error}; reconciliation failed: {readback_exc}",
+                    }
+                if len(matches) != 1:
+                    return {
+                        "status": "rejected",
+                        "detail": f"{creation_error}; expected one bound approval, found {len(matches)}",
+                    }
+                matched = matches[0]
+                approval_id = matched.get("approval_request_id")
+                if not isinstance(approval_id, str) or not approval_id:
+                    return {
+                        "status": "rejected",
+                        "detail": f"{creation_error}; missing approval ID",
+                    }
+                if matched.get("status") == "approved":
+                    already_approved = True
+                elif matched.get("status") != "pending":
+                    return {
+                        "status": "rejected",
+                        "detail": f"{creation_error}; approval is not pending or approved",
+                    }
+            else:
+                if created.status_code >= 300:
+                    return {
+                        "status": "rejected",
+                        "detail": (
+                            f"approval creation failed ({created.status_code}): "
+                            f"{created.text[:200]}"
+                        ),
+                    }
+                approval_id = created.json()["approval_request_id"]
 
             resolution_error = ""
             try:
-                resolved = await client.post(
-                    f"{store_url}/api/v1/tickets/{ticket_id}"
-                    f"/approvals/{approval_id}/resolve",
-                    json={
-                        "decision": "approved",
-                        "reason": "automatic approval per user_pre_run_approval=false",
-                        "validation_id": validation_id,
-                        "presented_run_file_digest": record.get("runfile_fingerprint"),
-                        "execution_intent_digest": record.get(
-                            "execution_intent_digest"
-                        ),
-                    },
-                )
-                if resolved.status_code >= 300:
+                if already_approved:
+                    resolved = None
+                else:
+                    resolved = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}"
+                        f"/approvals/{approval_id}/resolve",
+                        json={
+                            "decision": "approved",
+                            "reason": "automatic approval per user_pre_run_approval=false",
+                            "validation_id": validation_id,
+                            "presented_run_file_digest": record.get(
+                                "runfile_fingerprint"
+                            ),
+                            "execution_intent_digest": record.get(
+                                "execution_intent_digest"
+                            ),
+                        },
+                    )
+                if resolved is not None and resolved.status_code >= 300:
                     resolution_error = (
                         f"approval resolution failed ({resolved.status_code}): "
                         f"{resolved.text[:200]}"
                     )
-                elif not bound_approved(resolved.json()):
+                elif resolved is not None and not bound_approved(
+                    resolved.json(), approval_id
+                ):
                     resolution_error = "approval resolution response did not confirm the bound approval"
             except Exception as exc:
                 resolution_error = f"approval resolution response lost: {exc}"
@@ -2674,7 +2742,9 @@ async def _autoconsume_runfile_approval(
                     if listed.status_code >= 300:
                         raise RuntimeError(f"listing failed ({listed.status_code})")
                     approvals = listed.json().get("approvals", [])
-                    confirmed = any(bound_approved(item) for item in approvals)
+                    confirmed = any(
+                        bound_approved(item, approval_id) for item in approvals
+                    )
                 except Exception as exc:
                     return {
                         "status": "rejected",
@@ -3036,9 +3106,9 @@ async def execute_benchmark(
         harness_name == "crucible"
         and bool(active_check.get("id") or os.environ.get("TICKET_ID"))
         and not approval_request_id
-        and (active_check.get("custom_fields") or {})
-        .get("directives", {})
-        .get("user_pre_run_approval")
+        and ((active_check.get("custom_fields") or {}).get("directives") or {}).get(
+            "user_pre_run_approval"
+        )
         is False
     )
     if validation_id and (approval_request_id or autoapproval_eligible):
