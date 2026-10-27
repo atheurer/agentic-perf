@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import shlex
 import time
 import traceback
 from collections.abc import Awaitable, Callable
@@ -52,6 +53,37 @@ class SSHResult:
     stdout: str
     stderr: str
     exit_code: int
+
+
+def annotate_host_key_error(stderr: str) -> str:
+    """Append an operator recipe when SSH refuses a changed remote host key.
+
+    Lab allocations wipe hosts between assignments, so a reimage presents
+    new keys and every SSH step fails closed with "REMOTE HOST
+    IDENTIFICATION HAS CHANGED". The raw message includes the changed host,
+    while the ``Offending ... key in`` line names the known_hosts file and
+    line number. Keep those concepts separate: ``ssh-keygen -R`` takes a
+    host/IP, not a known_hosts path. New keys must be fingerprint-checked
+    with the host owner before they are added to known_hosts.
+    """
+    if "REMOTE HOST IDENTIFICATION HAS CHANGED" not in stderr:
+        return stderr
+    changed = re.search(r"Host key for (\S+) has changed", stderr)
+    changed_host = changed.group(1) if changed else "REPLACE_WITH_HOST_OR_IP"
+    changed_token = shlex.quote(changed_host)
+    other_token = shlex.quote("REPLACE_WITH_OTHER_HOSTNAME_OR_IP")
+    recipe = (
+        "Changed host key. Remove both stale identifiers (replace "
+        "placeholders): "
+        f"ssh-keygen -R {changed_token}; ssh-keygen -R {other_token}. "
+        "Collect untrusted scan results and inspect their fingerprints: "
+        f"candidate_keys=$(mktemp); ssh-keyscan -T 5 -t ecdsa,ed25519 "
+        f'{changed_token} {other_token} >"$candidate_keys"; '
+        'ssh-keygen -lf "$candidate_keys". Compare to an independently '
+        "confirmed owner fingerprint; only then append: "
+        'cat "$candidate_keys" >> ~/.ssh/known_hosts.'
+    )
+    return recipe
 
 
 @dataclass

@@ -51,7 +51,7 @@ from agents.skill_gateway import (
     skill_context_gateway,
 )
 from providers.llm.base import ToolDefinition
-from providers.ssh import SSHExecutor
+from providers.ssh import SSHExecutor, annotate_host_key_error
 
 logger = logging.getLogger(__name__)
 
@@ -893,6 +893,7 @@ async def _verify_harness_install_one(
     )
     harness_verified = result.exit_code == 0 or zathras_help_succeeded
     context: dict[str, Any] | None = None
+    identity_ready: bool | None = None
 
     # The context gateway bootstraps Crucible from the controller's installed
     # tree.  Keep this harness-specific detail in the provisioning result, not
@@ -923,29 +924,92 @@ async def _verify_harness_install_one(
                 else "bootstrap document is not readable"
             )
 
+        # Run-file validation requires a non-empty run email, which comes
+        # from the controller's crucible identity; a fresh host has none
+        # and the failure otherwise appears only much later as a schema
+        # error far from the cause. Surface it read-only at verification
+        # time (#1233). The services themselves are run-dynamic (crucible
+        # starts valkey/opensearch/cdm with the run), so they are not
+        # probed here — the skill doc covers the preflight instead.
+        identity_probe = _crucible_identity_probe_command()
+        try:
+            identity_result = await _ssh.run(host, identity_probe, timeout=15)
+        except Exception:
+            logger.warning(
+                "Read-only Crucible identity probe failed for %s",
+                host,
+                exc_info=True,
+            )
+        else:
+            if identity_result.exit_code == 0:
+                probe_lines = (identity_result.stdout or "").strip().splitlines()
+                if probe_lines and probe_lines[-1] in {"identity=0", "identity=1"}:
+                    identity_ready = probe_lines[-1] == "identity=1"
+
     context_ready = context is None or context["ready"]
     verified = harness_verified and context_ready
+    # A changed remote host key (lab reimage) surfaces here as a failed
+    # verification; annotate the stderr with the refresh recipe so the
+    # operator guidance reaches the agent and the comment verbatim.
+    error_output = annotate_host_key_error(result.stderr or "")
     message = (
         f"{harness_name} verified"
         if verified
         else (
             f"{harness_name} executable verified but controller context is not ready"
             if harness_verified and context is not None and not context_ready
-            else f"Verification failed: {result.stderr[:200]}"
+            else f"Verification failed: {error_output[:200]}"
         )
     )
+    if harness_name == "crucible" and verified:
+        if identity_ready is False:
+            message += (
+                " (warning: /root/.crucible/identity is missing CRUCIBLE_EMAIL — "
+                "run-file validation will fail until it is set)"
+            )
+        elif identity_ready is None:
+            message += (
+                " (warning: the read-only Crucible identity probe did not "
+                "complete successfully, so CRUCIBLE_EMAIL could not be checked)"
+            )
     return {
         "host": host,
         "harness": harness_name,
         "verified": verified,
         "harness_verified": harness_verified,
         "context_ready": context_ready,
+        "identity_ready": identity_ready if harness_name == "crucible" else None,
         "install_path": path,
         "output": result.stdout[:500] if result.stdout else "",
-        "error": result.stderr[:500] if result.stderr else "",
+        "error": error_output[:500] if error_output else "",
         "context": context,
         "message": message,
     }
+
+
+def _crucible_identity_probe_command(
+    identity_path: str = "/root/.crucible/identity",
+) -> str:
+    """Build a read-only shell probe for a non-empty Crucible email value."""
+    quoted_path = shlex.quote(identity_path)
+    return (
+        f"if test -r {quoted_path} && "
+        "awk -F= '"
+        "/^[[:space:]]*#/ { next } "
+        "$1 ~ /^[[:space:]]*(export[[:space:]]+)?CRUCIBLE_EMAIL[[:space:]]*$/ { "
+        "value = $2; "
+        'sub(/[[:space:]]+#.*/, "", value); '
+        'gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); '
+        'if ((substr(value, 1, 1) == "\\"" && '
+        'substr(value, length(value), 1) == "\\"") || '
+        '(substr(value, 1, 1) == sprintf("%c", 39) && '
+        'substr(value, length(value), 1) == sprintf("%c", 39))) '
+        "value = substr(value, 2, length(value) - 2); "
+        'gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); '
+        'found = (value != "" && value !~ /^#/) '
+        f"}} END {{ exit !found }}' {quoted_path}; "
+        "then printf 'identity=1'; else printf 'identity=0'; fi"
+    )
 
 
 async def _check_existing_install_one(
@@ -1138,11 +1202,17 @@ async def _ensure_harness_one(
         if not verify_result.get("verified"):
             verify_result["status"] = "installed_verify_failed"
             return verify_result
+        verification_warning = verify_result.get("message", "").partition(
+            " (warning: "
+        )[2]
+        message = f"{harness_name} already installed and verified on {host}"
+        if verification_warning:
+            message += f" (warning: {verification_warning}"
         verify_result.update(
             {
                 "status": "already_installed",
                 "version": existing.get("version", "unknown"),
-                "message": f"{harness_name} already installed and verified on {host}",
+                "message": message,
             }
         )
         return verify_result

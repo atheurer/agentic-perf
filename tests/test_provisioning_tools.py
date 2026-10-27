@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import subprocess
 from unittest.mock import patch
 
 import pytest
 
 from agents.provisioning.prompts import PROVISIONING_BASE_PROMPT
 from agents.provisioning.server import (
+    _crucible_identity_probe_command,
     _parse_os_release,
     _summarize,
     _verify_harness_install_one,
@@ -200,13 +202,14 @@ async def test_check_existing_reads_from_config(mock_provider):
 
 @pytest.mark.asyncio
 async def test_verify_crucible_is_read_only_and_reports_context(mock_ssh, monkeypatch):
-    """Crucible verification checks the executable and bootstrap document only."""
+    """Crucible verification checks executable, context, and identity read-only."""
     from agents.provisioning import server
 
     monkeypatch.setattr(server, "_ssh", mock_ssh)
     mock_ssh._results = {
         "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
         "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+        "/root/.crucible/identity": SSHResult(stdout="identity=1"),
     }
 
     result = await _verify_harness_install_one(
@@ -218,6 +221,8 @@ async def test_verify_crucible_is_read_only_and_reports_context(mock_ssh, monkey
     assert result["verified"] is True
     assert result["harness_verified"] is True
     assert result["context_ready"] is True
+    assert result["identity_ready"] is True
+    assert "warning" not in result["message"]
     assert result["context"] == {
         "ready": True,
         "bootstrap": "/opt/crucible/AGENTS.md",
@@ -1007,3 +1012,190 @@ async def test_all_install_tools_have_controller_host():
         assert "controller_host" in tool.input_schema["properties"], (
             f"Tool {name} missing controller_host property"
         )
+
+
+@pytest.mark.asyncio
+async def test_verify_crucible_warns_when_identity_is_missing(mock_ssh, monkeypatch):
+    """A fresh host has no crucible identity; verification stays verified
+    (services and harness are fine) but the message must carry the
+    warning so the run-file email failure is surfaced near the cause."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
+        "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+        "/root/.crucible/identity": SSHResult(stdout="identity=0"),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is True
+    assert result["identity_ready"] is False
+    assert "CRUCIBLE_EMAIL" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_identity_probe_failure_is_not_reported_as_missing_email(
+    mock_ssh, monkeypatch
+):
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
+        "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+        "/root/.crucible/identity": SSHResult(
+            stdout="", stderr="SSH probe failed", exit_code=255
+        ),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is True
+    assert result["identity_ready"] is None
+    assert "identity probe did not complete" in result["message"]
+    assert "missing CRUCIBLE_EMAIL" not in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_identity_probe_spawn_exception_leaves_readiness_unknown(
+    mock_ssh, monkeypatch
+):
+    from agents.provisioning import server
+
+    original_run = mock_ssh.run
+
+    async def fail_identity_probe(host, command, timeout=300):
+        if "/root/.crucible/identity" in command:
+            raise OSError("could not create SSH subprocess")
+        return await original_run(host, command, timeout=timeout)
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    monkeypatch.setattr(mock_ssh, "run", fail_identity_probe)
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is True
+    assert result["identity_ready"] is None
+    assert "identity probe did not complete" in result["message"]
+    assert "missing CRUCIBLE_EMAIL" not in result["message"]
+
+
+@pytest.mark.parametrize(
+    ("identity_contents", "expected"),
+    [
+        ('CRUCIBLE_EMAIL="person@example.com"\n', "identity=1"),
+        ("export CRUCIBLE_EMAIL='person@example.com'\n", "identity=1"),
+        ('CRUCIBLE_EMAIL=""\n', "identity=0"),
+        ("CRUCIBLE_EMAIL=''\n", "identity=0"),
+        ("# CRUCIBLE_EMAIL=person@example.com\n", "identity=0"),
+        ("CRUCIBLE_EMAIL= # not configured\n", "identity=0"),
+        (
+            'CRUCIBLE_EMAIL="person@example.com"\nCRUCIBLE_EMAIL=""\n',
+            "identity=0",
+        ),
+        (
+            'CRUCIBLE_EMAIL=""\nCRUCIBLE_EMAIL="person@example.com"\n',
+            "identity=1",
+        ),
+    ],
+    ids=[
+        "double-quoted",
+        "single-quoted",
+        "empty-double",
+        "empty-single",
+        "commented",
+        "empty-with-comment",
+        "last-empty-wins",
+        "last-nonempty-wins",
+    ],
+)
+def test_crucible_identity_probe_requires_active_nonempty_email(
+    tmp_path, identity_contents, expected
+):
+    identity_file = tmp_path / "identity"
+    identity_file.write_text(identity_contents)
+
+    result = subprocess.run(
+        ["bash", "-c", _crucible_identity_probe_command(str(identity_file))],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == expected
+
+
+@pytest.mark.asyncio
+async def test_ensure_existing_install_preserves_identity_warning(monkeypatch):
+    from agents.provisioning import server
+
+    async def existing_install(*args, **kwargs):
+        return {"installed": True, "version": "1.2.3"}
+
+    async def verified_install(*args, **kwargs):
+        return {
+            "verified": True,
+            "identity_ready": False,
+            "message": (
+                "crucible verified (warning: /root/.crucible/identity is "
+                "missing CRUCIBLE_EMAIL — run-file validation will fail until "
+                "it is set)"
+            ),
+        }
+
+    monkeypatch.setattr(server, "_check_existing_install_one", existing_install)
+    monkeypatch.setattr(server, "_verify_harness_install_one", verified_install)
+
+    result = await server._ensure_harness_one("controller", "crucible", {}, {}, {})
+
+    assert result["status"] == "already_installed"
+    assert "warning:" in result["message"]
+    assert "missing CRUCIBLE_EMAIL" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_verify_annotates_changed_host_key_with_refresh_recipe(
+    mock_ssh, monkeypatch
+):
+    """A reimage presents new host keys; the verification error must name
+    the offending known_hosts entry and the both-forms refresh recipe."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(
+            exit_code=255,
+            stderr=(
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n"
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                "Offending ED25519 key in /root/.ssh/known_hosts:61\n"
+                "Host key for 10.6.60.88 has changed and you have requested strict checking.\n"
+                "Host key verification failed.\n"
+            ),
+        ),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is False
+    assert "ssh-keygen -R 10.6.60.88" in result["error"]
+    assert "ssh-keygen -R /root/.ssh/known_hosts" not in result["error"]
