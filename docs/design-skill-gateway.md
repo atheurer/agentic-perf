@@ -1,9 +1,10 @@
 # Subject-based skill gateway
 
-Status: implementation draft for issues [#1118](https://github.com/atheurer/agentic-perf/issues/1118),
+Status: design and implementation notes for issues [#1118](https://github.com/atheurer/agentic-perf/issues/1118),
 [#246](https://github.com/atheurer/agentic-perf/issues/246), and the migration
 inventory [#1153](https://github.com/atheurer/agentic-perf/issues/1153).
-Runtime activation and publication are pending review. The initial subject is
+For current setup and verification, follow the [how-to](context-gateway-howto.md).
+The initial subject is
 `harness/crucible`, with an explicit bundled project-guidance manifest and
 ticket-bound source captures for the gateway adapters covered by this slice.
 
@@ -26,9 +27,9 @@ filtered by phase and agent and has the lowest default authority for overlapping
 soft guidance. Authenticated user sources remain future work.
 
 The recommended first migration includes both guidance and structured Crucible
-runtime configuration. The draft includes this scope; a documents-only configuration
-can explicitly retain legacy settings temporarily. Secret values continue through
-the existing secret providers.
+runtime configuration. The implementation includes this scope; a documents-only
+configuration can explicitly retain legacy settings temporarily. Secret values
+continue through the existing secret providers.
 
 ## New-developer onboarding acceptance
 
@@ -336,10 +337,11 @@ The discovered or explicitly bound service JSON contains validated settings used
 execution, and review services. Existing tool-side contracts continue to read
 structured data; the agent does not translate prose into installation settings.
 The raw resource is excluded from document inventory, search, and arbitrary
-model-facing reads. A documents-only discovered subject has no service settings;
-it does not silently fall back to legacy JSON. A config-only subject supplies
-service settings without organization document entrypoints; applicable software
-references remain available. Model-facing configuration views require a
+model-facing reads. A documents-only discovered subject has no organization
+service settings; current harness tools retain their existing defaults and legacy
+runtime settings when no organization runtime configuration is bound. A config-only
+subject supplies service settings without organization document entrypoints;
+applicable software references remain available. Model-facing configuration views require a
 registered projection schema, initially provided for `harness/crucible`. An explicit
 `legacy_config: true` documents-only binding retains legacy runtime
 loading rather than pinning those legacy settings; the coherent configuration

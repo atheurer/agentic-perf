@@ -88,7 +88,8 @@ guidance. The subject-based context gateway gives agents a shared, bounded way t
 retrieve applicable material with its source and scope visible. This helps keep
 agents consistent, preserve the difference between software behavior and local
 preferences, and identify conflicting guidance instead of silently choosing a
-copy. See the [context gateway overview and migration plan](docs/context-gateway.md).
+copy. See the [context gateway overview and migration plan](docs/context-gateway.md)
+and the [setup and verification how-to](docs/context-gateway-howto.md).
 
 ## Resource Providers
 
@@ -346,6 +347,7 @@ For end-to-end testing with real infrastructure, see
 ### Operators
 
 - [Configuration](docs/configuration.md) — current settings
+- [Context gateway how-to](docs/context-gateway-howto.md) — publish guidance, configure sources, and verify ticket retrieval
 - [Secrets](docs/secrets.md) — current secret providers and resolution
 - [Monitoring runbook](docs/monitoring.md) — current recovery procedures
 - [Multi-user](docs/multi-user.md) — current identity and ownership
