@@ -42,8 +42,8 @@ attrs==26.1.0 \
     #   jsonschema
     #   jsonschema-path
     #   referencing
-authlib==1.7.2 \
-    --hash=sha256:2cea25fefcd4e7173bdf1372c0afc265c8034b23a8cd5dcb6a9164b826c64231 \
+authlib==1.9.0 \
+    --hash=sha256:c54c963ede35c428d126f5bb5d6f84617e91ace74d6ea9acad659c30f5ff1819 \
     --hash=sha256:3e1faedc9d87e7d56a164eca3ccb6ace0d61b94abe83e92242f8dc8bba9b4a9f
     # via fastmcp-slim
 beartype==0.22.9 \
