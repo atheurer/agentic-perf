@@ -139,6 +139,18 @@
         "identity"
       ],
       "entrypoint": true
+    },
+    {
+      "id": "general-rhel-kernel",
+      "path": "skills/general/rhel-kernel.md",
+      "harness": "general",
+      "phase": "provision",
+      "agent": "provisioning-agent",
+      "subjects": [
+        "kernel",
+        "kernel-transitions"
+      ],
+      "entrypoint": true
     }
   ]
 }

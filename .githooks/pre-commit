@@ -84,6 +84,14 @@ discover_tests() {
 
 TEST_FILES=$(discover_tests)
 
+# Git exports repository-local variables to hooks. Child tests create temporary
+# repositories; inherited GIT_DIR/GIT_INDEX_FILE could mutate this real checkout.
+GIT_LOCAL_ENV_VARS=$(git rev-parse --local-env-vars)
+while IFS= read -r git_local_name; do
+    [[ "$git_local_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || exit 1
+    unset "$git_local_name"
+done <<< "$GIT_LOCAL_ENV_VARS"
+
 if [[ -z "$TEST_FILES" ]]; then
     echo ""
     echo "=== No test mapping found — running full suite ==="

@@ -44,7 +44,7 @@ SKILL_GATEWAY_TOOL_DESCRIPTION = """Retrieve subject guidance and software refer
 
 Bootstrap returns applicable bundled project and organization entrypoints,
 phase-compatible software entrypoints, and approved configuration-view refs.
-Project entries come from the explicit Crucible manifest and are filtered by
+Project entries come from the explicit project manifest and are filtered by
 the server-owned phase and agent. Read a returned file ref; use
 operation='list' with a directory ref to see its immediate children. List results
 include typed, reusable refs and do not read directory contents. Organization
@@ -280,7 +280,10 @@ async def _project_documents(
     agent_name: str,
     benchmark: str | None,
 ) -> tuple[Any | None, list[dict[str, Any]]]:
-    if subject != "harness/crucible":
+    harness = {"harness/crucible": "crucible", "platform/kernel": "general"}.get(
+        subject
+    )
+    if harness is None:
         return None, []
     source = getattr(provider, "project_context_source", None)
     if source is None:
@@ -299,7 +302,7 @@ async def _project_documents(
             "source_snapshot_unavailable", "Project context snapshot is unavailable"
         ) from exc
     documents = source.list_documents(
-        harness="crucible",
+        harness=harness,
         benchmark=benchmark,
         phase=phase,
         agent=agent_name,

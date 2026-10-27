@@ -12,6 +12,7 @@ from ..models import (
     ClaimRequest,
     CreateTicketRequest,
     ExtendIterationsRequest,
+    KernelControlRequest,
     TicketStatus,
     UpdateFieldsRequest,
 )
@@ -300,6 +301,35 @@ def extend_iterations(ticket_id: str, body: ExtendIterationsRequest, request: Re
         ) from e
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+
+
+@router.post(
+    "/{ticket_id}/kernel-control", dependencies=[Depends(_require_claim_control)]
+)
+def kernel_control(ticket_id: str, body: KernelControlRequest, request: Request):
+    """Provisioning control plane; ordinary ticket writers cannot forge evidence."""
+    store = _get_store(request)
+    try:
+        ticket = store.get_ticket(ticket_id)
+        require_write_access(_get_principal(request), ticket, _is_multi_user(request))
+        session_id, epoch, claim_id, leader_only = mutation_fence(request)
+        if leader_only:
+            raise ValueError("kernel control requires a provisioning claim")
+        return store.kernel_control(
+            ticket_id,
+            body.kind,
+            body.record_id,
+            body.expected_version,
+            body.record,
+            session_id=session_id,
+            epoch=epoch,
+            claim_id=claim_id,
+            actor=_get_principal(request).username,
+        )
+    except TicketNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, ClaimFenceError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.patch("/{ticket_id}/fields")
