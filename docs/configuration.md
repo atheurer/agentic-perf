@@ -59,6 +59,9 @@ tokens, organization settings, and private document contents are never included.
 
 ## Organization skill gateway
 
+For an end-to-end package, source setup, and ticket verification example, follow
+the [context gateway how-to](context-gateway-howto.md).
+
 An administrator can configure one organization source or a named list of
 sources maintained by different teams. Subjects are discovered by layout across
 all repositories, so adding a package or service configuration does not require
@@ -140,7 +143,9 @@ Only manifest-listed package documents are served. The service-config tree is
 physically outside those packages and is never exposed as skill files.
 Configured organization settings
 are canonical and are not overlaid with legacy private JSON or harness defaults.
-Documents-only discovered subjects have empty service settings. Configuration-only
+Documents-only discovered subjects have no organization service settings;
+current harness tools retain their existing defaults and legacy runtime settings
+when no organization runtime configuration is bound. Configuration-only
 subjects provide service settings without organization document entrypoints.
 Approved model-facing configuration views require a registered projection
 schema; this release supplies one for `harness/crucible`. Unconfigured subjects

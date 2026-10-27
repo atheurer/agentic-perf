@@ -16,7 +16,8 @@ repository reads are pinned to exact upstream commits for ticket-bound calls.
 This is a narrow project-local migration bridge, not a general project package
 service. Zathras and Arcaflow retain their existing paths; authenticated
 user-level sources and migration of other subjects remain future work. See
-[configuration](configuration.md#organization-skill-gateway) for current setup
+[setup and verification how-to](context-gateway-howto.md) for a complete example,
+[configuration](configuration.md#organization-skill-gateway) for settings,
 and [the detailed design](design-skill-gateway.md) for contracts and
 implementation boundaries.
 
@@ -245,7 +246,7 @@ user sources at the same level still need HITL when material and unresolved.
 
 ## Crucible is the first migration, not the final coverage
 
-The current implementation draft supports one or more administrator
+The current implementation supports one or more administrator
 organization sources (local paths or Git URLs), subject discovery, source
 provenance, duplicate and same-path conflict reporting, and ticket-scoped
 organization snapshots. Crucible project guidance is separately declared in
