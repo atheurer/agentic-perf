@@ -6,12 +6,13 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-import openai
 import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.main import _make_llm_factory, _resolve_api_key_secret
 from providers.llm.base import ToolDefinition
+
+openai = pytest.importorskip("openai")
 
 
 @pytest.mark.parametrize("api", ["chat_completions", "responses"])
