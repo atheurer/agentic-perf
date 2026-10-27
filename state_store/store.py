@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import uuid
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -15,6 +16,11 @@ from providers.execution import (
     AuditedFilesystem,
     RootedPath,
     durable_filesystem_emitter,
+)
+from providers.iteration_budget import (
+    ITERATION_BUDGET_FIELD,
+    STATUS_AGENT_MAP,
+    iteration_limit,
 )
 from providers.tracing import (
     ActionDescriptor,
@@ -94,6 +100,7 @@ class TicketStore:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._tickets: dict[str, Ticket] = {}
+        self._pending_iteration_writes: dict[str, Ticket] = {}
         # Deferred ticket paths: closed tickets not yet loaded
         # into memory.  Loaded on demand by get_ticket().
         self._deferred_paths: dict[str, Path] = {}
@@ -269,12 +276,14 @@ class TicketStore:
             self._persist_ticket(ticket)
 
     def _expire_all_pending_approvals_unlocked(self) -> None:
-        for ticket in self._tickets.values():
-            self._expire_pending_approvals_unlocked(ticket)
+        for ticket_id in list(self._tickets):
+            self._expire_pending_approvals_unlocked(self._resolve(ticket_id))
 
     def _cancel_pending_approvals_unlocked_all(self, *, reason: str) -> None:
-        for ticket in self._tickets.values():
-            self._cancel_pending_approvals_unlocked(ticket, reason=reason)
+        for ticket_id in list(self._tickets):
+            self._cancel_pending_approvals_unlocked(
+                self._resolve(ticket_id), reason=reason
+            )
 
     def _pending_approval_requests_unlocked(
         self, ticket: Ticket
@@ -413,6 +422,8 @@ class TicketStore:
         with self._lock:
             self._global_seq += 1
             custom_fields = dict(request.custom_fields)
+            if ITERATION_BUDGET_FIELD in custom_fields:
+                raise ValueError("iteration budget records are reserved")
             protected = _VALIDATION_RESERVED_FIELDS.intersection(custom_fields)
             if protected:
                 raise ValueError("benchmark validation fields are reserved")
@@ -445,6 +456,8 @@ class TicketStore:
         Must be called under self._lock.  Raises TicketNotFound
         if the ticket doesn't exist in memory or on disk.
         """
+        if ticket_id in self._pending_iteration_writes:
+            self._reconcile_iteration_write(ticket_id)
         ticket = self._tickets.get(ticket_id)
         if ticket is None and ticket_id in self._deferred_paths:
             ticket = self._load_deferred(ticket_id)
@@ -498,10 +511,11 @@ class TicketStore:
     def invalidate_cached_usage_summary(self, ticket_id: str) -> None:
         """Drop a closed-ticket snapshot when late usage arrives."""
         with self._lock:
-            ticket = self._tickets.get(ticket_id)
-            if ticket is None and ticket_id in self._deferred_paths:
-                ticket = self._load_deferred(ticket_id)
-            if ticket is None or "_usage_summary" not in ticket.custom_fields:
+            try:
+                ticket = self._resolve(ticket_id)
+            except TicketNotFound:
+                return
+            if "_usage_summary" not in ticket.custom_fields:
                 return
             ticket.custom_fields.pop("_usage_summary", None)
             self._persist_ticket(ticket)
@@ -766,6 +780,193 @@ class TicketStore:
 
             return ticket.model_copy()
 
+    @staticmethod
+    def _iteration_agent(ticket: Ticket, requested: str | None = None) -> str:
+        if requested is not None:
+            if requested not in STATUS_AGENT_MAP.values():
+                raise ValueError("unknown iteration-budget agent type")
+            return requested
+        status = (
+            ticket.previous_status
+            if ticket.status == TicketStatus.AWAITING_CUSTOMER_GUIDANCE
+            else ticket.status
+        )
+        agent = STATUS_AGENT_MAP.get(status.value if status else "")
+        if agent is None:
+            raise ValueError("ticket has no agent to receive additional iterations")
+        return agent
+
+    @staticmethod
+    def _add_iteration_allowance(
+        fields: dict,
+        budget: dict,
+        agent_type: str,
+        additional: int,
+        configured_agent_limits: dict[str, int],
+        configured_global_limit: int,
+    ) -> None:
+        limits = budget.setdefault("agent_limits", {})
+        baseline = (
+            0
+            if fields.get("investigation_ledger") or fields.get("anomaly_context")
+            else configured_agent_limits[agent_type]
+        )
+        current = iteration_limit(
+            limits.get(agent_type, baseline),
+            "agent iteration limit",
+        )
+        global_limit = iteration_limit(
+            fields.get("global_max_iterations_override", configured_global_limit),
+            "global iteration limit",
+        )
+        limits[agent_type] = current + additional if current else 0
+        fields["global_max_iterations_override"] = (
+            global_limit + additional if global_limit else 0
+        )
+        budget["legacy_total"] += additional
+        fields["max_iterations_override"] = budget["legacy_total"]
+
+    def _iteration_budget_fields(
+        self,
+        ticket: Ticket,
+        configured_agent_limits: dict[str, int],
+        configured_global_limit: int,
+    ) -> tuple[dict, dict]:
+        """Materialize a pre-upgrade pending scalar once, preserving its target."""
+        fields = deepcopy(ticket.custom_fields)
+        budget = fields.get(ITERATION_BUDGET_FIELD)
+        if budget is not None:
+            if not isinstance(budget, dict):
+                raise ValueError("invalid iteration budget record")
+            return fields, budget
+        budget = {"agent_limits": {}, "receipts": {}, "legacy_total": 0}
+        fields[ITERATION_BUDGET_FIELD] = budget
+        legacy = fields.get("max_iterations_override")
+        if legacy is not None:
+            legacy = iteration_limit(legacy, "max_iterations_override")
+            agent = self._iteration_agent(ticket)
+            if legacy == 0:
+                budget["agent_limits"][agent] = 0
+            else:
+                self._add_iteration_allowance(
+                    fields,
+                    budget,
+                    agent,
+                    legacy,
+                    configured_agent_limits,
+                    configured_global_limit,
+                )
+        return fields, budget
+
+    def _reconcile_iteration_write(self, ticket_id: str) -> None:
+        """Resolve an ambiguous replacement before any later ticket mutation."""
+        candidate = self._pending_iteration_writes[ticket_id]
+        persisted = Ticket.model_validate_json(
+            (self._persist_dir / f"{ticket_id}.json").read_text(encoding="utf-8")
+        )
+        if persisted == candidate:
+            self._tickets[ticket_id] = candidate
+        elif persisted != self._tickets[ticket_id]:
+            raise OSError("cannot verify an ambiguous iteration allowance write")
+        del self._pending_iteration_writes[ticket_id]
+
+    def _persist_iteration_ticket(self, ticket: Ticket) -> None:
+        # A filesystem audit failure can happen after replacement. Verify disk
+        # before allowing a later grant to overwrite a possibly committed one.
+        self._pending_iteration_writes[ticket.id] = ticket
+        try:
+            self._persist_ticket(ticket, require_durable=True)
+        except Exception:
+            try:
+                self._reconcile_iteration_write(ticket.id)
+            except Exception:
+                logger.exception(
+                    "Iteration allowance write remains ambiguous for %s", ticket.id
+                )
+            raise
+        self._tickets[ticket.id] = ticket
+        del self._pending_iteration_writes[ticket.id]
+
+    def extend_iterations(
+        self,
+        ticket_id: str,
+        additional_iterations: int,
+        request_id: str,
+        *,
+        configured_agent_limits: dict[str, int],
+        configured_global_limit: int,
+        agent_type: str | None = None,
+        make_unlimited: bool = False,
+        session_id: uuid.UUID | None = None,
+        epoch: int | None = None,
+        claim_id: str | None = None,
+        leader_only: bool = False,
+    ) -> Ticket:
+        """Atomically grant one agent and the ticket the same extra allowance.
+
+        Receipts bind retries to their original agent even if the ticket has
+        moved to another phase. Zero permits migration of legacy pending grants.
+        """
+        additional = iteration_limit(additional_iterations, "additional_iterations")
+        if not isinstance(make_unlimited, bool):
+            raise ValueError("make_unlimited must be boolean")
+        if make_unlimited and additional:
+            raise ValueError("make_unlimited requires zero additional_iterations")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+            raise ValueError("request_id must contain between 1 and 128 characters")
+        with self._lock:
+            ticket = self._resolve(ticket_id)
+            self._validate_mutation_fence(
+                ticket_id, session_id, epoch, claim_id, leader_only=leader_only
+            )
+            prior = ticket.custom_fields.get(ITERATION_BUDGET_FIELD, {})
+            receipt = prior.get("receipts", {}).get(request_id)
+            if receipt is not None:
+                if (
+                    receipt["additional_iterations"] != additional
+                    or receipt.get("make_unlimited", False) != make_unlimited
+                    or (agent_type is not None and receipt["agent_type"] != agent_type)
+                ):
+                    raise ValueError(
+                        "request_id already identifies another iteration grant"
+                    )
+                return ticket.model_copy(deep=True)
+            ticket = ticket.model_copy(deep=True)
+            fields, budget = self._iteration_budget_fields(
+                ticket, configured_agent_limits, configured_global_limit
+            )
+            agent = self._iteration_agent(ticket, agent_type)
+            if ticket.status in TERMINAL_STATUSES:
+                raise ValueError("cannot extend a terminal ticket")
+            if make_unlimited:
+                budget["agent_limits"][agent] = 0
+            elif additional:
+                self._add_iteration_allowance(
+                    fields,
+                    budget,
+                    agent,
+                    additional,
+                    configured_agent_limits,
+                    configured_global_limit,
+                )
+            budget["receipts"][request_id] = {
+                "agent_type": agent,
+                "additional_iterations": additional,
+                "make_unlimited": make_unlimited,
+            }
+            ticket.custom_fields = fields
+            ticket.updated_at = datetime.now(timezone.utc)
+            self._persist_iteration_ticket(ticket)
+            details = {
+                "agent_type": agent,
+                "additional_iterations": additional,
+                "request_id": request_id,
+                "make_unlimited": make_unlimited,
+            }
+            self._audit_log("extend_iterations", ticket_id, details)
+            self._trace_mutation(ticket_id, "extend_iterations", attributes=details)
+            return ticket.model_copy(deep=True)
+
     def update_fields(
         self,
         ticket_id: str,
@@ -774,12 +975,24 @@ class TicketStore:
         epoch: int | None = None,
         claim_id: str | None = None,
         leader_only: bool = False,
+        iteration_limits: tuple[dict[str, int], int] | None = None,
     ) -> Ticket:
         with self._lock:
             ticket = self._resolve(ticket_id)
             self._validate_mutation_fence(
                 ticket_id, session_id, epoch, claim_id, leader_only=leader_only
             )
+            durable_grant = fields.get("max_iterations_override") is not None
+            if durable_grant and "global_max_iterations_override" in fields:
+                raise ValueError(
+                    "iteration grant and global override must be separate operations"
+                )
+            if durable_grant:
+                ticket = ticket.model_copy(deep=True)
+            if ITERATION_BUDGET_FIELD in fields:
+                raise ValueError(
+                    "iteration budget records are immutable; use iteration-extensions"
+                )
             protected = _VALIDATION_RESERVED_FIELDS.intersection(fields)
             if protected:
                 raise ValueError(
@@ -795,13 +1008,56 @@ class TicketStore:
                     ticket,
                     reason="execution intent changed or ticket aborted",
                 )
+            updated_field_names = sorted(fields)
+            if "max_iterations_override" in fields:
+                fields = dict(fields)
+                desired = fields.pop("max_iterations_override")
+                # Older orchestrators cleared this field after dispatch. The
+                # cumulative marker must survive that cleanup to prevent replay.
+                if (
+                    desired is None
+                    and ITERATION_BUDGET_FIELD not in ticket.custom_fields
+                ):
+                    fields["max_iterations_override"] = None
+                if desired is not None:
+                    desired = iteration_limit(desired, "max_iterations_override")
+                    if iteration_limits is None:
+                        raise ValueError(
+                            "iteration limits are required for iteration grants"
+                        )
+                    agent_limits, global_limit = iteration_limits
+                    working, budget = self._iteration_budget_fields(
+                        ticket, agent_limits, global_limit
+                    )
+                    previous = budget["legacy_total"]
+                    if desired == 0:
+                        budget["agent_limits"][self._iteration_agent(ticket)] = 0
+                        desired = previous
+                    elif desired < previous:
+                        raise ValueError(
+                            "max_iterations_override cannot decrease; it counts cumulative grants"
+                        )
+                    elif desired > previous:
+                        self._add_iteration_allowance(
+                            working,
+                            budget,
+                            self._iteration_agent(ticket),
+                            desired - previous,
+                            agent_limits,
+                            global_limit,
+                        )
+                    working["max_iterations_override"] = desired
+                    ticket.custom_fields = working
             ticket.custom_fields.update(fields)
             ticket.updated_at = datetime.now(timezone.utc)
-            self._persist_ticket(ticket)
+            if durable_grant:
+                self._persist_iteration_ticket(ticket)
+            else:
+                self._persist_ticket(ticket)
             self._audit_log(
                 "update_fields",
                 ticket_id,
-                {"field_names": sorted(fields.keys())},
+                {"field_names": updated_field_names},
             )
             self._trace_mutation(ticket_id, "update_fields")
             return ticket.model_copy()
@@ -2071,7 +2327,7 @@ class TicketStore:
         logger.info(f"Archived ticket {ticket_id}: {archived}")
         return {"ticket_id": ticket_id, "archived_files": archived}
 
-    def _persist_ticket(self, ticket: Ticket) -> None:
+    def _persist_ticket(self, ticket: Ticket, *, require_durable: bool = False) -> None:
         try:
             self._filesystem(ticket.id).write(
                 f"{self._persist_dir.name}/{ticket.id}.json",
@@ -2079,6 +2335,8 @@ class TicketStore:
             )
         except OSError:
             logger.exception(f"Failed to persist ticket {ticket.id}")
+            if require_durable:
+                raise
 
     def _load_deferred(self, ticket_id: str) -> Ticket | None:
         """Load a deferred (closed) ticket from disk into memory.

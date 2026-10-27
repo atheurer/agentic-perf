@@ -8,12 +8,14 @@ import json
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 
 from paths import DEFAULT_STATE_STORE_URL, resolve_state_store
+from providers.iteration_budget import STATUS_AGENT_MAP
 
 DEFAULT_STORE_URL = DEFAULT_STATE_STORE_URL
 
@@ -28,6 +30,47 @@ def show_disclaimer():
         file=sys.stderr,
     )
     os.environ["AGENTIC_PERF_DISCLAIMER_SHOWN"] = "1"
+
+
+def _iteration_target(ticket: dict) -> str:
+    status = (
+        ticket.get("previous_status")
+        if ticket.get("status") == "awaiting_customer_guidance"
+        else ticket.get("status")
+    )
+    agent_type = STATUS_AGENT_MAP.get(status)
+    if agent_type is None:
+        raise ValueError("ticket has no known agent to receive the iteration allowance")
+    return agent_type
+
+
+def _extend_iterations(
+    client: httpx.Client,
+    ticket_id: str,
+    additional: int,
+    ticket: dict,
+    *,
+    make_unlimited: bool = False,
+) -> None:
+    """Pin each retryable grant to the agent the user actually replied to."""
+    response = client.post(
+        f"/api/v1/tickets/{ticket_id}/iteration-extensions",
+        json={
+            "additional_iterations": additional,
+            "request_id": uuid.uuid4().hex,
+            "agent_type": _iteration_target(ticket),
+            "make_unlimited": make_unlimited,
+        },
+    )
+    response.raise_for_status()
+
+
+def _apply_iteration_override(args, client: httpx.Client, ticket: dict) -> None:
+    additional = getattr(args, "max_iterations", None)
+    if additional is not None and not args.abort:
+        _extend_iterations(
+            client, args.ticket_id, additional, ticket, make_unlimited=additional == 0
+        )
 
 
 def get_client(args) -> tuple[httpx.Client, str]:
@@ -418,6 +461,7 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
         if not cmd_arg:
             print("Usage: /model <model-id>")
             return True
+        _apply_iteration_override(args, client, ticket)
         r = client.patch(
             f"/api/v1/tickets/{ticket_id}/fields",
             json={"fields": {"llm_override": {"model": cmd_arg}}},
@@ -439,17 +483,15 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
         return True
 
     if cmd == "/extend-iterations":
-        if not cmd_arg or not cmd_arg.strip().isdigit():
-            print("Usage: /extend-iterations <n>")
+        if not cmd_arg or not cmd_arg.strip().isdigit() or int(cmd_arg.strip()) == 0:
+            print("Usage: /extend-iterations <positive n>")
             return True
+        if getattr(args, "max_iterations", None) is not None:
+            raise ValueError(
+                "use either /extend-iterations or --max-iterations, not both"
+            )
         n = int(cmd_arg.strip())
-        current = ticket.get("custom_fields", {}).get("max_iterations_override") or 0
-        new_max = (current or 0) + n
-        r = client.patch(
-            f"/api/v1/tickets/{ticket_id}/fields",
-            json={"fields": {"max_iterations_override": new_max}},
-        )
-        r.raise_for_status()
+        _extend_iterations(client, ticket_id, n, ticket)
         r = client.post(
             f"/api/v1/tickets/{ticket_id}/comments",
             json={"author": "user", "body": message},
@@ -458,10 +500,12 @@ def _handle_cli_slash_command(args, client, ticket) -> bool:
         _emit_user_reply(client, ticket_id, message)
         resumed = _resume_ticket(client, ticket, ticket_id)
         if resumed:
-            print(f"Iterations extended by {n} (new max: {new_max}) — ticket resumed.")
+            print(
+                f"Agent and ticket iteration allowances extended by {n} — ticket resumed."
+            )
         else:
             print(
-                f"Iterations extended by {n} (new max: {new_max}) — ticket has no previous status, still paused."
+                f"Agent and ticket iteration allowances extended by {n} — ticket has no previous status, still paused."
             )
         return True
 
@@ -523,6 +567,13 @@ def cmd_archive(args):
 
 
 def cmd_reply(args):
+    additional = getattr(args, "max_iterations", None)
+    if additional is not None and (
+        isinstance(additional, bool)
+        or not isinstance(additional, int)
+        or additional < 0
+    ):
+        raise ValueError("--max-iterations must be a non-negative integer")
     client, url = get_client(args)
 
     r = client.get(f"/api/v1/tickets/{args.ticket_id}")
@@ -534,7 +585,7 @@ def cmd_reply(args):
         return
 
     # Handle CLI-resolved slash commands before posting the message
-    if args.message.strip().startswith("/"):
+    if args.message.strip().startswith("/") and not args.abort:
         if _handle_cli_slash_command(args, client, t):
             return
 
@@ -567,6 +618,8 @@ def cmd_reply(args):
             )
             return
         if len(pending) == 1:
+            if additional is not None:
+                _iteration_target(t)
             comment = client.post(
                 f"/api/v1/tickets/{args.ticket_id}/comments",
                 json={"author": "user", "body": args.message},
@@ -580,6 +633,7 @@ def cmd_reply(args):
                 json={"decision": decision, "comment_id": comment_id},
             )
             resolved.raise_for_status()
+            _apply_iteration_override(args, client, t)
             print(f"Benchmark approval {pending[0]['approval_request_id']} {decision}.")
             previous = t.get("previous_status")
             if previous:
@@ -593,6 +647,7 @@ def cmd_reply(args):
                 resumed.raise_for_status()
             return
 
+    _apply_iteration_override(args, client, t)
     r = client.post(
         f"/api/v1/tickets/{args.ticket_id}/comments",
         json={
@@ -629,14 +684,6 @@ def cmd_reply(args):
         )
         r.raise_for_status()
 
-    max_iter = getattr(args, "max_iterations", None)
-    if max_iter is not None:
-        r = client.patch(
-            f"/api/v1/tickets/{args.ticket_id}/fields",
-            json={"fields": {"max_iterations_override": max_iter}},
-        )
-        r.raise_for_status()
-
     remember = getattr(args, "remember", False)
     if remember:
         r = client.patch(
@@ -665,8 +712,8 @@ def cmd_reply(args):
         overrides.append(f"provider={provider}")
     if model:
         overrides.append(f"model={model}")
-    if max_iter is not None:
-        overrides.append(f"max_iterations={max_iter}")
+    if additional is not None:
+        overrides.append(f"additional_iterations={additional}")
     if remember:
         overrides.append("remember")
     if overrides:
@@ -1548,7 +1595,7 @@ def main():
     p_reply.add_argument(
         "--max-iterations",
         type=int,
-        help="Override max iterations for the next agent (e.g., 40)",
+        help="Grant additional agent and ticket iterations (e.g., 40); 0 makes the agent unlimited",
     )
     p_reply.add_argument(
         "--remember",

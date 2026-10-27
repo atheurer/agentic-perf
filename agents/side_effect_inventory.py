@@ -280,6 +280,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/synthesis/agent.py", "_handle_completion", "mcp"),
     ("agents/triage/server.py", "get_benchmark_details", "filesystem"),
     ("cli.py", "_emit_user_reply", "mutating_http_state"),
+    ("cli.py", "_extend_iterations", "mutating_http_state"),
     ("cli.py", "_handle_cli_slash_command", "mutating_http_state"),
     ("cli.py", "_resume_ticket", "mutating_http_state"),
     ("cli.py", "cmd_abort", "mutating_http_state"),
@@ -750,6 +751,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/api/tickets.py", "archive_ticket", "mutating_http_state"),
     ("state_store/api/tickets.py", "claim_ticket", "mutating_http_state"),
     ("state_store/api/tickets.py", "create_ticket", "mutating_http_state"),
+    ("state_store/api/tickets.py", "extend_iterations", "mutating_http_state"),
     ("state_store/api/tickets.py", "release_claim", "mutating_http_state"),
     ("state_store/api/tickets.py", "renew_claim", "mutating_http_state"),
     ("state_store/api/tickets.py", "update_fields", "mutating_http_state"),
@@ -2173,6 +2175,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/triage/server.py:get_benchmark_details",
+        "2027-12-31",
+    ),
+    ("cli.py", "_extend_iterations", "mutating_http_state"): (
+        "system_only",
+        "orchestration-maintainers",
+        "cli.py:_extend_iterations",
         "2027-12-31",
     ),
     ("cli.py", "_handle_cli_slash_command", "mutating_http_state"): (
@@ -4161,6 +4169,12 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/api/tickets.py:create_ticket",
+        "2027-12-31",
+    ),
+    ("state_store/api/tickets.py", "extend_iterations", "mutating_http_state"): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/api/tickets.py:extend_iterations",
         "2027-12-31",
     ),
     ("state_store/api/tickets.py", "release_claim", "mutating_http_state"): (

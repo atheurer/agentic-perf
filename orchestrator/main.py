@@ -1319,9 +1319,12 @@ async def run_agent_task(
 
         dispatcher.set_agent(ticket_id, agent)
 
+        agent._iteration_agent_type = STATUS_AGENT_MAP.get(status, "")
+
         if config and hasattr(agent, "DEFAULT_GLOBAL_MAX_ITERATIONS"):
             agent.DEFAULT_GLOBAL_MAX_ITERATIONS = config.global_max_iterations
 
+        legacy_budget_pending = False
         # Investigation tickets get unlimited iterations for
         # all agents — convergence gates and budget guardrails
         # handle termination, not arbitrary iteration caps.
@@ -1339,20 +1342,22 @@ async def run_agent_task(
                     cf = r.json().get("custom_fields", {})
                     if cf.get("investigation_ledger") or cf.get("anomaly_context"):
                         agent.max_iterations = 0
-                    max_iter_override = cf.get("max_iterations_override")
-                    if max_iter_override is not None:
-                        try:
-                            agent.max_iterations = int(max_iter_override)
-                            agent._max_iterations_is_override = True
-                            logger.info(
-                                f"Max iterations override for {ticket_id}:"
-                                f" {max_iter_override}"
-                            )
-                        except (ValueError, TypeError):
-                            logger.warning(
-                                f"Invalid max_iterations_override for {ticket_id}:"
-                                f" {max_iter_override!r}"
-                            )
+                    if (
+                        cf.get("max_iterations_override") is not None
+                        and "iteration_budget" not in cf
+                    ):
+                        legacy_budget_pending = True
+                        migration = await client.post(
+                            f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/iteration-extensions",
+                            json={
+                                "additional_iterations": 0,
+                                "request_id": "migrate-legacy-iterations",
+                            },
+                            headers=mutation_headers,
+                        )
+                        migration.raise_for_status()
+                        cf = migration.json().get("custom_fields", {})
+                        legacy_budget_pending = False
                     llm_override = cf.get("llm_override")
                     if llm_override and config:
                         agent_type = STATUS_AGENT_MAP.get(status, "")
@@ -1412,7 +1417,10 @@ async def run_agent_task(
                         )
 
         except Exception:
-            pass  # proceed with default iterations
+            if legacy_budget_pending:
+                logger.exception("Cannot materialize iteration grant for %s", ticket_id)
+                return
+            # Model overrides remain optional when the config read fails.
 
         # Retire pending plan steps when entering synthesis.
         # When an investigation concludes early (e.g., review
@@ -1519,18 +1527,9 @@ async def run_agent_task(
                 async with AuditedAsyncHTTPClient(
                     timeout=10.0, headers=mutation_headers
                 ) as client:
-                    # Preserve max_iterations_override when the
-                    # agent paused (awaiting_customer_guidance) so
-                    # re-dispatch after HITL reuses the override.
+                    # Iteration grants are durable ticket allowances. Only the
+                    # one-dispatch model override is retired here.
                     clear_fields: dict[str, Any] = {"llm_override": None}
-                    r = await client.get(
-                        f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}",
-                    )
-                    if r.status_code == 200:
-                        post_status = r.json().get("status", "")
-                        if post_status != "awaiting_customer_guidance":
-                            clear_fields["max_iterations_override"] = None
-                    # On failed status read, preserve override (fail safe)
 
                     await client.patch(
                         f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/fields",
