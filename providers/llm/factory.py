@@ -13,7 +13,6 @@ def create_llm_provider(
     Supported providers:
       - "claude" / "anthropic": Anthropic Claude API (direct or Vertex AI)
       - "openai": OpenAI-compatible API (OpenAI, Azure, vLLM, Ollama, etc.)
-      - "enmaas": Red Hat ENMaaS gateway (GPT, Gemini, DeepSeek, GLM, etc.)
       - "gemini" / "google": Google Gemini API (direct or Vertex AI)
       - "mock": Returns canned responses for testing
     """
@@ -28,18 +27,7 @@ def create_llm_provider(
             region=config.get("region"),
         )
 
-    if provider in ("openai", "enmaas"):
-        # ENMaaS uses dedicated provider for proper base_url validation
-        if provider == "enmaas":
-            from .enmaas import ENMaaSLLMProvider
-
-            return ENMaaSLLMProvider(
-                api_key=config.get("api_key"),
-                model=model or "gpt-5.4",
-                base_url=config.get("base_url"),
-            )
-
-        # OpenAI generic
+    if provider == "openai":
         from .openai_compat import OpenAICompatLLMProvider
 
         return OpenAICompatLLMProvider(
@@ -66,5 +54,5 @@ def create_llm_provider(
 
     raise ValueError(
         f"Unknown LLM provider: {provider!r}. "
-        f"Supported: 'claude', 'anthropic', 'openai', 'enmaas', 'gemini', 'google', 'mock'"
+        f"Supported: 'claude', 'anthropic', 'openai', 'gemini', 'google', 'mock'"
     )

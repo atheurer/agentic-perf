@@ -365,6 +365,42 @@ the Anthropic SDK. Set `llm.api` or `OPENAI_API` to `responses` to select the
 OpenAI Responses API; the default is `chat_completions`. Responses uses
 `max_output_tokens` internally.
 
+#### EnMaaS gateway
+
+Red Hat Engineering's EnMaaS gateway exposes an OpenAI-compatible API for
+supported hosted and commercial models. Use the existing `openai` provider and
+install its SDK with `pip install -e ".[openai]"`. For example, merge this
+section into `~/.agentic-perf/config.json`:
+
+```json
+{
+    "llm": {
+        "provider": "openai",
+        "model": "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "base_url": "https://api.enmaas.devshift.net/v1",
+        "api": "chat_completions",
+        "api_key_secret": "enmaas/api-key"
+    }
+}
+```
+
+Store the gateway key under the configured secrets provider at the referenced
+path; `api_key_secret` contains a reference, not the key itself. Alternatively,
+omit it and set `OPENAI_API_KEY` to the EnMaaS key. An explicit secret
+reference takes precedence over `OPENAI_API_KEY`. `OPENAI_BASE_URL` and
+`OPENAI_API`, if set, override `base_url` and `api`; `LLM_PROVIDER` and
+`LLM_MODEL` override `provider` and `model`.
+
+The example selects Chat Completions. Set `api` to `responses` for a gateway
+model that supports the Responses API. Select an exact EnMaaS model ID, such as
+`rits/zai-org/glm-5-3` or `rits/deepseek-ai/DeepSeek-V4.1-Flash-1017`; the
+gateway model catalog may omit models that are available to your credential.
+Supported APIs, tool capabilities, context windows, and output limits vary by
+model. In particular, hosted vLLM models do not execute built-in hosted tools,
+and Responses custom tools using a grammar format are rejected. Consult the
+[EnMaaS guide](https://source.redhat.com/departments/products_and_global_engineering/workload_management/enmaas)
+for current model availability and limits.
+
 ---
 
 ### `agent_models` — Per-Agent LLM Overrides
