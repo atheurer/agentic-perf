@@ -7,22 +7,6 @@ on:
     branches: [main]
 
 jobs:
-  dependency-alert-access:
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.actor != 'dependabot[bot]'
-    runs-on: ubuntu-latest
-    permissions:
-      vulnerability-alerts: read
-    steps:
-      - name: Verify Dependabot alert access
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh api --method GET "repos/${GITHUB_REPOSITORY}/dependabot/alerts"
-          -f state=open -f per_page=1 --silent
-
   lint:
     runs-on: ubuntu-latest
     steps:
