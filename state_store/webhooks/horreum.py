@@ -12,8 +12,6 @@ from typing import Any
 def translate(payload: dict[str, Any]) -> dict[str, Any]:
     """Map Horreum change/new payload to ticket fields."""
     change = payload.get("change", {})
-    # variable and dataset are nested under change
-    # in Horreum's Change.Event payload.
     variable = change.get("variable", {})
     dataset = change.get("dataset", {})
 
@@ -37,6 +35,10 @@ def translate(payload: dict[str, Any]) -> dict[str, Any]:
         "dataset_ordinal": dataset.get("ordinal"),
         "change_description": change.get("description"),
         "timestamp": change.get("timestamp"),
+        # metric is the variable name as-is from Horreum.  Agents
+        # should call resolve_metric on the Domain MCP to map it
+        # to a canonical queryable ID at analysis time.
+        "metric": variable_name,
     }
 
     return {

@@ -1176,6 +1176,69 @@ volumes:
 
 ---
 
+### Domain MCP metric resolution
+
+When Horreum alerts trigger tickets, the alert variable name
+(e.g., `BOOT KPI - Time to First Container with Network Timestamp ms`)
+is stored in `anomaly_context.metric`.  Agents resolve this to a
+canonical queryable metric ID at analysis time using the Domain MCP's
+`resolve_metric` tool.
+
+Enable `resolve_metric` for agents that query metric baselines:
+
+```json
+{
+    "external_mcp_servers": [
+        {
+            "name": "domain-mcp",
+            "url": "https://<domain-mcp-host>/mcp/http",
+            "transport": "streamable_http",
+            "agents": {
+                "gathering_context": {
+                    "enabled_tools": [
+                        "get_run_info",
+                        "find_similar_anomalies",
+                        "resolve_metric"
+                    ]
+                },
+                "analyze": {
+                    "enabled_tools": [
+                        "get_run_info",
+                        "get_baseline_stats",
+                        "get_distribution",
+                        "compare_run_to_baseline",
+                        "find_similar_anomalies",
+                        "get_dataset_data",
+                        "resolve_metric"
+                    ]
+                },
+                "review": {
+                    "enabled_tools": [
+                        "get_baseline_stats",
+                        "compare_run_to_baseline",
+                        "get_dataset_data",
+                        "resolve_metric"
+                    ]
+                },
+                "evaluating_convergence": {
+                    "enabled_tools": [
+                        "get_baseline_stats",
+                        "compare_run_to_baseline",
+                        "find_similar_anomalies",
+                        "get_distribution",
+                        "resolve_metric"
+                    ]
+                }
+            }
+        }
+    ]
+}
+```
+
+When `resolve_metric` is available, agents can map Horreum label
+names and other metric aliases to canonical IDs before querying
+baseline statistics or comparing runs.
+
 ### `external_mcp_servers` — Remote MCP Servers
 
 Connect agents to remote MCP servers via SSE or StreamableHTTP.
