@@ -21,6 +21,9 @@ dependencies = [
     "mcp~=1.30.0",
     # FastMCP 3.4.10 fixes the component authorization bypass GHSA-7xgj-8392-5q4r.
     "fastmcp~=3.4.10",
+    # Block empty JWS signatures: CVE-2026-96760 / GHSA-6v38-4h7w-rj9h.
+    # FastMCP permits older Authlib; keep fresh installs on its fixed release.
+    "authlib>=1.9.0",
 ]
 
 [tool.setuptools.packages.find]
