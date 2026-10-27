@@ -24,6 +24,9 @@ dependencies = [
     # Block empty JWS signatures: CVE-2026-96760 / GHSA-6v38-4h7w-rj9h.
     # FastMCP permits older Authlib; keep fresh installs on its fixed release.
     "authlib>=1.9.0",
+    # Bound DNS decompression CPU use: CVE-2026-114605 / GHSA-45c3-73f7-pv4m.
+    # email-validator permits older dnspython; require its patched release.
+    "dnspython>=2.9.0",
 ]
 
 [tool.setuptools.packages.find]
