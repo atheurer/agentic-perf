@@ -253,43 +253,61 @@ class TestAgentStopFlag:
         assert agent._stop_requested is True
 
     @pytest.mark.asyncio
-    async def test_graceful_stop_breaks_loop(self):
+    async def test_graceful_stop_breaks_loop(self, tmp_path):
+        from typing import Any
+
         from agents.base import AgentBase
+        from providers.events import EventBus
+        from providers.llm.base import LLMResponse
+
+        class StoppingAgent(AgentBase):
+            def _system_prompt(self, ticket: dict[str, Any]) -> str:
+                return "prompt"
+
+            def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
+                return []
+
+            async def _handle_completion(
+                self, ticket_id: str, response: LLMResponse
+            ) -> None:
+                pass
 
         mock_llm = MagicMock()
         mock_llm.complete = AsyncMock()
-
-        agent = MagicMock(spec=AgentBase)
-        agent._stop_requested = True
-        agent.agent_name = "test-agent"
-        agent._events = None
-        agent._client = AsyncMock()
-        agent.store_url = "http://localhost:8090"
-        agent.max_iterations = 10
-        agent.DEFAULT_GLOBAL_MAX_ITERATIONS = 100
-        agent._wrapup_reason = None
-
+        events = EventBus(log_dir=tmp_path / "events")
+        agent = StoppingAgent(
+            agent_name="test-agent",
+            llm_provider=mock_llm,
+            state_store_url="http://localhost:8090",
+            event_bus=events,
+            max_iterations=10,
+        )
+        agent.request_stop()
         agent._emit = MagicMock()
         agent._transition_ticket = AsyncMock()
         agent._get_ticket = AsyncMock(
-            return_value={"id": "PERF-test", "custom_fields": {}},
+            return_value={
+                "id": "PERF-test",
+                "status": "triage_pending",
+                "custom_fields": {},
+            },
         )
-        agent._system_prompt = MagicMock(return_value="prompt")
-        agent._build_messages = MagicMock(return_value=[])
-
-        await AgentBase.run(agent, "PERF-test")
-
-        agent._emit.assert_any_call(
-            "PERF-test",
-            "agent_stopped",
-            {"mode": "graceful"},
-        )
-        agent._transition_ticket.assert_called_once_with(
-            "PERF-test",
-            "awaiting_customer_guidance",
-            comment="Agent stopped (graceful) by user request",
-        )
-        mock_llm.complete.assert_not_called()
+        try:
+            await agent.run("PERF-test")
+            agent._emit.assert_any_call(
+                "PERF-test",
+                "agent_stopped",
+                {"mode": "graceful"},
+            )
+            agent._transition_ticket.assert_called_once_with(
+                "PERF-test",
+                "awaiting_customer_guidance",
+                comment="Agent stopped (graceful) by user request",
+            )
+            mock_llm.complete.assert_not_awaited()
+        finally:
+            await agent.close()
+            events.close()
 
 
 # ── Dispatcher Stop Tests ─────────────────────────────────
