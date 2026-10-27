@@ -68,10 +68,10 @@ reviewing orchestration, configuration, and agent workflow changes.
 
 ## Dependency updates
 
-Dependabot proposes weekly updates for Python, Go, GitHub Actions, and
-container image references. Review the changes and CI results before merging.
-The MCP and FastMCP version constraints in `pyproject.toml` represent a tested
-pair and need particular care when changed.
+Dependabot security updates are enabled; routine version update PRs are
+disabled. Review proposed fixes and CI results before merging. The MCP and
+FastMCP version constraints in `pyproject.toml` represent a tested pair and
+need particular care when changed.
 
 Dependabot's Python updater does not recognize the pip-compile-generated
 `requirements.lock` and `requirements-dev.lock` files. A Python update to
@@ -83,9 +83,18 @@ review resulting transitive changes and hashes. The separate Jumpstarter
 installation in the container also uses its own index and is not locked by
 these files.
 
-Dependabot alerts depend on GitHub's dependency graph and may not cover these
-`.lock` files. The CI `pip-audit` check scans the installed development lock;
-review and audit other deployment dependency sets separately.
+The Python dependency inventory workflow submits both lock files to GitHub's
+dependency graph on every push to `main`, so Dependabot can alert on their
+exact pinned versions. A separate workflow checks those alerts every 15
+minutes and creates an issue for each affected package and advisory, grouping
+the two locks and reopening the issue if an alert remains open. GitHub may
+delay scheduled jobs and advisory data may lag publication. This inventory
+does not include Python packages added
+by the separate, unlocked container installation, or optional extras installed
+outside the locks. Dependabot may not be able to create fix PRs for transitive
+dependencies in these files. The CI `pip-audit` check scans the installed
+development lock; review and audit other deployment dependency sets separately.
+Dependencies installed solely for a benchmark harness are outside this scope.
 
 ## Commit Messages
 
