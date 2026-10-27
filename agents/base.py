@@ -13,6 +13,12 @@ from typing import Any, Callable, Literal
 
 from providers.events import EventBus
 from providers.execution import AuditedAsyncHTTPClient
+from providers.iteration_budget import (
+    DEFAULT_AGENT_ITERATIONS,
+    ITERATION_BUDGET_FIELD,
+    STATUS_AGENT_MAP,
+    iteration_limit,
+)
 from providers.llm.base import (
     LLMProvider,
     LLMRateLimitError,
@@ -74,7 +80,7 @@ class AgentBase(ABC):
     # termination is then driven by convergence gates, cost
     # guardrails (#127), or HITL intervention rather than an
     # arbitrary count.
-    DEFAULT_MAX_ITERATIONS = 20
+    DEFAULT_MAX_ITERATIONS = DEFAULT_AGENT_ITERATIONS
 
     # Global ticket-wide iteration ceiling. Configurable
     # via config.json global_max_iterations or env var
@@ -103,9 +109,6 @@ class AgentBase(ABC):
     # Default maximum tool response size (in bytes) before spilling
     # to the ticket scratchpad workspace to optimize LLM tokens.
     DEFAULT_TOOL_SPILL_THRESHOLD = 4096
-
-    # Class-level default for mock spec compatibility
-    _max_iterations_is_override = False
 
     def __init__(
         self,
@@ -138,7 +141,6 @@ class AgentBase(ABC):
             else self.DEFAULT_MAX_ITERATIONS
         )
         self._stop_requested = False
-        self._max_iterations_is_override = False
         self._current_ticket_id: str | None = None
         self._tool_call_seq: int = 0
         self._spill_threshold: int = (
@@ -320,35 +322,44 @@ class AgentBase(ABC):
     def _get_previous_iteration_counts(self, ticket_id: str) -> tuple[int, int]:
         """Count previous iterations (llm_request events) from the ticket's jsonl log file.
 
-        For fleet investigations, only counts iterations AFTER
-        the last ``fleet_iteration_epoch`` event. This resets
-        the per-agent budget each fleet iteration so agents
-        don't exhaust their budget across the full fleet.
-
-        Likewise, a ``hitl_resume_epoch`` event (emitted by the
-        state store when a human reply transitions the ticket out of
-        ``awaiting_customer_guidance``) restarts the budgets: the
-        iteration caps guard autonomous operation between human
-        touchpoints, so a pause-and-resume cycle must not consume
-        them (#1231). Without this reset an agent that once hit its
-        limit is locked out again on every subsequent dispatch.
+        Fleet epochs reset only the per-agent phase count. The global count
+        covers the ticket's lifetime. Human guidance never resets either
+        counter; explicit grants increase the durable allowances instead.
         """
         from providers.events import EventBus
 
         events = self._events or EventBus()
         agent_iters = 0
         global_iters = 0
+        target_type = self._iteration_type()
+        legacy_phase: str | None = None
         try:
             for evt in events.get_events(ticket_id, since=0, limit=100_000):
-                if evt.get("event_type") in (
-                    "fleet_iteration_epoch",
-                    "hitl_resume_epoch",
-                ):
+                kind = evt.get("event_type")
+                data = evt.get("data") or {}
+                if kind == "status_change":
+                    status = data.get("to")
+                    if status == "awaiting_customer_guidance":
+                        legacy_phase = STATUS_AGENT_MAP.get(
+                            data.get("from"), legacy_phase
+                        )
+                    else:
+                        legacy_phase = STATUS_AGENT_MAP.get(status)
+                elif kind == "fleet_iteration_epoch":
                     agent_iters = 0
-                    global_iters = 0
-                elif evt.get("event_type") == "llm_request":
+                elif kind == "llm_request":
                     global_iters += 1
-                    if evt.get("agent") == self.agent_name:
+                    event_type = data.get("agent_type")
+                    if event_type is not None:
+                        matches = event_type == target_type
+                    else:
+                        # Older logs lack type metadata. Use their status trail
+                        # when available, otherwise conservatively count the
+                        # shared name rather than silently granting more work.
+                        matches = evt.get("agent") == self.agent_name and (
+                            legacy_phase is None or legacy_phase == target_type
+                        )
+                    if matches:
                         agent_iters += 1
         except Exception as e:
             logger.warning(
@@ -358,6 +369,30 @@ class AgentBase(ABC):
             if self._events is None:
                 events.close()
         return agent_iters, global_iters
+
+    def _iteration_type(self) -> str:
+        return getattr(
+            self, "_iteration_agent_type", self.agent_name.removesuffix("-agent")
+        )
+
+    def _refresh_iteration_limits(self, ticket: dict[str, Any]) -> None:
+        """Observe durable absolute allowances without resetting consumed work."""
+        fields = ticket.get("custom_fields", {})
+        budget = fields.get(ITERATION_BUDGET_FIELD) or {}
+        limit = budget.get("agent_limits", {}).get(self._iteration_type())
+        if limit is not None:
+            limit = iteration_limit(limit, "agent iteration limit")
+            if (limit == 0 or limit > self.max_iterations) and getattr(
+                self, "_wrapup_reason", None
+            ) == "iteration":
+                self._wrapup_reason = None
+            self.max_iterations = limit
+        self._global_iteration_limit = iteration_limit(
+            fields.get(
+                "global_max_iterations_override", self.DEFAULT_GLOBAL_MAX_ITERATIONS
+            ),
+            "global iteration limit",
+        )
 
     def _emit(
         self, ticket_id: str, event_type: str, data: dict[str, Any] | None = None
@@ -397,6 +432,10 @@ class AgentBase(ABC):
         logger.info(f"[{self.agent_name}] Starting on ticket {ticket_id}")
         ticket = await self._get_ticket(ticket_id)
         self._dispatched_status = ticket.get("status", "")
+        if not getattr(self, "_iteration_agent_type", None):
+            self._iteration_agent_type = STATUS_AGENT_MAP.get(
+                self._dispatched_status, self._iteration_type()
+            )
         self._aborted = False
         self._last_interject_ticket: dict[str, Any] | None = None
         system_prompt = self._system_prompt(ticket)
@@ -497,27 +536,13 @@ class AgentBase(ABC):
                 previous_agent_iterations, previous_global_iterations = 0, 0
             iteration = previous_agent_iterations
 
-            # Override is additive: grant N new iterations on
-            # top of what was already consumed in prior runs.
-            if (
-                self._max_iterations_is_override
-                and previous_agent_iterations > 0
-                and configured_max > 0
-            ):
-                self.max_iterations = configured_max + previous_agent_iterations
-                logger.info(
-                    f"[{self.agent_name}] Additive override:"
-                    f" {configured_max} new iterations"
-                    f" (effective limit {self.max_iterations})"
-                )
+            self._refresh_iteration_limits(ticket)
 
             if self.max_iterations > 0:
                 remaining_agent = max(
                     0, self.max_iterations - previous_agent_iterations
                 )
-                global_max = cf.get(
-                    "global_max_iterations_override", self.DEFAULT_GLOBAL_MAX_ITERATIONS
-                )
+                global_max = self._global_iteration_limit
                 remaining_global = max(0, global_max - previous_global_iterations)
                 messages.append(
                     {
@@ -595,24 +620,12 @@ class AgentBase(ABC):
                         }
                     )
 
-                iteration += 1
-                llm_context, llm_timer = self._trace.start(
-                    ActionType.LLM, phase="request", iteration=iteration
-                )
-                self._emit(
-                    ticket_id,
-                    "llm_request",
-                    {"iteration": iteration - 1},
-                )
-
                 # Check global ticket max iterations
-                global_max = cf.get(
-                    "global_max_iterations_override", self.DEFAULT_GLOBAL_MAX_ITERATIONS
-                )
+                global_max = self._global_iteration_limit
                 global_iterations = previous_global_iterations + (
                     iteration - previous_agent_iterations
                 )
-                if global_max > 0 and global_iterations > global_max:
+                if global_max > 0 and global_iterations >= global_max:
                     logger.warning(
                         f"[{self.agent_name}] Hit global ticket max iterations"
                         f" ({global_max}) on {ticket_id}"
@@ -626,7 +639,8 @@ class AgentBase(ABC):
                     await self._add_comment(
                         ticket_id,
                         f"**Ticket reached global maximum iteration limit ({global_max}).**"
-                        f" The execution across all agents has exhausted the global budget. Pausing for customer guidance.",
+                        f" The execution across all agents has exhausted the global budget. "
+                        f"Use /extend-iterations N to grant more work, or abort.",
                     )
                     await self._transition_ticket(
                         ticket_id,
@@ -634,6 +648,16 @@ class AgentBase(ABC):
                         comment=f"Global iteration limit ({global_max}) reached",
                     )
                     break
+
+                iteration += 1
+                llm_context, llm_timer = self._trace.start(
+                    ActionType.LLM, phase="request", iteration=iteration
+                )
+                self._emit(
+                    ticket_id,
+                    "llm_request",
+                    {"iteration": iteration - 1, "agent_type": self._iteration_type()},
+                )
 
                 # Set ticket context for OTLP span
                 # correlation so the span processor
@@ -1513,7 +1537,7 @@ class AgentBase(ABC):
                         f" The agent could not complete its work within"
                         f" the iteration budget. You can reply to guide"
                         f" next steps (e.g., retry, skip to review,"
-                        f" or abort).",
+                        f" or abort). Use /extend-iterations N to grant more iterations.",
                     )
                     await self._transition_ticket(
                         ticket_id,
@@ -1542,7 +1566,6 @@ class AgentBase(ABC):
             raise
         finally:
             self.max_iterations = configured_max
-            self._max_iterations_is_override = False
             reset_trace_context(trace_token)
 
         self._emit(ticket_id, "agent_finished")
@@ -2659,6 +2682,7 @@ class AgentBase(ABC):
         except Exception:
             return None
         self._last_interject_ticket = ticket
+        self._refresh_iteration_limits(ticket)
         cf = ticket.get("custom_fields", {})
         interject = cf.get("pending_interject")
         if not interject:
@@ -2823,6 +2847,7 @@ class AgentBase(ABC):
                         "ticket_id": ticket_id,
                     },
                 )
+                self._refresh_iteration_limits(ticket)
                 new_comments = ticket.get("comments", [])[comment_count:]
                 user_replies = [
                     c["body"]
@@ -2893,6 +2918,7 @@ class AgentBase(ABC):
                             f"{resumed_status} while agent "
                             f"{self.agent_name} was waiting"
                         )
+                    self._refresh_iteration_limits(ticket)
                     new_comments = ticket.get("comments", [])[comment_count:]
                     user_replies = [
                         c["body"]

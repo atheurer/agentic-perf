@@ -380,10 +380,8 @@ def _emit_events(bus, ticket_id, events):
         bus.emit(ticket_id, agent, event_type, {})
 
 
-def test_hitl_resume_epoch_resets_iteration_counts(tmp_path):
-    """A hitl_resume_epoch event (human reply resuming the ticket)
-    restarts both the per-agent and global iteration budgets, so a
-    pause-and-approve cycle does not consume the budget (#1231)."""
+def test_human_resume_does_not_reset_iteration_counts(tmp_path):
+    """A reply alone cannot renew either lifetime allowance, even on old logs."""
     bus = EventBus(log_dir=tmp_path / "logs")
     llm = _CountingLLM()
     agent = _StubAgent(
@@ -406,22 +404,22 @@ def test_hitl_resume_epoch_resets_iteration_counts(tmp_path):
         agent_iters, global_iters = agent._get_previous_iteration_counts(tid)
         assert (agent_iters, global_iters) == (2, 3)
 
-        # The human replies; the store emits the resume epoch boundary.
+        # An old resume marker cannot erase work from cumulative counters.
         _emit_events(bus, tid, [("user", "hitl_resume_epoch")])
 
         agent_iters, global_iters = agent._get_previous_iteration_counts(tid)
-        assert (agent_iters, global_iters) == (0, 0)
+        assert (agent_iters, global_iters) == (2, 3)
 
-        # Work done after the resume counts from zero again.
+        # Subsequent work continues to count against the same allowances.
         _emit_events(bus, tid, [("benchmark-agent", "llm_request")])
         agent_iters, global_iters = agent._get_previous_iteration_counts(tid)
-        assert (agent_iters, global_iters) == (1, 1)
+        assert (agent_iters, global_iters) == (3, 4)
     finally:
         bus.close()
 
 
 def test_fleet_epoch_still_resets_counts(tmp_path):
-    """The existing fleet_iteration_epoch reset is unchanged."""
+    """Fleet epochs reset the agent phase, preserving the lifetime global count."""
     bus = EventBus(log_dir=tmp_path / "logs")
     llm = _CountingLLM()
     agent = _StubAgent(
@@ -436,6 +434,6 @@ def test_fleet_epoch_still_resets_counts(tmp_path):
         _emit_events(bus, tid, [("system", "fleet_iteration_epoch")])
         _emit_events(bus, tid, [("benchmark-agent", "llm_request")])
         agent_iters, global_iters = agent._get_previous_iteration_counts(tid)
-        assert (agent_iters, global_iters) == (1, 1)
+        assert (agent_iters, global_iters) == (1, 2)
     finally:
         bus.close()

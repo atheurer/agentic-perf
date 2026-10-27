@@ -19,6 +19,7 @@ from agents.stub import StubAgent
 from agents.synthesis.agent import SynthesisAgent
 from agents.triage.agent import TriageAgent
 from providers.events import EventBus
+from providers.iteration_budget import STATUS_AGENT_MAP
 from providers.llm.base import LLMProvider
 from providers.secrets.base import SecretsProvider
 from providers.skills.base import SkillProvider
@@ -37,27 +38,6 @@ if TYPE_CHECKING:
     from state_store.identity import UserStore
 
 logger = logging.getLogger(__name__)
-
-STATUS_AGENT_MAP = {
-    # Original linear pipeline
-    "triage_pending": "triage",
-    "awaiting_hardware": "resource_create",
-    "preparing_platform": "platform",
-    "awaiting_provision": "provisioning",
-    "executing_benchmark": "benchmark",
-    "awaiting_review": "review",
-    "awaiting_teardown": "resource_teardown",
-    "retrospective_pending": "retrospective",
-    # Data analysis path
-    "analyzing": "analyze",
-    "building_image": "image_builder",
-    # Recursive investigation loop
-    "gathering_context": "gathering_context",
-    "planning_investigation": "planning_investigation",
-    "evaluating_convergence": "evaluating_convergence",
-    "coordinating_fleet": "fleet_coordinator",
-    "synthesizing_results": "synthesizing_results",
-}
 
 
 class Dispatcher:

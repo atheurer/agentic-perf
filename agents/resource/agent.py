@@ -908,6 +908,9 @@ class ResourceAgent(AgentBase):
             tool_handlers={},
             event_bus=event_bus,
         )
+        self._iteration_agent_type = (
+            "resource_teardown" if mode == "teardown" else "resource_create"
+        )
 
     async def _check_fleet_exhaustion(self, context: str = "") -> bool:
         """Route to fleet coordinator if all boards are tested.

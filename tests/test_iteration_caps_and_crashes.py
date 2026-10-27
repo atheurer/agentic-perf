@@ -291,6 +291,7 @@ def _make_agent(llm, event_bus, max_iterations=5):
         event_bus=event_bus,
         max_iterations=max_iterations,
     )
+    agent._iteration_agent_type = "test"
     return agent
 
 
@@ -328,8 +329,8 @@ def _mock_client(ticket_id, custom_fields=None):
 
 
 @pytest.mark.asyncio
-async def test_override_is_additive(tmp_path):
-    """Override=10 after 20 prior iterations grants 10 NEW iterations, not 10 total."""
+async def test_durable_grant_is_not_recharged_on_redispatch(tmp_path):
+    """A cumulative cap grants only its unused allowance on every dispatch."""
     log_dir = tmp_path / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     ticket_id = "PERF-OVERRIDE"
@@ -337,30 +338,36 @@ async def test_override_is_additive(tmp_path):
 
     event_bus = EventBus(log_dir=log_dir)
     llm = _InfiniteToolLLM()
-    agent = _make_agent(llm, event_bus, max_iterations=10)
-    agent._max_iterations_is_override = True
-    agent._client = _mock_client(ticket_id)
+    agent = _make_agent(llm, event_bus, max_iterations=20)
+    agent._client = _mock_client(
+        ticket_id,
+        {"iteration_budget": {"agent_limits": {"test": 30}}},
+    )
 
     await agent.run(ticket_id)
 
     # 10 new + 1 grace = 11 LLM calls
     assert llm.call_count == 11
-    # Configured value is restored after run (no mutation)
-    assert agent.max_iterations == 10
+    # A pause/resume without another explicit grant cannot renew these calls.
+    await agent.run(ticket_id)
+    assert llm.call_count == 11
+    assert agent.max_iterations == 20
 
 
 @pytest.mark.asyncio
-async def test_override_without_prior_iterations(tmp_path):
-    """Override on a fresh ticket works like an absolute limit."""
+async def test_durable_cap_without_prior_iterations(tmp_path):
+    """An absolute per-agent cap is respected on a fresh ticket."""
     log_dir = tmp_path / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     ticket_id = "PERF-FRESH"
 
     event_bus = EventBus(log_dir=log_dir)
     llm = _InfiniteToolLLM()
-    agent = _make_agent(llm, event_bus, max_iterations=5)
-    agent._max_iterations_is_override = True
-    agent._client = _mock_client(ticket_id)
+    agent = _make_agent(llm, event_bus, max_iterations=2)
+    agent._client = _mock_client(
+        ticket_id,
+        {"iteration_budget": {"agent_limits": {"test": 5}}},
+    )
 
     await agent.run(ticket_id)
 
@@ -379,10 +386,228 @@ async def test_non_override_retains_lifetime_semantics(tmp_path):
     event_bus = EventBus(log_dir=log_dir)
     llm = _InfiniteToolLLM()
     agent = _make_agent(llm, event_bus, max_iterations=5)
-    # NOT setting _max_iterations_is_override — default path
     agent._client = _mock_client(ticket_id)
 
     await agent.run(ticket_id)
 
     # Lifetime: 5 total - 3 prior = 2 remaining + 1 grace = 3 calls
     assert llm.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_exhausted_global_budget_has_no_phantom_iterations(tmp_path):
+    """Granting three more calls after exhaustion permits exactly three calls."""
+    from providers.tracing import ActionType, LifecycleState, TraceRecorder
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    ticket_id = "PERF-GLOBAL-GRANT"
+    _prewrite_events(log_dir / f"{ticket_id}.jsonl", "test-agent", 20)
+    event_bus = EventBus(log_dir=log_dir)
+    llm = _InfiniteToolLLM()
+    agent = _make_agent(llm, event_bus, max_iterations=0)
+    fields = {"global_max_iterations_override": 20}
+    agent._client = _mock_client(ticket_id, fields)
+    recorded = []
+
+    class Sink:
+        def record(self, event):
+            recorded.append(event)
+
+    agent._trace = TraceRecorder(client=Sink())
+    try:
+        await agent.run(ticket_id)
+        assert llm.call_count == 0
+        assert agent._get_previous_iteration_counts(ticket_id) == (20, 20)
+        assert not [event for event in recorded if event.action.type == ActionType.LLM]
+
+        fields["global_max_iterations_override"] = 23
+        await agent.run(ticket_id)
+        assert llm.call_count == 3
+        assert agent._get_previous_iteration_counts(ticket_id) == (23, 23)
+        llm_events = [
+            event for event in recorded if event.action.type == ActionType.LLM
+        ]
+        started = [
+            event
+            for event in llm_events
+            if event.lifecycle.state == LifecycleState.STARTED
+        ]
+        terminal = [
+            event
+            for event in llm_events
+            if event.lifecycle.state != LifecycleState.STARTED
+        ]
+        assert len(started) == len(terminal) == 3
+        assert {event.action_id for event in started} == {
+            event.action_id for event in terminal
+        }
+    finally:
+        event_bus.close()
+        await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_human_reply_observes_new_agent_and_global_allowances(tmp_path):
+    """A grant at the old limit applies while this same invocation is waiting."""
+    from providers.llm.base import ToolResult
+
+    event_bus = EventBus(log_dir=tmp_path / "logs")
+    llm = _InfiniteToolLLM()
+    agent = _make_agent(llm, event_bus, max_iterations=2)
+    fields = {"global_max_iterations_override": 3}
+    agent._client = _mock_client("PERF-INLINE", fields)
+    ticket = agent._client.get.return_value.json()
+    agent._HITL_POLL_INTERVAL = 0.001
+    granted = False
+
+    async def user_replies(ticket_id, status, comment=None):
+        nonlocal granted
+        if not granted:
+            granted = True
+            fields["iteration_budget"] = {"agent_limits": {"test": 5}}
+            fields["global_max_iterations_override"] = 6
+            ticket["comments"] = [
+                {"author": "user", "body": "Continue with three more iterations."}
+            ]
+
+    async def tool_call(call, **kwargs):
+        if llm.call_count == 3:
+            assert agent._wrapup_reason == "iteration"
+            await agent._request_human_input("PERF-INLINE", "Continue?")
+            assert agent.max_iterations == 5
+            assert agent._global_iteration_limit == 6
+            assert agent._wrapup_reason is None
+        return ToolResult(tool_use_id=call.id, content="ok")
+
+    agent._transition_ticket = AsyncMock(side_effect=user_replies)
+    agent._add_comment = AsyncMock()
+    agent._execute_tool = AsyncMock(side_effect=tool_call)
+    try:
+        await agent.run("PERF-INLINE")
+        assert granted
+        assert llm.call_count == 6
+        assert agent._get_previous_iteration_counts("PERF-INLINE") == (6, 6)
+    finally:
+        event_bus.close()
+        await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_resource_teardown_has_independent_allowance_and_shared_global_count(
+    tmp_path,
+):
+    """Creation work cannot spend a later teardown phase's explicit allowance."""
+    bus = EventBus(log_dir=tmp_path / "logs")
+    ticket_id = "PERF-RESOURCE-PHASES"
+    for _ in range(12):
+        bus.emit(
+            ticket_id,
+            "resource-agent",
+            "llm_request",
+            {"agent_type": "resource_create"},
+        )
+    llm = _InfiniteToolLLM()
+    agent = _StubAgent(
+        agent_name="resource-agent",
+        llm_provider=llm,
+        state_store_url="http://localhost:8090",
+        event_bus=bus,
+        max_iterations=20,
+    )
+    agent._iteration_agent_type = "resource_teardown"
+    agent._client = _mock_client(
+        ticket_id,
+        {
+            "iteration_budget": {"agent_limits": {"resource_teardown": 30}},
+            # The configured global allowance was32; +10 grants a cap42. It
+            # permits exactly30 teardown calls after the12 creation calls.
+            "global_max_iterations_override": 42,
+        },
+    )
+    try:
+        assert agent._get_previous_iteration_counts(ticket_id) == (0, 12)
+        await agent.run(ticket_id)
+        assert llm.call_count == 30
+        assert agent._get_previous_iteration_counts(ticket_id) == (30, 42)
+        requests = [
+            event
+            for event in bus.get_events(ticket_id, limit=100_000)
+            if event["event_type"] == "llm_request"
+        ]
+        assert (
+            len(
+                [
+                    event
+                    for event in requests
+                    if event["data"].get("agent_type") == "resource_teardown"
+                ]
+            )
+            == 30
+        )
+    finally:
+        bus.close()
+        await agent.close()
+
+
+@pytest.mark.parametrize("with_status_trail,expected", [(True, 0), (False, 12)])
+@pytest.mark.asyncio
+async def test_legacy_shared_agent_name_uses_phase_evidence_or_conservative_fallback(
+    tmp_path, with_status_trail, expected
+):
+    bus = EventBus(log_dir=tmp_path / "logs")
+    tid = "PERF-LEGACY-PHASE"
+    if with_status_trail:
+        bus.emit(
+            tid,
+            "user",
+            "status_change",
+            {"from": "triage_pending", "to": "awaiting_hardware"},
+        )
+    for _ in range(12):
+        bus.emit(tid, "resource-agent", "llm_request", {})
+    if with_status_trail:
+        bus.emit(
+            tid,
+            "user",
+            "status_change",
+            {"from": "awaiting_hardware", "to": "awaiting_teardown"},
+        )
+    agent = _StubAgent(
+        agent_name="resource-agent",
+        llm_provider=_InfiniteToolLLM(),
+        state_store_url="http://localhost:8090",
+        event_bus=bus,
+    )
+    agent._iteration_agent_type = "resource_teardown"
+    try:
+        assert agent._get_previous_iteration_counts(tid) == (expected, 12)
+    finally:
+        bus.close()
+        await agent.close()
+
+
+@pytest.mark.parametrize("mode,expected", [("create", 12), ("teardown", 4)])
+@pytest.mark.asyncio
+async def test_direct_resource_agent_keeps_correct_budget_identity(
+    tmp_path, mode, expected
+):
+    from agents.resource.agent import ResourceAgent
+
+    bus = EventBus(log_dir=tmp_path / "logs")
+    tid = "PERF-DIRECT-RESOURCE"
+    for phase, count in (("resource_create", 12), ("resource_teardown", 4)):
+        for _ in range(count):
+            bus.emit(tid, "resource-agent", "llm_request", {"agent_type": phase})
+    agent = ResourceAgent(
+        llm_provider=_InfiniteToolLLM(),
+        state_store_url="http://localhost:8090",
+        mode=mode,
+        event_bus=bus,
+    )
+    try:
+        assert agent._iteration_agent_type == f"resource_{mode}"
+        assert agent._get_previous_iteration_counts(tid) == (expected, 16)
+    finally:
+        bus.close()
+        await agent.close()

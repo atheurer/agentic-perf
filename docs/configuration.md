@@ -517,25 +517,75 @@ resources.
 | `global_max_iterations` | int | `100` | `GLOBAL_MAX_ITERATIONS` |
 
 Individual tickets can override this via
-`custom_fields.global_max_iterations_override`.
+`custom_fields.global_max_iterations_override`, an absolute ticket ceiling.
+Human guidance and fleet iterations do not reset the global usage counter.
+An explicit iteration extension increases this ceiling by the same amount as
+its target agent's allowance. A zero ceiling remains unlimited.
 
-#### Per-Ticket Runtime Override
+#### Per-Ticket Runtime Extensions
 
-Individual tickets can override the per-agent limit at runtime via
-`custom_fields.max_iterations_override`. This takes precedence over
-both config and built-in defaults. The override is **additive**: it
-grants N new iterations on top of what the agent already consumed in
-prior runs, so setting `max_iterations_override=40` after a 20-iteration
-run gives the agent 40 fresh iterations on re-dispatch.
+Grant additional iterations to the agent currently handling a ticket using
+`agentic-perf reply PERF-123 "/extend-iterations 30"` or
+`agentic-perf reply PERF-123 "Continue" --max-iterations 30`.
+Each command atomically adds 30 to that agent's absolute ceiling and 30 to
+the ticket's global ceiling. A normal guidance reply changes neither ceiling
+nor usage counter. For a paused ticket the target is its previous status.
+
+For example, with agent defaults of 20 and a global default of 100:
+
+| Explicit grant | Agent A ceiling | Agent B ceiling | Global ceiling |
+|---|---:|---:|---:|
+| A +30 | 50 | 20 | 130 |
+| A +20 | 70 | 20 | 150 |
+| B +10 | 70 | 30 | 160 |
+
+Previously consumed iterations stay counted. Dispatches, retries, and process
+restarts never grant more work. An agent already waiting for an inline human
+reply observes the new ceilings when that same invocation resumes. Configured
+unlimited agent limits remain unlimited after positive grants; a finite global
+limit still increases. `reply --max-iterations 0` makes only the current agent
+unlimited without increasing or disabling the global limit. The CLI pins both
+positive and unlimited operations to the agent from the fetched ticket, so an
+intervening phase change cannot credit another agent. Iteration flags also
+apply to valid model switches and single approval replies before resume.
+
+API clients should use the additive operation with a unique request ID:
 
 ```bash
-curl -X PATCH .../api/v1/tickets/PERF-123/fields \
-  -d '{"fields": {"max_iterations_override": 40}}'
+curl -X POST .../api/v1/tickets/PERF-123/iteration-extensions \
+  -H 'Content-Type: application/json' \
+  -d '{"additional_iterations": 30, "request_id": "operator-grant-001"}'
 ```
 
-The override is preserved while the ticket is paused
-(`awaiting_customer_guidance`) and cleared after the agent
-completes successfully.
+Retry the same request ID and amount after an ambiguous response. The stored
+receipt prevents duplicate credit, including after the ticket changes agents.
+An optional `agent_type` (for example, `benchmark` or `review`) targets another
+agent explicitly. Reusing an ID with a different amount or explicit target is
+rejected. The store owns `custom_fields.iteration_budget`, whose per-agent
+absolute ceilings and request receipts cannot be replaced through field edits.
+An API amount of zero only materializes a pending legacy allowance by default.
+To make the selected agent unlimited explicitly, send an amount of zero with
+`make_unlimited: true`; this never increases or disables the global cap. The
+request receipt binds this mode too. An amount greater than zero cannot be
+combined with `make_unlimited`.
+
+For compatibility, `PATCH fields.max_iterations_override` remains accepted as
+a **cumulative grant total**. Setting it from 30 to 50 grants only the additional
+20 to the current agent and the global ceiling; retrying 50 adds nothing.
+It tracks additions across all agents, and decreases are rejected. Setting
+zero retains the legacy per-agent unlimited control while preserving the
+cumulative marker. New additive API grants also increase this marker, so old
+clients can read it and add the next extension. The marker survives successful
+dispatch and human pauses. A pre-upgrade pending scalar is migrated once into
+durable agent/global ceilings before the agent runs. A single legacy PATCH
+cannot combine a non-null `max_iterations_override` with an absolute
+`global_max_iterations_override`; use separate operations so the computed
+extension cannot be silently overwritten.
+
+New LLM request events carry the dispatch agent type, matching the identity
+used by per-agent ceilings (including resource creation versus teardown).
+Older events use their status trail when available; logs without phase
+evidence conservatively retain the prior shared-agent-name accounting.
 
 #### Migration Note
 

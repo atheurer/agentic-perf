@@ -5,8 +5,17 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    model_validator,
+)
 
+from providers.iteration_budget import ITERATION_BUDGET_FIELD
 from providers.tracing import PayloadDescriptor
 
 
@@ -277,6 +286,8 @@ class CreateTicketRequest(BaseModel):
 
     @model_validator(mode="after")
     def _reject_reserved_validation_fields(self) -> "CreateTicketRequest":
+        if ITERATION_BUDGET_FIELD in self.custom_fields:
+            raise ValueError("iteration budget records are reserved")
         protected = _VALIDATION_RESERVED_FIELDS.intersection(self.custom_fields)
         if protected:
             raise ValueError("benchmark validation fields are reserved")
@@ -294,6 +305,21 @@ class TransitionRequest(BaseModel):
 
 class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
+
+
+class ExtendIterationsRequest(BaseModel):
+    """A retryable addition, explicit unlimited control, or legacy migration."""
+
+    additional_iterations: StrictInt = Field(ge=0)
+    request_id: StrictStr = Field(min_length=1, max_length=128)
+    agent_type: StrictStr | None = None
+    make_unlimited: StrictBool = False
+
+    @model_validator(mode="after")
+    def _validate_unlimited(self) -> "ExtendIterationsRequest":
+        if self.make_unlimited and self.additional_iterations:
+            raise ValueError("make_unlimited requires zero additional_iterations")
+        return self
 
 
 class OrchestratorLease(BaseModel):

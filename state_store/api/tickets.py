@@ -4,10 +4,14 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from orchestrator.config import OrchestratorConfig
+from providers.iteration_budget import DEFAULT_AGENT_ITERATIONS, STATUS_AGENT_MAP
+
 from ..auth import Principal, require_write_access
 from ..models import (
     ClaimRequest,
     CreateTicketRequest,
+    ExtendIterationsRequest,
     TicketStatus,
     UpdateFieldsRequest,
 )
@@ -256,6 +260,48 @@ def get_ticket(ticket_id: str, request: Request):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+def _iteration_limits() -> tuple[dict[str, int], int]:
+    """Use the same configuration precedence as dispatch, including unlimited."""
+    config = OrchestratorConfig()
+    limits = {}
+    for agent in set(STATUS_AGENT_MAP.values()):
+        value = config.get_agent_max_iterations(agent)
+        limits[agent] = DEFAULT_AGENT_ITERATIONS if value is None else value
+    return limits, config.global_max_iterations
+
+
+@router.post("/{ticket_id}/iteration-extensions")
+def extend_iterations(ticket_id: str, body: ExtendIterationsRequest, request: Request):
+    store = _get_store(request)
+    try:
+        ticket = store.get_ticket(ticket_id)
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    require_write_access(_get_principal(request), ticket, _is_multi_user(request))
+    try:
+        session_id, epoch, claim_id, leader_only = mutation_fence(request)
+        limits, global_limit = _iteration_limits()
+        return store.extend_iterations(
+            ticket_id,
+            body.additional_iterations,
+            body.request_id,
+            agent_type=body.agent_type,
+            make_unlimited=body.make_unlimited,
+            configured_agent_limits=limits,
+            configured_global_limit=global_limit,
+            session_id=session_id,
+            epoch=epoch,
+            claim_id=claim_id,
+            leader_only=leader_only,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409, detail={"reason": e.reason, "message": str(e)}
+        ) from e
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+
 @router.patch("/{ticket_id}/fields")
 def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
     store = _get_store(request)
@@ -290,6 +336,11 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
         result = store.update_fields(
             ticket_id,
             fields,
+            iteration_limits=(
+                _iteration_limits()
+                if fields.get("max_iterations_override") is not None
+                else None
+            ),
             session_id=session_id,
             epoch=epoch,
             claim_id=claim_id,
