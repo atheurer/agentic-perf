@@ -393,6 +393,21 @@ class ReviewAgent(AgentBase):
                 "the user explicitly ends the "
                 "investigation."
             )
+        # Surface anomaly context for alert-triggered tickets so the
+        # review agent knows this is an investigation and what metric
+        # to query via the Domain MCP's resolve_metric tool.
+        anomaly = cf.get("anomaly_context")
+        if anomaly:
+            variable = anomaly.get("variable_name", anomaly.get("metric", ""))
+            prompt += (
+                f"\n\n## Alert-Triggered Investigation\n\n"
+                f"This ticket was triggered by a change detection alert "
+                f"on variable `{variable}`.\n"
+                f"Use `resolve_metric` to map this variable name to a "
+                f"canonical metric ID before querying baseline data.\n"
+                f"An analysis has already been performed — the finding "
+                f"is included below. Cross-check it against baseline data."
+            )
         return prompt
 
     def _build_messages(self, ticket: dict[str, Any]) -> list[dict[str, Any]]:
@@ -455,6 +470,22 @@ class ReviewAgent(AgentBase):
             )
         if cf.get("benchmark_suite"):
             content += f"**Benchmark Suite:** {cf['benchmark_suite']}\n"
+
+        # Include prior analysis result so the review agent can
+        # cross-check without parsing ticket comments.
+        analysis_result = cf.get("analysis_result")
+        if isinstance(analysis_result, dict):
+            content += "\n## Prior Analysis Result\n"
+            if analysis_result.get("conclusive"):
+                content += "**Conclusive finding:**\n"
+            else:
+                content += "**Inconclusive finding:**\n"
+            finding = analysis_result.get("finding", "")
+            if finding:
+                content += f"{finding[:3000]}\n"
+            root_cause = analysis_result.get("root_cause", "")
+            if root_cause:
+                content += f"\n**Root cause:** {root_cause[:1000]}\n"
 
         # Pre-scan local artifacts so the LLM doesn't need
         # to discover them via SSH trial-and-error.
