@@ -66,6 +66,27 @@ principles, and key file paths.
 See [docs/reviewing.md](docs/reviewing.md) for project-specific guidance on
 reviewing orchestration, configuration, and agent workflow changes.
 
+## Dependency updates
+
+Dependabot proposes weekly updates for Python, Go, GitHub Actions, and
+container image references. Review the changes and CI results before merging.
+The MCP and FastMCP version constraints in `pyproject.toml` represent a tested
+pair and need particular care when changed.
+
+Dependabot's Python updater does not recognize the pip-compile-generated
+`requirements.lock` and `requirements-dev.lock` files. A Python update to
+`pyproject.toml` therefore does not automatically update the versions used by
+CI and the container build. Regenerate both locks, using the Python version and
+commands recorded in their headers, and include the changes in the PR. Use
+`--upgrade-package <name>` with each command when updating a specific package;
+review resulting transitive changes and hashes. The separate Jumpstarter
+installation in the container also uses its own index and is not locked by
+these files.
+
+Dependabot alerts depend on GitHub's dependency graph and may not cover these
+`.lock` files. The CI `pip-audit` check scans the installed development lock;
+review and audit other deployment dependency sets separately.
+
 ## Commit Messages
 
 Use conventional commits with thorough descriptions:
