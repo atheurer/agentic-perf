@@ -13,6 +13,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+import anyio
 import httpx
 
 from providers.llm.base import ToolDefinition
@@ -40,6 +41,14 @@ class ChatAuditUnavailable(RuntimeError):
     deliberately distinct from a handler error so callers can safely tell the
     user that no action was attempted.
     """
+
+
+class ChatAuditStartUnavailable(ChatAuditUnavailable):
+    """A rejection STARTED event could not be confirmed as persisted."""
+
+
+class ChatAuditTerminalUnavailable(ChatAuditUnavailable):
+    """A rejection terminal event could not be confirmed as persisted."""
 
 
 # This maps the advertised chat capability to the concrete handler and the
@@ -204,6 +213,24 @@ class ChatToolAudit:
                     "audit ingestion unavailable; chat tool was not attempted"
                 ) from exc
 
+    async def _emit_cancellation_safe(self, **kwargs: Any) -> bool:
+        """Finish one audit send before allowing caller cancellation to escape."""
+        delivery = asyncio.create_task(self._emit(**kwargs))
+        cancellation_requested = False
+        with anyio.CancelScope(shield=True):
+            while True:
+                try:
+                    await asyncio.shield(delivery)
+                    break
+                except asyncio.CancelledError:
+                    if delivery.cancelled():
+                        raise
+                    cancellation_requested = True
+                    if delivery.done():
+                        break
+        delivery.result()
+        return cancellation_requested
+
     async def invoke(
         self,
         tool_name: str,
@@ -233,34 +260,75 @@ class ChatToolAudit:
             ),
         )
         timer = MonotonicTimer()
-        await self._emit(
-            context,
-            LifecycleState.STARTED,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            required=True,
-        )
+        try:
+            cancelled_during_start = await self._emit_cancellation_safe(
+                context=context,
+                state=LifecycleState.STARTED,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                required=True,
+            )
+        except asyncio.CancelledError:
+            # The start send may have reached ingestion before cancellation.
+            # Record a terminal outcome before propagating it; no handler ran.
+            try:
+                await self._emit_cancellation_safe(
+                    context=context,
+                    state=LifecycleState.CANCELLED,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    timer=timer,
+                    outcome=OperationOutcome.CANCELLED,
+                    error=asyncio.CancelledError(),
+                    required=True,
+                )
+            except ChatAuditUnavailable as audit_error:
+                raise ChatAuditUnavailable(
+                    "chat tool outcome is indeterminate; audit terminal was not persisted"
+                ) from audit_error
+            raise
+        if cancelled_during_start:
+            try:
+                await self._emit_cancellation_safe(
+                    context=context,
+                    state=LifecycleState.CANCELLED,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    timer=timer,
+                    outcome=OperationOutcome.CANCELLED,
+                    error=asyncio.CancelledError(),
+                    required=True,
+                )
+            except ChatAuditUnavailable as audit_error:
+                raise ChatAuditUnavailable(
+                    "chat tool outcome is indeterminate; audit terminal was not persisted"
+                ) from audit_error
+            raise asyncio.CancelledError
         try:
             result = await handler()
         except BaseException as exc:
-            state = (
-                LifecycleState.CANCELLED
-                if isinstance(exc, asyncio.CancelledError)
-                else LifecycleState.FAILED
+            uncertain_effect = (
+                isinstance(exc, asyncio.CancelledError)
+                and tool_name in _CHAT_MUTATION_CONTRACTS
             )
-            outcome = (
-                OperationOutcome.CANCELLED
-                if state == LifecycleState.CANCELLED
-                else OperationOutcome.FAILURE
-            )
+            if uncertain_effect:
+                # A cancellation can arrive after a remote mutation was sent.
+                state = LifecycleState.INDETERMINATE
+                outcome = OperationOutcome.INDETERMINATE
+            elif isinstance(exc, asyncio.CancelledError):
+                state = LifecycleState.CANCELLED
+                outcome = OperationOutcome.CANCELLED
+            else:
+                state = LifecycleState.FAILED
+                outcome = OperationOutcome.FAILURE
             try:
                 # The handler has already crossed its effect boundary.  Never
                 # quietly return an ordinary handler failure when its terminal
                 # audit outcome could not be persisted: callers must treat the
                 # operation as indeterminate and reconcile it.
-                await self._emit(
-                    context,
-                    state,
+                terminal_interrupted = await self._emit_cancellation_safe(
+                    context=context,
+                    state=state,
                     tool_name=tool_name,
                     tool_input=tool_input,
                     timer=timer,
@@ -272,6 +340,8 @@ class ChatToolAudit:
                 raise ChatAuditUnavailable(
                     "chat tool outcome is indeterminate; audit terminal was not persisted"
                 ) from audit_error
+            if terminal_interrupted and not isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError from exc
             raise
         failed = False
         try:
@@ -280,9 +350,9 @@ class ChatToolAudit:
         except (TypeError, json.JSONDecodeError):
             pass
         try:
-            await self._emit(
-                context,
-                LifecycleState.FAILED if failed else LifecycleState.COMPLETED,
+            terminal_interrupted = await self._emit_cancellation_safe(
+                context=context,
+                state=(LifecycleState.FAILED if failed else LifecycleState.COMPLETED),
                 tool_name=tool_name,
                 tool_input=tool_input,
                 timer=timer,
@@ -295,6 +365,10 @@ class ChatToolAudit:
             raise ChatAuditUnavailable(
                 "chat tool outcome is indeterminate; audit terminal was not persisted"
             ) from audit_error
+        if terminal_interrupted:
+            raise asyncio.CancelledError(
+                "chat tool completed while its response was cancelled"
+            )
         return result
 
     async def reject(
@@ -331,22 +405,34 @@ class ChatToolAudit:
             ),
         )
         timer = MonotonicTimer()
-        await self._emit(
-            context,
-            LifecycleState.STARTED,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            required=True,
-        )
-        await self._emit(
-            context,
-            LifecycleState.REJECTED,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            timer=timer,
-            outcome=OperationOutcome.REJECTED,
-            required=True,
-        )
+        try:
+            cancellation_requested = await self._emit_cancellation_safe(
+                context=context,
+                state=LifecycleState.STARTED,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                required=True,
+            )
+        except ChatAuditUnavailable as exc:
+            raise ChatAuditStartUnavailable(
+                "rejection STARTED audit event could not be confirmed"
+            ) from exc
+        try:
+            cancellation_requested |= await self._emit_cancellation_safe(
+                context=context,
+                state=LifecycleState.REJECTED,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                timer=timer,
+                outcome=OperationOutcome.REJECTED,
+                required=True,
+            )
+        except ChatAuditUnavailable as exc:
+            raise ChatAuditTerminalUnavailable(
+                "rejection terminal audit event could not be confirmed"
+            ) from exc
+        if cancellation_requested:
+            raise asyncio.CancelledError("rejection audit completed after disconnect")
 
 
 def _require(params: dict[str, Any], *keys: str) -> str | None:
@@ -924,6 +1010,34 @@ async def _search_tickets(
     return json.dumps({"tickets": results, "count": len(results)})
 
 
+def _trim_fleet_investigation(
+    fleet: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Trim fleet_investigation to essential fields.
+
+    The ``tested_hosts`` list can be very large; keep only the
+    fields the chat agent needs for summarisation.
+    """
+    if not fleet or not isinstance(fleet, dict):
+        return fleet
+    trimmed = dict(fleet)
+    hosts = trimmed.get("tested_hosts")
+    if isinstance(hosts, list):
+        trimmed["tested_hosts"] = [
+            {
+                "host_id": h.get("host_id"),
+                "status": h.get("status"),
+                "failure_reason": (h.get("failure_reason") or "")[:500],
+                "samples_collected": (h.get("iteration_data", {}) or {}).get(
+                    "samples_collected"
+                ),
+            }
+            for h in hosts
+            if isinstance(h, dict)
+        ]
+    return trimmed
+
+
 async def _get_ticket(
     client: httpx.AsyncClient,
     store_url: str,
@@ -944,7 +1058,7 @@ async def _get_ticket(
     # Return a trimmed view
     cf = ticket.get("custom_fields", {})
     comments = ticket.get("comments", [])
-    last_comments = comments[-5:] if comments else []
+    last_comments = comments[-10:] if comments else []
 
     directives = cf.get("directives", {})
     result = {
@@ -966,10 +1080,15 @@ async def _get_ticket(
         "benchmark_status": cf.get("benchmark_status"),
         "image_build_result": cf.get("image_build_result"),
         "hypothesis": cf.get("hypothesis"),
+        "synthesis_result": cf.get("synthesis_result"),
+        "fleet_investigation": _trim_fleet_investigation(cf.get("fleet_investigation")),
+        "root_cause_summary": cf.get("root_cause_summary"),
+        "result_summary": cf.get("result_summary"),
+        "evaluation_result": cf.get("evaluation_result"),
         "last_comments": [
             {
                 "author": c.get("author", ""),
-                "body": c.get("body", "")[:500],
+                "body": c.get("body", "")[:2000],
             }
             for c in last_comments
         ],

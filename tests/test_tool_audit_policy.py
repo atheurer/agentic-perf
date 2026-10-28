@@ -1007,6 +1007,21 @@ def test_user_reply_inventory_allows_owner_user_principals() -> None:
     assert INVENTORY_DISPOSITIONS[entry][0] == "audited"
 
 
+def test_chat_delivery_acknowledgement_is_scoped_system_state() -> None:
+    entry = (
+        "state_store/api/chat.py",
+        "acknowledge_message_delivery",
+        "mutating_http_state",
+    )
+    assert entry in INVENTORIED_SIDE_EFFECTS
+    assert INVENTORY_DISPOSITIONS[entry] == (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/api/chat.py:acknowledge_message_delivery",
+        "2027-12-31",
+    )
+
+
 def test_tool_audit_exemptions_and_side_effect_owners_are_reviewable() -> None:
     """Exemptions may be necessary, but cannot become silent permanent bypasses."""
     used_owners = set()
@@ -1974,10 +1989,138 @@ async def test_chat_audit_cancellation_emits_terminal_and_preserves_parent() -> 
         reset_trace_context(token)
     assert [event.lifecycle.state for event in events] == [
         LifecycleState.STARTED,
-        LifecycleState.CANCELLED,
+        LifecycleState.INDETERMINATE,
     ]
+    assert events[-1].outcome.value == "indeterminate"
     assert {event.trace_id for event in events} == {parent.trace_id}
     assert {event.parent_action_id for event in events} == {parent.action_id}
+
+
+@pytest.mark.asyncio
+async def test_chat_audit_cancellation_waits_for_terminal_delivery() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatToolAudit
+
+    events = []
+    handler_started = asyncio.Event()
+    terminal_started = asyncio.Event()
+    finish_terminal = asyncio.Event()
+
+    async def record(event):
+        state = event.lifecycle.state
+        if state == LifecycleState.INDETERMINATE:
+            terminal_started.set()
+            await finish_terminal.wait()
+        events.append(state)
+
+    async def handler():
+        handler_started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(
+        ChatToolAudit(
+            AsyncMock(),
+            "http://state-store.invalid",
+            "service-token",
+            record=record,
+        ).invoke("start_ticket", {"ticket_id": "PERF-policy"}, handler)
+    )
+    await handler_started.wait()
+    task.cancel()
+    await terminal_started.wait()
+
+    assert not task.done()
+    assert events == [LifecycleState.STARTED]
+
+    finish_terminal.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == [LifecycleState.STARTED, LifecycleState.INDETERMINATE]
+
+
+@pytest.mark.asyncio
+async def test_chat_audit_normal_terminal_survives_cancellation() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatToolAudit
+
+    events = []
+    terminal_started = asyncio.Event()
+    finish_terminal = asyncio.Event()
+
+    async def record(event):
+        state = event.lifecycle.state
+        if state == LifecycleState.COMPLETED:
+            terminal_started.set()
+            await finish_terminal.wait()
+        events.append(state)
+
+    task = asyncio.create_task(
+        ChatToolAudit(
+            AsyncMock(),
+            "http://state-store.invalid",
+            "service-token",
+            record=record,
+        ).invoke(
+            "start_ticket",
+            {"ticket_id": "PERF-policy"},
+            AsyncMock(return_value='{"status": "started"}'),
+        )
+    )
+    await terminal_started.wait()
+    task.cancel()
+
+    assert not task.done()
+    assert events == [LifecycleState.STARTED]
+
+    finish_terminal.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == [LifecycleState.STARTED, LifecycleState.COMPLETED]
+
+
+@pytest.mark.asyncio
+async def test_chat_audit_cancellation_during_start_records_terminal() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatToolAudit
+
+    events = []
+    start_started = asyncio.Event()
+    finish_start = asyncio.Event()
+    handler = AsyncMock(return_value='{"status": "unexpected"}')
+
+    async def record(event):
+        if event.lifecycle.state == LifecycleState.STARTED:
+            start_started.set()
+            await finish_start.wait()
+        events.append(event)
+
+    task = asyncio.create_task(
+        ChatToolAudit(
+            AsyncMock(),
+            "http://state-store.invalid",
+            "service-token",
+            record=record,
+        ).invoke("start_ticket", {"ticket_id": "PERF-policy"}, handler)
+    )
+    await start_started.wait()
+    task.cancel()
+    assert not task.done()
+
+    finish_start.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [event.lifecycle.state for event in events] == [
+        LifecycleState.STARTED,
+        LifecycleState.CANCELLED,
+    ]
+    handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2005,16 +2148,74 @@ async def test_chat_rejection_terminal_delivery_is_required() -> None:
     """Confirmation invalidation also has a durable started/rejected pair."""
     from unittest.mock import AsyncMock, MagicMock
 
-    from agents.chat.tools import ChatAuditUnavailable, ChatToolAudit
+    from agents.chat.tools import ChatAuditTerminalUnavailable, ChatToolAudit
 
     response = MagicMock()
     response.raise_for_status = MagicMock()
     client = AsyncMock()
     client.post = AsyncMock(side_effect=[response, OSError("trace unavailable")])
-    with pytest.raises(ChatAuditUnavailable):
+    with pytest.raises(ChatAuditTerminalUnavailable):
         await ChatToolAudit(
             client, "http://state-store.invalid", "service-token"
         ).reject("create_ticket", {"summary": "safe"})
+
+
+@pytest.mark.asyncio
+async def test_chat_rejection_start_delivery_failure_is_distinct() -> None:
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatAuditStartUnavailable, ChatToolAudit
+
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=OSError("start event unavailable"))
+
+    with pytest.raises(ChatAuditStartUnavailable):
+        await ChatToolAudit(
+            client, "http://state-store.invalid", "service-token"
+        ).reject("create_ticket", {"summary": "safe"})
+
+    assert client.post.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_rejection_pair_finishes_before_cancellation_escapes() -> None:
+    """A disconnect during REJECTED delivery must not strand STARTED."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatToolAudit
+
+    events = []
+    terminal_started = asyncio.Event()
+    finish_terminal = asyncio.Event()
+
+    async def record(event):
+        state = event.lifecycle.state
+        if state == LifecycleState.STARTED:
+            events.append(state)
+        elif state == LifecycleState.REJECTED:
+            terminal_started.set()
+            await finish_terminal.wait()
+            events.append(state)
+
+    task = asyncio.create_task(
+        ChatToolAudit(
+            AsyncMock(),
+            "http://state-store.invalid",
+            "service-token",
+            record=record,
+        ).reject("create_ticket", {"summary": "safe"})
+    )
+    await terminal_started.wait()
+    task.cancel()
+
+    assert not task.done()
+    assert events == [LifecycleState.STARTED]
+
+    finish_terminal.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == [LifecycleState.STARTED, LifecycleState.REJECTED]
 
 
 def test_chat_tool_dispatch_has_no_production_audit_bypass() -> None:

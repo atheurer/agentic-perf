@@ -242,8 +242,27 @@ API endpoints:
 | Method | Path | Description |
 |---|---|---|
 | POST | `/api/v1/chat/message` | Send a message, get a response |
+| POST | `/api/v1/chat/message/stream` | Send a message and receive SSE response events |
+| POST | `/api/v1/chat/message/ack` | Acknowledge a fully received response by its delivery ID |
 | GET | `/api/v1/chat/history` | Get chat history for current user |
 | DELETE | `/api/v1/chat/session` | Clear current user's session |
+
+Clients opt into request-scoped delivery tracking by setting
+`X-Chat-Delivery-Ack: 1`. Opt-in JSON responses and SSE `done` events include a
+server-generated `delivery_id`; clients POST it to `/chat/message/ack` as the
+same authenticated user after consuming the complete response. Existing clients
+that omit the header retain the legacy response fields and do not get lost-response
+duplicate protection. For an opt-in mutation, a missing ACK blocks later chat
+until the response send completes and its receipt is acknowledged. A separate
+bounded send watchdog moves a stalled send into recovery; an ACK watchdog starts
+after ASGI send completion. A late server-side send completion cannot clear that
+recovery state by itself. Transport-level send success alone does not prove that
+a browser received a response.
+
+Chat sessions and delivery receipts are held in process memory. They do not
+survive a state-store restart, so this is same-process retry protection, not
+durable idempotency. After a restart, inspect the external action's state and its
+audit history before retrying.
 
 Available tools:
 
