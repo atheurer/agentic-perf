@@ -487,7 +487,9 @@ class TestSearchFiltering:
 
 
 class TestHandleMessage:
-    async def test_cancelled_tool_reconciles_history_and_blocks_follow_up(self):
+    async def test_cancelled_mutating_tool_reconciles_history_and_blocks_follow_up(
+        self,
+    ):
         from unittest.mock import patch
 
         import pytest
@@ -503,7 +505,7 @@ class TestHandleMessage:
         response.tool_calls = [
             ToolCall(
                 id="toolu-read",
-                name="get_ticket",
+                name="start_ticket",
                 input={"ticket_id": "PERF-1"},
             )
         ]
@@ -562,6 +564,58 @@ class TestHandleMessage:
         )
         assert llm.complete.await_count == 1
         assert agent.clear_session("alice") is True
+
+    async def test_anonymous_readonly_cancellations_do_not_accumulate_pause_state(self):
+        from unittest.mock import patch
+
+        import pytest
+
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        response = MagicMock()
+        response.text = None
+        response.tool_calls = [
+            ToolCall(
+                id="toolu-read",
+                name="get_ticket",
+                input={"ticket_id": "PERF-1"},
+            )
+        ]
+        response.raw_content = [{"type": "tool_use", "id": "toolu-read"}]
+        response.usage = {}
+        llm.complete = AsyncMock(return_value=response)
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+
+        async def cancelled_read(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        with patch("agents.chat.agent.execute_tool", cancelled_read):
+            for index in range(200):
+                with pytest.raises(asyncio.CancelledError):
+                    await agent.handle_message(
+                        f"anonymous-{index}", "inspect ticket", "", readonly=True
+                    )
+
+        assert agent._indeterminate_sessions == {}
+        assert len(agent._sessions._sessions) <= agent._sessions._max_sessions
+
+        fresh_response = MagicMock(
+            text="read-only chat remains available", tool_calls=[], raw_content=[]
+        )
+        fresh_response.usage = {}
+        llm.complete.return_value = fresh_response
+        assert (
+            await agent.handle_message(
+                "anonymous-199", "hello again", "", readonly=True
+            )
+            == "read-only chat remains available"
+        )
 
     async def test_confirmation_remains_pending_until_action_finishes(self):
         from unittest.mock import patch
@@ -796,6 +850,60 @@ class TestHandleMessage:
             for call in agent._client.post.await_args_list
         ] == ["started", "rejected"]
 
+    async def test_failed_rejection_terminal_blocks_confirmation_until_recovery(self):
+        from agents.chat.agent import (
+            _CHAT_AUDIT_INDETERMINATE_MESSAGE,
+            ChatAgent,
+        )
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        response = MagicMock(text="fresh response", tool_calls=[], raw_content=[])
+        response.usage = {}
+        llm.complete = AsyncMock(return_value=response)
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        audit_response = MagicMock()
+        audit_response.raise_for_status = MagicMock()
+        agent._client.post = AsyncMock(
+            side_effect=[audit_response, RuntimeError("terminal event lost")]
+        )
+        session = agent._sessions.get_or_create("alice")
+        session.messages = [
+            {"role": "user", "content": "create a ticket"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tc"}]},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tc"}],
+            },
+            {"role": "assistant", "content": "Please confirm."},
+        ]
+        session.pending_action = {
+            "tool": "create_ticket",
+            "input": {"summary": "must remain rejected"},
+            "tool_call_id": "tc",
+        }
+
+        result = await agent.handle_message("alice", "no", "token")
+
+        assert result == _CHAT_AUDIT_INDETERMINATE_MESSAGE
+        assert session.pending_action is None
+        assert agent.is_session_indeterminate("alice")
+        assert [
+            call.kwargs["json"]["lifecycle"]["state"]
+            for call in agent._client.post.await_args_list
+        ] == ["started", "rejected"]
+        assert await agent.handle_message("alice", "yes", "token") == result
+        llm.complete.assert_not_awaited()
+
+        assert agent.clear_session("alice") is True
+        assert await agent.handle_message("alice", "hello", "token") == (
+            "fresh response"
+        )
+        llm.complete.assert_awaited_once()
+
     async def test_rejected_confirmation_stays_rejected_after_disconnect(self):
         from unittest.mock import patch
 
@@ -995,7 +1103,7 @@ class TestChatAPI:
         from state_store.api.chat import get_history
 
         agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
-        agent._indeterminate_sessions.add("default")
+        agent._indeterminate_sessions["default"] = "uncertain"
 
         history = await get_history(self._chat_request(agent))
 
@@ -1296,7 +1404,8 @@ class TestChatAPI:
 
         assert events == ["started", "cancelled"]
         session = agent._sessions.get_or_create("default")
-        assert "outcome is uncertain" in session.messages[-1]["content"]
+        assert not agent.is_session_indeterminate("default")
+        assert "read-only lookup was interrupted" in session.messages[-1]["content"]
         await asyncio.sleep(0)
         assert worker_task not in chat_api._CHAT_TASKS_AWAITING_CLEANUP
 

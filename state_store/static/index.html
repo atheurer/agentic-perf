@@ -1633,7 +1633,7 @@ th.col-right { text-align: right; }
     <h4>Chat Agent <span class="chat-help-icon" title="Ask questions about tickets, create tests, send interjections, or get help. Try: 'show recent tickets', 'run uperf on my cluster', or 'help' for more.">?</span></h4>
     <div class="chat-messages" id="chat-messages"></div>
     <div class="chat-recovery" id="chat-recovery" style="display:none">
-      <div>An interrupted action may already have taken effect. Reconcile its result in the ticket or audit history before clearing chat and trying again.</div>
+      <div>Chat is paused because an action's outcome may be uncertain or its audit record is incomplete. Reconcile any external effect and the audit history before clearing chat and trying again.</div>
       <button type="button" onclick="clearChatSession()">I reconciled it — clear chat</button>
     </div>
     <div class="chat-bar">
@@ -2520,7 +2520,7 @@ async function renderDetail(ticketId) {
               '<h4 style="color:var(--accent)">Chat Agent <span class="chat-help-icon" title="Ask about this ticket, send interjections, or get help. The chat has full context of the current ticket.">?</span></h4>' +
               '<div class="chat-messages" id="ticket-chat-messages"></div>' +
               '<div class="chat-recovery" id="ticket-chat-recovery" style="display:none">' +
-                '<div>An interrupted action may already have taken effect. Reconcile its result in the ticket or audit history before clearing chat and trying again.</div>' +
+                '<div>Chat is paused because an action\'s outcome may be uncertain or its audit record is incomplete. Reconcile any external effect and the audit history before clearing chat and trying again.</div>' +
                 '<button type="button" onclick="clearChatSession()">I reconciled it — clear chat</button>' +
               '</div>' +
               '<div class="chat-bar">' +
@@ -4850,7 +4850,7 @@ function updateChatRecovery(indeterminate) {
 
 async function clearChatSession() {
   if (!chatSessionIndeterminate) return;
-  if (!window.confirm('The interrupted action may already have taken effect. Reconcile it in the ticket or audit history before clearing chat and retrying. Continue?')) return;
+  if (!window.confirm('Chat is paused because an action result may be uncertain or its audit history may be incomplete. Reconcile any external effect and the audit entry before clearing chat and retrying. Continue?')) return;
 
   var buttons = [
     document.querySelector('#chat-recovery button'),
@@ -4986,7 +4986,10 @@ async function _streamChatRequest(msg, ticketContext, containerId, costElId) {
       return {ok: false, error: 'The chat response ended unexpectedly. Please try again.'};
     }
     if (fullText) {
-      if (fullText.indexOf('outcome is uncertain') !== -1) updateChatRecovery(true);
+      if (
+        fullText.indexOf('outcome is uncertain') !== -1 ||
+        fullText.indexOf('audit lifecycle is incomplete') !== -1
+      ) updateChatRecovery(true);
       appendChatMessage(containerId, 'assistant', fullText);
     }
     return {ok: true};

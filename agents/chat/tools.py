@@ -43,6 +43,14 @@ class ChatAuditUnavailable(RuntimeError):
     """
 
 
+class ChatAuditStartUnavailable(ChatAuditUnavailable):
+    """A rejection STARTED event could not be confirmed as persisted."""
+
+
+class ChatAuditTerminalUnavailable(ChatAuditUnavailable):
+    """A rejection terminal event could not be confirmed as persisted."""
+
+
 # This maps the advertised chat capability to the concrete handler and the
 # state-store API domain it mutates.  It is intentionally local to the
 # dispatcher: the audit event records the same operation owner that executes
@@ -397,22 +405,32 @@ class ChatToolAudit:
             ),
         )
         timer = MonotonicTimer()
-        cancellation_requested = await self._emit_cancellation_safe(
-            context=context,
-            state=LifecycleState.STARTED,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            required=True,
-        )
-        cancellation_requested |= await self._emit_cancellation_safe(
-            context=context,
-            state=LifecycleState.REJECTED,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            timer=timer,
-            outcome=OperationOutcome.REJECTED,
-            required=True,
-        )
+        try:
+            cancellation_requested = await self._emit_cancellation_safe(
+                context=context,
+                state=LifecycleState.STARTED,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                required=True,
+            )
+        except ChatAuditUnavailable as exc:
+            raise ChatAuditStartUnavailable(
+                "rejection STARTED audit event could not be confirmed"
+            ) from exc
+        try:
+            cancellation_requested |= await self._emit_cancellation_safe(
+                context=context,
+                state=LifecycleState.REJECTED,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                timer=timer,
+                outcome=OperationOutcome.REJECTED,
+                required=True,
+            )
+        except ChatAuditUnavailable as exc:
+            raise ChatAuditTerminalUnavailable(
+                "rejection terminal audit event could not be confirmed"
+            ) from exc
         if cancellation_requested:
             raise asyncio.CancelledError("rejection audit completed after disconnect")
 

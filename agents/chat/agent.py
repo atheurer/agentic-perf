@@ -29,6 +29,7 @@ from .prompts import CHAT_SYSTEM_PROMPT
 from .tools import (
     CHAT_TOOLS,
     DESTRUCTIVE_TOOLS,
+    READONLY_TOOLS,
     ChatAuditUnavailable,
     ChatToolAudit,
     execute_tool,
@@ -105,6 +106,14 @@ _CHAT_INDETERMINATE_MESSAGE = (
     "A previous chat action was interrupted and its outcome is uncertain. "
     "This chat is paused to prevent the action from being repeated. "
     "Clear the chat session before continuing."
+)
+_CHAT_AUDIT_INDETERMINATE_MESSAGE = (
+    "The action remains rejected, but its audit lifecycle is incomplete. "
+    "This chat is paused. Reconcile the audit history and clear the chat "
+    "session before continuing."
+)
+_CHAT_READONLY_CANCELLED_MESSAGE = (
+    "The read-only lookup was interrupted. You can safely ask again."
 )
 
 
@@ -249,7 +258,7 @@ class ChatAgent:
         # supplies its deployment token instead.
         self._audit_token = audit_token
         self._session_locks: dict[str, asyncio.Lock] = {}
-        self._indeterminate_sessions: set[str] = set()
+        self._indeterminate_sessions: dict[str, str] = {}
 
     async def handle_message(
         self,
@@ -282,7 +291,7 @@ class ChatAgent:
         await lock.acquire()
         try:
             if user in self._indeterminate_sessions:
-                return _CHAT_INDETERMINATE_MESSAGE
+                return self._indeterminate_sessions[user]
 
             # Every web request has a root context before it can reach
             # ChatToolAudit. Destructive confirmations retain this root.
@@ -347,8 +356,38 @@ class ChatAgent:
         else:
             self._remove_trailing_tool_use(session)
         session.pending_action = None
-        self._indeterminate_sessions.add(user)
+        self._indeterminate_sessions[user] = _CHAT_INDETERMINATE_MESSAGE
         session.add_assistant_message(_CHAT_INDETERMINATE_MESSAGE)
+
+    def _mark_rejection_audit_indeterminate(
+        self, user: str, session: ChatSession
+    ) -> None:
+        """Keep a failed rejection audit from reopening the pending action."""
+        self._remove_confirmation_exchange(session)
+        session.pending_action = None
+        self._indeterminate_sessions[user] = _CHAT_AUDIT_INDETERMINATE_MESSAGE
+        session.add_assistant_message(_CHAT_AUDIT_INDETERMINATE_MESSAGE)
+
+    def _mark_tool_cancelled(
+        self,
+        user: str,
+        session: ChatSession,
+        *,
+        tool_name: str,
+        confirmation_exchange: bool,
+    ) -> None:
+        """Reconcile cancelled read-only history without a permanent pause."""
+        if tool_name in READONLY_TOOLS:
+            if confirmation_exchange:
+                self._remove_confirmation_exchange(session)
+            else:
+                self._remove_trailing_tool_use(session)
+            session.pending_action = None
+            session.add_assistant_message(_CHAT_READONLY_CANCELLED_MESSAGE)
+            return
+        self._mark_tool_outcome_indeterminate(
+            user, session, confirmation_exchange=confirmation_exchange
+        )
 
     async def handle_message_stream(
         self,
@@ -456,6 +495,9 @@ class ChatAgent:
             except asyncio.CancelledError:
                 self._remove_confirmation_exchange(session)
                 raise
+            except ChatAuditUnavailable:
+                self._mark_rejection_audit_indeterminate(user, session)
+                return _CHAT_AUDIT_INDETERMINATE_MESSAGE
             if self._cancellation_requested():
                 self._remove_confirmation_exchange(session)
                 raise asyncio.CancelledError
@@ -486,6 +528,9 @@ class ChatAgent:
             except asyncio.CancelledError:
                 self._remove_confirmation_exchange(session)
                 raise
+            except ChatAuditUnavailable:
+                self._mark_rejection_audit_indeterminate(user, session)
+                return _CHAT_AUDIT_INDETERMINATE_MESSAGE
             if self._cancellation_requested():
                 self._remove_confirmation_exchange(session)
                 raise asyncio.CancelledError
@@ -766,12 +811,23 @@ class ChatAgent:
                         tool_call_id=tc.id,
                     )
                 except asyncio.CancelledError:
-                    self._mark_tool_outcome_indeterminate(
-                        user, session, confirmation_exchange=False
+                    self._mark_tool_cancelled(
+                        user,
+                        session,
+                        tool_name=tc.name,
+                        confirmation_exchange=False,
                     )
                     raise
                 except ChatAuditUnavailable as exc:
                     if "outcome is indeterminate" in str(exc) or tool_results:
+                        if tc.name in READONLY_TOOLS:
+                            self._remove_trailing_tool_use(session)
+                            message_text = (
+                                "The read-only lookup's audit record is incomplete. "
+                                "No changes were made; you can safely ask again."
+                            )
+                            session.add_assistant_message(message_text)
+                            return message_text
                         self._mark_tool_outcome_indeterminate(
                             user, session, confirmation_exchange=False
                         )
@@ -784,8 +840,11 @@ class ChatAgent:
                     session.add_assistant_message(message_text)
                     return message_text
                 if self._cancellation_requested():
-                    self._mark_tool_outcome_indeterminate(
-                        user, session, confirmation_exchange=False
+                    self._mark_tool_cancelled(
+                        user,
+                        session,
+                        tool_name=tc.name,
+                        confirmation_exchange=False,
                     )
                     raise asyncio.CancelledError
                 tool_results.append(
@@ -855,6 +914,6 @@ class ChatAgent:
         lock = self._session_locks.get(user)
         if lock is not None and lock.locked():
             return False
-        self._indeterminate_sessions.discard(user)
+        self._indeterminate_sessions.pop(user, None)
         self._sessions.delete(user)
         return True

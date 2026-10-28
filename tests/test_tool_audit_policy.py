@@ -2133,16 +2133,33 @@ async def test_chat_rejection_terminal_delivery_is_required() -> None:
     """Confirmation invalidation also has a durable started/rejected pair."""
     from unittest.mock import AsyncMock, MagicMock
 
-    from agents.chat.tools import ChatAuditUnavailable, ChatToolAudit
+    from agents.chat.tools import ChatAuditTerminalUnavailable, ChatToolAudit
 
     response = MagicMock()
     response.raise_for_status = MagicMock()
     client = AsyncMock()
     client.post = AsyncMock(side_effect=[response, OSError("trace unavailable")])
-    with pytest.raises(ChatAuditUnavailable):
+    with pytest.raises(ChatAuditTerminalUnavailable):
         await ChatToolAudit(
             client, "http://state-store.invalid", "service-token"
         ).reject("create_ticket", {"summary": "safe"})
+
+
+@pytest.mark.asyncio
+async def test_chat_rejection_start_delivery_failure_is_distinct() -> None:
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatAuditStartUnavailable, ChatToolAudit
+
+    client = AsyncMock()
+    client.post = AsyncMock(side_effect=OSError("start event unavailable"))
+
+    with pytest.raises(ChatAuditStartUnavailable):
+        await ChatToolAudit(
+            client, "http://state-store.invalid", "service-token"
+        ).reject("create_ticket", {"summary": "safe"})
+
+    assert client.post.await_count == 1
 
 
 @pytest.mark.asyncio
