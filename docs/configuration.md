@@ -401,6 +401,10 @@ and Responses custom tools using a grammar format are rejected. Consult the
 [EnMaaS guide](https://source.redhat.com/departments/products_and_global_engineering/workload_management/enmaas)
 for current model availability and limits.
 
+The bundled cost estimates use zero token prices for the hosted GLM 5.3 and
+DeepSeek V4.1 Flash gateway IDs while they are available at no usage cost.
+Administrators can supply their own `pricing.yaml` when rates change.
+
 ---
 
 ### `agent_models` — Per-Agent LLM Overrides
