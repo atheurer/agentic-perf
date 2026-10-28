@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -113,10 +114,11 @@ _CHAT_AUDIT_INDETERMINATE_MESSAGE = (
     "session before continuing."
 )
 _CHAT_DELIVERY_INDETERMINATE_MESSAGE = (
-    "A chat action may have completed before its response was interrupted. "
-    "Check the action's current state before retrying, then clear the chat "
-    "session to continue."
+    "A chat action may have completed, but the browser did not acknowledge "
+    "the response. Check the action's current state before retrying, then "
+    "clear the chat session to continue."
 )
+_CHAT_DELIVERY_ACK_TIMEOUT_SECONDS = 30.0
 _CHAT_READONLY_AUDIT_UNAVAILABLE_MESSAGE = (
     "This action was blocked before dispatch, but its rejection audit could "
     "not be confirmed. No action was attempted."
@@ -268,7 +270,11 @@ class ChatAgent:
         self._audit_token = audit_token
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._indeterminate_sessions: dict[str, str] = {}
-        self._pending_response_deliveries: set[str] = set()
+        self._pending_response_deliveries: dict[str, str] = {}
+        self._active_response_deliveries: dict[str, tuple[str, dict[str, bool]]] = {}
+        self._sent_response_deliveries: dict[str, str] = {}
+        self._delivery_indeterminate_ids: dict[str, str] = {}
+        self._delivery_timeouts: dict[str, asyncio.TimerHandle] = {}
 
     async def handle_message(
         self,
@@ -278,6 +284,7 @@ class ChatAgent:
         ticket_context: str | None = None,
         readonly: bool = False,
         track_response_delivery: bool = False,
+        delivery_id: str | None = None,
     ) -> str:
         """Process a user message and return the assistant response.
 
@@ -310,8 +317,13 @@ class ChatAgent:
             # ChatToolAudit. Destructive confirmations retain this root.
             root = new_trace_context(ticket_id=ticket_context, agent_id="chat-agent")
             token = bind_trace_context(root)
+            delivery_id = delivery_id or (
+                uuid.uuid4().hex if track_response_delivery else None
+            )
+            mutation_state = {"completed": False, "delivery_interrupted": False}
+            if track_response_delivery and delivery_id is not None:
+                self._active_response_deliveries[user] = (delivery_id, mutation_state)
             try:
-                mutation_state = {"completed": False}
                 try:
                     response = await self._handle_message(
                         user,
@@ -323,16 +335,23 @@ class ChatAgent:
                     )
                 except asyncio.CancelledError:
                     if mutation_state["completed"]:
-                        self._mark_request_interrupted(user)
+                        self._mark_request_interrupted(user, delivery_id)
                     raise
                 except Exception:
                     if mutation_state["completed"]:
-                        self._mark_request_interrupted(user)
+                        self._mark_request_interrupted(user, delivery_id)
                     raise
-                if track_response_delivery and mutation_state["completed"]:
-                    self._pending_response_deliveries.add(user)
+                if mutation_state["delivery_interrupted"]:
+                    if mutation_state["completed"]:
+                        self._mark_request_interrupted(user, delivery_id)
+                elif track_response_delivery and mutation_state["completed"]:
+                    assert delivery_id is not None
+                    self._pending_response_deliveries[user] = delivery_id
                 return response
             finally:
+                active_delivery = self._active_response_deliveries.get(user)
+                if active_delivery is not None and active_delivery[0] == delivery_id:
+                    self._active_response_deliveries.pop(user, None)
                 reset_trace_context(token)
         finally:
             lock.release()
@@ -546,6 +565,7 @@ class ChatAgent:
         auth_token: str,
         ticket_context: str | None = None,
         readonly: bool = False,
+        delivery_id: str | None = None,
     ):
         """Yield response chunks for SSE streaming.
 
@@ -554,6 +574,7 @@ class ChatAgent:
         the SSE connection alive and prevents reverse-proxy timeouts.
         True token-level streaming can be layered in later.
         """
+        delivery_id = delivery_id or uuid.uuid4().hex
         response = await self.handle_message(
             user=user,
             message=message,
@@ -561,14 +582,15 @@ class ChatAgent:
             ticket_context=ticket_context,
             readonly=readonly,
             track_response_delivery=True,
+            delivery_id=delivery_id,
         )
         try:
             yield response
         except BaseException:
-            self.mark_response_delivery_interrupted(user)
+            self.mark_response_delivery_interrupted(user, delivery_id)
             raise
         else:
-            self.mark_response_delivery_complete(user)
+            self.mark_response_delivery_sent(user, delivery_id)
 
     async def _handle_message(
         self,
@@ -1141,24 +1163,93 @@ class ChatAgent:
         """Whether an interrupted action requires reconciliation before chat."""
         return user in self._indeterminate_sessions
 
-    def _mark_request_interrupted(self, user: str) -> None:
+    def _mark_request_interrupted(
+        self, user: str, delivery_id: str | None = None
+    ) -> None:
         if user in self._indeterminate_sessions:
             return
         session = self._sessions.get_or_create(user)
         session.pending_action = None
         self._indeterminate_sessions[user] = _CHAT_DELIVERY_INDETERMINATE_MESSAGE
+        if delivery_id is not None:
+            self._delivery_indeterminate_ids[user] = delivery_id
         session.add_assistant_message(_CHAT_DELIVERY_INDETERMINATE_MESSAGE)
 
-    def mark_response_delivery_complete(self, user: str) -> None:
-        """Release a successful streamed response from its pending-delivery guard."""
-        self._pending_response_deliveries.discard(user)
-
-    def mark_response_delivery_interrupted(self, user: str) -> None:
-        """Pause chat when a completed mutation's response could not be delivered."""
-        if user not in self._pending_response_deliveries:
+    def mark_response_delivery_sent(self, user: str, delivery_id: str) -> None:
+        """Wait briefly for the browser to acknowledge a complete response."""
+        if self._pending_response_deliveries.get(user) != delivery_id:
             return
-        self._pending_response_deliveries.discard(user)
-        self._mark_request_interrupted(user)
+        self._sent_response_deliveries[user] = delivery_id
+        timeout = self._delivery_timeouts.pop(user, None)
+        if timeout is not None:
+            timeout.cancel()
+        loop = asyncio.get_running_loop()
+        self._delivery_timeouts[user] = loop.call_later(
+            _CHAT_DELIVERY_ACK_TIMEOUT_SECONDS,
+            self.mark_response_delivery_interrupted,
+            user,
+            delivery_id,
+        )
+
+    def mark_response_delivery_complete(self, user: str, delivery_id: str) -> bool:
+        """Release a response only when its owning user acknowledges its ID."""
+        pending_id = self._pending_response_deliveries.get(user)
+        indeterminate_id = self._delivery_indeterminate_ids.get(user)
+        if pending_id != delivery_id and indeterminate_id != delivery_id:
+            return False
+        if pending_id == delivery_id:
+            if self._sent_response_deliveries.get(user) != delivery_id:
+                return False
+            self._pending_response_deliveries.pop(user, None)
+            self._sent_response_deliveries.pop(user, None)
+            timeout = self._delivery_timeouts.pop(user, None)
+            if timeout is not None:
+                timeout.cancel()
+        if indeterminate_id != delivery_id:
+            return True
+        self._delivery_indeterminate_ids.pop(user, None)
+        self._indeterminate_sessions.pop(user, None)
+        session = self._sessions.get_or_create(user)
+        session.messages = [
+            message
+            for message in session.messages
+            if not (
+                message.get("role") == "assistant"
+                and message.get("content") == _CHAT_DELIVERY_INDETERMINATE_MESSAGE
+            )
+        ]
+        return True
+
+    def mark_response_delivery_interrupted(
+        self, user: str, delivery_id: str | None
+    ) -> None:
+        """Pause only the matching request when response delivery is uncertain."""
+        if delivery_id is None:
+            return
+        if self._pending_response_deliveries.get(user) == delivery_id:
+            self._pending_response_deliveries.pop(user, None)
+            self._sent_response_deliveries.pop(user, None)
+            timeout = self._delivery_timeouts.pop(user, None)
+            if timeout is not None:
+                timeout.cancel()
+            self._mark_request_interrupted(user, delivery_id)
+            return
+        active = self._active_response_deliveries.get(user)
+        if active is None or active[0] != delivery_id:
+            return
+        mutation_state = active[1]
+        mutation_state["delivery_interrupted"] = True
+        if mutation_state["completed"]:
+            self._mark_request_interrupted(user, delivery_id)
+
+    def is_response_delivery_pending(self, user: str) -> bool:
+        """Whether a completed mutation is awaiting browser acknowledgement."""
+        return user in self._pending_response_deliveries
+
+    def is_request_in_flight(self, user: str) -> bool:
+        """Whether a request currently owns this user's chat session lock."""
+        lock = self._session_locks.get(user)
+        return lock is not None and lock.locked()
 
     def get_usage(self, user: str) -> dict[str, Any]:
         usage = self._sessions.get_usage(user)
@@ -1194,5 +1285,10 @@ class ChatAgent:
         ) or user in self._pending_response_deliveries:
             return False
         self._indeterminate_sessions.pop(user, None)
+        self._delivery_indeterminate_ids.pop(user, None)
+        self._sent_response_deliveries.pop(user, None)
+        timeout = self._delivery_timeouts.pop(user, None)
+        if timeout is not None:
+            timeout.cancel()
         self._sessions.delete(user)
         return True

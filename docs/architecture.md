@@ -242,8 +242,18 @@ API endpoints:
 | Method | Path | Description |
 |---|---|---|
 | POST | `/api/v1/chat/message` | Send a message, get a response |
+| POST | `/api/v1/chat/message/stream` | Send a message and receive SSE response events |
+| POST | `/api/v1/chat/message/ack` | Acknowledge a fully received response by its delivery ID |
 | GET | `/api/v1/chat/history` | Get chat history for current user |
 | DELETE | `/api/v1/chat/session` | Clear current user's session |
+
+Both message endpoints include a server-generated, request-scoped `delivery_id`
+in the response. Clients should call `/chat/message/ack` with that ID and the
+same authenticated user only after consuming the complete JSON body or SSE `done`
+event. Existing request bodies remain compatible. A client that does not ACK is
+blocked from starting another chat action; after a bounded wait, the session is
+marked indeterminate and requires reconciliation before the user clears it.
+Transport-level send success does not prove that a browser received a response.
 
 Available tools:
 

@@ -10,11 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from typing import Any
 
 import anyio
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse, StreamingResponse
 
 from ..auth import Principal
@@ -31,26 +32,43 @@ class ChatMessageRequest(BaseModel):
     ticket_context: str | None = None
 
 
+class ChatDeliveryAckRequest(BaseModel):
+    delivery_id: str = Field(min_length=1, max_length=128)
+
+
 class ChatMessageResponse(BaseModel):
     response: str
     usage: dict[str, Any]
+    delivery_id: str = Field(
+        description=(
+            "A request-scoped response ID. After consuming the complete JSON body, "
+            "POST it to /chat/message/ack with the same authenticated user. Older "
+            "clients may omit the ACK; the session will become indeterminate "
+            "after the bounded ACK wait instead of allowing a silent retry."
+        )
+    )
+    indeterminate: bool = False
+    delivery_pending: bool = False
 
 
 class ChatHistoryResponse(BaseModel):
     messages: list[dict[str, str]]
     usage: dict[str, Any]
     indeterminate: bool = False
+    delivery_pending: bool = False
+    request_in_flight: bool = False
 
 
 class _ChatDeliveryJSONResponse(JSONResponse):
-    """Acknowledge response delivery to the agent after ASGI send completes."""
+    """Track transport completion while waiting for a browser ACK."""
 
-    def __init__(self, content: Any, agent: Any, user: str) -> None:
+    def __init__(self, content: Any, agent: Any, user: str, delivery_id: str) -> None:
         super().__init__(content=content)
         self._agent = agent
         self._user = user
+        self._delivery_id = delivery_id
 
-    async def __call__(self, scope, receive, send) -> None:
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         try:
             await super().__call__(scope, receive, send)
         except BaseException:
@@ -58,14 +76,12 @@ class _ChatDeliveryJSONResponse(JSONResponse):
                 self._agent, "mark_response_delivery_interrupted", None
             )
             if delivery_interrupted is not None:
-                delivery_interrupted(self._user)
+                delivery_interrupted(self._user, self._delivery_id)
             raise
         else:
-            delivery_complete = getattr(
-                self._agent, "mark_response_delivery_complete", None
-            )
-            if delivery_complete is not None:
-                delivery_complete(self._user)
+            delivery_sent = getattr(self._agent, "mark_response_delivery_sent", None)
+            if delivery_sent is not None:
+                delivery_sent(self._user, self._delivery_id)
 
 
 def _get_chat_agent(request: Request):
@@ -113,14 +129,40 @@ async def _cancel_chat_task(task: asyncio.Task[str]) -> None:
 class _ChatStreamingResponse(StreamingResponse):
     """Close the SSE iterator even when the ASGI server send fails."""
 
-    async def __call__(self, scope, receive, send) -> None:
+    def __init__(
+        self,
+        content: Any,
+        *,
+        agent: Any,
+        user: str,
+        delivery_id: str,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(content, **kwargs)
+        self._agent = agent
+        self._user = user
+        self._delivery_id = delivery_id
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         try:
-            await super().__call__(scope, receive, send)
-        finally:
-            close_iterator = getattr(self.body_iterator, "aclose", None)
-            if close_iterator is not None:
-                with anyio.CancelScope(shield=True):
-                    await close_iterator()
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                close_iterator = getattr(self.body_iterator, "aclose", None)
+                if close_iterator is not None:
+                    with anyio.CancelScope(shield=True):
+                        await close_iterator()
+        except BaseException:
+            delivery_interrupted = getattr(
+                self._agent, "mark_response_delivery_interrupted", None
+            )
+            if delivery_interrupted is not None:
+                delivery_interrupted(self._user, self._delivery_id)
+            raise
+        else:
+            delivery_sent = getattr(self._agent, "mark_response_delivery_sent", None)
+            if delivery_sent is not None:
+                delivery_sent(self._user, self._delivery_id)
 
 
 def _get_principal(request: Request) -> Principal:
@@ -221,10 +263,17 @@ async def send_message(
     body: ChatMessageRequest,
     request: Request,
 ):
-    """Send a message to the chat agent."""
+    """Send a message and return a delivery ID for a post-read ACK.
+
+    Existing request bodies remain valid. Clients should POST the returned
+    ``delivery_id`` to ``/message/ack`` after consuming the complete response.
+    A client that does not ACK remains guarded, then enters recovery state after
+    the bounded wait; the server never silently enables an uncertain retry.
+    """
     agent = _get_chat_agent(request)
     principal = _get_principal(request)
     user = _get_user(request)
+    delivery_id = uuid.uuid4().hex
     token = _get_token(request)
     is_anonymous = principal.kind == "anonymous"
 
@@ -252,6 +301,7 @@ async def send_message(
             ticket_context=body.ticket_context,
             readonly=is_anonymous,
             track_response_delivery=True,
+            delivery_id=delivery_id,
         )
     except Exception:
         # Never return 500 to the user — surface the error
@@ -265,12 +315,38 @@ async def send_message(
         logging.getLogger(__name__).exception("Chat message handling failed")
 
     usage = agent.get_usage(user)
-    response = ChatMessageResponse(response=response_text, usage=usage)
+    response = ChatMessageResponse(
+        response=response_text,
+        usage=usage,
+        delivery_id=delivery_id,
+        indeterminate=agent.is_session_indeterminate(user),
+        delivery_pending=agent.is_response_delivery_pending(user),
+    )
     return _ChatDeliveryJSONResponse(
         content=response.model_dump(),
         agent=agent,
         user=user,
+        delivery_id=delivery_id,
     )
+
+
+@router.post("/message/ack")
+async def acknowledge_message_delivery(
+    body: ChatDeliveryAckRequest,
+    request: Request,
+):
+    """Acknowledge a response ID for its authenticated owner.
+
+    The request ID is generated by the server and is scoped to the user that
+    received it. Duplicate, late, unknown, and cross-user ACKs cannot settle a
+    different request. A late ACK can clear only the delivery pause created by
+    its own response ID.
+    """
+    agent = _get_chat_agent(request)
+    _get_principal(request)
+    user = _get_user(request)
+    acknowledged = agent.mark_response_delivery_complete(user, body.delivery_id)
+    return {"acknowledged": acknowledged}
 
 
 @router.post("/message/stream")
@@ -286,6 +362,7 @@ async def send_message_stream(
     agent = _get_chat_agent(request)
     principal = _get_principal(request)
     user = _get_user(request)
+    delivery_id = uuid.uuid4().hex
     token = _get_token(request)
     is_anonymous = principal.kind == "anonymous"
 
@@ -316,6 +393,7 @@ async def send_message_stream(
                 ticket_context=body.ticket_context,
                 readonly=is_anonymous,
                 track_response_delivery=True,
+                delivery_id=delivery_id,
             )
         )
         task_result_observed = False
@@ -339,26 +417,19 @@ async def send_message_stream(
             await _cancel_chat_task(task)
             if task.done() and not task_result_observed:
                 _consume_chat_task_result(task)
-        try:
-            yield f"data: {json.dumps({'text': response_text})}\n\n"
-        except BaseException:
-            delivery_interrupted = getattr(
-                agent, "mark_response_delivery_interrupted", None
-            )
-            if delivery_interrupted is not None:
-                delivery_interrupted(user)
-            raise
-        else:
-            delivery_complete = getattr(agent, "mark_response_delivery_complete", None)
-            if delivery_complete is not None:
-                delivery_complete(user)
+        yield f"data: {json.dumps({'text': response_text})}\n\n"
         usage = agent.get_usage(user)
-        yield f"data: {json.dumps({'done': True, 'usage': usage})}\n\n"
+        yield (
+            f"data: {json.dumps({'done': True, 'usage': usage, 'delivery_id': delivery_id, 'indeterminate': agent.is_session_indeterminate(user), 'delivery_pending': agent.is_response_delivery_pending(user)})}\n\n"
+        )
 
     return _ChatStreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        agent=agent,
+        user=user,
+        delivery_id=delivery_id,
     )
 
 
@@ -379,6 +450,8 @@ async def get_history(request: Request):
         messages=history,
         usage=usage,
         indeterminate=agent.is_session_indeterminate(user),
+        delivery_pending=agent.is_response_delivery_pending(user),
+        request_in_flight=agent.is_request_in_flight(user),
     )
 
 

@@ -6,6 +6,8 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from agents.chat.agent import ChatSession, ChatSessionStore
 from agents.chat.tools import CHAT_TOOLS, ChatToolAudit, execute_tool
 
@@ -1761,6 +1763,144 @@ class TestChatAPI:
 
         assert history.indeterminate is True
 
+    async def test_history_reports_pending_delivery_and_active_request(self):
+        from agents.chat.agent import ChatAgent
+        from state_store.api.chat import get_history
+
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._pending_response_deliveries["default"] = "request-A"
+        lock = agent._session_locks.setdefault("default", asyncio.Lock())
+        await lock.acquire()
+        try:
+            history = await get_history(self._chat_request(agent))
+        finally:
+            lock.release()
+
+        assert history.delivery_pending is True
+        assert history.request_in_flight is True
+        assert history.indeterminate is False
+
+    async def test_late_delivery_ack_only_resolves_its_matching_request(
+        self, monkeypatch
+    ):
+        import agents.chat.agent as chat_agent_module
+        from agents.chat.agent import ChatAgent
+
+        monkeypatch.setattr(
+            chat_agent_module, "_CHAT_DELIVERY_ACK_TIMEOUT_SECONDS", 0.01
+        )
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._pending_response_deliveries["alice"] = "request-A"
+        assert agent.mark_response_delivery_complete("alice", "request-A") is False
+        agent.mark_response_delivery_sent("alice", "request-A")
+        await asyncio.sleep(0.03)
+
+        assert agent.is_session_indeterminate("alice")
+        assert agent._pending_response_deliveries == {}
+        response = await agent.handle_message("alice", "retry", "token")
+        assert "before retrying" in response
+        agent._llm.complete.assert_not_awaited()
+        assert agent.mark_response_delivery_complete("alice", "request-B") is False
+        assert agent.is_session_indeterminate("alice")
+        assert agent.mark_response_delivery_complete("alice", "request-A") is True
+        assert not agent.is_session_indeterminate("alice")
+        assert agent.mark_response_delivery_complete("alice", "request-A") is False
+
+    async def test_disconnected_active_mutation_becomes_indeterminate_when_it_finishes(
+        self,
+    ):
+        from unittest.mock import patch
+
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        tool_call = ToolCall(
+            id="toolu-start",
+            name="start_ticket",
+            input={"ticket_id": "PERF-1"},
+        )
+        tool_response = MagicMock(
+            text=None,
+            tool_calls=[tool_call],
+            raw_content=[{"type": "tool_use", "id": tool_call.id}],
+        )
+        tool_response.usage = {}
+        final_response = MagicMock(
+            text="Ticket started.", tool_calls=[], raw_content=[]
+        )
+        final_response.usage = {}
+        completion_started = asyncio.Event()
+        finish_completion = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        completion_calls = 0
+
+        async def complete(**_kwargs):
+            nonlocal completion_calls
+            completion_calls += 1
+            if completion_calls == 1:
+                return tool_response
+            completion_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await finish_completion.wait()
+            return final_response
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm._model = ""
+        llm.complete = AsyncMock(side_effect=complete)
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        with patch(
+            "agents.chat.agent.execute_tool",
+            new_callable=AsyncMock,
+            return_value='{"id":"PERF-1","status":"running"}',
+        ):
+            task = asyncio.create_task(
+                agent.handle_message(
+                    "alice",
+                    "start PERF-1",
+                    "token",
+                    track_response_delivery=True,
+                    delivery_id="request-A",
+                )
+            )
+            await completion_started.wait()
+            task.cancel()
+            agent.mark_response_delivery_interrupted("alice", "request-A")
+            await cancellation_seen.wait()
+            finish_completion.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert agent.is_session_indeterminate("alice")
+        assert agent._pending_response_deliveries == {}
+        assert "alice" not in agent._active_response_deliveries
+
+    async def test_delivery_ack_is_bound_to_authenticated_user(self):
+        from agents.chat.agent import ChatAgent
+        from state_store.api.chat import (
+            ChatDeliveryAckRequest,
+            acknowledge_message_delivery,
+        )
+        from state_store.auth import Principal
+
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._pending_response_deliveries["alice"] = "request-A"
+        request = self._chat_request(agent)
+        request.state.principal = Principal(kind="user", username="bob", is_admin=False)
+
+        result = await acknowledge_message_delivery(
+            ChatDeliveryAckRequest(delivery_id="request-A"), request
+        )
+
+        assert result == {"acknowledged": False}
+        assert agent._pending_response_deliveries == {"alice": "request-A"}
+
     async def test_clear_session_endpoint_reports_in_flight_conflict(self):
         import pytest
         from fastapi import HTTPException
@@ -1777,6 +1917,68 @@ class TestChatAPI:
             assert exc.value.status_code == 409
         finally:
             lock.release()
+
+    @pytest.mark.parametrize("response_kind", ["json", "stream"])
+    @pytest.mark.parametrize("disconnect", [False, True])
+    async def test_busy_response_cannot_finalize_another_request_delivery(
+        self, response_kind, disconnect
+    ):
+        import pytest
+        from starlette.requests import ClientDisconnect
+
+        from agents.chat.agent import ChatAgent
+        from state_store.api.chat import (
+            _ChatDeliveryJSONResponse,
+            _ChatStreamingResponse,
+        )
+
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._pending_response_deliveries["default"] = "mutation-request-A"
+        if response_kind == "json":
+            response = _ChatDeliveryJSONResponse(
+                {"response": "busy"},
+                agent,
+                "default",
+                "busy-request-B",
+            )
+        else:
+            response = _ChatStreamingResponse(
+                iter(["data: busy\n\n"]),
+                media_type="text/event-stream",
+                agent=agent,
+                user="default",
+                delivery_id="busy-request-B",
+            )
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if (
+                disconnect
+                and message["type"] == "http.response.body"
+                and message.get("body")
+            ):
+                raise OSError("request B disconnected")
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/api/v1/chat/message",
+            "headers": [],
+        }
+        if disconnect:
+            expected_exception = (
+                OSError if response_kind == "json" else ClientDisconnect
+            )
+            with pytest.raises(expected_exception):
+                await response(scope, receive, send)
+        else:
+            await response(scope, receive, send)
+
+        assert agent._pending_response_deliveries == {"default": "mutation-request-A"}
+        assert not agent.is_session_indeterminate("default")
 
     async def test_send_message_no_agent(self):
         """Chat returns 503 when agent not initialized."""
@@ -1937,8 +2139,9 @@ class TestChatAPI:
         assert agent.started.is_set()
         assert agent.cancelled.is_set()
 
-    async def test_asgi_final_response_send_failure_pauses_after_completed_mutation(
-        self,
+    @pytest.mark.parametrize("failure_point", ["heartbeat", "text", "done", "final"])
+    async def test_asgi_send_failure_pauses_after_completed_mutation(
+        self, failure_point
     ):
         from unittest.mock import patch
 
@@ -1972,6 +2175,15 @@ class TestChatAPI:
         agent = ChatAgent(
             llm=llm, store_url="http://localhost:8090", audit_token="service-token"
         )
+        request_finished = asyncio.Event()
+        original_handle_message = agent.handle_message
+
+        async def tracked_handle_message(**kwargs):
+            result = await original_handle_message(**kwargs)
+            request_finished.set()
+            return result
+
+        agent.handle_message = tracked_handle_message
         response = await chat_api.send_message_stream(
             chat_api.ChatMessageRequest(message="start PERF-1"),
             self._chat_request(agent),
@@ -1981,10 +2193,19 @@ class TestChatAPI:
             return {"type": "http.request", "body": b"", "more_body": False}
 
         async def send(message):
-            if message["type"] == "http.response.body" and message["body"].startswith(
-                b"data:"
-            ):
-                raise OSError("client disconnected before response delivery")
+            if message["type"] != "http.response.body":
+                return
+            body = message["body"]
+            should_fail = (
+                (failure_point == "heartbeat" and body.startswith(b": heartbeat"))
+                or (failure_point == "text" and b'"text"' in body)
+                or (failure_point == "done" and b'"done": true' in body)
+                or (failure_point == "final" and not body and not message["more_body"])
+            )
+            if should_fail:
+                if failure_point == "heartbeat":
+                    await request_finished.wait()
+                raise OSError(f"client disconnected at {failure_point}")
 
         scope = {
             "type": "http",
@@ -2002,6 +2223,7 @@ class TestChatAPI:
                 await response(scope, receive, send)
 
         assert agent.is_session_indeterminate("default")
+        assert not agent._pending_response_deliveries
         session = agent._sessions.get_or_create("default")
         assert "Ticket started." in session.messages[-2]["content"]
         assert "may have completed" in session.messages[-1]["content"]
@@ -2069,7 +2291,7 @@ class TestChatAPI:
         assert agent.is_session_indeterminate("default")
         assert not agent._pending_response_deliveries
 
-    async def test_successful_json_delivery_releases_mutation_delivery_guard(self):
+    async def test_json_delivery_requires_request_scoped_browser_ack(self):
         from unittest.mock import patch
 
         import state_store.api.chat as chat_api
@@ -2124,8 +2346,38 @@ class TestChatAPI:
         }
         await response(scope, receive, send)
 
-        assert not agent._pending_response_deliveries
+        response_body = json.loads(response.body)
+        delivery_id = response_body["delivery_id"]
+        assert response_body["delivery_pending"] is True
+        assert response_body["indeterminate"] is False
+        assert agent._pending_response_deliveries == {"default": delivery_id}
         assert not agent.is_session_indeterminate("default")
+
+        from state_store.api.chat import (
+            ChatDeliveryAckRequest,
+            acknowledge_message_delivery,
+        )
+
+        wrong_ack = await acknowledge_message_delivery(
+            ChatDeliveryAckRequest(delivery_id="another-request"),
+            self._chat_request(agent),
+        )
+        assert wrong_ack == {"acknowledged": False}
+        assert agent._pending_response_deliveries == {"default": delivery_id}
+
+        ack = await acknowledge_message_delivery(
+            ChatDeliveryAckRequest(delivery_id=delivery_id),
+            self._chat_request(agent),
+        )
+        assert ack == {"acknowledged": True}
+        assert agent._pending_response_deliveries == {}
+        assert not agent.is_session_indeterminate("default")
+
+        duplicate_ack = await acknowledge_message_delivery(
+            ChatDeliveryAckRequest(delivery_id=delivery_id),
+            self._chat_request(agent),
+        )
+        assert duplicate_ack == {"acknowledged": False}
 
     async def test_asgi_20_disconnect_cancels_chat_stream(self):
         from state_store.api.chat import ChatMessageRequest, send_message_stream
