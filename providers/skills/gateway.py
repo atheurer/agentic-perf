@@ -544,6 +544,12 @@ class OrganizationSkillResolver:
             git_descriptors = [
                 item for item in descriptors if item["source"].get("kind") == "git"
             ]
+            if not descriptors:
+                return cls.from_instance_config(
+                    raw_config,
+                    snapshot_root=snapshot_root,
+                    audit_emit=audit_emit,
+                )
             if not git_descriptors and ticket_id is None:
                 return cls.from_instance_config(
                     raw_config,
