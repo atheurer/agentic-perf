@@ -130,7 +130,7 @@ class RetrospectiveAgent(AgentBase):
         )
         self._mcp = mcp
         mcp_tools = await mcp.list_tools()
-        self.tools = mcp_tools + self.tools
+        self._install_mcp_tools(mcp_tools)
 
         try:
             await super().run(ticket_id)

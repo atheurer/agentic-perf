@@ -956,7 +956,7 @@ class TriageAgent(AgentBase):
             mcp_tools = filter_external_tools(
                 mcp_tools, mcp._tool_routing, connected_ext, ext_tools
             )
-        self.tools = mcp_tools + self.tools
+        self._install_mcp_tools(mcp_tools)
 
         try:
             await super().run(ticket_id)

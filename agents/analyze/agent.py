@@ -156,7 +156,7 @@ class AnalyzeAgent(AgentBase):
             mcp_tools = filter_external_tools(
                 mcp_tools, mcp._tool_routing, connected_ext, ext_tools
             )
-        self.tools = mcp_tools + self.tools
+        self._install_mcp_tools(mcp_tools)
 
         # Pre-fetch run info for cited run IDs so the LLM
         # has the data without needing to call get_run_info.

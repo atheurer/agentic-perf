@@ -1271,7 +1271,7 @@ class ProvisioningAgent(AgentBase):
                     return
 
         mcp_tools = await mcp.list_tools()
-        self.tools = mcp_tools + self.tools
+        self._install_mcp_tools(mcp_tools)
 
         # For Jumpstarter with non-self-installing
         # harnesses, keep install tools but don't
