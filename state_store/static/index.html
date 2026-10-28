@@ -1633,7 +1633,7 @@ th.col-right { text-align: right; }
     <h4>Chat Agent <span class="chat-help-icon" title="Ask questions about tickets, create tests, send interjections, or get help. Try: 'show recent tickets', 'run uperf on my cluster', or 'help' for more.">?</span></h4>
     <div class="chat-messages" id="chat-messages"></div>
     <div class="chat-recovery" id="chat-recovery" style="display:none">
-      <div>Chat is paused because an action's outcome may be uncertain or its audit record is incomplete. Reconcile any external effect and the audit history before clearing chat and trying again.</div>
+      <div>Chat is paused because an action's outcome may be uncertain or its audit record is incomplete. Reconcile any external effect and the audit history before clearing chat and trying again. This pause is held only in the current server process; after a restart, inspect the action and audit history before retrying.</div>
       <button type="button" onclick="clearChatSession()">I reconciled it — clear chat</button>
     </div>
     <div class="chat-bar">
@@ -2520,7 +2520,7 @@ async function renderDetail(ticketId) {
               '<h4 style="color:var(--accent)">Chat Agent <span class="chat-help-icon" title="Ask about this ticket, send interjections, or get help. The chat has full context of the current ticket.">?</span></h4>' +
               '<div class="chat-messages" id="ticket-chat-messages"></div>' +
               '<div class="chat-recovery" id="ticket-chat-recovery" style="display:none">' +
-                '<div>Chat is paused because an action\'s outcome may be uncertain or its audit record is incomplete. Reconcile any external effect and the audit history before clearing chat and trying again.</div>' +
+                '<div>Chat is paused because an action\'s outcome may be uncertain or its audit record is incomplete. Reconcile any external effect and the audit history before clearing chat and trying again. This pause is held only in the current server process; after a restart, inspect the action and audit history before retrying.</div>' +
                 '<button type="button" onclick="clearChatSession()">I reconciled it — clear chat</button>' +
               '</div>' +
               '<div class="chat-bar">' +
@@ -4767,6 +4767,7 @@ var chatEnabled = false;
 var currentTicketForChat = null;
 var chatSessionIndeterminate = false;
 var chatDeliveryPending = false;
+var chatRecoveryMonitor = null;
 
 function restoreChatHeight(containerId) {
   var key = 'chatHeight_' + containerId;
@@ -4852,7 +4853,7 @@ function updateChatRecovery(indeterminate, deliveryPending) {
     if (message) {
       message.textContent = chatDeliveryPending && !chatSessionIndeterminate
         ? 'A chat response is waiting for browser confirmation. Keep this page open; if it disconnects, check chat status before retrying.'
-        : 'Chat is paused because an action may have completed or its audit record is incomplete. Reconcile any external effect and the audit history before clearing chat and trying again.';
+        : 'Chat is paused because an action may have completed or its audit record is incomplete. Reconcile any external effect and the audit history before clearing chat and trying again. This pause is held only in the current server process; after a restart, inspect the action and audit history before retrying.';
     }
     var button = el.querySelector('button');
     if (button) button.style.display = chatSessionIndeterminate ? '' : 'none';
@@ -4860,40 +4861,93 @@ function updateChatRecovery(indeterminate, deliveryPending) {
 }
 
 async function refreshChatRecoveryStatus() {
+  var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  var timeout = controller ? setTimeout(function() { controller.abort(); }, 2000) : null;
   try {
-    var r = await fetch(API + '/chat/history', { headers: getAuthHeaders() });
+    var options = { headers: getAuthHeaders() };
+    if (controller) options.signal = controller.signal;
+    var r = await fetch(API + '/chat/history', options);
     if (!r.ok) return null;
     var data = await r.json();
     updateChatRecovery(!!data.indeterminate, !!data.delivery_pending);
     return data;
   } catch(e) {
     return null;
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
+}
+
+async function postChatDeliveryAck(deliveryId) {
+  var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  var timeout = controller ? setTimeout(function() { controller.abort(); }, 2000) : null;
+  try {
+    var options = {
+      method: 'POST',
+      headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()),
+      body: JSON.stringify({delivery_id: deliveryId})
+    };
+    if (controller) options.signal = controller.signal;
+    var r = await fetch(API + '/chat/message/ack', options);
+    if (r.ok) {
+      var result = await r.json();
+      if (result.acknowledged) {
+        return true;
+      }
+    }
+  } catch(e) { /* this request ID can be retried safely */ }
+  finally {
+    if (timeout) clearTimeout(timeout);
+  }
+  return false;
+}
+
+function startChatRecoveryMonitor(deliveryId) {
+  if (chatRecoveryMonitor) return;
+  chatRecoveryMonitor = (async function() {
+    var deadline = Date.now() + 35000;
+    for (var attempt = 0; attempt < 35 && Date.now() < deadline; attempt++) {
+      if (deliveryId && await postChatDeliveryAck(deliveryId)) {
+        await refreshChatRecoveryStatus();
+        return;
+      }
+      var status = await refreshChatRecoveryStatus();
+      if (!status) return;
+      if (status.indeterminate && !status.delivery_pending) return;
+      if (!status.delivery_pending && !status.request_in_flight) return;
+      await new Promise(function(resolve) { setTimeout(resolve, 1000); });
+    }
+    await refreshChatRecoveryStatus();
+  })().finally(function() {
+    chatRecoveryMonitor = null;
+  });
 }
 
 async function acknowledgeChatDelivery(deliveryId) {
   if (!deliveryId) return false;
-  try {
-    var r = await fetch(API + '/chat/message/ack', {
-      method: 'POST',
-      headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()),
-      body: JSON.stringify({delivery_id: deliveryId})
-    });
-    if (r.ok) {
-      var result = await r.json();
-      if (result.acknowledged) {
-        await refreshChatRecoveryStatus();
-        return true;
-      }
+  var status = null;
+  for (var attempt = 0; attempt < 3; attempt++) {
+    if (await postChatDeliveryAck(deliveryId)) {
+      await refreshChatRecoveryStatus();
+      return true;
     }
-  } catch(e) { /* retrying the same ACK is safe; status check follows */ }
-  await refreshChatRecoveryStatus();
+    status = await refreshChatRecoveryStatus();
+    if (!status || (!status.delivery_pending && !status.request_in_flight)) {
+      return false;
+    }
+    if (attempt < 2) {
+      await new Promise(function(resolve) { setTimeout(resolve, 100 * (attempt + 1)); });
+    }
+  }
+  if (status && (status.delivery_pending || status.request_in_flight)) {
+    startChatRecoveryMonitor(deliveryId);
+  }
   return false;
 }
 
 async function clearChatSession() {
   if (!chatSessionIndeterminate) return;
-  if (!window.confirm('Chat is paused because an action result may be uncertain or its audit history may be incomplete. Reconcile any external effect and the audit entry before clearing chat and retrying. Continue?')) return;
+  if (!window.confirm('Chat is paused because an action result may be uncertain or its audit history may be incomplete. Reconcile any external effect and the audit entry before clearing chat and retrying. This recovery marker is in memory and does not survive a server restart. Continue?')) return;
 
   var buttons = [
     document.querySelector('#chat-recovery button'),
@@ -4965,7 +5019,7 @@ async function _streamChatRequest(msg, ticketContext, containerId, costElId) {
   try {
     var r = await fetch(API + '/chat/message/stream', {
       method: 'POST',
-      headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()),
+      headers: Object.assign({'Content-Type': 'application/json', 'X-Chat-Delivery-Ack': '1'}, getAuthHeaders()),
       body: JSON.stringify({ message: msg, ticket_context: ticketContext || undefined })
     });
     if (!r.ok) {
@@ -4984,13 +5038,22 @@ async function _streamChatRequest(msg, ticketContext, containerId, costElId) {
         if (failedStatus && failedStatus.indeterminate) {
           errorMessage = 'The response was interrupted and an action may have completed. Reconcile its current state before clearing chat or retrying.';
         } else if (failedStatus && (failedStatus.delivery_pending || failedStatus.request_in_flight)) {
+          startChatRecoveryMonitor(null);
           errorMessage = 'The chat request is still being finalized. Wait for its status to resolve before retrying.';
         }
       }
       return {ok: false, error: errorMessage};
     }
     if (!r.body) {
-      return {ok: false, error: 'The chat response could not be read. Please try again.'};
+      var bodyStatus = await refreshChatRecoveryStatus();
+      if (bodyStatus && bodyStatus.indeterminate) {
+        return {ok: false, error: 'The response was interrupted and an action may have completed. Reconcile its current state before clearing chat or retrying.'};
+      }
+      if (bodyStatus && (bodyStatus.delivery_pending || bodyStatus.request_in_flight)) {
+        startChatRecoveryMonitor(null);
+        return {ok: false, error: 'The chat request is still being finalized. Wait for its status to resolve before retrying.'};
+      }
+      return {ok: false, error: 'The chat response could not be read. Check chat status before retrying.'};
     }
 
     var container = document.getElementById(containerId);
@@ -5045,6 +5108,7 @@ async function _streamChatRequest(msg, ticketContext, containerId, costElId) {
         return {ok: false, error: 'The response was interrupted and an action may have completed. Reconcile its current state before clearing chat or retrying.'};
       }
       if (status && (status.delivery_pending || status.request_in_flight)) {
+        startChatRecoveryMonitor(deliveryId);
         return {ok: false, error: 'The chat request is still being finalized. Wait for its status to resolve before retrying.'};
       }
       return {ok: false, error: 'The chat response ended unexpectedly. Check chat status before retrying.'};
@@ -5061,6 +5125,7 @@ async function _streamChatRequest(msg, ticketContext, containerId, costElId) {
       return {ok: false, error: 'The response was interrupted and an action may have completed. Reconcile its current state before clearing chat or retrying.'};
     }
     if (status && (status.delivery_pending || status.request_in_flight)) {
+      startChatRecoveryMonitor(null);
       return {ok: false, error: 'The chat request is still being finalized. Wait for its status to resolve before retrying.'};
     }
     return {ok: false, error: 'Connection error. Check chat status before retrying.'};

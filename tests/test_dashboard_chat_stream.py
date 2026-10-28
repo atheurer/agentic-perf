@@ -116,6 +116,55 @@ def test_chat_recovery_ui_explains_reconciliation_and_handles_clear_conflict() -
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
+def test_delivery_ack_retries_and_polls_until_recovery_status_changes() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    start = html.index("function updateChatRecovery")
+    end = html.index("\nfunction appendChatMessage", start)
+    recovery = html[start:end]
+    script = (
+        "const assert = require('node:assert/strict');\n"
+        "const API = '/api/v1';\n"
+        "let currentTicketForChat = null;\n"
+        "let chatSessionIndeterminate = false;\n"
+        "let chatDeliveryPending = false;\n"
+        "let chatRecoveryMonitor = null;\n"
+        "const elements = new Map();\n"
+        "function element(id) { if (!elements.has(id)) elements.set(id, {style: {}, querySelector: function(selector) { return selector === 'div' ? this.message : this.button; }, message: {textContent: ''}, button: {style: {}, disabled: false}}); return elements.get(id); }\n"
+        "const document = {getElementById: element, querySelector: function(selector) { return selector === '#chat-recovery button' ? element('chat-recovery').button : element('ticket-chat-recovery').button; }};\n"
+        "const window = {confirm: function() { return true; }};\n"
+        "function getAuthHeaders() { return {}; }\n"
+        "function appendChatMessage() {}\n"
+        "function renderChatMessages() {}\n"
+        "function updateChatCost() {}\n"
+        "let ackCalls = 0;\n"
+        "let historyCalls = 0;\n"
+        "const nativeSetTimeout = globalThis.setTimeout;\n"
+        "globalThis.setTimeout = function(callback, delay) { return nativeSetTimeout(callback, delay === 1000 ? 0 : delay); };\n"
+        "globalThis.fetch = async function(url, options) {\n"
+        "  if (url === API + '/chat/message/ack') { ackCalls++; return {ok: true, json: async function() { return {acknowledged: false}; }}; }\n"
+        "  if (url === API + '/chat/history') { historyCalls++; const indeterminate = historyCalls >= 5; return {ok: true, json: async function() { return {indeterminate: indeterminate, delivery_pending: !indeterminate, request_in_flight: false}; }}; }\n"
+        "  throw new Error('unexpected URL ' + url);\n"
+        "};\n"
+        + recovery
+        + r"""
+(async function() {
+  const acknowledged = await acknowledgeChatDelivery('request-A');
+  assert.equal(acknowledged, false);
+  assert.ok(chatRecoveryMonitor);
+  const monitor = chatRecoveryMonitor;
+  await monitor;
+  assert.equal(ackCalls, 5);
+  assert.equal(historyCalls, 5);
+  assert.equal(chatSessionIndeterminate, true);
+  assert.equal(element('chat-recovery').style.display, 'block');
+})().catch(function(error) {
+  process.nextTick(function() { throw error; });
+});
+"""
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 def test_stream_uses_structured_indeterminate_status_and_acknowledges_response_id() -> (
     None
 ):
@@ -173,6 +222,7 @@ def test_incomplete_stream_checks_status_before_allowing_retry() -> None:
         "function updateChatRecovery(indeterminate, pending) { updates.push([indeterminate, pending]); }\n"
         "async function refreshChatRecoveryStatus() { const state = {indeterminate: false, delivery_pending: true, request_in_flight: false}; updateChatRecovery(state.indeterminate, state.delivery_pending); return state; }\n"
         "async function acknowledgeChatDelivery(id) { acknowledgements.push(id); return true; }\n"
+        "function startChatRecoveryMonitor() {}\n"
         "const document = {getElementById: function() { return null; }};\n"
         'const bytes = new TextEncoder().encode(\'data: {"text":"Action may have run"}\\n\\n\');\n'
         "let read = false;\n"

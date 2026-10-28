@@ -740,6 +740,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/api/approvals.py", "create_approval", "mutating_http_state"),
     ("state_store/api/approvals.py", "resolve_approval", "mutating_http_state"),
     ("state_store/api/artifacts.py", "download_archive", "filesystem"),
+    (
+        "state_store/api/chat.py",
+        "acknowledge_message_delivery",
+        "mutating_http_state",
+    ),
     ("state_store/api/chat.py", "clear_session", "mutating_http_state"),
     ("state_store/api/chat.py", "send_message", "mutating_http_state"),
     ("state_store/api/chat.py", "send_message_stream", "mutating_http_state"),
@@ -4125,6 +4130,16 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/api/artifacts.py:download_archive",
+        "2027-12-31",
+    ),
+    (
+        "state_store/api/chat.py",
+        "acknowledge_message_delivery",
+        "mutating_http_state",
+    ): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/api/chat.py:acknowledge_message_delivery",
         "2027-12-31",
     ),
     ("state_store/api/chat.py", "clear_session", "mutating_http_state"): (

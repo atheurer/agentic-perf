@@ -273,6 +273,7 @@ class ChatAgent:
         self._pending_response_deliveries: dict[str, str] = {}
         self._active_response_deliveries: dict[str, tuple[str, dict[str, bool]]] = {}
         self._sent_response_deliveries: dict[str, str] = {}
+        self._early_response_delivery_acks: dict[str, str] = {}
         self._delivery_indeterminate_ids: dict[str, str] = {}
         self._delivery_timeouts: dict[str, asyncio.TimerHandle] = {}
 
@@ -1180,6 +1181,10 @@ class ChatAgent:
         if self._pending_response_deliveries.get(user) != delivery_id:
             return
         self._sent_response_deliveries[user] = delivery_id
+        if self._early_response_delivery_acks.get(user) == delivery_id:
+            self._early_response_delivery_acks.pop(user, None)
+            self.mark_response_delivery_complete(user, delivery_id)
+            return
         timeout = self._delivery_timeouts.pop(user, None)
         if timeout is not None:
             timeout.cancel()
@@ -1199,9 +1204,11 @@ class ChatAgent:
             return False
         if pending_id == delivery_id:
             if self._sent_response_deliveries.get(user) != delivery_id:
+                self._early_response_delivery_acks[user] = delivery_id
                 return False
             self._pending_response_deliveries.pop(user, None)
             self._sent_response_deliveries.pop(user, None)
+            self._early_response_delivery_acks.pop(user, None)
             timeout = self._delivery_timeouts.pop(user, None)
             if timeout is not None:
                 timeout.cancel()
@@ -1229,6 +1236,7 @@ class ChatAgent:
         if self._pending_response_deliveries.get(user) == delivery_id:
             self._pending_response_deliveries.pop(user, None)
             self._sent_response_deliveries.pop(user, None)
+            self._early_response_delivery_acks.pop(user, None)
             timeout = self._delivery_timeouts.pop(user, None)
             if timeout is not None:
                 timeout.cancel()
@@ -1287,6 +1295,7 @@ class ChatAgent:
         self._indeterminate_sessions.pop(user, None)
         self._delivery_indeterminate_ids.pop(user, None)
         self._sent_response_deliveries.pop(user, None)
+        self._early_response_delivery_acks.pop(user, None)
         timeout = self._delivery_timeouts.pop(user, None)
         if timeout is not None:
             timeout.cancel()

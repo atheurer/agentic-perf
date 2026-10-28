@@ -247,13 +247,20 @@ API endpoints:
 | GET | `/api/v1/chat/history` | Get chat history for current user |
 | DELETE | `/api/v1/chat/session` | Clear current user's session |
 
-Both message endpoints include a server-generated, request-scoped `delivery_id`
-in the response. Clients should call `/chat/message/ack` with that ID and the
-same authenticated user only after consuming the complete JSON body or SSE `done`
-event. Existing request bodies remain compatible. A client that does not ACK is
-blocked from starting another chat action; after a bounded wait, the session is
-marked indeterminate and requires reconciliation before the user clears it.
-Transport-level send success does not prove that a browser received a response.
+Clients opt into request-scoped delivery tracking by setting
+`X-Chat-Delivery-Ack: 1`. Opt-in JSON responses and SSE `done` events include a
+server-generated `delivery_id`; clients POST it to `/chat/message/ack` as the
+same authenticated user after consuming the complete response. Existing clients
+that omit the header retain the legacy response fields and do not get lost-response
+duplicate protection. For an opt-in mutation, a missing ACK blocks later chat
+until the receipt is acknowledged or the bounded wait moves the session into
+recovery state. Transport-level send success alone does not prove that a browser
+received a response.
+
+Chat sessions and delivery receipts are held in process memory. They do not
+survive a state-store restart, so this is same-process retry protection, not
+durable idempotency. After a restart, inspect the external action's state and its
+audit history before retrying.
 
 Available tools:
 

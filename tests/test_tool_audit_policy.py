@@ -1007,6 +1007,21 @@ def test_user_reply_inventory_allows_owner_user_principals() -> None:
     assert INVENTORY_DISPOSITIONS[entry][0] == "audited"
 
 
+def test_chat_delivery_acknowledgement_is_scoped_system_state() -> None:
+    entry = (
+        "state_store/api/chat.py",
+        "acknowledge_message_delivery",
+        "mutating_http_state",
+    )
+    assert entry in INVENTORIED_SIDE_EFFECTS
+    assert INVENTORY_DISPOSITIONS[entry] == (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/api/chat.py:acknowledge_message_delivery",
+        "2027-12-31",
+    )
+
+
 def test_tool_audit_exemptions_and_side_effect_owners_are_reviewable() -> None:
     """Exemptions may be necessary, but cannot become silent permanent bypasses."""
     used_owners = set()

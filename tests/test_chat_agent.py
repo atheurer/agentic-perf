@@ -1735,18 +1735,21 @@ class TestHandleMessage:
 
 
 class TestChatAPI:
-    def _chat_request(self, agent):
+    def _chat_request(self, agent, *, delivery_ack=False):
         from fastapi import FastAPI
         from starlette.requests import Request
 
         app = FastAPI()
         app.state.chat_agent = agent
         app.state.api_token = "test-token"
+        headers = [(b"authorization", b"Bearer test-token")]
+        if delivery_ack:
+            headers.append((b"x-chat-delivery-ack", b"1"))
         return Request(
             {
                 "type": "http",
                 "method": "POST",
-                "headers": [(b"authorization", b"Bearer test-token")],
+                "headers": headers,
                 "app": app,
                 "state": {},
             }
@@ -1791,7 +1794,6 @@ class TestChatAPI:
         )
         agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
         agent._pending_response_deliveries["alice"] = "request-A"
-        assert agent.mark_response_delivery_complete("alice", "request-A") is False
         agent.mark_response_delivery_sent("alice", "request-A")
         await asyncio.sleep(0.03)
 
@@ -1900,6 +1902,51 @@ class TestChatAPI:
 
         assert result == {"acknowledged": False}
         assert agent._pending_response_deliveries == {"alice": "request-A"}
+
+    async def test_early_ack_is_settled_after_asgi_body_send_returns(self):
+        import state_store.api.chat as chat_api
+        from agents.chat.agent import ChatAgent
+
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._pending_response_deliveries["default"] = "request-A"
+        response = chat_api._ChatDeliveryJSONResponse(
+            {"response": "complete"}, agent, "default", "request-A"
+        )
+        body_send_started = asyncio.Event()
+        release_body_send = asyncio.Event()
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message["body"]:
+                body_send_started.set()
+                await release_body_send.wait()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/api/v1/chat/message",
+            "headers": [],
+        }
+        response_task = asyncio.create_task(response(scope, receive, send))
+        await body_send_started.wait()
+
+        early_ack = await chat_api.acknowledge_message_delivery(
+            chat_api.ChatDeliveryAckRequest(delivery_id="request-A"),
+            self._chat_request(agent),
+        )
+        assert early_ack == {"acknowledged": False}
+        assert agent._early_response_delivery_acks == {"default": "request-A"}
+        assert agent._pending_response_deliveries == {"default": "request-A"}
+
+        release_body_send.set()
+        await response_task
+
+        assert agent._pending_response_deliveries == {}
+        assert agent._early_response_delivery_acks == {}
+        assert agent._delivery_timeouts == {}
 
     async def test_clear_session_endpoint_reports_in_flight_conflict(self):
         import pytest
@@ -2016,6 +2063,109 @@ class TestChatAPI:
             json={"message": "hello"},
         )
         assert r.status_code == 401
+
+    async def test_delivery_ack_is_opt_in_for_json_and_sse_clients(self):
+        import state_store.api.chat as chat_api
+
+        class RecordingAgent:
+            def __init__(self):
+                self.kwargs = None
+                self.sent = []
+                self.acks = []
+
+            async def handle_message(self, **kwargs):
+                self.kwargs = kwargs
+                return "answer"
+
+            def get_usage(self, _user):
+                return {}
+
+            def is_session_indeterminate(self, _user):
+                return False
+
+            def is_response_delivery_pending(self, _user):
+                return False
+
+            def mark_response_delivery_sent(self, user, delivery_id):
+                self.sent.append((user, delivery_id))
+
+            def mark_response_delivery_interrupted(self, user, delivery_id):
+                raise AssertionError((user, delivery_id))
+
+            def mark_response_delivery_complete(self, user, delivery_id):
+                self.acks.append((user, delivery_id))
+                return True
+
+        async def run_json(delivery_ack):
+            agent = RecordingAgent()
+            response = await chat_api.send_message(
+                chat_api.ChatMessageRequest(message="hello"),
+                self._chat_request(agent, delivery_ack=delivery_ack),
+            )
+            payload = json.loads(response.body)
+            assert agent.kwargs["track_response_delivery"] is delivery_ack
+            if delivery_ack:
+                assert payload["delivery_id"]
+                assert payload["indeterminate"] is False
+                assert payload["delivery_pending"] is False
+            else:
+                assert set(payload) == {"response", "usage"}
+                assert agent.kwargs["delivery_id"] is None
+            return agent, response
+
+        async def run_stream(delivery_ack):
+            agent = RecordingAgent()
+            response = await chat_api.send_message_stream(
+                chat_api.ChatMessageRequest(message="hello"),
+                self._chat_request(agent, delivery_ack=delivery_ack),
+            )
+            sent_messages = []
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message):
+                sent_messages.append(message)
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "method": "POST",
+                "path": "/api/v1/chat/message/stream",
+                "headers": [],
+            }
+            await response(scope, receive, send)
+            events = [
+                json.loads(line[6:])
+                for message in sent_messages
+                if message["type"] == "http.response.body"
+                for line in message["body"].decode().splitlines()
+                if line.startswith("data: ")
+            ]
+            done = next(event for event in events if event.get("done"))
+            assert agent.kwargs["track_response_delivery"] is delivery_ack
+            if delivery_ack:
+                assert done["delivery_id"]
+                assert done["indeterminate"] is False
+                assert done["delivery_pending"] is False
+                assert agent.sent == [("default", done["delivery_id"])]
+            else:
+                assert set(done) == {"done", "usage"}
+                assert agent.kwargs["delivery_id"] is None
+
+        legacy_agent, _ = await run_json(False)
+        assert legacy_agent.sent == []
+        negotiated_agent, negotiated_response = await run_json(True)
+        delivery_id = json.loads(negotiated_response.body)["delivery_id"]
+        ack = await chat_api.acknowledge_message_delivery(
+            chat_api.ChatDeliveryAckRequest(delivery_id=delivery_id),
+            self._chat_request(negotiated_agent, delivery_ack=True),
+        )
+        assert ack == {"acknowledged": True}
+        assert negotiated_agent.acks == [("default", delivery_id)]
+
+        await run_stream(False)
+        await run_stream(True)
 
     async def test_stream_disconnect_cancels_chat_task(self):
         from state_store.api.chat import ChatMessageRequest, send_message_stream
@@ -2186,7 +2336,7 @@ class TestChatAPI:
         agent.handle_message = tracked_handle_message
         response = await chat_api.send_message_stream(
             chat_api.ChatMessageRequest(message="start PERF-1"),
-            self._chat_request(agent),
+            self._chat_request(agent, delivery_ack=True),
         )
 
         async def receive():
@@ -2267,7 +2417,7 @@ class TestChatAPI:
         ):
             response = await chat_api.send_message(
                 chat_api.ChatMessageRequest(message="start PERF-1"),
-                self._chat_request(agent),
+                self._chat_request(agent, delivery_ack=True),
             )
         assert "default" in agent._pending_response_deliveries
 
@@ -2291,7 +2441,8 @@ class TestChatAPI:
         assert agent.is_session_indeterminate("default")
         assert not agent._pending_response_deliveries
 
-    async def test_json_delivery_requires_request_scoped_browser_ack(self):
+    @pytest.mark.parametrize("delivery_ack", [False, True])
+    async def test_json_mutation_delivery_ack_is_opt_in(self, delivery_ack):
         from unittest.mock import patch
 
         import state_store.api.chat as chat_api
@@ -2328,7 +2479,7 @@ class TestChatAPI:
         ):
             response = await chat_api.send_message(
                 chat_api.ChatMessageRequest(message="start PERF-1"),
-                self._chat_request(agent),
+                self._chat_request(agent, delivery_ack=delivery_ack),
             )
 
         async def receive():
@@ -2347,6 +2498,12 @@ class TestChatAPI:
         await response(scope, receive, send)
 
         response_body = json.loads(response.body)
+        if not delivery_ack:
+            assert set(response_body) == {"response", "usage"}
+            assert agent._pending_response_deliveries == {}
+            assert not agent.is_session_indeterminate("default")
+            return
+
         delivery_id = response_body["delivery_id"]
         assert response_body["delivery_pending"] is True
         assert response_body["indeterminate"] is False
