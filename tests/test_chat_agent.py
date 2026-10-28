@@ -646,6 +646,231 @@ class TestHandleMessage:
         assert "outcome is uncertain" in blocked
         assert llm.complete.await_count == 1
 
+    async def test_cancelled_followup_llm_blocks_retry_after_mutation(self):
+        from unittest.mock import patch
+
+        import pytest
+
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        call = ToolCall(
+            id="toolu-start",
+            name="start_ticket",
+            input={"ticket_id": "PERF-1"},
+        )
+        tool_response = MagicMock(
+            text=None,
+            tool_calls=[call],
+            raw_content=[{"type": "tool_use", "id": call.id, "name": call.name}],
+        )
+        tool_response.usage = {}
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm.complete = AsyncMock(side_effect=[tool_response, asyncio.CancelledError()])
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+
+        with patch(
+            "agents.chat.agent.execute_tool",
+            new_callable=AsyncMock,
+            return_value='{"id":"PERF-1","status":"running"}',
+        ) as execute:
+            with pytest.raises(asyncio.CancelledError):
+                await agent.handle_message("alice", "start PERF-1", "token")
+
+        execute.assert_awaited_once()
+        assert agent.is_session_indeterminate("alice")
+        session = agent._sessions.get_or_create("alice")
+        result_message = next(
+            message["content"]
+            for message in session.messages
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), list)
+            and any(item.get("type") == "tool_result" for item in message["content"])
+        )
+        assert result_message[0]["tool_use_id"] == "toolu-start"
+        assert json.loads(result_message[0]["content"]) == {
+            "id": "PERF-1",
+            "status": "running",
+        }
+        assert "may have completed" in session.messages[-1]["content"]
+        assert "may have completed" in await agent.handle_message(
+            "alice", "start PERF-1 again", "token"
+        )
+        assert llm.complete.await_count == 2
+
+    async def test_later_batch_read_cancellation_keeps_prior_mutation_indeterminate(
+        self,
+    ):
+        from unittest.mock import patch
+
+        import pytest
+
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        mutation_call = ToolCall(
+            id="toolu-start",
+            name="start_ticket",
+            input={"ticket_id": "PERF-1"},
+        )
+        read_call = ToolCall(
+            id="toolu-read",
+            name="get_ticket",
+            input={"ticket_id": "PERF-1"},
+        )
+        responses = []
+        for call in (mutation_call, read_call):
+            response = MagicMock(
+                text=None,
+                tool_calls=[call],
+                raw_content=[{"type": "tool_use", "id": call.id, "name": call.name}],
+            )
+            response.usage = {}
+            responses.append(response)
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm.complete = AsyncMock(side_effect=responses)
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+
+        async def execute(name, *_args, **_kwargs):
+            if name == "start_ticket":
+                return '{"id":"PERF-1","status":"running"}'
+            raise asyncio.CancelledError
+
+        with patch("agents.chat.agent.execute_tool", execute):
+            with pytest.raises(asyncio.CancelledError):
+                await agent.handle_message("alice", "start and inspect", "token")
+
+        assert agent.is_session_indeterminate("alice")
+        session = agent._sessions.get_or_create("alice")
+        result_ids = [
+            result["tool_use_id"]
+            for message in session.messages
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), list)
+            for result in message["content"]
+            if result.get("type") == "tool_result"
+        ]
+        assert result_ids == ["toolu-start", "toolu-read"]
+        assert json.loads(
+            next(
+                result["content"]
+                for message in session.messages
+                if message.get("role") == "user"
+                and isinstance(message.get("content"), list)
+                for result in message["content"]
+                if result.get("tool_use_id") == "toolu-start"
+            )
+        ) == {"id": "PERF-1", "status": "running"}
+
+    async def test_readonly_followup_cancellation_does_not_pause_without_mutation(self):
+        from unittest.mock import patch
+
+        import pytest
+
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        call = ToolCall(
+            id="toolu-read",
+            name="get_ticket",
+            input={"ticket_id": "PERF-1"},
+        )
+        tool_response = MagicMock(
+            text=None,
+            tool_calls=[call],
+            raw_content=[{"type": "tool_use", "id": call.id, "name": call.name}],
+        )
+        tool_response.usage = {}
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm.complete = AsyncMock(side_effect=[tool_response, asyncio.CancelledError()])
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+
+        with patch(
+            "agents.chat.agent.execute_tool",
+            new_callable=AsyncMock,
+            return_value='{"id":"PERF-1"}',
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await agent.handle_message(
+                    "anonymous-session", "inspect PERF-1", "", readonly=True
+                )
+
+        assert not agent.is_session_indeterminate("anonymous-session")
+        fresh_response = MagicMock(
+            text="The lookup can be repeated safely.", tool_calls=[], raw_content=[]
+        )
+        fresh_response.usage = {}
+        llm.complete.side_effect = None
+        llm.complete.return_value = fresh_response
+        assert (
+            await agent.handle_message(
+                "anonymous-session", "inspect again", "", readonly=True
+            )
+            == "The lookup can be repeated safely."
+        )
+
+    async def test_closing_stream_after_mutation_pauses_before_retry(self):
+        from unittest.mock import patch
+
+        from agents.chat.agent import _CHAT_BUSY_MESSAGE, ChatAgent
+        from providers.llm.base import ToolCall
+
+        call = ToolCall(
+            id="toolu-start",
+            name="start_ticket",
+            input={"ticket_id": "PERF-1"},
+        )
+        tool_response = MagicMock(
+            text=None,
+            tool_calls=[call],
+            raw_content=[{"type": "tool_use", "id": call.id, "name": call.name}],
+        )
+        tool_response.usage = {}
+        final_response = MagicMock(
+            text="Ticket started.", tool_calls=[], raw_content=[]
+        )
+        final_response.usage = {}
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm._model = ""
+        llm.complete = AsyncMock(side_effect=[tool_response, final_response])
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        stream = agent.handle_message_stream("alice", "start PERF-1", "token")
+
+        with patch(
+            "agents.chat.agent.execute_tool",
+            new_callable=AsyncMock,
+            return_value='{"id":"PERF-1","status":"running"}',
+        ):
+            assert await anext(stream) == "Ticket started."
+            assert "alice" in agent._pending_response_deliveries
+            assert agent.clear_session("alice") is False
+            assert await agent.handle_message("alice", "retry", "token") == (
+                _CHAT_BUSY_MESSAGE
+            )
+            await stream.aclose()
+
+        assert agent.is_session_indeterminate("alice")
+        session = agent._sessions.get_or_create("alice")
+        assert "Ticket started." in session.messages[-2]["content"]
+        assert await agent.handle_message("alice", "start again", "token")
+        assert llm.complete.await_count == 2
+
     async def test_later_read_audit_failure_blocks_after_completed_mutation(self):
         from unittest.mock import patch
 
@@ -749,11 +974,21 @@ class TestHandleMessage:
         llm = AsyncMock()
         llm.max_tokens = 4096
         llm.timeout = 60
+        llm._model = ""
         llm.complete = AsyncMock(side_effect=[tool_response, final_response])
         agent = ChatAgent(
             llm=llm, store_url="http://localhost:8090", audit_token="service-token"
         )
         executed_names = []
+        audit_states = []
+
+        async def post(_url, **kwargs):
+            audit_states.append(kwargs["json"]["lifecycle"]["state"])
+            audit_response = MagicMock()
+            audit_response.raise_for_status = MagicMock()
+            return audit_response
+
+        agent._client.post = AsyncMock(side_effect=post)
 
         async def fake_execute(name, *_args, **_kwargs):
             executed_names.append(name)
@@ -767,6 +1002,7 @@ class TestHandleMessage:
 
         assert result == "I only used the allowed read."
         assert executed_names == ["get_ticket"]
+        assert audit_states == ["started", "rejected"]
         assert not agent.is_session_indeterminate("anonymous-session")
         sent_messages = llm.complete.await_args_list[1].kwargs["messages"]
         tool_results = next(
@@ -829,6 +1065,9 @@ class TestHandleMessage:
             store_url="http://localhost:8090",
             audit_token="service-token",
         )
+        audit_response = MagicMock()
+        audit_response.raise_for_status = MagicMock()
+        agent._client.post = AsyncMock(return_value=audit_response)
 
         with patch("agents.chat.agent.execute_tool", new_callable=AsyncMock) as execute:
             for index in range(120):
@@ -838,10 +1077,145 @@ class TestHandleMessage:
                 assert result == "No allowed action was requested."
 
         execute.assert_not_awaited()
+        assert agent._client.post.await_count == 240
         assert agent._indeterminate_sessions == {}
         assert agent._session_locks == {}
         assert len(agent._sessions._sessions) == agent._sessions._max_sessions
         assert "anonymous-0" not in agent._sessions._sessions
+
+    async def test_readonly_denial_audit_failures_are_reported_without_dispatch(self):
+        from unittest.mock import patch
+
+        from agents.chat.agent import (
+            _CHAT_READONLY_AUDIT_UNAVAILABLE_MESSAGE,
+            ChatAgent,
+        )
+        from providers.llm.base import ToolCall
+
+        for failed_state in ("started", "rejected"):
+            call = ToolCall(
+                id=f"toolu-{failed_state}",
+                name="start_ticket",
+                input={"ticket_id": "PERF-1"},
+            )
+            llm_response = MagicMock(
+                text=None,
+                tool_calls=[call],
+                raw_content=[{"type": "tool_use", "id": call.id, "name": call.name}],
+            )
+            llm_response.usage = {}
+            llm = AsyncMock()
+            llm.max_tokens = 4096
+            llm.timeout = 60
+            llm.complete = AsyncMock(return_value=llm_response)
+            agent = ChatAgent(
+                llm=llm,
+                store_url="http://localhost:8090",
+                audit_token="service-token",
+            )
+            audit_states = []
+
+            async def post(_url, **kwargs):
+                state = kwargs["json"]["lifecycle"]["state"]
+                audit_states.append(state)
+                if state == failed_state:
+                    raise RuntimeError("audit service unavailable")
+                audit_response = MagicMock()
+                audit_response.raise_for_status = MagicMock()
+                return audit_response
+
+            agent._client.post = AsyncMock(side_effect=post)
+            with patch(
+                "agents.chat.agent.execute_tool", new_callable=AsyncMock
+            ) as execute:
+                result = await agent.handle_message(
+                    f"anonymous-{failed_state}",
+                    "start PERF-1",
+                    "",
+                    readonly=True,
+                )
+
+            assert result == _CHAT_READONLY_AUDIT_UNAVAILABLE_MESSAGE
+            assert audit_states == (
+                ["started"] if failed_state == "started" else ["started", "rejected"]
+            )
+            execute.assert_not_awaited()
+            assert not agent.is_session_indeterminate(f"anonymous-{failed_state}")
+
+    async def test_readonly_denial_cancellation_finishes_audit_pair_without_dispatch(
+        self,
+    ):
+        from unittest.mock import patch
+
+        import pytest
+
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        call = ToolCall(
+            id="toolu-denied",
+            name="start_ticket",
+            input={"ticket_id": "PERF-1"},
+        )
+        llm_response = MagicMock(
+            text=None,
+            tool_calls=[call],
+            raw_content=[{"type": "tool_use", "id": call.id, "name": call.name}],
+        )
+        llm_response.usage = {}
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm.complete = AsyncMock(return_value=llm_response)
+        agent = ChatAgent(
+            llm=llm,
+            store_url="http://localhost:8090",
+            audit_token="service-token",
+        )
+        audit_states = []
+        terminal_started = asyncio.Event()
+        finish_terminal = asyncio.Event()
+
+        async def post(_url, **kwargs):
+            state = kwargs["json"]["lifecycle"]["state"]
+            audit_states.append(state)
+            if state == "rejected":
+                terminal_started.set()
+                await finish_terminal.wait()
+            audit_response = MagicMock()
+            audit_response.raise_for_status = MagicMock()
+            return audit_response
+
+        agent._client.post = AsyncMock(side_effect=post)
+        with patch("agents.chat.agent.execute_tool", new_callable=AsyncMock) as execute:
+            task = asyncio.create_task(
+                agent.handle_message(
+                    "anonymous-cancel", "start PERF-1", "", readonly=True
+                )
+            )
+            await terminal_started.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            finish_terminal.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        execute.assert_not_awaited()
+        assert audit_states == ["started", "rejected"]
+        assert not agent.is_session_indeterminate("anonymous-cancel")
+        session = agent._sessions.get_or_create("anonymous-cancel")
+        result_message = next(
+            message["content"]
+            for message in session.messages
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), list)
+            and any(item.get("type") == "tool_result" for item in message["content"])
+        )
+        assert result_message[0]["tool_use_id"] == "toolu-denied"
+        assert (
+            "No action was attempted"
+            in json.loads(result_message[0]["content"])["error"]
+        )
 
     async def test_anonymous_readonly_cancellations_do_not_accumulate_pause_state(self):
         from unittest.mock import patch
@@ -1562,6 +1936,196 @@ class TestChatAPI:
 
         assert agent.started.is_set()
         assert agent.cancelled.is_set()
+
+    async def test_asgi_final_response_send_failure_pauses_after_completed_mutation(
+        self,
+    ):
+        from unittest.mock import patch
+
+        import pytest
+        from starlette.requests import ClientDisconnect
+
+        import state_store.api.chat as chat_api
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        call = ToolCall(
+            id="toolu-start",
+            name="start_ticket",
+            input={"ticket_id": "PERF-1"},
+        )
+        tool_response = MagicMock(
+            text=None,
+            tool_calls=[call],
+            raw_content=[{"type": "tool_use", "id": call.id, "name": call.name}],
+        )
+        tool_response.usage = {}
+        final_response = MagicMock(
+            text="Ticket started.", tool_calls=[], raw_content=[]
+        )
+        final_response.usage = {}
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm._model = ""
+        llm.complete = AsyncMock(side_effect=[tool_response, final_response])
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        response = await chat_api.send_message_stream(
+            chat_api.ChatMessageRequest(message="start PERF-1"),
+            self._chat_request(agent),
+        )
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message["body"].startswith(
+                b"data:"
+            ):
+                raise OSError("client disconnected before response delivery")
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/api/v1/chat/message/stream",
+            "headers": [],
+        }
+        with patch(
+            "agents.chat.agent.execute_tool",
+            new_callable=AsyncMock,
+            return_value='{"id":"PERF-1","status":"running"}',
+        ):
+            with pytest.raises(ClientDisconnect):
+                await response(scope, receive, send)
+
+        assert agent.is_session_indeterminate("default")
+        session = agent._sessions.get_or_create("default")
+        assert "Ticket started." in session.messages[-2]["content"]
+        assert "may have completed" in session.messages[-1]["content"]
+
+    async def test_json_response_send_failure_pauses_after_completed_mutation(self):
+        from unittest.mock import patch
+
+        import pytest
+
+        import state_store.api.chat as chat_api
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        call = ToolCall(
+            id="toolu-start",
+            name="start_ticket",
+            input={"ticket_id": "PERF-1"},
+        )
+        tool_response = MagicMock(
+            text=None,
+            tool_calls=[call],
+            raw_content=[{"type": "tool_use", "id": call.id, "name": call.name}],
+        )
+        tool_response.usage = {}
+        final_response = MagicMock(
+            text="Ticket started.", tool_calls=[], raw_content=[]
+        )
+        final_response.usage = {}
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm._model = ""
+        llm.complete = AsyncMock(side_effect=[tool_response, final_response])
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        with patch(
+            "agents.chat.agent.execute_tool",
+            new_callable=AsyncMock,
+            return_value='{"id":"PERF-1","status":"running"}',
+        ):
+            response = await chat_api.send_message(
+                chat_api.ChatMessageRequest(message="start PERF-1"),
+                self._chat_request(agent),
+            )
+        assert "default" in agent._pending_response_deliveries
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message["body"]:
+                raise OSError("client disconnected before JSON delivery")
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/api/v1/chat/message",
+            "headers": [],
+        }
+        with pytest.raises(OSError, match="before JSON delivery"):
+            await response(scope, receive, send)
+
+        assert agent.is_session_indeterminate("default")
+        assert not agent._pending_response_deliveries
+
+    async def test_successful_json_delivery_releases_mutation_delivery_guard(self):
+        from unittest.mock import patch
+
+        import state_store.api.chat as chat_api
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        call = ToolCall(
+            id="toolu-start",
+            name="start_ticket",
+            input={"ticket_id": "PERF-1"},
+        )
+        tool_response = MagicMock(
+            text=None,
+            tool_calls=[call],
+            raw_content=[{"type": "tool_use", "id": call.id, "name": call.name}],
+        )
+        tool_response.usage = {}
+        final_response = MagicMock(
+            text="Ticket started.", tool_calls=[], raw_content=[]
+        )
+        final_response.usage = {}
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm._model = ""
+        llm.complete = AsyncMock(side_effect=[tool_response, final_response])
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        with patch(
+            "agents.chat.agent.execute_tool",
+            new_callable=AsyncMock,
+            return_value='{"id":"PERF-1","status":"running"}',
+        ):
+            response = await chat_api.send_message(
+                chat_api.ChatMessageRequest(message="start PERF-1"),
+                self._chat_request(agent),
+            )
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message):
+            return None
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/api/v1/chat/message",
+            "headers": [],
+        }
+        await response(scope, receive, send)
+
+        assert not agent._pending_response_deliveries
+        assert not agent.is_session_indeterminate("default")
 
     async def test_asgi_20_disconnect_cancels_chat_stream(self):
         from state_store.api.chat import ChatMessageRequest, send_message_stream

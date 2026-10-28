@@ -112,6 +112,15 @@ _CHAT_AUDIT_INDETERMINATE_MESSAGE = (
     "This chat is paused. Reconcile the audit history and clear the chat "
     "session before continuing."
 )
+_CHAT_DELIVERY_INDETERMINATE_MESSAGE = (
+    "A chat action may have completed before its response was interrupted. "
+    "Check the action's current state before retrying, then clear the chat "
+    "session to continue."
+)
+_CHAT_READONLY_AUDIT_UNAVAILABLE_MESSAGE = (
+    "This action was blocked before dispatch, but its rejection audit could "
+    "not be confirmed. No action was attempted."
+)
 _CHAT_READONLY_CANCELLED_MESSAGE = (
     "The read-only lookup was interrupted. You can safely ask again."
 )
@@ -259,6 +268,7 @@ class ChatAgent:
         self._audit_token = audit_token
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._indeterminate_sessions: dict[str, str] = {}
+        self._pending_response_deliveries: set[str] = set()
 
     async def handle_message(
         self,
@@ -267,6 +277,7 @@ class ChatAgent:
         auth_token: str,
         ticket_context: str | None = None,
         readonly: bool = False,
+        track_response_delivery: bool = False,
     ) -> str:
         """Process a user message and return the assistant response.
 
@@ -290,6 +301,8 @@ class ChatAgent:
             return _CHAT_BUSY_MESSAGE
         await lock.acquire()
         try:
+            if user in self._pending_response_deliveries:
+                return _CHAT_BUSY_MESSAGE
             if user in self._indeterminate_sessions:
                 return self._indeterminate_sessions[user]
 
@@ -298,13 +311,27 @@ class ChatAgent:
             root = new_trace_context(ticket_id=ticket_context, agent_id="chat-agent")
             token = bind_trace_context(root)
             try:
-                return await self._handle_message(
-                    user,
-                    message,
-                    auth_token,
-                    ticket_context=ticket_context,
-                    readonly=readonly,
-                )
+                mutation_state = {"completed": False}
+                try:
+                    response = await self._handle_message(
+                        user,
+                        message,
+                        auth_token,
+                        ticket_context=ticket_context,
+                        readonly=readonly,
+                        mutation_state=mutation_state,
+                    )
+                except asyncio.CancelledError:
+                    if mutation_state["completed"]:
+                        self._mark_request_interrupted(user)
+                    raise
+                except Exception:
+                    if mutation_state["completed"]:
+                        self._mark_request_interrupted(user)
+                    raise
+                if track_response_delivery and mutation_state["completed"]:
+                    self._pending_response_deliveries.add(user)
+                return response
             finally:
                 reset_trace_context(token)
         finally:
@@ -433,6 +460,85 @@ class ChatAgent:
         self._indeterminate_sessions[user] = _CHAT_INDETERMINATE_MESSAGE
         session.add_assistant_message(_CHAT_INDETERMINATE_MESSAGE)
 
+    def _mark_denied_tool_audit_incomplete(
+        self,
+        session: ChatSession,
+        tool_calls: list[Any],
+        completed_results: list[dict[str, Any]],
+        *,
+        rejected_index: int,
+    ) -> None:
+        """Record a blocked capability whose rejection audit is incomplete."""
+        results_by_id = {result["tool_use_id"]: result for result in completed_results}
+        reconciled_results = []
+        for index, tool_call in enumerate(tool_calls):
+            if tool_call.id in results_by_id:
+                reconciled_results.append(results_by_id[tool_call.id])
+            elif index == rejected_index:
+                reconciled_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": json.dumps(
+                            {
+                                "error": (
+                                    "This action was denied and not dispatched, "
+                                    "but its audit lifecycle is incomplete."
+                                )
+                            }
+                        ),
+                    }
+                )
+            else:
+                reconciled_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": json.dumps(
+                            {"error": "Not run because an earlier tool call stopped."}
+                        ),
+                    }
+                )
+        session.add_tool_results(reconciled_results)
+        session.pending_action = None
+        session.add_assistant_message(_CHAT_READONLY_AUDIT_UNAVAILABLE_MESSAGE)
+
+    @staticmethod
+    def _mark_readonly_batch_cancelled(
+        session: ChatSession,
+        tool_calls: list[Any],
+        completed_results: list[dict[str, Any]],
+        *,
+        cancelled_index: int,
+        cancelled_result: str,
+    ) -> None:
+        results_by_id = {result["tool_use_id"]: result for result in completed_results}
+        reconciled_results = []
+        for index, tool_call in enumerate(tool_calls):
+            if tool_call.id in results_by_id:
+                reconciled_results.append(results_by_id[tool_call.id])
+            elif index == cancelled_index:
+                reconciled_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": cancelled_result,
+                    }
+                )
+            else:
+                reconciled_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": json.dumps(
+                            {"error": "Not run because an earlier tool call stopped."}
+                        ),
+                    }
+                )
+        session.add_tool_results(reconciled_results)
+        session.pending_action = None
+        session.add_assistant_message(_CHAT_READONLY_CANCELLED_MESSAGE)
+
     async def handle_message_stream(
         self,
         user: str,
@@ -454,14 +560,22 @@ class ChatAgent:
             auth_token=auth_token,
             ticket_context=ticket_context,
             readonly=readonly,
+            track_response_delivery=True,
         )
-        yield response
+        try:
+            yield response
+        except BaseException:
+            self.mark_response_delivery_interrupted(user)
+            raise
+        else:
+            self.mark_response_delivery_complete(user)
 
     async def _handle_message(
         self,
         user: str,
         message: str,
         auth_token: str,
+        mutation_state: dict[str, bool],
         ticket_context: str | None = None,
         readonly: bool = False,
     ) -> str:
@@ -504,6 +618,7 @@ class ChatAgent:
                     user, session, confirmation_exchange=True
                 )
                 raise asyncio.CancelledError
+            mutation_state["completed"] = True
             session.pending_action = None
             parsed = json.loads(result)
             if "error" in parsed:
@@ -688,6 +803,7 @@ class ChatAgent:
         deadline = time.monotonic() + llm_timeout
         _WRAP_UP_RESERVE = 15  # seconds for final response
         _MIN_ROUND_TIME = 10  # minimum for a tool round
+        mutating_action_completed = mutation_state["completed"]
 
         for _round in range(self._max_tool_rounds):
             remaining = deadline - time.monotonic()
@@ -808,7 +924,6 @@ class ChatAgent:
             )
 
             tool_results = []
-            mutating_action_completed = False
             known_tool_names = {tool.name for tool in CHAT_TOOLS}
             for index, tc in enumerate(response.tool_calls):
                 # The model's advertised tool list is guidance, not an
@@ -826,6 +941,41 @@ class ChatAgent:
                     )
                     continue
                 if readonly and tc.name not in READONLY_TOOLS:
+                    try:
+                        await ChatToolAudit(
+                            self._client,
+                            self._store_url,
+                            self._audit_token or "",
+                        ).reject(
+                            tc.name,
+                            tc.input,
+                            tool_call_id=tc.id,
+                        )
+                    except asyncio.CancelledError:
+                        self._mark_readonly_batch_cancelled(
+                            session,
+                            response.tool_calls,
+                            tool_results,
+                            cancelled_index=index,
+                            cancelled_result=json.dumps(
+                                {
+                                    "error": (
+                                        "This action was denied and its rejection "
+                                        "audit pair completed during cancellation. "
+                                        "No action was attempted."
+                                    )
+                                }
+                            ),
+                        )
+                        raise
+                    except (ChatAuditUnavailable, ValueError):
+                        self._mark_denied_tool_audit_incomplete(
+                            session,
+                            response.tool_calls,
+                            tool_results,
+                            rejected_index=index,
+                        )
+                        return _CHAT_READONLY_AUDIT_UNAVAILABLE_MESSAGE
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -834,7 +984,8 @@ class ChatAgent:
                                 {
                                     "error": (
                                         "This tool is unavailable in read-only mode. "
-                                        "No action was attempted."
+                                        "The request was rejected and recorded; "
+                                        "no action was attempted."
                                     )
                                 }
                             ),
@@ -960,6 +1111,7 @@ class ChatAgent:
                 )
                 if tc.name not in READONLY_TOOLS:
                     mutating_action_completed = True
+                    mutation_state["completed"] = True
 
             session.add_tool_results(tool_results)
 
@@ -988,6 +1140,25 @@ class ChatAgent:
     def is_session_indeterminate(self, user: str) -> bool:
         """Whether an interrupted action requires reconciliation before chat."""
         return user in self._indeterminate_sessions
+
+    def _mark_request_interrupted(self, user: str) -> None:
+        if user in self._indeterminate_sessions:
+            return
+        session = self._sessions.get_or_create(user)
+        session.pending_action = None
+        self._indeterminate_sessions[user] = _CHAT_DELIVERY_INDETERMINATE_MESSAGE
+        session.add_assistant_message(_CHAT_DELIVERY_INDETERMINATE_MESSAGE)
+
+    def mark_response_delivery_complete(self, user: str) -> None:
+        """Release a successful streamed response from its pending-delivery guard."""
+        self._pending_response_deliveries.discard(user)
+
+    def mark_response_delivery_interrupted(self, user: str) -> None:
+        """Pause chat when a completed mutation's response could not be delivered."""
+        if user not in self._pending_response_deliveries:
+            return
+        self._pending_response_deliveries.discard(user)
+        self._mark_request_interrupted(user)
 
     def get_usage(self, user: str) -> dict[str, Any]:
         usage = self._sessions.get_usage(user)
@@ -1018,7 +1189,9 @@ class ChatAgent:
 
     def clear_session(self, user: str) -> bool:
         lock = self._session_locks.get(user)
-        if lock is not None and lock.locked():
+        if (
+            lock is not None and lock.locked()
+        ) or user in self._pending_response_deliveries:
             return False
         self._indeterminate_sessions.pop(user, None)
         self._sessions.delete(user)

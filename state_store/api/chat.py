@@ -15,7 +15,7 @@ from typing import Any
 import anyio
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from starlette.responses import StreamingResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 from ..auth import Principal
 
@@ -40,6 +40,32 @@ class ChatHistoryResponse(BaseModel):
     messages: list[dict[str, str]]
     usage: dict[str, Any]
     indeterminate: bool = False
+
+
+class _ChatDeliveryJSONResponse(JSONResponse):
+    """Acknowledge response delivery to the agent after ASGI send completes."""
+
+    def __init__(self, content: Any, agent: Any, user: str) -> None:
+        super().__init__(content=content)
+        self._agent = agent
+        self._user = user
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        except BaseException:
+            delivery_interrupted = getattr(
+                self._agent, "mark_response_delivery_interrupted", None
+            )
+            if delivery_interrupted is not None:
+                delivery_interrupted(self._user)
+            raise
+        else:
+            delivery_complete = getattr(
+                self._agent, "mark_response_delivery_complete", None
+            )
+            if delivery_complete is not None:
+                delivery_complete(self._user)
 
 
 def _get_chat_agent(request: Request):
@@ -225,6 +251,7 @@ async def send_message(
             auth_token=token,
             ticket_context=body.ticket_context,
             readonly=is_anonymous,
+            track_response_delivery=True,
         )
     except Exception:
         # Never return 500 to the user — surface the error
@@ -238,7 +265,12 @@ async def send_message(
         logging.getLogger(__name__).exception("Chat message handling failed")
 
     usage = agent.get_usage(user)
-    return ChatMessageResponse(response=response_text, usage=usage)
+    response = ChatMessageResponse(response=response_text, usage=usage)
+    return _ChatDeliveryJSONResponse(
+        content=response.model_dump(),
+        agent=agent,
+        user=user,
+    )
 
 
 @router.post("/message/stream")
@@ -283,6 +315,7 @@ async def send_message_stream(
                 auth_token=token,
                 ticket_context=body.ticket_context,
                 readonly=is_anonymous,
+                track_response_delivery=True,
             )
         )
         task_result_observed = False
@@ -306,7 +339,19 @@ async def send_message_stream(
             await _cancel_chat_task(task)
             if task.done() and not task_result_observed:
                 _consume_chat_task_result(task)
-        yield f"data: {json.dumps({'text': response_text})}\n\n"
+        try:
+            yield f"data: {json.dumps({'text': response_text})}\n\n"
+        except BaseException:
+            delivery_interrupted = getattr(
+                agent, "mark_response_delivery_interrupted", None
+            )
+            if delivery_interrupted is not None:
+                delivery_interrupted(user)
+            raise
+        else:
+            delivery_complete = getattr(agent, "mark_response_delivery_complete", None)
+            if delivery_complete is not None:
+                delivery_complete(user)
         usage = agent.get_usage(user)
         yield f"data: {json.dumps({'done': True, 'usage': usage})}\n\n"
 
