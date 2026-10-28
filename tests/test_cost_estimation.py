@@ -11,6 +11,7 @@ import providers.cost as cost_module
 from providers.cost import (
     estimate_cost,
     estimate_cumulative_cost,
+    get_context_window,
 )
 
 
@@ -50,6 +51,41 @@ def test_unknown_model_uses_fallback():
     c = estimate_cost("unknown-model-v1", 1000, 500)
     # Fallback: 3.0/1M input, 15.0/1M output
     assert abs(c - 0.0105) < 0.0001
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["rits/zai-org/glm-5-3", "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017"],
+)
+def test_enmaas_hosted_models_have_zero_cost_including_cache(model):
+    assert estimate_cost(model, 1_000_000, 200_000) == 0
+    assert (
+        estimate_cost(
+            model,
+            1_000_000,
+            200_000,
+            cache_read_input_tokens=400_000,
+            cache_creation_input_tokens=100_000,
+        )
+        == 0
+    )
+    assert (
+        estimate_cumulative_cost(
+            {
+                "models_used": [model],
+                "input_tokens": 1_000_000,
+                "output_tokens": 200_000,
+            }
+        )
+        == 0
+    )
+
+
+def test_enmaas_hosted_context_windows_are_independent():
+    assert get_context_window("rits/zai-org/glm-5-3") == 1_000_000
+    # DeepSeek's limit is not supplied by the gateway documentation; keep the
+    # conservative fallback instead of copying GLM's context metadata.
+    assert get_context_window("rits/deepseek-ai/DeepSeek-V4.1-Flash-1017") == 128_000
 
 
 def test_zero_tokens():

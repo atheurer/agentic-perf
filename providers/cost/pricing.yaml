@@ -30,6 +30,17 @@ fallback:
   context_window: 128000
 
 models:
+  # --- Red Hat Engineering EnMaaS hosted models ---
+  # The gateway currently provides these specific models at no usage cost.
+  rits/zai-org/glm-5-3:
+    input_per_token: 0
+    output_per_token: 0
+    context_window: 1000000
+
+  rits/deepseek-ai/DeepSeek-V4.1-Flash-1017:
+    input_per_token: 0
+    output_per_token: 0
+
   # --- Anthropic ---
   # Source: https://platform.claude.com/docs/en/about-claude/pricing
   # Cache: 90% discount on reads (0.1x), 25% premium on 5m writes (1.25x)
