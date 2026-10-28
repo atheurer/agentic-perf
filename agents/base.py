@@ -149,9 +149,27 @@ class AgentBase(ABC):
             else self._load_tool_spill_threshold()
         )
         self._register_workspace_tools()
+        self._local_tools_snapshot = tuple(self.tools)
         self.trace_context = None
         self._trace = TraceRecorder()
         self._trace_terminal_state = LifecycleState.COMPLETED
+
+    def _install_mcp_tools(self, mcp_tools: list[ToolDefinition]) -> None:
+        """Merge fresh MCP tools while preserving immutable local tool definitions."""
+        local_tool_names = {tool.name for tool in self._local_tools_snapshot}
+        collision_names = {
+            tool.name for tool in mcp_tools if tool.name in local_tool_names
+        }
+        if collision_names:
+            logger.warning(
+                "%s ignoring MCP tools that collide with local tools: %s",
+                self.agent_name,
+                ", ".join(sorted(collision_names)),
+            )
+        filtered_mcp_tools = [
+            tool for tool in mcp_tools if tool.name not in local_tool_names
+        ]
+        self.tools = filtered_mcp_tools + list(self._local_tools_snapshot)
 
     def set_fence_context(
         self,

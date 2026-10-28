@@ -98,7 +98,8 @@ class PlatformAgent(AgentBase):
                 state_store_url=self.store_url,
                 agent_name=self.agent_name,
             )
-            self.tools = await mcp.list_tools()
+            mcp_tools = await mcp.list_tools()
+            self._install_mcp_tools(mcp_tools)
             await super().run(ticket_id)
         finally:
             try:
