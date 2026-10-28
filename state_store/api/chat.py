@@ -39,6 +39,7 @@ class ChatMessageResponse(BaseModel):
 class ChatHistoryResponse(BaseModel):
     messages: list[dict[str, str]]
     usage: dict[str, Any]
+    indeterminate: bool = False
 
 
 def _get_chat_agent(request: Request):
@@ -325,11 +326,15 @@ async def get_history(request: Request):
     principal = _get_principal(request)
     if principal.kind == "anonymous":
         usage = agent.get_usage(user)
-        return ChatHistoryResponse(messages=[], usage=usage)
+        return ChatHistoryResponse(messages=[], usage=usage, indeterminate=False)
 
     history = agent.get_history(user)
     usage = agent.get_usage(user)
-    return ChatHistoryResponse(messages=history, usage=usage)
+    return ChatHistoryResponse(
+        messages=history,
+        usage=usage,
+        indeterminate=agent.is_session_indeterminate(user),
+    )
 
 
 @router.delete("/session")

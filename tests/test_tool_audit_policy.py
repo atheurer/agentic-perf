@@ -2145,6 +2145,47 @@ async def test_chat_rejection_terminal_delivery_is_required() -> None:
         ).reject("create_ticket", {"summary": "safe"})
 
 
+@pytest.mark.asyncio
+async def test_chat_rejection_pair_finishes_before_cancellation_escapes() -> None:
+    """A disconnect during REJECTED delivery must not strand STARTED."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatToolAudit
+
+    events = []
+    terminal_started = asyncio.Event()
+    finish_terminal = asyncio.Event()
+
+    async def record(event):
+        state = event.lifecycle.state
+        if state == LifecycleState.STARTED:
+            events.append(state)
+        elif state == LifecycleState.REJECTED:
+            terminal_started.set()
+            await finish_terminal.wait()
+            events.append(state)
+
+    task = asyncio.create_task(
+        ChatToolAudit(
+            AsyncMock(),
+            "http://state-store.invalid",
+            "service-token",
+            record=record,
+        ).reject("create_ticket", {"summary": "safe"})
+    )
+    await terminal_started.wait()
+    task.cancel()
+
+    assert not task.done()
+    assert events == [LifecycleState.STARTED]
+
+    finish_terminal.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == [LifecycleState.STARTED, LifecycleState.REJECTED]
+
+
 def test_chat_tool_dispatch_has_no_production_audit_bypass() -> None:
     """Any direct *or aliased* production dispatcher needs an audit boundary."""
     calls: list[tuple[str, ast.Call]] = []

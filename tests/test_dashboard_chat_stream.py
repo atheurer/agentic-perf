@@ -46,3 +46,62 @@ def test_chat_stream_keeps_http_errors_user_visible() -> None:
 """
     )
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+def test_chat_recovery_ui_explains_reconciliation_and_handles_clear_conflict() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    start = html.index("function updateChatRecovery")
+    end = html.index("\nfunction appendChatMessage", start)
+    recovery = html[start:end]
+    script = (
+        "const assert = require('node:assert/strict');\n"
+        "const API = '/api/v1';\n"
+        "let currentTicketForChat = null;\n"
+        "let status = 409;\n"
+        "const messages = [];\n"
+        "const elements = new Map();\n"
+        "function element(id) {\n"
+        "  if (!elements.has(id)) elements.set(id, {style: {}, innerHTML: '', textContent: '', disabled: false});\n"
+        "  return elements.get(id);\n"
+        "}\n"
+        "const document = {\n"
+        "  getElementById: element,\n"
+        "  querySelector: function(selector) {\n"
+        "    if (selector === '#chat-recovery button') return element('chat-button');\n"
+        "    if (selector === '#ticket-chat-recovery button') return element('ticket-button');\n"
+        "    return null;\n"
+        "  }\n"
+        "};\n"
+        "const window = {confirm: function() { return true; }};\n"
+        "function getAuthHeaders() { return {Authorization: 'Bearer user'}; }\n"
+        "function appendChatMessage(id, role, text) { messages.push([id, role, text]); }\n"
+        "function renderChatMessages(id, rows) { element(id).innerHTML = JSON.stringify(rows); }\n"
+        "function updateChatCost() {}\n"
+        "globalThis.fetch = async function(url, options) {\n"
+        "  assert.equal(url, API + '/chat/session');\n"
+        "  assert.equal(options.method, 'DELETE');\n"
+        "  assert.equal(options.headers.Authorization, 'Bearer user');\n"
+        "  return {ok: status !== 409, status: status};\n"
+        "};\n"
+        + recovery
+        + r"""
+(async function() {
+  updateChatRecovery(true);
+  assert.equal(element('chat-recovery').style.display, 'block');
+  assert.equal(element('ticket-chat-recovery').style.display, 'block');
+  await clearChatSession();
+  assert.equal(chatSessionIndeterminate, true);
+  assert.match(messages[0][2], /still finishing/i);
+
+  status = 204;
+  await clearChatSession();
+  assert.equal(chatSessionIndeterminate, false);
+  assert.equal(element('chat-recovery').style.display, 'none');
+  assert.equal(element('ticket-chat-recovery').style.display, 'none');
+  assert.equal(element('chat-messages').innerHTML, '[]');
+})().catch(function(error) {
+  process.nextTick(function() { throw error; });
+});
+"""
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)

@@ -397,22 +397,24 @@ class ChatToolAudit:
             ),
         )
         timer = MonotonicTimer()
-        await self._emit(
-            context,
-            LifecycleState.STARTED,
+        cancellation_requested = await self._emit_cancellation_safe(
+            context=context,
+            state=LifecycleState.STARTED,
             tool_name=tool_name,
             tool_input=tool_input,
             required=True,
         )
-        await self._emit(
-            context,
-            LifecycleState.REJECTED,
+        cancellation_requested |= await self._emit_cancellation_safe(
+            context=context,
+            state=LifecycleState.REJECTED,
             tool_name=tool_name,
             tool_input=tool_input,
             timer=timer,
             outcome=OperationOutcome.REJECTED,
             required=True,
         )
+        if cancellation_requested:
+            raise asyncio.CancelledError("rejection audit completed after disconnect")
 
 
 def _require(params: dict[str, Any], *keys: str) -> str | None:

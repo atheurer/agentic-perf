@@ -300,6 +300,12 @@ class ChatAgent:
                 reset_trace_context(token)
         finally:
             lock.release()
+            # The current implementation never queues on this lock: callers
+            # encountering an active request return immediately above.  Once
+            # released, this task is its last user, so discard the per-user
+            # lock instead of retaining anonymous/user ids indefinitely.
+            if self._session_locks.get(user) is lock and not lock.locked():
+                self._session_locks.pop(user, None)
 
     @staticmethod
     def _cancellation_requested() -> bool:
@@ -433,15 +439,23 @@ class ChatAgent:
             return response_text
         elif session.pending_action and _is_cancellation(message):
             action = session.pending_action
-            await ChatToolAudit(
-                self._client, self._store_url, self._audit_token or ""
-            ).reject(
-                action["tool"],
-                action["input"],
-                tool_call_id=action.get("tool_call_id"),
-                parent_context=action.get("trace_context"),
-            )
+            # A user rejection is authoritative even when the client
+            # disconnects while its audit pair is being written.  Clear the
+            # capability before the first await so it can never be approved
+            # by a later message.
             session.pending_action = None
+            try:
+                await ChatToolAudit(
+                    self._client, self._store_url, self._audit_token or ""
+                ).reject(
+                    action["tool"],
+                    action["input"],
+                    tool_call_id=action.get("tool_call_id"),
+                    parent_context=action.get("trace_context"),
+                )
+            except asyncio.CancelledError:
+                self._remove_confirmation_exchange(session)
+                raise
             if self._cancellation_requested():
                 self._remove_confirmation_exchange(session)
                 raise asyncio.CancelledError
@@ -459,16 +473,21 @@ class ChatAgent:
             # durable: if the audit service is down, do not continue this
             # conversation as though no decision had been made.
             action = session.pending_action
-            await ChatToolAudit(
-                self._client, self._store_url, self._audit_token or ""
-            ).reject(
-                action["tool"],
-                action["input"],
-                tool_call_id=action.get("tool_call_id"),
-                parent_context=action.get("trace_context"),
-            )
             session.pending_action = None
+            try:
+                await ChatToolAudit(
+                    self._client, self._store_url, self._audit_token or ""
+                ).reject(
+                    action["tool"],
+                    action["input"],
+                    tool_call_id=action.get("tool_call_id"),
+                    parent_context=action.get("trace_context"),
+                )
+            except asyncio.CancelledError:
+                self._remove_confirmation_exchange(session)
+                raise
             if self._cancellation_requested():
+                self._remove_confirmation_exchange(session)
                 raise asyncio.CancelledError
 
         # Add context prefix for ticket-scoped chat.
@@ -800,6 +819,10 @@ class ChatAgent:
                 history.append({"role": "assistant", "text": content})
             # Skip tool_use/tool_result entries in display
         return history
+
+    def is_session_indeterminate(self, user: str) -> bool:
+        """Whether an interrupted action requires reconciliation before chat."""
+        return user in self._indeterminate_sessions
 
     def get_usage(self, user: str) -> dict[str, Any]:
         usage = self._sessions.get_usage(user)

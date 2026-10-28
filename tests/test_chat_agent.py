@@ -796,6 +796,119 @@ class TestHandleMessage:
             for call in agent._client.post.await_args_list
         ] == ["started", "rejected"]
 
+    async def test_rejected_confirmation_stays_rejected_after_disconnect(self):
+        from unittest.mock import patch
+
+        import pytest
+
+        from agents.chat.agent import ChatAgent
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        response = MagicMock(text="new response", tool_calls=[], raw_content=[])
+        response.usage = {}
+        llm.complete = AsyncMock(return_value=response)
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        session = agent._sessions.get_or_create("alice")
+        session.messages = [
+            {"role": "user", "content": "create a ticket"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tc"}]},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tc"}],
+            },
+            {"role": "assistant", "content": "Please confirm."},
+        ]
+        session.pending_action = {
+            "tool": "create_ticket",
+            "input": {"summary": "do not create"},
+            "tool_call_id": "tc",
+        }
+        events = []
+        terminal_started = asyncio.Event()
+        finish_terminal = asyncio.Event()
+        audit_response = MagicMock()
+        audit_response.raise_for_status = MagicMock()
+
+        async def post(_url, **kwargs):
+            event = kwargs["json"]
+            state = event["lifecycle"]["state"]
+            if state == "rejected":
+                terminal_started.set()
+                await finish_terminal.wait()
+            events.append(state)
+            return audit_response
+
+        agent._client.post = AsyncMock(side_effect=post)
+        with patch("agents.chat.agent.execute_tool", new_callable=AsyncMock) as execute:
+            task = asyncio.create_task(agent.handle_message("alice", "no", "token"))
+            await terminal_started.wait()
+            task.cancel()
+            assert session.pending_action is None
+            assert not task.done()
+
+            finish_terminal.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert events == ["started", "rejected"]
+            assert session.pending_action is None
+            assert len(session.messages) == 1
+
+            await agent.handle_message("alice", "yes", "token")
+            execute.assert_not_awaited()
+
+    async def test_session_locks_are_reclaimed_after_anonymous_churn(self):
+        from agents.chat.agent import ChatAgent
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        response = MagicMock(text="answer", tool_calls=[], raw_content=[])
+        response.usage = {}
+        llm.complete = AsyncMock(return_value=response)
+        agent = ChatAgent(llm=llm, store_url="http://localhost:8090")
+
+        for index in range(40):
+            await agent.handle_message(f"anonymous-{index}", "hello", "", readonly=True)
+
+        assert agent._session_locks == {}
+
+    async def test_active_session_lock_is_preserved_until_request_finishes(self):
+        from agents.chat.agent import _CHAT_BUSY_MESSAGE, ChatAgent
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm_started = asyncio.Event()
+        finish_llm = asyncio.Event()
+        response = MagicMock(text="answer", tool_calls=[], raw_content=[])
+        response.usage = {}
+
+        async def blocked_completion(*_args, **_kwargs):
+            llm_started.set()
+            await finish_llm.wait()
+            return response
+
+        llm.complete = AsyncMock(side_effect=blocked_completion)
+        agent = ChatAgent(llm=llm, store_url="http://localhost:8090")
+        task = asyncio.create_task(agent.handle_message("alice", "hello", "token"))
+        await llm_started.wait()
+
+        lock = agent._session_locks["alice"]
+        assert lock.locked()
+        assert await agent.handle_message("alice", "another", "token") == (
+            _CHAT_BUSY_MESSAGE
+        )
+        assert agent._session_locks["alice"] is lock
+
+        finish_llm.set()
+        assert await task == "answer"
+        assert "alice" not in agent._session_locks
+
     async def test_ticket_context_only_first_message(self):
         from agents.chat.agent import ChatAgent
 
@@ -876,6 +989,34 @@ class TestChatAPI:
                 "state": {},
             }
         )
+
+    async def test_history_reports_indeterminate_session_for_recovery_ui(self):
+        from agents.chat.agent import ChatAgent
+        from state_store.api.chat import get_history
+
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._indeterminate_sessions.add("default")
+
+        history = await get_history(self._chat_request(agent))
+
+        assert history.indeterminate is True
+
+    async def test_clear_session_endpoint_reports_in_flight_conflict(self):
+        import pytest
+        from fastapi import HTTPException
+
+        from agents.chat.agent import ChatAgent
+        from state_store.api.chat import clear_session
+
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        lock = agent._session_locks.setdefault("default", asyncio.Lock())
+        await lock.acquire()
+        try:
+            with pytest.raises(HTTPException) as exc:
+                await clear_session(self._chat_request(agent))
+            assert exc.value.status_code == 409
+        finally:
+            lock.release()
 
     async def test_send_message_no_agent(self):
         """Chat returns 503 when agent not initialized."""

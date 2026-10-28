@@ -1577,6 +1577,23 @@ th.col-right { text-align: right; }
   color: var(--text-muted);
   white-space: nowrap;
 }
+.chat-recovery {
+  margin: 8px 0;
+  padding: 8px;
+  border: 1px solid var(--yellow);
+  border-radius: 6px;
+  color: var(--text-bright);
+  font-size: 12px;
+}
+.chat-recovery button {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
 .chat-typing {
   color: var(--text-muted);
   font-size: 12px;
@@ -1615,6 +1632,10 @@ th.col-right { text-align: right; }
   <div id="chat-container" class="chat-card" style="display:none">
     <h4>Chat Agent <span class="chat-help-icon" title="Ask questions about tickets, create tests, send interjections, or get help. Try: 'show recent tickets', 'run uperf on my cluster', or 'help' for more.">?</span></h4>
     <div class="chat-messages" id="chat-messages"></div>
+    <div class="chat-recovery" id="chat-recovery" style="display:none">
+      <div>An interrupted action may already have taken effect. Reconcile its result in the ticket or audit history before clearing chat and trying again.</div>
+      <button type="button" onclick="clearChatSession()">I reconciled it — clear chat</button>
+    </div>
     <div class="chat-bar">
       <textarea id="chat-input" placeholder="Ask about tickets, create tests, or get help..." autocomplete="off" rows="1"></textarea>
       <button id="chat-send" onclick="sendChatMessage()">Send</button>
@@ -2498,6 +2519,10 @@ async function renderDetail(ticketId) {
             '<div class="left-panel-section" id="ticket-chat-section" style="display:none">' +
               '<h4 style="color:var(--accent)">Chat Agent <span class="chat-help-icon" title="Ask about this ticket, send interjections, or get help. The chat has full context of the current ticket.">?</span></h4>' +
               '<div class="chat-messages" id="ticket-chat-messages"></div>' +
+              '<div class="chat-recovery" id="ticket-chat-recovery" style="display:none">' +
+                '<div>An interrupted action may already have taken effect. Reconcile its result in the ticket or audit history before clearing chat and trying again.</div>' +
+                '<button type="button" onclick="clearChatSession()">I reconciled it — clear chat</button>' +
+              '</div>' +
               '<div class="chat-bar">' +
                 '<textarea id="ticket-chat-input" placeholder="Ask about this ticket..." autocomplete="off" rows="1"></textarea>' +
                 '<button onclick="sendTicketChatMessage()">Send</button>' +
@@ -2650,6 +2675,7 @@ async function renderDetail(ticketId) {
       if (chatSection) {
         chatSection.style.display = 'block';
         restoreChatHeight('ticket-chat-messages');
+        updateChatRecovery(chatSessionIndeterminate);
       }
       var globalChat = document.getElementById('chat-container');
       if (globalChat) globalChat.style.display = 'none';
@@ -4739,6 +4765,7 @@ render();
 
 var chatEnabled = false;
 var currentTicketForChat = null;
+var chatSessionIndeterminate = false;
 
 function restoreChatHeight(containerId) {
   var key = 'chatHeight_' + containerId;
@@ -4780,6 +4807,7 @@ async function initChat() {
       chatEnabled = true;
       document.getElementById('chat-container').style.display = 'block';
       var data = await r.json();
+      updateChatRecovery(!!data.indeterminate);
       renderChatMessages('chat-messages', data.messages || []);
       updateChatCost(data.usage || {});
       restoreChatHeight('chat-messages');
@@ -4810,6 +4838,52 @@ function renderChatMessages(containerId, messages) {
     return '<div class="chat-msg ' + cls + '">' + chatRender(m.text || '', m.role) + '</div>';
   }).join('');
   el.scrollTop = el.scrollHeight;
+}
+
+function updateChatRecovery(indeterminate) {
+  chatSessionIndeterminate = !!indeterminate;
+  ['chat-recovery', 'ticket-chat-recovery'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.style.display = chatSessionIndeterminate ? 'block' : 'none';
+  });
+}
+
+async function clearChatSession() {
+  if (!chatSessionIndeterminate) return;
+  if (!window.confirm('The interrupted action may already have taken effect. Reconcile it in the ticket or audit history before clearing chat and retrying. Continue?')) return;
+
+  var buttons = [
+    document.querySelector('#chat-recovery button'),
+    document.querySelector('#ticket-chat-recovery button')
+  ].filter(Boolean);
+  buttons.forEach(function(button) { button.disabled = true; });
+  try {
+    var r = await fetch(API + '/chat/session', {
+      method: 'DELETE',
+      headers: getAuthHeaders()
+    });
+    if (!r.ok) {
+      var message = 'Could not clear the chat session (HTTP ' + r.status + ').';
+      if (r.status === 409) {
+        message = 'A chat request is still finishing. Wait a moment, then try clearing the session again.';
+      }
+      var target = currentTicketForChat && document.getElementById('ticket-chat-messages')
+        ? 'ticket-chat-messages' : 'chat-messages';
+      appendChatMessage(target, 'system', message);
+      return;
+    }
+    updateChatRecovery(false);
+    renderChatMessages('chat-messages', []);
+    renderChatMessages('ticket-chat-messages', []);
+    updateChatCost({}, 'chat-cost');
+    updateChatCost({}, 'ticket-chat-cost');
+  } catch(e) {
+    var target = currentTicketForChat && document.getElementById('ticket-chat-messages')
+      ? 'ticket-chat-messages' : 'chat-messages';
+    appendChatMessage(target, 'system', 'Could not reach the server to clear chat. Try again when the connection is restored.');
+  } finally {
+    buttons.forEach(function(button) { button.disabled = false; });
+  }
 }
 
 function appendChatMessage(containerId, role, text) {
@@ -4912,6 +4986,7 @@ async function _streamChatRequest(msg, ticketContext, containerId, costElId) {
       return {ok: false, error: 'The chat response ended unexpectedly. Please try again.'};
     }
     if (fullText) {
+      if (fullText.indexOf('outcome is uncertain') !== -1) updateChatRecovery(true);
       appendChatMessage(containerId, 'assistant', fullText);
     }
     return {ok: true};
