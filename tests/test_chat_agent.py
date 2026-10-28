@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -739,6 +740,23 @@ class TestHandleMessage:
 
 
 class TestChatAPI:
+    def _chat_request(self, agent):
+        from fastapi import FastAPI
+        from starlette.requests import Request
+
+        app = FastAPI()
+        app.state.chat_agent = agent
+        app.state.api_token = "test-token"
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "headers": [(b"authorization", b"Bearer test-token")],
+                "app": app,
+                "state": {},
+            }
+        )
+
     async def test_send_message_no_agent(self):
         """Chat returns 503 when agent not initialized."""
         from fastapi import FastAPI
@@ -775,6 +793,78 @@ class TestChatAPI:
             json={"message": "hello"},
         )
         assert r.status_code == 401
+
+    async def test_stream_disconnect_cancels_chat_task(self):
+        from state_store.api.chat import ChatMessageRequest, send_message_stream
+
+        class BlockingAgent:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.cancelled = asyncio.Event()
+                self.finished = asyncio.Event()
+
+            async def handle_message(self, **_kwargs):
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    raise
+                finally:
+                    self.finished.set()
+
+        agent = BlockingAgent()
+        response = await send_message_stream(
+            ChatMessageRequest(message="hello"), self._chat_request(agent)
+        )
+        stream = response.body_iterator
+
+        assert await anext(stream) == ": heartbeat\n\n"
+        await asyncio.wait_for(agent.started.wait(), timeout=0.2)
+        await asyncio.wait_for(stream.aclose(), timeout=0.2)
+
+        assert agent.cancelled.is_set()
+        assert agent.finished.is_set()
+
+    async def test_stream_disconnect_bounds_cancellation_cleanup(self, monkeypatch):
+        import state_store.api.chat as chat_api
+
+        monkeypatch.setattr(chat_api, "_CHAT_TASK_CLEANUP_TIMEOUT_SECONDS", 0.01)
+
+        class SlowCleanupAgent:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.cancelled = asyncio.Event()
+                self.task = None
+
+            async def handle_message(self, **_kwargs):
+                self.task = asyncio.current_task()
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    await asyncio.Event().wait()
+
+        agent = SlowCleanupAgent()
+        response = await chat_api.send_message_stream(
+            chat_api.ChatMessageRequest(message="hello"),
+            self._chat_request(agent),
+        )
+        stream = response.body_iterator
+
+        assert await anext(stream) == ": heartbeat\n\n"
+        await asyncio.wait_for(agent.started.wait(), timeout=0.2)
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        await asyncio.wait_for(stream.aclose(), timeout=0.2)
+
+        assert agent.cancelled.is_set()
+        assert loop.time() - started_at < 0.2
+        assert agent.task is not None
+        completed, _ = await asyncio.wait({agent.task}, timeout=0.2)
+        assert completed == {agent.task}
+        assert agent.task.cancelled()
 
 
 class TestBenchmarkCatalog:

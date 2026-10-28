@@ -7,6 +7,7 @@ chat agent uses it for all downstream API calls.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -18,6 +19,7 @@ from starlette.responses import StreamingResponse
 from ..auth import Principal
 
 logger = logging.getLogger(__name__)
+_CHAT_TASK_CLEANUP_TIMEOUT_SECONDS = 2.0
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -46,6 +48,33 @@ def _get_chat_agent(request: Request):
             detail="Chat agent not available",
         )
     return agent
+
+
+def _consume_chat_task_result(task: asyncio.Task[str]) -> None:
+    """Retrieve a task's result after its SSE consumer has gone away."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Chat task failed after its response stream closed")
+
+
+async def _cancel_chat_task(task: asyncio.Task[str]) -> None:
+    """Cancel chat work on stream exit and bound time spent awaiting cleanup."""
+    if task.done():
+        return
+
+    task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=_CHAT_TASK_CLEANUP_TIMEOUT_SECONDS)
+    if done:
+        return
+
+    # A task can suppress cancellation while waiting on an uncooperative
+    # dependency. Request cancellation again and consume its eventual result.
+    logger.warning("Chat task did not stop before SSE cleanup timed out")
+    task.cancel()
+    task.add_done_callback(_consume_chat_task_result)
 
 
 def _get_principal(request: Request) -> Principal:
@@ -223,8 +252,6 @@ async def send_message_stream(
             )
 
     async def event_generator():
-        import asyncio
-
         # Run the LLM call in a task so we can send heartbeats
         # while it processes.  SSE comments (": heartbeat\n\n")
         # are ignored by browsers but keep the reverse-proxy
@@ -238,6 +265,7 @@ async def send_message_stream(
                 readonly=is_anonymous,
             )
         )
+        task_result_observed = False
         try:
             while not task.done():
                 yield ": heartbeat\n\n"
@@ -246,14 +274,18 @@ async def send_message_stream(
                 except asyncio.TimeoutError:
                     pass  # task still running, send another heartbeat
             response_text = task.result()
+            task_result_observed = True
         except Exception:
+            task_result_observed = task.done()
             logger.exception("Chat streaming failed")
-            if not task.done():
-                task.cancel()
             response_text = (
                 "Sorry, I encountered an error processing your "
                 "message. Please try again or rephrase your request."
             )
+        finally:
+            await _cancel_chat_task(task)
+            if task.done() and not task_result_observed:
+                _consume_chat_task_result(task)
         yield f"data: {json.dumps({'text': response_text})}\n\n"
         usage = agent.get_usage(user)
         yield f"data: {json.dumps({'done': True, 'usage': usage})}\n\n"
