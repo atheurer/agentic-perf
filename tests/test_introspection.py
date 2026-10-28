@@ -1206,6 +1206,27 @@ class TestIntrospectionConfig:
 
 
 class TestMaybeStartIntrospection:
+    def test_llm_uses_current_config_snapshot(self, monkeypatch) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.main import _maybe_start_introspection
+
+        monkeypatch.delenv("LLM_TIMEOUT", raising=False)
+        config = OrchestratorConfig(
+            raw_config={
+                "llm": {"provider": "mock", "model": "rits/zai-org/glm-5-3"},
+                "introspection": {"enabled": True},
+            }
+        )
+        dispatcher = MagicMock()
+        dispatcher.is_introspection_active.return_value = False
+        dispatcher._introspection_starting = set()
+        dispatcher._introspection_llm = True
+        _maybe_start_introspection(dispatcher, config, {"custom_fields": {}}, "PERF-1")
+
+        call = dispatcher.start_introspection.call_args
+        assert call.args == ("PERF-1",)
+        assert call.kwargs["llm_factory"]("introspection").default_timeout == 600
+
     def test_starts_when_globally_enabled(self) -> None:
         from orchestrator.config import OrchestratorConfig
         from orchestrator.main import _maybe_start_introspection

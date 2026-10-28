@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from copy import deepcopy
 
 import pytest
 
@@ -112,6 +113,23 @@ class TestBuildRedactedConfig:
         assert "api_key" not in intro_model
         assert intro_model["provider"] == "anthropic"
         assert intro_model["model"] == "claude-haiku-4-5-20251001"
+
+    def test_agent_timeout_diagnostics_never_expose_invalid_values(self, fake_config):
+        data = deepcopy(fake_config)
+        data["agent_models"]["introspection"]["timeout"] = 600
+        data["agent_models"]["review"] = {"timeout": "secret-invalid-value"}
+        snapshot = build_redacted_config(OrchestratorConfig(raw_config=data))
+        assert snapshot["agent_models"]["introspection"]["timeout"] == 600
+        assert snapshot["agent_models"]["review"]["timeout"] == 120
+        assert "secret-invalid-value" not in json.dumps(snapshot)
+
+    def test_model_timeout_diagnostics_show_effective_safe_defaults(self, fake_config):
+        data = deepcopy(fake_config)
+        glm = "rits/zai-org/glm-5-3"
+        data["llm"]["model_timeouts"] = {glm: 900, "other": "secret-invalid"}
+        snapshot = build_redacted_config(OrchestratorConfig(raw_config=data))
+        assert snapshot["llm"]["model_timeouts"] == {glm: 900}
+        assert "secret-invalid" not in json.dumps(snapshot)
 
     def test_paths_are_strings(self, fake_config, tmp_path):
         config = OrchestratorConfig(raw_config=fake_config)

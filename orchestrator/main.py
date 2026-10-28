@@ -329,7 +329,7 @@ def _make_llm_factory(
             api=agent_cfg.get("api", ""),
             api_key=(api_keys or {}).get(agent_type),
         )
-        provider.default_timeout = config.llm_timeout
+        provider.default_timeout = config.get_agent_llm_timeout(agent_type)
         effort = agent_cfg.get("reasoning_effort") or config.llm_reasoning_effort
         if effort:
             provider.reasoning_effort = effort
@@ -1432,7 +1432,10 @@ async def run_agent_task(
                             api=llm_override.get("api", ""),
                             api_key=override_api_key,
                         )
-                        override_llm.default_timeout = config.llm_timeout
+                        override_llm.default_timeout = config.get_agent_llm_timeout(
+                            agent_type,
+                            model=llm_override.get("model") or config.llm_model,
+                        )
                         override_effort = llm_override.get("reasoning_effort")
                         if override_effort:
                             override_llm.reasoning_effort = override_effort
@@ -2360,7 +2363,13 @@ def _maybe_start_introspection(
             )
             return
 
-    started = dispatcher.start_introspection(ticket_id)
+    if dispatcher._introspection_llm:
+        # Use the same current config snapshot as the ticket's other agents.
+        started = dispatcher.start_introspection(
+            ticket_id, llm_factory=_make_llm_factory(config)
+        )
+    else:
+        started = dispatcher.start_introspection(ticket_id)
     if started:
         logger.info(f"Introspection started for {ticket_id}")
 
