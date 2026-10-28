@@ -119,6 +119,7 @@ _CHAT_DELIVERY_INDETERMINATE_MESSAGE = (
     "clear the chat session to continue."
 )
 _CHAT_DELIVERY_ACK_TIMEOUT_SECONDS = 30.0
+_CHAT_DELIVERY_SEND_TIMEOUT_SECONDS = 30.0
 _CHAT_READONLY_AUDIT_UNAVAILABLE_MESSAGE = (
     "This action was blocked before dispatch, but its rejection audit could "
     "not be confirmed. No action was attempted."
@@ -275,6 +276,7 @@ class ChatAgent:
         self._sent_response_deliveries: dict[str, str] = {}
         self._early_response_delivery_acks: dict[str, str] = {}
         self._delivery_indeterminate_ids: dict[str, str] = {}
+        self._delivery_send_timeouts: dict[str, asyncio.TimerHandle] = {}
         self._delivery_timeouts: dict[str, asyncio.TimerHandle] = {}
 
     async def handle_message(
@@ -348,6 +350,7 @@ class ChatAgent:
                 elif track_response_delivery and mutation_state["completed"]:
                     assert delivery_id is not None
                     self._pending_response_deliveries[user] = delivery_id
+                    self._arm_response_delivery_send_timeout(user, delivery_id)
                 return response
             finally:
                 active_delivery = self._active_response_deliveries.get(user)
@@ -1176,14 +1179,36 @@ class ChatAgent:
             self._delivery_indeterminate_ids[user] = delivery_id
         session.add_assistant_message(_CHAT_DELIVERY_INDETERMINATE_MESSAGE)
 
+    def _arm_response_delivery_send_timeout(self, user: str, delivery_id: str) -> None:
+        """Bound time spent sending a completed mutation's response body."""
+        previous = self._delivery_send_timeouts.pop(user, None)
+        if previous is not None:
+            previous.cancel()
+        loop = asyncio.get_running_loop()
+        self._delivery_send_timeouts[user] = loop.call_later(
+            _CHAT_DELIVERY_SEND_TIMEOUT_SECONDS,
+            self.mark_response_delivery_interrupted,
+            user,
+            delivery_id,
+        )
+
     def mark_response_delivery_sent(self, user: str, delivery_id: str) -> None:
-        """Wait briefly for the browser to acknowledge a complete response."""
-        if self._pending_response_deliveries.get(user) != delivery_id:
+        """Start the ACK window after the ASGI response send completes."""
+        pending = self._pending_response_deliveries.get(user) == delivery_id
+        indeterminate = self._delivery_indeterminate_ids.get(user) == delivery_id
+        if not pending and not indeterminate:
             return
+        send_timeout = self._delivery_send_timeouts.pop(user, None)
+        if send_timeout is not None:
+            send_timeout.cancel()
         self._sent_response_deliveries[user] = delivery_id
         if self._early_response_delivery_acks.get(user) == delivery_id:
             self._early_response_delivery_acks.pop(user, None)
             self.mark_response_delivery_complete(user, delivery_id)
+            return
+        if indeterminate:
+            # A late send completion is not proof that the browser received
+            # the body. Keep the pause until its request-scoped ACK arrives.
             return
         timeout = self._delivery_timeouts.pop(user, None)
         if timeout is not None:
@@ -1209,6 +1234,9 @@ class ChatAgent:
             self._pending_response_deliveries.pop(user, None)
             self._sent_response_deliveries.pop(user, None)
             self._early_response_delivery_acks.pop(user, None)
+            send_timeout = self._delivery_send_timeouts.pop(user, None)
+            if send_timeout is not None:
+                send_timeout.cancel()
             timeout = self._delivery_timeouts.pop(user, None)
             if timeout is not None:
                 timeout.cancel()
@@ -1216,6 +1244,8 @@ class ChatAgent:
             return True
         self._delivery_indeterminate_ids.pop(user, None)
         self._indeterminate_sessions.pop(user, None)
+        self._sent_response_deliveries.pop(user, None)
+        self._early_response_delivery_acks.pop(user, None)
         session = self._sessions.get_or_create(user)
         session.messages = [
             message
@@ -1236,7 +1266,11 @@ class ChatAgent:
         if self._pending_response_deliveries.get(user) == delivery_id:
             self._pending_response_deliveries.pop(user, None)
             self._sent_response_deliveries.pop(user, None)
-            self._early_response_delivery_acks.pop(user, None)
+            # Preserve an early ACK until a late ASGI send completion can
+            # validate it. A later explicit ACK can also clear this pause.
+            send_timeout = self._delivery_send_timeouts.pop(user, None)
+            if send_timeout is not None:
+                send_timeout.cancel()
             timeout = self._delivery_timeouts.pop(user, None)
             if timeout is not None:
                 timeout.cancel()
@@ -1299,5 +1333,8 @@ class ChatAgent:
         timeout = self._delivery_timeouts.pop(user, None)
         if timeout is not None:
             timeout.cancel()
+        send_timeout = self._delivery_send_timeouts.pop(user, None)
+        if send_timeout is not None:
+            send_timeout.cancel()
         self._sessions.delete(user)
         return True

@@ -165,6 +165,118 @@ def test_delivery_ack_retries_and_polls_until_recovery_status_changes() -> None:
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
+def test_delivery_recovery_retries_status_after_transient_history_outage() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    start = html.index("function updateChatRecovery")
+    end = html.index("\nfunction appendChatMessage", start)
+    recovery = html[start:end]
+    script = (
+        "const assert = require('node:assert/strict');\n"
+        "const API = '/api/v1';\n"
+        "let currentTicketForChat = null;\n"
+        "let chatSessionIndeterminate = false;\n"
+        "let chatDeliveryPending = false;\n"
+        "let chatRecoveryStatusUnavailable = false;\n"
+        "let chatRecoveryMonitor = null;\n"
+        "const elements = new Map();\n"
+        "function element(id) { if (!elements.has(id)) elements.set(id, {style: {}, querySelector: function(selector) { if (selector === 'div') return this.message; if (selector === '.chat-recovery-refresh') return this.refreshButton; return this.clearButton; }, message: {textContent: ''}, refreshButton: {style: {}}, clearButton: {style: {}}}); return elements.get(id); }\n"
+        "const document = {getElementById: element, querySelector: function() { return null; }};\n"
+        "function getAuthHeaders() { return {}; }\n"
+        "function appendChatMessage() {}\n"
+        "function renderChatMessages() {}\n"
+        "function updateChatCost() {}\n"
+        "let ackCalls = 0;\n"
+        "let historyCalls = 0;\n"
+        "const nativeSetTimeout = globalThis.setTimeout;\n"
+        "globalThis.setTimeout = function(callback, delay) { return nativeSetTimeout(callback, delay === 1000 ? 0 : delay); };\n"
+        "globalThis.fetch = async function(url) {\n"
+        "  if (url === API + '/chat/message/ack') { ackCalls++; return {ok: true, json: async function() { return {acknowledged: false}; }}; }\n"
+        "  if (url === API + '/chat/history') { historyCalls++; if (historyCalls === 1) throw new Error('temporary outage'); const indeterminate = historyCalls >= 5; return {ok: true, json: async function() { return {indeterminate: indeterminate, delivery_pending: !indeterminate, request_in_flight: false}; }}; }\n"
+        "  throw new Error('unexpected URL ' + url);\n"
+        "};\n"
+        + recovery
+        + r"""
+(async function() {
+  assert.equal(await acknowledgeChatDelivery('request-A'), false);
+  assert.ok(chatRecoveryMonitor);
+  await chatRecoveryMonitor;
+  assert.ok(ackCalls > 2);
+  assert.ok(historyCalls >= 5);
+  assert.equal(chatRecoveryMonitor, null);
+  assert.equal(chatSessionIndeterminate, true);
+  assert.equal(chatRecoveryStatusUnavailable, false);
+  assert.equal(element('chat-recovery').style.display, 'block');
+  assert.equal(element('ticket-chat-recovery').style.display, 'block');
+})().catch(function(error) {
+  process.nextTick(function() { throw error; });
+});
+"""
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
+def test_fully_unavailable_delivery_status_keeps_manual_recovery_on_both_surfaces() -> (
+    None
+):
+    html = INDEX.read_text(encoding="utf-8")
+    start = html.index("function updateChatRecovery")
+    end = html.index("\nfunction appendChatMessage", start)
+    recovery = html[start:end]
+    script = (
+        "const assert = require('node:assert/strict');\n"
+        "const API = '/api/v1';\n"
+        "let currentTicketForChat = null;\n"
+        "let chatSessionIndeterminate = false;\n"
+        "let chatDeliveryPending = false;\n"
+        "let chatRecoveryStatusUnavailable = false;\n"
+        "let chatRecoveryMonitor = null;\n"
+        "let recoveryAvailable = false;\n"
+        "const elements = new Map();\n"
+        "function element(id) { if (!elements.has(id)) elements.set(id, {style: {}, querySelector: function(selector) { if (selector === 'div') return this.message; if (selector === '.chat-recovery-refresh') return this.refreshButton; return this.clearButton; }, message: {textContent: ''}, refreshButton: {style: {}}, clearButton: {style: {}}}); return elements.get(id); }\n"
+        "const document = {getElementById: element, querySelector: function() { return null; }};\n"
+        "function getAuthHeaders() { return {}; }\n"
+        "function appendChatMessage() {}\n"
+        "function renderChatMessages() {}\n"
+        "function updateChatCost() {}\n"
+        "let ackCalls = 0;\n"
+        "let historyCalls = 0;\n"
+        "const nativeSetTimeout = globalThis.setTimeout;\n"
+        "globalThis.setTimeout = function(callback, delay) { return nativeSetTimeout(callback, delay === 1000 ? 0 : delay); };\n"
+        "globalThis.fetch = async function(url) {\n"
+        "  if (url === API + '/chat/message/ack') { ackCalls++; return {ok: false}; }\n"
+        "  if (url === API + '/chat/history') { historyCalls++; if (!recoveryAvailable) throw new Error('offline'); return {ok: true, json: async function() { return {indeterminate: true, delivery_pending: false, request_in_flight: false}; }}; }\n"
+        "  throw new Error('unexpected URL ' + url);\n"
+        "};\n"
+        + recovery
+        + r"""
+(async function() {
+  assert.equal(await acknowledgeChatDelivery('request-A'), false);
+  assert.ok(chatRecoveryMonitor);
+  await chatRecoveryMonitor;
+  assert.equal(chatRecoveryMonitor, null);
+  assert.ok(ackCalls <= 18);
+  assert.ok(historyCalls <= 19);
+  assert.equal(chatRecoveryStatusUnavailable, true);
+  assert.equal(element('chat-recovery').style.display, 'block');
+  assert.equal(element('ticket-chat-recovery').style.display, 'block');
+  assert.equal(element('chat-recovery').refreshButton.style.display, '');
+  assert.equal(element('ticket-chat-recovery').refreshButton.style.display, '');
+  assert.equal(element('chat-recovery').clearButton.style.display, 'none');
+
+  recoveryAvailable = true;
+  assert.equal(await refreshChatRecoveryManually(), true);
+  assert.equal(chatRecoveryStatusUnavailable, false);
+  assert.equal(chatSessionIndeterminate, true);
+  assert.equal(element('chat-recovery').clearButton.style.display, '');
+  assert.equal(element('ticket-chat-recovery').clearButton.style.display, '');
+})().catch(function(error) {
+  process.nextTick(function() { throw error; });
+});
+"""
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 def test_stream_uses_structured_indeterminate_status_and_acknowledges_response_id() -> (
     None
 ):

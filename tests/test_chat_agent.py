@@ -1948,6 +1948,155 @@ class TestChatAPI:
         assert agent._early_response_delivery_acks == {}
         assert agent._delivery_timeouts == {}
 
+    async def test_stalled_asgi_send_is_bounded_and_late_send_needs_ack(
+        self, monkeypatch
+    ):
+        import agents.chat.agent as chat_agent_module
+        import state_store.api.chat as chat_api
+        from agents.chat.agent import ChatAgent
+
+        monkeypatch.setattr(
+            chat_agent_module, "_CHAT_DELIVERY_SEND_TIMEOUT_SECONDS", 0.01
+        )
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._pending_response_deliveries["default"] = "request-A"
+        agent._arm_response_delivery_send_timeout("default", "request-A")
+        response = chat_api._ChatDeliveryJSONResponse(
+            {"response": "complete"}, agent, "default", "request-A"
+        )
+        body_send_started = asyncio.Event()
+        release_body_send = asyncio.Event()
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message["body"]:
+                body_send_started.set()
+                await release_body_send.wait()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/api/v1/chat/message",
+            "headers": [],
+        }
+        response_task = asyncio.create_task(response(scope, receive, send))
+        await body_send_started.wait()
+        await asyncio.sleep(0.03)
+
+        assert agent.is_session_indeterminate("default")
+        assert agent._pending_response_deliveries == {}
+        assert agent._delivery_send_timeouts == {}
+
+        release_body_send.set()
+        await response_task
+
+        # Finishing a blocked send after the watchdog cannot silently release
+        # the mutation guard; only the matching explicit receipt can do that.
+        assert agent.is_session_indeterminate("default")
+        assert agent.mark_response_delivery_complete("default", "request-A")
+        assert not agent.is_session_indeterminate("default")
+        assert agent._delivery_timeouts == {}
+        assert agent._sent_response_deliveries == {}
+
+    async def test_early_ack_during_stalled_send_settles_only_after_send_returns(
+        self, monkeypatch
+    ):
+        import agents.chat.agent as chat_agent_module
+        import state_store.api.chat as chat_api
+        from agents.chat.agent import ChatAgent
+
+        monkeypatch.setattr(
+            chat_agent_module, "_CHAT_DELIVERY_SEND_TIMEOUT_SECONDS", 0.01
+        )
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._pending_response_deliveries["default"] = "request-A"
+        agent._arm_response_delivery_send_timeout("default", "request-A")
+        response = chat_api._ChatDeliveryJSONResponse(
+            {"response": "complete"}, agent, "default", "request-A"
+        )
+        body_send_started = asyncio.Event()
+        release_body_send = asyncio.Event()
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message["body"]:
+                body_send_started.set()
+                await release_body_send.wait()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/api/v1/chat/message",
+            "headers": [],
+        }
+        response_task = asyncio.create_task(response(scope, receive, send))
+        await body_send_started.wait()
+
+        early_ack = await chat_api.acknowledge_message_delivery(
+            chat_api.ChatDeliveryAckRequest(delivery_id="request-A"),
+            self._chat_request(agent),
+        )
+        assert early_ack == {"acknowledged": False}
+        assert agent._early_response_delivery_acks == {"default": "request-A"}
+
+        await asyncio.sleep(0.03)
+        assert agent.is_session_indeterminate("default")
+        release_body_send.set()
+        await response_task
+
+        assert not agent.is_session_indeterminate("default")
+        assert agent._pending_response_deliveries == {}
+        assert agent._early_response_delivery_acks == {}
+
+    async def test_cancelled_stalled_asgi_send_keeps_timed_out_guard(self, monkeypatch):
+        import agents.chat.agent as chat_agent_module
+        import state_store.api.chat as chat_api
+        from agents.chat.agent import ChatAgent
+
+        monkeypatch.setattr(
+            chat_agent_module, "_CHAT_DELIVERY_SEND_TIMEOUT_SECONDS", 0.01
+        )
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._pending_response_deliveries["default"] = "request-A"
+        agent._arm_response_delivery_send_timeout("default", "request-A")
+        response = chat_api._ChatDeliveryJSONResponse(
+            {"response": "complete"}, agent, "default", "request-A"
+        )
+        body_send_started = asyncio.Event()
+        never_release = asyncio.Event()
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message["body"]:
+                body_send_started.set()
+                await never_release.wait()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/api/v1/chat/message",
+            "headers": [],
+        }
+        response_task = asyncio.create_task(response(scope, receive, send))
+        await body_send_started.wait()
+        await asyncio.sleep(0.03)
+        response_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await response_task
+
+        assert agent.is_session_indeterminate("default")
+        assert agent._pending_response_deliveries == {}
+        assert agent._delivery_send_timeouts == {}
+
     async def test_clear_session_endpoint_reports_in_flight_conflict(self):
         import pytest
         from fastapi import HTTPException
