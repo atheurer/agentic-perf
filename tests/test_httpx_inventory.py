@@ -15,7 +15,7 @@ EXCLUDED = {
     "providers/skills/crucible.py",
     "providers/tracing/client.py",
 }
-EXCLUDED_CALLS = {"orchestrator/dispatcher.py": {132}}
+EXCLUDED_CALLS = {"orchestrator/dispatcher.py": {137}}
 
 
 def _direct_httpx_calls(path: Path) -> list[int]:
