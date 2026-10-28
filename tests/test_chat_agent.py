@@ -546,16 +546,18 @@ class TestHandleMessage:
 
         session = agent._sessions.get_or_create("alice")
         assert session.pending_action is None
-        assert all(
-            not (
-                message.get("role") == "assistant"
-                and isinstance(message.get("content"), list)
-                and any(
-                    isinstance(block, dict) and block.get("type") == "tool_use"
-                    for block in message["content"]
-                )
-            )
+        tool_use_message = next(
+            message
             for message in session.messages
+            if message.get("role") == "assistant"
+            and isinstance(message.get("content"), list)
+            and any(block.get("type") == "tool_use" for block in message["content"])
+        )
+        result_message = session.messages[session.messages.index(tool_use_message) + 1]
+        assert result_message["content"][0]["tool_use_id"] == "toolu-read"
+        assert (
+            "outcome is uncertain"
+            in json.loads(result_message["content"][0]["content"])["error"]
         )
         assert "outcome is uncertain" in session.messages[-1]["content"]
         assert (
@@ -564,6 +566,282 @@ class TestHandleMessage:
         )
         assert llm.complete.await_count == 1
         assert agent.clear_session("alice") is True
+
+    async def test_later_read_cancellation_preserves_completed_mutation_result(self):
+        from unittest.mock import patch
+
+        import pytest
+
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        calls = [
+            ToolCall(
+                id="toolu-start",
+                name="start_ticket",
+                input={"ticket_id": "PERF-1"},
+            ),
+            ToolCall(
+                id="toolu-read",
+                name="get_ticket",
+                input={"ticket_id": "PERF-1"},
+            ),
+        ]
+        response = MagicMock(
+            text=None,
+            tool_calls=calls,
+            raw_content=[
+                {"type": "tool_use", "id": call.id, "name": call.name} for call in calls
+            ],
+        )
+        response.usage = {}
+        llm.complete = AsyncMock(return_value=response)
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        dispatches = 0
+
+        async def execute(name, *_args, **_kwargs):
+            nonlocal dispatches
+            dispatches += 1
+            if name == "start_ticket":
+                return '{"id":"PERF-1","status":"running"}'
+            raise asyncio.CancelledError
+
+        with patch("agents.chat.agent.execute_tool", execute):
+            with pytest.raises(asyncio.CancelledError):
+                await agent.handle_message("alice", "start and inspect", "token")
+
+        session = agent._sessions.get_or_create("alice")
+        tool_use_message = next(
+            message
+            for message in session.messages
+            if message.get("role") == "assistant"
+            and isinstance(message.get("content"), list)
+            and any(block.get("type") == "tool_use" for block in message["content"])
+        )
+        result_message = session.messages[session.messages.index(tool_use_message) + 1]
+        assert [call["id"] for call in tool_use_message["content"]] == [
+            "toolu-start",
+            "toolu-read",
+        ]
+        assert [result["tool_use_id"] for result in result_message["content"]] == [
+            "toolu-start",
+            "toolu-read",
+        ]
+        assert json.loads(result_message["content"][0]["content"]) == {
+            "id": "PERF-1",
+            "status": "running",
+        }
+        assert (
+            "read-only lookup was interrupted"
+            in json.loads(result_message["content"][1]["content"])["error"]
+        )
+        assert dispatches == 2
+        assert agent.is_session_indeterminate("alice")
+        blocked = await agent.handle_message("alice", "start it again", "token")
+        assert "outcome is uncertain" in blocked
+        assert llm.complete.await_count == 1
+
+    async def test_later_read_audit_failure_blocks_after_completed_mutation(self):
+        from unittest.mock import patch
+
+        from agents.chat.agent import ChatAgent
+        from agents.chat.tools import ChatAuditUnavailable
+        from providers.llm.base import ToolCall
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        calls = [
+            ToolCall(
+                id="toolu-start",
+                name="start_ticket",
+                input={"ticket_id": "PERF-1"},
+            ),
+            ToolCall(
+                id="toolu-read",
+                name="get_ticket",
+                input={"ticket_id": "PERF-1"},
+            ),
+        ]
+        response = MagicMock(
+            text=None,
+            tool_calls=calls,
+            raw_content=[
+                {"type": "tool_use", "id": call.id, "name": call.name} for call in calls
+            ],
+        )
+        response.usage = {}
+        llm.complete = AsyncMock(return_value=response)
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+
+        async def execute(name, *_args, **_kwargs):
+            if name == "start_ticket":
+                return '{"id":"PERF-1","status":"running"}'
+            raise ChatAuditUnavailable("audit ingestion unavailable")
+
+        with patch("agents.chat.agent.execute_tool", execute):
+            result = await agent.handle_message("alice", "start and inspect", "token")
+
+        assert "outcome is uncertain" in result
+        assert agent.is_session_indeterminate("alice")
+        session = agent._sessions.get_or_create("alice")
+        tool_results = next(
+            message["content"]
+            for message in session.messages
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), list)
+            and any(item.get("type") == "tool_result" for item in message["content"])
+        )
+        assert [item["tool_use_id"] for item in tool_results] == [
+            "toolu-start",
+            "toolu-read",
+        ]
+        assert json.loads(tool_results[0]["content"]) == {
+            "id": "PERF-1",
+            "status": "running",
+        }
+        assert llm.complete.await_count == 1
+
+    async def test_readonly_dispatch_guard_rejects_model_mutation_and_unknown_tools(
+        self,
+    ):
+        from unittest.mock import patch
+
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        calls = [
+            ToolCall(
+                id="toolu-read",
+                name="get_ticket",
+                input={"ticket_id": "PERF-1"},
+            ),
+            ToolCall(
+                id="toolu-mutate",
+                name="start_ticket",
+                input={"ticket_id": "PERF-1"},
+            ),
+            ToolCall(
+                id="toolu-unknown",
+                name="invented_tool",
+                input={},
+            ),
+        ]
+        tool_response = MagicMock(
+            text=None,
+            tool_calls=calls,
+            raw_content=[
+                {"type": "tool_use", "id": call.id, "name": call.name} for call in calls
+            ],
+        )
+        tool_response.usage = {}
+        final_response = MagicMock(
+            text="I only used the allowed read.", tool_calls=[], raw_content=[]
+        )
+        final_response.usage = {}
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm.complete = AsyncMock(side_effect=[tool_response, final_response])
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        executed_names = []
+
+        async def fake_execute(name, *_args, **_kwargs):
+            executed_names.append(name)
+            assert name == "get_ticket"
+            return '{"id":"PERF-1"}'
+
+        with patch("agents.chat.agent.execute_tool", fake_execute):
+            result = await agent.handle_message(
+                "anonymous-session", "inspect PERF-1", "", readonly=True
+            )
+
+        assert result == "I only used the allowed read."
+        assert executed_names == ["get_ticket"]
+        assert not agent.is_session_indeterminate("anonymous-session")
+        sent_messages = llm.complete.await_args_list[1].kwargs["messages"]
+        tool_results = next(
+            message["content"]
+            for message in sent_messages
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), list)
+            and any(item.get("type") == "tool_result" for item in message["content"])
+        )
+        assert [item["tool_use_id"] for item in tool_results] == [
+            "toolu-read",
+            "toolu-mutate",
+            "toolu-unknown",
+        ]
+        assert "read-only mode" in json.loads(tool_results[1]["content"])["error"]
+        assert (
+            "Unknown or unavailable tool"
+            in json.loads(tool_results[2]["content"])["error"]
+        )
+
+    async def test_anonymous_adversarial_calls_do_not_accumulate_pause_state(self):
+        from unittest.mock import patch
+
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        tool_calls = [
+            ToolCall(
+                id="toolu-mutate",
+                name="start_ticket",
+                input={"ticket_id": "PERF-1"},
+            ),
+            ToolCall(id="toolu-unknown", name="unknown_tool", input={}),
+        ]
+        tool_response = MagicMock(
+            text=None,
+            tool_calls=tool_calls,
+            raw_content=[
+                {"type": "tool_use", "id": call.id, "name": call.name}
+                for call in tool_calls
+            ],
+        )
+        tool_response.usage = {}
+        final_response = MagicMock(
+            text="No allowed action was requested.", tool_calls=[], raw_content=[]
+        )
+        final_response.usage = {}
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm.complete = AsyncMock(
+            side_effect=[
+                response
+                for _ in range(120)
+                for response in (tool_response, final_response)
+            ]
+        )
+        agent = ChatAgent(
+            llm=llm,
+            store_url="http://localhost:8090",
+            audit_token="service-token",
+        )
+
+        with patch("agents.chat.agent.execute_tool", new_callable=AsyncMock) as execute:
+            for index in range(120):
+                result = await agent.handle_message(
+                    f"anonymous-{index}", "start a ticket", "", readonly=True
+                )
+                assert result == "No allowed action was requested."
+
+        execute.assert_not_awaited()
+        assert agent._indeterminate_sessions == {}
+        assert agent._session_locks == {}
+        assert len(agent._sessions._sessions) == agent._sessions._max_sessions
+        assert "anonymous-0" not in agent._sessions._sessions
 
     async def test_anonymous_readonly_cancellations_do_not_accumulate_pause_state(self):
         from unittest.mock import patch

@@ -389,6 +389,50 @@ class ChatAgent:
             user, session, confirmation_exchange=confirmation_exchange
         )
 
+    def _mark_tool_batch_indeterminate(
+        self,
+        user: str,
+        session: ChatSession,
+        tool_calls: list[Any],
+        completed_results: list[dict[str, Any]],
+        *,
+        interrupted_index: int,
+        interrupted_mutation: bool,
+    ) -> None:
+        """Keep every tool-use paired when a batch stops after a mutation."""
+        results_by_id = {result["tool_use_id"]: result for result in completed_results}
+        reconciled_results = []
+        for index, tool_call in enumerate(tool_calls):
+            if tool_call.id in results_by_id:
+                reconciled_results.append(results_by_id[tool_call.id])
+            elif index == interrupted_index:
+                detail = (
+                    "This action was interrupted; its outcome is uncertain."
+                    if interrupted_mutation
+                    else "This read-only lookup was interrupted; no changes were made."
+                )
+                reconciled_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": json.dumps({"error": detail}),
+                    }
+                )
+            else:
+                reconciled_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_call.id,
+                        "content": json.dumps(
+                            {"error": "Not run because an earlier tool call stopped."}
+                        ),
+                    }
+                )
+        session.add_tool_results(reconciled_results)
+        session.pending_action = None
+        self._indeterminate_sessions[user] = _CHAT_INDETERMINATE_MESSAGE
+        session.add_assistant_message(_CHAT_INDETERMINATE_MESSAGE)
+
     async def handle_message_stream(
         self,
         user: str,
@@ -621,8 +665,6 @@ class ChatAgent:
         # Run the tool-use loop
         # Filter tools for anonymous/readonly sessions
         if readonly:
-            from .tools import READONLY_TOOLS
-
             available_tools = [t for t in CHAT_TOOLS if t.name in READONLY_TOOLS]
             system_prompt += (
                 "\n\nYou are in read-only mode (anonymous user). "
@@ -766,7 +808,40 @@ class ChatAgent:
             )
 
             tool_results = []
-            for tc in response.tool_calls:
+            mutating_action_completed = False
+            known_tool_names = {tool.name for tool in CHAT_TOOLS}
+            for index, tc in enumerate(response.tool_calls):
+                # The model's advertised tool list is guidance, not an
+                # authorization boundary. Recheck every returned call before
+                # reaching the audited dispatcher.
+                if tc.name not in known_tool_names:
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tc.id,
+                            "content": json.dumps(
+                                {"error": f"Unknown or unavailable tool: {tc.name}"}
+                            ),
+                        }
+                    )
+                    continue
+                if readonly and tc.name not in READONLY_TOOLS:
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tc.id,
+                            "content": json.dumps(
+                                {
+                                    "error": (
+                                        "This tool is unavailable in read-only mode. "
+                                        "No action was attempted."
+                                    )
+                                }
+                            ),
+                        }
+                    )
+                    continue
+
                 # Code-level guardrail: destructive tools
                 # require explicit user confirmation
                 if tc.name in DESTRUCTIVE_TOOLS:
@@ -811,25 +886,44 @@ class ChatAgent:
                         tool_call_id=tc.id,
                     )
                 except asyncio.CancelledError:
-                    self._mark_tool_cancelled(
-                        user,
-                        session,
-                        tool_name=tc.name,
-                        confirmation_exchange=False,
-                    )
+                    if mutating_action_completed or tc.name not in READONLY_TOOLS:
+                        self._mark_tool_batch_indeterminate(
+                            user,
+                            session,
+                            response.tool_calls,
+                            tool_results,
+                            interrupted_index=index,
+                            interrupted_mutation=tc.name not in READONLY_TOOLS,
+                        )
+                    else:
+                        self._mark_tool_cancelled(
+                            user,
+                            session,
+                            tool_name=tc.name,
+                            confirmation_exchange=False,
+                        )
                     raise
                 except ChatAuditUnavailable as exc:
-                    if "outcome is indeterminate" in str(exc) or tool_results:
-                        if tc.name in READONLY_TOOLS:
-                            self._remove_trailing_tool_use(session)
-                            message_text = (
-                                "The read-only lookup's audit record is incomplete. "
-                                "No changes were made; you can safely ask again."
-                            )
-                            session.add_assistant_message(message_text)
-                            return message_text
-                        self._mark_tool_outcome_indeterminate(
-                            user, session, confirmation_exchange=False
+                    action_outcome_uncertain = "outcome is indeterminate" in str(exc)
+                    if tc.name in READONLY_TOOLS and not mutating_action_completed:
+                        self._remove_trailing_tool_use(session)
+                        message_text = (
+                            "The read-only lookup could not be recorded. "
+                            "No changes were made; you can safely ask again."
+                        )
+                        session.add_assistant_message(message_text)
+                        return message_text
+                    if action_outcome_uncertain or mutating_action_completed:
+                        self._mark_tool_batch_indeterminate(
+                            user,
+                            session,
+                            response.tool_calls,
+                            tool_results,
+                            interrupted_index=index,
+                            interrupted_mutation=(
+                                tc.name not in READONLY_TOOLS
+                                and action_outcome_uncertain
+                            ),
                         )
                         return _CHAT_INDETERMINATE_MESSAGE
                     self._remove_trailing_tool_use(session)
@@ -840,12 +934,22 @@ class ChatAgent:
                     session.add_assistant_message(message_text)
                     return message_text
                 if self._cancellation_requested():
-                    self._mark_tool_cancelled(
-                        user,
-                        session,
-                        tool_name=tc.name,
-                        confirmation_exchange=False,
-                    )
+                    if mutating_action_completed or tc.name not in READONLY_TOOLS:
+                        self._mark_tool_batch_indeterminate(
+                            user,
+                            session,
+                            response.tool_calls,
+                            tool_results,
+                            interrupted_index=index,
+                            interrupted_mutation=tc.name not in READONLY_TOOLS,
+                        )
+                    else:
+                        self._mark_tool_cancelled(
+                            user,
+                            session,
+                            tool_name=tc.name,
+                            confirmation_exchange=False,
+                        )
                     raise asyncio.CancelledError
                 tool_results.append(
                     {
@@ -854,6 +958,8 @@ class ChatAgent:
                         "content": result,
                     }
                 )
+                if tc.name not in READONLY_TOOLS:
+                    mutating_action_completed = True
 
             session.add_tool_results(tool_results)
 
