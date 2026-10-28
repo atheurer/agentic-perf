@@ -110,6 +110,33 @@ class SynthesisAgent(AgentBase):
                 f"```\n\n"
             )
 
+        # Include analysis and review results for the
+        # analysis→review→synthesis path (no evaluation/ledger).
+        analysis_result = cf.get("analysis_result")
+        if isinstance(analysis_result, dict):
+            content += "**Analysis Result:**\n"
+            if analysis_result.get("conclusive"):
+                content += "Conclusive finding:\n"
+            else:
+                content += "Inconclusive finding:\n"
+            finding = analysis_result.get("finding", "")
+            if finding:
+                content += f"{finding[:3000]}\n"
+            root_cause = analysis_result.get("root_cause", "")
+            if root_cause:
+                content += f"Root cause: {root_cause[:1000]}\n"
+            content += "\n"
+
+        verdict = cf.get("verdict")
+        review_summary = cf.get("review_summary")
+        if verdict or review_summary:
+            content += "**Review Result:**\n"
+            if verdict:
+                content += f"- Verdict: {verdict}\n"
+            if review_summary:
+                content += f"- Summary: {review_summary[:2000]}\n"
+            content += "\n"
+
         content += (
             "Produce the final Investigation Record summary "
             "by calling submit_synthesis_result.\n"
