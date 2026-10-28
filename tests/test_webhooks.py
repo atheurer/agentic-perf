@@ -415,3 +415,67 @@ class TestServiceAccountRuntimeEnforcement:
         # Runtime enforcement: service_account strips admin
         effective_admin = user.is_admin and not user.service_account
         assert effective_admin is False
+
+
+class TestHorreumAnomalyContext:
+    """Verify anomaly_context fields pass through correctly."""
+
+    def test_metric_is_raw_variable_name(self):
+        """metric should be the raw Horreum variable name for agent resolution."""
+        result = horreum_translator.translate(
+            {
+                "testName": "boot-time-verbose",
+                "change": {
+                    "variable": {
+                        "name": "BOOT KPI - Time to First Container with Network Timestamp ms",
+                    },
+                    "dataset": {"runId": 9287},
+                },
+            }
+        )
+        ctx = result["custom_fields"]["anomaly_context"]
+        assert (
+            ctx["metric"]
+            == "BOOT KPI - Time to First Container with Network Timestamp ms"
+        )
+        assert (
+            ctx["variable_name"]
+            == "BOOT KPI - Time to First Container with Network Timestamp ms"
+        )
+
+    def test_anomaly_context_has_required_fields(self):
+        result = horreum_translator.translate(
+            {
+                "testName": "boot-time-verbose",
+                "change": {
+                    "id": 42,
+                    "variable": {"name": "throughput_mbps", "group": "net"},
+                    "dataset": {"id": 100, "runId": 200, "ordinal": 1},
+                    "description": "Threshold exceeded",
+                    "timestamp": "2026-10-27T10:00:00Z",
+                },
+            }
+        )
+        ctx = result["custom_fields"]["anomaly_context"]
+        assert ctx["source"] == "horreum"
+        assert ctx["test_name"] == "boot-time-verbose"
+        assert ctx["variable_name"] == "throughput_mbps"
+        assert ctx["metric"] == "throughput_mbps"
+        assert ctx["run_id"] == 200
+        assert ctx["change_id"] == 42
+        assert ctx["dataset_id"] == 100
+        assert ctx["variable_group"] == "net"
+
+    def test_empty_variable_name(self):
+        result = horreum_translator.translate(
+            {
+                "testName": "test",
+                "change": {
+                    "variable": {},
+                    "dataset": {"runId": 1},
+                },
+            }
+        )
+        ctx = result["custom_fields"]["anomaly_context"]
+        assert ctx["metric"] == ""
+        assert ctx["variable_name"] == ""
