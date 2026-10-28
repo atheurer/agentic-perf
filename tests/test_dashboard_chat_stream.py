@@ -60,18 +60,20 @@ def test_chat_recovery_ui_explains_reconciliation_and_handles_clear_conflict() -
         "let currentTicketForChat = null;\n"
         "let chatSessionIndeterminate = false;\n"
         "let chatDeliveryPending = false;\n"
+        "let chatRequestInFlight = false;\n"
+        "let chatRecoveryStatusUnavailable = false;\n"
         "let status = 409;\n"
         "const messages = [];\n"
         "const elements = new Map();\n"
         "function element(id) {\n"
-        "  if (!elements.has(id)) elements.set(id, {style: {}, innerHTML: '', textContent: '', disabled: false, querySelector: function(selector) { return selector === 'div' ? this.message : this.button; }, message: {textContent: ''}, button: {style: {}, disabled: false}});\n"
+        "  if (!elements.has(id)) elements.set(id, {style: {}, innerHTML: '', textContent: '', querySelector: function(selector) { if (selector === 'div') return this.message; if (selector === '.chat-recovery-refresh') return this.refreshButton; return this.clearButton; }, message: {textContent: ''}, refreshButton: {style: {}, disabled: false}, clearButton: {style: {}, disabled: false}});\n"
         "  return elements.get(id);\n"
         "}\n"
         "const document = {\n"
         "  getElementById: element,\n"
         "  querySelector: function(selector) {\n"
-        "    if (selector === '#chat-recovery button') return element('chat-recovery').button;\n"
-        "    if (selector === '#ticket-chat-recovery button') return element('ticket-chat-recovery').button;\n"
+        "    if (selector === '#chat-recovery .chat-recovery-clear') return element('chat-recovery').clearButton;\n"
+        "    if (selector === '#ticket-chat-recovery .chat-recovery-clear') return element('ticket-chat-recovery').clearButton;\n"
         "    return null;\n"
         "  }\n"
         "};\n"
@@ -107,7 +109,16 @@ def test_chat_recovery_ui_explains_reconciliation_and_handles_clear_conflict() -
   assert.equal(chatDeliveryPending, true);
   assert.equal(element('chat-recovery').style.display, 'block');
   assert.match(element('chat-recovery').message.textContent, /waiting for browser confirmation/i);
-  assert.equal(element('chat-recovery').button.style.display, 'none');
+  assert.equal(element('chat-recovery').clearButton.style.display, 'none');
+
+  updateChatRecovery(false, false, false, true);
+  assert.equal(chatRequestInFlight, true);
+  assert.equal(element('chat-recovery').style.display, 'block');
+  assert.equal(element('ticket-chat-recovery').style.display, 'block');
+  assert.match(element('chat-recovery').message.textContent, /still running/i);
+  assert.equal(element('chat-recovery').refreshButton.style.display, '');
+  assert.equal(element('ticket-chat-recovery').refreshButton.style.display, '');
+  assert.equal(element('chat-recovery').clearButton.style.display, 'none');
 })().catch(function(error) {
   process.nextTick(function() { throw error; });
 });
@@ -127,6 +138,8 @@ def test_delivery_ack_retries_and_polls_until_recovery_status_changes() -> None:
         "let currentTicketForChat = null;\n"
         "let chatSessionIndeterminate = false;\n"
         "let chatDeliveryPending = false;\n"
+        "let chatRequestInFlight = false;\n"
+        "let chatRecoveryStatusUnavailable = false;\n"
         "let chatRecoveryMonitor = null;\n"
         "const elements = new Map();\n"
         "function element(id) { if (!elements.has(id)) elements.set(id, {style: {}, querySelector: function(selector) { return selector === 'div' ? this.message : this.button; }, message: {textContent: ''}, button: {style: {}, disabled: false}}); return elements.get(id); }\n"
@@ -176,6 +189,7 @@ def test_delivery_recovery_retries_status_after_transient_history_outage() -> No
         "let currentTicketForChat = null;\n"
         "let chatSessionIndeterminate = false;\n"
         "let chatDeliveryPending = false;\n"
+        "let chatRequestInFlight = false;\n"
         "let chatRecoveryStatusUnavailable = false;\n"
         "let chatRecoveryMonitor = null;\n"
         "const elements = new Map();\n"
@@ -215,6 +229,57 @@ def test_delivery_recovery_retries_status_after_transient_history_outage() -> No
     subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 
 
+def test_delivery_monitor_covers_server_watchdog_window() -> None:
+    html = INDEX.read_text(encoding="utf-8")
+    start = html.index("function updateChatRecovery")
+    end = html.index("\nfunction appendChatMessage", start)
+    recovery = html[start:end]
+    script = (
+        "const assert = require('node:assert/strict');\n"
+        "const API = '/api/v1';\n"
+        "let currentTicketForChat = null;\n"
+        "let chatSessionIndeterminate = false;\n"
+        "let chatDeliveryPending = false;\n"
+        "let chatRequestInFlight = false;\n"
+        "let chatRecoveryStatusUnavailable = false;\n"
+        "let chatRecoveryMonitor = null;\n"
+        "const elements = new Map();\n"
+        "function element(id) { if (!elements.has(id)) elements.set(id, {style: {}, querySelector: function(selector) { return selector === 'div' ? this.message : this.button; }, message: {textContent: ''}, button: {style: {}, disabled: false}}); return elements.get(id); }\n"
+        "const document = {getElementById: element, querySelector: function() { return null; }};\n"
+        "function getAuthHeaders() { return {}; }\n"
+        "function appendChatMessage() {}\n"
+        "function renderChatMessages() {}\n"
+        "function updateChatCost() {}\n"
+        "let ackCalls = 0;\n"
+        "let historyCalls = 0;\n"
+        "let fakeNow = 0;\n"
+        "Date.now = function() { return fakeNow; };\n"
+        "const nativeSetTimeout = globalThis.setTimeout;\n"
+        "globalThis.setTimeout = function(callback, delay) { if (delay === 1000) { fakeNow += 1000; return nativeSetTimeout(callback, 0); } return nativeSetTimeout(callback, delay); };\n"
+        "globalThis.fetch = async function(url) {\n"
+        "  if (url === API + '/chat/message/ack') { ackCalls++; return {ok: true, json: async function() { return {acknowledged: false}; }}; }\n"
+        "  if (url === API + '/chat/history') { historyCalls++; const indeterminate = fakeNow >= 30000; return {ok: true, json: async function() { return {indeterminate: indeterminate, delivery_pending: !indeterminate, request_in_flight: false}; }}; }\n"
+        "  throw new Error('unexpected URL ' + url);\n"
+        "};\n"
+        + recovery
+        + r"""
+(async function() {
+  assert.equal(await acknowledgeChatDelivery('request-A'), false);
+  assert.ok(chatRecoveryMonitor);
+  await chatRecoveryMonitor;
+  assert.ok(fakeNow >= 30000);
+  assert.ok(historyCalls >= 32);
+  assert.ok(ackCalls >= 31);
+  assert.equal(chatSessionIndeterminate, true);
+  assert.equal(chatRecoveryMonitor, null);
+})().catch(function(error) {
+  process.nextTick(function() { throw error; });
+});
+"""
+    )
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+
+
 def test_fully_unavailable_delivery_status_keeps_manual_recovery_on_both_surfaces() -> (
     None
 ):
@@ -228,6 +293,7 @@ def test_fully_unavailable_delivery_status_keeps_manual_recovery_on_both_surface
         "let currentTicketForChat = null;\n"
         "let chatSessionIndeterminate = false;\n"
         "let chatDeliveryPending = false;\n"
+        "let chatRequestInFlight = false;\n"
         "let chatRecoveryStatusUnavailable = false;\n"
         "let chatRecoveryMonitor = null;\n"
         "let recoveryAvailable = false;\n"
@@ -254,8 +320,8 @@ def test_fully_unavailable_delivery_status_keeps_manual_recovery_on_both_surface
   assert.ok(chatRecoveryMonitor);
   await chatRecoveryMonitor;
   assert.equal(chatRecoveryMonitor, null);
-  assert.ok(ackCalls <= 18);
-  assert.ok(historyCalls <= 19);
+  assert.ok(ackCalls <= 38);
+  assert.ok(historyCalls <= 38);
   assert.equal(chatRecoveryStatusUnavailable, true);
   assert.equal(element('chat-recovery').style.display, 'block');
   assert.equal(element('ticket-chat-recovery').style.display, 'block');

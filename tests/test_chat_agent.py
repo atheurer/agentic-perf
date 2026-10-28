@@ -1799,6 +1799,7 @@ class TestChatAPI:
 
         assert agent.is_session_indeterminate("alice")
         assert agent._pending_response_deliveries == {}
+        assert agent._sent_response_deliveries == {"alice": "request-A"}
         response = await agent.handle_message("alice", "retry", "token")
         assert "before retrying" in response
         agent._llm.complete.assert_not_awaited()
@@ -1807,6 +1808,25 @@ class TestChatAPI:
         assert agent.mark_response_delivery_complete("alice", "request-A") is True
         assert not agent.is_session_indeterminate("alice")
         assert agent.mark_response_delivery_complete("alice", "request-A") is False
+
+    async def test_delivery_ack_only_resolves_its_user_and_request(self):
+        from agents.chat.agent import ChatAgent
+
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._pending_response_deliveries.update(
+            {"alice": "request-A", "bob": "request-B"}
+        )
+        agent.mark_response_delivery_sent("alice", "request-A")
+        agent.mark_response_delivery_sent("bob", "request-B")
+
+        assert agent.mark_response_delivery_complete("alice", "request-B") is False
+        assert agent._pending_response_deliveries == {
+            "alice": "request-A",
+            "bob": "request-B",
+        }
+        assert agent.mark_response_delivery_complete("alice", "request-A") is True
+        assert agent._pending_response_deliveries == {"bob": "request-B"}
+        assert agent.mark_response_delivery_complete("bob", "request-B") is True
 
     async def test_disconnected_active_mutation_becomes_indeterminate_when_it_finishes(
         self,
@@ -2047,12 +2067,57 @@ class TestChatAPI:
 
         await asyncio.sleep(0.03)
         assert agent.is_session_indeterminate("default")
+        repeated_ack = await chat_api.acknowledge_message_delivery(
+            chat_api.ChatDeliveryAckRequest(delivery_id="request-A"),
+            self._chat_request(agent),
+        )
+        assert repeated_ack == {"acknowledged": False}
+        assert agent.is_session_indeterminate("default")
         release_body_send.set()
         await response_task
 
         assert not agent.is_session_indeterminate("default")
         assert agent._pending_response_deliveries == {}
         assert agent._early_response_delivery_acks == {}
+
+    async def test_failed_asgi_send_cannot_be_acknowledged_as_delivered(self):
+        import state_store.api.chat as chat_api
+        from agents.chat.agent import ChatAgent
+
+        agent = ChatAgent(llm=AsyncMock(), store_url="http://localhost:8090")
+        agent._pending_response_deliveries["default"] = "request-A"
+        response = chat_api._ChatDeliveryJSONResponse(
+            {"response": "complete"}, agent, "default", "request-A"
+        )
+        body_send_started = asyncio.Event()
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message["body"]:
+                body_send_started.set()
+                raise OSError("connection closed before ASGI send completed")
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/api/v1/chat/message",
+            "headers": [],
+        }
+        with pytest.raises(OSError):
+            await response(scope, receive, send)
+        assert body_send_started.is_set()
+        assert agent.is_session_indeterminate("default")
+        assert agent._sent_response_deliveries == {}
+
+        rejected_ack = await chat_api.acknowledge_message_delivery(
+            chat_api.ChatDeliveryAckRequest(delivery_id="request-A"),
+            self._chat_request(agent),
+        )
+        assert rejected_ack == {"acknowledged": False}
+        assert agent.is_session_indeterminate("default")
 
     async def test_cancelled_stalled_asgi_send_keeps_timed_out_guard(self, monkeypatch):
         import agents.chat.agent as chat_agent_module

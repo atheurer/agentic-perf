@@ -1240,6 +1240,14 @@ class ChatAgent:
             timeout = self._delivery_timeouts.pop(user, None)
             if timeout is not None:
                 timeout.cancel()
+        if (
+            indeterminate_id == delivery_id
+            and self._sent_response_deliveries.get(user) != delivery_id
+        ):
+            # A repeated ACK is not evidence that ASGI finished sending this
+            # response. Retain it for a possible later successful completion.
+            self._early_response_delivery_acks[user] = delivery_id
+            return False
         if indeterminate_id != delivery_id:
             return True
         self._delivery_indeterminate_ids.pop(user, None)
@@ -1265,9 +1273,10 @@ class ChatAgent:
             return
         if self._pending_response_deliveries.get(user) == delivery_id:
             self._pending_response_deliveries.pop(user, None)
-            self._sent_response_deliveries.pop(user, None)
             # Preserve an early ACK until a late ASGI send completion can
-            # validate it. A later explicit ACK can also clear this pause.
+            # validate it. A sent marker is preserved only when ASGI had
+            # already completed, allowing ACK-timeout recovery but not send
+            # failure recovery.
             send_timeout = self._delivery_send_timeouts.pop(user, None)
             if send_timeout is not None:
                 send_timeout.cancel()

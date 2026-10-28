@@ -2677,7 +2677,12 @@ async function renderDetail(ticketId) {
       if (chatSection) {
         chatSection.style.display = 'block';
         restoreChatHeight('ticket-chat-messages');
-        updateChatRecovery(chatSessionIndeterminate, chatDeliveryPending);
+        updateChatRecovery(
+          chatSessionIndeterminate,
+          chatDeliveryPending,
+          chatRecoveryStatusUnavailable,
+          chatRequestInFlight,
+        );
       }
       var globalChat = document.getElementById('chat-container');
       if (globalChat) globalChat.style.display = 'none';
@@ -4769,6 +4774,7 @@ var chatEnabled = false;
 var currentTicketForChat = null;
 var chatSessionIndeterminate = false;
 var chatDeliveryPending = false;
+var chatRequestInFlight = false;
 var chatRecoveryStatusUnavailable = false;
 var chatRecoveryMonitor = null;
 
@@ -4812,7 +4818,12 @@ async function initChat() {
       chatEnabled = true;
       document.getElementById('chat-container').style.display = 'block';
       var data = await r.json();
-      updateChatRecovery(!!data.indeterminate, !!data.delivery_pending);
+      updateChatRecovery(
+        !!data.indeterminate,
+        !!data.delivery_pending,
+        false,
+        !!data.request_in_flight,
+      );
       renderChatMessages('chat-messages', data.messages || []);
       updateChatCost(data.usage || {});
       restoreChatHeight('chat-messages');
@@ -4845,20 +4856,23 @@ function renderChatMessages(containerId, messages) {
   el.scrollTop = el.scrollHeight;
 }
 
-function updateChatRecovery(indeterminate, deliveryPending, statusUnavailable) {
+function updateChatRecovery(indeterminate, deliveryPending, statusUnavailable, requestInFlight) {
   chatSessionIndeterminate = !!indeterminate;
   chatDeliveryPending = !!deliveryPending;
+  chatRequestInFlight = !!requestInFlight;
   chatRecoveryStatusUnavailable = !!statusUnavailable;
   ['chat-recovery', 'ticket-chat-recovery'].forEach(function(id) {
     var el = document.getElementById(id);
     if (!el) return;
-    el.style.display = (chatSessionIndeterminate || chatDeliveryPending || chatRecoveryStatusUnavailable) ? 'block' : 'none';
+    el.style.display = (chatSessionIndeterminate || chatDeliveryPending || chatRequestInFlight || chatRecoveryStatusUnavailable) ? 'block' : 'none';
     var message = el.querySelector('div');
     if (message) {
       message.textContent = chatRecoveryStatusUnavailable
         ? 'Chat status is temporarily unavailable. Refresh status before retrying; if an action may have run, reconcile its external state before continuing.'
         : chatDeliveryPending && !chatSessionIndeterminate
         ? 'A chat response is waiting for browser confirmation. Keep this page open; if it disconnects, check chat status before retrying.'
+        : chatRequestInFlight && !chatSessionIndeterminate
+        ? 'A chat request is still running. Refresh status before retrying; an action may complete while it is in flight.'
         : 'Chat is paused because an action may have completed or its audit record is incomplete. Reconcile any external effect and the audit history before clearing chat and trying again. This pause is held only in the current server process; after a restart, inspect the action and audit history before retrying.';
     }
     var refreshButton = el.querySelector('.chat-recovery-refresh');
@@ -4879,14 +4893,29 @@ async function refreshChatRecoveryStatus(deadline) {
     if (controller) options.signal = controller.signal;
     var r = await fetch(API + '/chat/history', options);
     if (!r.ok) {
-      updateChatRecovery(chatSessionIndeterminate, chatDeliveryPending, true);
+      updateChatRecovery(
+        chatSessionIndeterminate,
+        chatDeliveryPending,
+        true,
+        chatRequestInFlight,
+      );
       return null;
     }
     var data = await r.json();
-    updateChatRecovery(!!data.indeterminate, !!data.delivery_pending);
+    updateChatRecovery(
+      !!data.indeterminate,
+      !!data.delivery_pending,
+      false,
+      !!data.request_in_flight,
+    );
     return data;
   } catch(e) {
-    updateChatRecovery(chatSessionIndeterminate, chatDeliveryPending, true);
+    updateChatRecovery(
+      chatSessionIndeterminate,
+      chatDeliveryPending,
+      true,
+      chatRequestInFlight,
+    );
     return null;
   } finally {
     if (timeout) clearTimeout(timeout);
@@ -4931,8 +4960,8 @@ async function refreshChatRecoveryManually() {
 function startChatRecoveryMonitor(deliveryId) {
   if (chatRecoveryMonitor) return;
   chatRecoveryMonitor = (async function() {
-    var deadline = Date.now() + 30000;
-    for (var attempt = 0; attempt < 15 && Date.now() < deadline; attempt++) {
+    var deadline = Date.now() + 35000;
+    for (var attempt = 0; attempt < 35 && Date.now() < deadline; attempt++) {
       if (deliveryId) await postChatDeliveryAck(deliveryId, deadline);
       if (Date.now() >= deadline) break;
       var status = await refreshChatRecoveryStatus(deadline);
@@ -4941,7 +4970,7 @@ function startChatRecoveryMonitor(deliveryId) {
         if (!status.delivery_pending && !status.request_in_flight) return;
       }
       var remaining = deadline - Date.now();
-      if (attempt < 14 && remaining > 0) {
+      if (attempt < 34 && remaining > 0) {
         await new Promise(function(resolve) {
           setTimeout(resolve, Math.min(1000, remaining));
         });
