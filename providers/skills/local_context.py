@@ -26,6 +26,13 @@ class LocalContextSource:
         self.manifest_path = Path(manifest_path).resolve()
         self.root = Path(root).resolve() if root else self.manifest_path.parent
 
+    @property
+    def binding_identity(self) -> str:
+        """Identify the configured source without exposing its local paths."""
+        return hashlib.sha256(
+            f"{self.root}\0{self.manifest_path}".encode("utf-8")
+        ).hexdigest()
+
     @staticmethod
     def _values(value: Any) -> list[str]:
         if value is None:
