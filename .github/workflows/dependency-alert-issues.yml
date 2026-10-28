@@ -1,0 +1,27 @@
+name: Python vulnerability issues
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  vulnerability-alerts: read
+
+concurrency:
+  group: python-vulnerability-issues
+  cancel-in-progress: false
+
+jobs:
+  create-issues:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const { syncAlerts } = require('./scripts/dependency_alert_issues.cjs');
+            await syncAlerts(github, context.repo.owner, context.repo.repo);

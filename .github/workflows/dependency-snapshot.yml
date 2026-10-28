@@ -1,0 +1,27 @@
+name: Python dependency inventory
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: python-dependency-inventory
+  cancel-in-progress: false
+
+jobs:
+  submit:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Submit locked Python dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          python3 scripts/dependency_snapshot.py |
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/dependency-graph/snapshots" --input -
