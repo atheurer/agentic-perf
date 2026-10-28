@@ -6,6 +6,7 @@ state transitions, and dispatcher integration.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -61,6 +62,21 @@ class TestAgentConstruction:
 
 
 class TestMessageBuilding:
+    @staticmethod
+    def _message_content(custom_fields):
+        from agents.synthesis.agent import SynthesisAgent
+        from providers.llm.mock import MockLLMProvider
+
+        agent = SynthesisAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        messages = agent._build_messages(
+            {"summary": "Synthesis fixture", "custom_fields": custom_fields}
+        )
+        assert messages[0]["role"] == "user"
+        return messages[0]["content"]
+
     def test_includes_investigation_context(self):
         from agents.synthesis.agent import SynthesisAgent
         from providers.llm.mock import MockLLMProvider
@@ -105,6 +121,144 @@ class TestMessageBuilding:
         assert "0.95" in content
         assert "high concurrency" in content
         assert "low queue depth" in content
+
+    @pytest.mark.parametrize(
+        ("conclusive", "expected_label"),
+        [
+            (True, "Conclusive finding:"),
+            (False, "Inconclusive finding:"),
+        ],
+    )
+    def test_renders_analysis_and_review_producer_fields(
+        self, conclusive, expected_label
+    ):
+        content = self._message_content(
+            {
+                "analysis_result": {
+                    "conclusive": conclusive,
+                    "finding": "Throughput fell 12% across 8 runs.",
+                    "root_cause": "The queue depth was reduced.",
+                },
+                "verdict": "hypothesis_confirmed",
+                "review_summary": "The measured results support the hypothesis.",
+            }
+        )
+
+        assert expected_label in content
+        assert "Throughput fell 12% across 8 runs." in content
+        assert "Root cause: The queue depth was reduced." in content
+        assert "Verdict: hypothesis_confirmed" in content
+        assert "Summary: The measured results support the hypothesis." in content
+
+    @pytest.mark.asyncio
+    async def test_synthesis_consumes_analysis_and_review_fallback_fields(self):
+        from agents.analyze.agent import AnalyzeAgent
+        from agents.review.agent import ReviewAgent
+        from providers.llm.base import LLMResponse
+        from providers.llm.mock import MockLLMProvider
+
+        analysis_result = {
+            "conclusive": True,
+            "finding": {"metric": "throughput", "delta_percent": -12},
+            "root_cause": ["queue depth", "driver setting"],
+        }
+        analyze_agent = AnalyzeAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        analyze_agent._update_fields = AsyncMock()
+        analyze_agent._add_comment = AsyncMock()
+        analyze_agent._plan_controls_next_transition = AsyncMock(return_value=True)
+        await analyze_agent._handle_completion(
+            "PERF-PRODUCER-1",
+            LLMResponse(text=json.dumps(analysis_result)),
+        )
+        analysis_fields = analyze_agent._update_fields.await_args.args[1]
+
+        review_result = {
+            "review_summary": {"headline": "The result supports the hypothesis."},
+            "verdict": "hypothesis_confirmed",
+            "detailed_analysis": "The measured difference was 12%.",
+        }
+        review_agent = ReviewAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        review_agent._update_fields = AsyncMock()
+        review_agent._add_comment = AsyncMock()
+        review_agent._plan_controls_next_transition = AsyncMock(return_value=True)
+        await review_agent._handle_completion(
+            "PERF-PRODUCER-1",
+            LLMResponse(text=json.dumps(review_result)),
+        )
+        review_fields = review_agent._update_fields.await_args.args[1]
+
+        content = self._message_content(analysis_fields | review_fields)
+
+        assert analysis_fields["analysis_result"] == analysis_result
+        assert review_fields["review_summary"] == review_result["review_summary"]
+        assert '"metric": "throughput"' in content
+        assert '"delta_percent": -12' in content
+        assert "queue depth" in content
+        assert "Verdict: hypothesis_confirmed" in content
+        assert '"headline": "The result supports the hypothesis."' in content
+
+    def test_serializes_structured_results_and_does_not_infer_missing_status(self):
+        content = self._message_content(
+            {
+                "analysis_result": {
+                    "finding": {"metric": "throughput", "samples": [92, 88]},
+                    "root_cause": ["queue depth", "driver setting"],
+                },
+                "verdict": {"result": "hypothesis_refuted"},
+                "review_summary": ["The baseline comparison was inconclusive."],
+            }
+        )
+
+        assert "Finding (conclusive status not provided):" in content
+        assert "Conclusive finding:" not in content
+        assert "Inconclusive finding:" not in content
+        assert '"metric": "throughput"' in content
+        assert '"samples": [\n    92,\n    88\n  ]' in content
+        assert '[\n  "queue depth",\n  "driver setting"\n]' in content
+        assert '"result": "hypothesis_refuted"' in content
+        assert '"The baseline comparison was inconclusive."' in content
+
+    def test_bounds_analysis_and_review_result_context(self):
+        content = self._message_content(
+            {
+                "analysis_result": {
+                    "conclusive": True,
+                    "finding": "f" * 4000,
+                    "root_cause": "r" * 1500,
+                },
+                "verdict": "v" * 700,
+                "review_summary": "s" * 2500,
+            }
+        )
+
+        analysis = content.split("Conclusive finding:\n", 1)[1].split(
+            "\n\n**Review Result:**", 1
+        )[0]
+        finding = analysis.split("\nRoot cause:", 1)[0]
+        root_cause = next(
+            line for line in analysis.splitlines() if line.startswith("Root cause: ")
+        )
+        verdict = next(
+            line for line in content.splitlines() if line.startswith("- Verdict: ")
+        )
+        summary = next(
+            line for line in content.splitlines() if line.startswith("- Summary: ")
+        )
+
+        assert len(finding) <= 3000
+        assert finding.endswith("...[truncated]")
+        assert len(root_cause.removeprefix("Root cause: ")) <= 1000
+        assert root_cause.endswith("...[truncated]")
+        assert len(verdict.removeprefix("- Verdict: ")) <= 500
+        assert verdict.endswith("...[truncated]")
+        assert len(summary.removeprefix("- Summary: ")) <= 2000
+        assert summary.endswith("...[truncated]")
 
 
 # --- Operational metrics ---

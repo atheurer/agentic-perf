@@ -21,6 +21,7 @@ from typing import Any
 
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
+from agents.prompt_context import bounded_prompt_value
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse
 
@@ -115,20 +116,23 @@ class SynthesisAgent(AgentBase):
         analysis_result = cf.get("analysis_result")
         if isinstance(analysis_result, dict):
             content += "**Analysis Result:**\n"
-            if analysis_result.get("conclusive"):
+            conclusive = analysis_result.get("conclusive")
+            if conclusive is True:
                 content += "Conclusive finding:\n"
-            else:
+            elif conclusive is False:
                 content += "Inconclusive finding:\n"
-            finding = analysis_result.get("finding", "")
+            else:
+                content += "Finding (conclusive status not provided):\n"
+            finding = bounded_prompt_value(analysis_result.get("finding"), 3000)
             if finding:
-                content += f"{finding[:3000]}\n"
-            root_cause = analysis_result.get("root_cause", "")
+                content += f"{finding}\n"
+            root_cause = bounded_prompt_value(analysis_result.get("root_cause"), 1000)
             if root_cause:
-                content += f"Root cause: {root_cause[:1000]}\n"
+                content += f"Root cause: {root_cause}\n"
             content += "\n"
 
-        verdict = cf.get("verdict")
-        review_summary = cf.get("review_summary")
+        verdict = bounded_prompt_value(cf.get("verdict"), 500)
+        review_summary = bounded_prompt_value(cf.get("review_summary"), 2000)
         if verdict or review_summary:
             content += "**Review Result:**\n"
             if verdict:

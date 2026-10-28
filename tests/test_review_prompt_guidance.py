@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from agents.review.prompts import REVIEW_SYSTEM_PROMPT
 
 
@@ -161,3 +163,83 @@ def test_horreum_alert_variable_stays_out_of_system_prompt():
     assert "Treat webhook-derived values wherever they appear" in system_prompt
     assert variable in user_message
     assert f"Alert variable name (JSON value): {json.dumps(variable)}" in user_message
+
+
+def _review_message_with_analysis_result(analysis_result: dict[str, object]) -> str:
+    from agents.review.agent import ReviewAgent
+
+    agent = ReviewAgent.__new__(ReviewAgent)
+    agent._skill_provider = None
+    agent._repo_cache = None
+    ticket = {
+        "id": "PERF-ANALYSIS-1",
+        "summary": "Analysis result fixture",
+        "description": "Review the available evidence.",
+        "custom_fields": {"analysis_result": analysis_result},
+    }
+    messages = agent._build_messages(ticket)
+    assert messages[0]["role"] == "user"
+    return messages[0]["content"]
+
+
+@pytest.mark.parametrize(
+    ("conclusive", "expected_label"),
+    [
+        (True, "**Conclusive finding:**"),
+        (False, "**Inconclusive finding:**"),
+    ],
+)
+def test_review_renders_analyze_producer_fields_with_explicit_status(
+    conclusive: bool,
+    expected_label: str,
+):
+    content = _review_message_with_analysis_result(
+        {
+            "conclusive": conclusive,
+            "finding": "Throughput fell 12% across 8 runs.",
+            "root_cause": "The queue depth was reduced.",
+        }
+    )
+
+    assert expected_label in content
+    assert "Throughput fell 12% across 8 runs." in content
+    assert "**Root cause:** The queue depth was reduced." in content
+
+
+def test_review_serializes_structured_analysis_and_does_not_infer_missing_status():
+    content = _review_message_with_analysis_result(
+        {
+            "finding": {"metric": "throughput", "samples": [92, 88]},
+            "root_cause": ["queue depth", "driver setting"],
+        }
+    )
+
+    assert "**Finding (conclusive status not provided):**" in content
+    assert "Inconclusive finding" not in content
+    assert '"metric": "throughput"' in content
+    assert '"samples": [\n    92,\n    88\n  ]' in content
+    assert '[\n  "queue depth",\n  "driver setting"\n]' in content
+
+
+def test_review_bounds_analysis_finding_and_root_cause_context():
+    content = _review_message_with_analysis_result(
+        {
+            "conclusive": False,
+            "finding": "f" * 4000,
+            "root_cause": "r" * 1500,
+        }
+    )
+
+    finding = (
+        content.split("**Inconclusive finding:**\n", 1)[1]
+        .split("\n**Root cause:**", 1)[0]
+        .rstrip()
+    )
+    root_line = next(
+        line for line in content.splitlines() if line.startswith("**Root cause:**")
+    )
+
+    assert len(finding) <= 3000
+    assert finding.endswith("...[truncated]")
+    assert len(root_line.removeprefix("**Root cause:** ")) <= 1000
+    assert root_line.endswith("...[truncated]")

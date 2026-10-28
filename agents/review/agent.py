@@ -7,6 +7,7 @@ from typing import Any
 
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
+from agents.prompt_context import bounded_prompt_value
 from agents.skill_context import skill_context_prompt
 from providers.events import EventBus
 from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
@@ -492,16 +493,19 @@ class ReviewAgent(AgentBase):
         analysis_result = cf.get("analysis_result")
         if isinstance(analysis_result, dict):
             content += "\n## Prior Analysis Result\n"
-            if analysis_result.get("conclusive"):
+            conclusive = analysis_result.get("conclusive")
+            if conclusive is True:
                 content += "**Conclusive finding:**\n"
-            else:
+            elif conclusive is False:
                 content += "**Inconclusive finding:**\n"
-            finding = analysis_result.get("finding", "")
+            else:
+                content += "**Finding (conclusive status not provided):**\n"
+            finding = bounded_prompt_value(analysis_result.get("finding"), 3000)
             if finding:
-                content += f"{finding[:3000]}\n"
-            root_cause = analysis_result.get("root_cause", "")
+                content += f"{finding}\n"
+            root_cause = bounded_prompt_value(analysis_result.get("root_cause"), 1000)
             if root_cause:
-                content += f"\n**Root cause:** {root_cause[:1000]}\n"
+                content += f"\n**Root cause:** {root_cause}\n"
 
         # Pre-scan local artifacts so the LLM doesn't need
         # to discover them via SSH trial-and-error.
