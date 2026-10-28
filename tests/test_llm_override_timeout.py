@@ -141,6 +141,43 @@ class TestLLMOverrideTimeout:
         assert agent.llm is provider
         assert agent.llm.default_timeout == 120
 
+    async def test_omitted_timeout_inherits_agent_setting(self) -> None:
+        config = _make_config({"agent_models": {"benchmark": {"timeout": 600}}})
+        agent, _ = await _run_override(config, _make_ticket({"model": "custom"}))
+        assert agent.llm.default_timeout == 600
+
+    async def test_ticket_timeout_takes_precedence_over_agent(self) -> None:
+        config = _make_config({"agent_models": {"benchmark": {"timeout": 600}}})
+        agent, _ = await _run_override(config, _make_ticket({"timeout": 300}))
+        assert agent.llm.default_timeout == 300
+
+    async def test_ticket_can_disable_agent_timeout(self) -> None:
+        config = _make_config({"agent_models": {"benchmark": {"timeout": 600}}})
+        agent, _ = await _run_override(config, _make_ticket({"timeout": 0}))
+        assert agent.llm.default_timeout == 0
+
+    async def test_invalid_ticket_timeout_inherits_agent_setting(self) -> None:
+        config = _make_config({"agent_models": {"benchmark": {"timeout": 600}}})
+        agent, _ = await _run_override(config, _make_ticket({"timeout": -1}))
+        assert agent.llm.default_timeout == 600
+
+    async def test_ticket_model_selects_its_builtin_timeout(self) -> None:
+        glm = "rits/zai-org/glm-5-3"
+        config = _make_config()
+        agent, _ = await _run_override(config, _make_ticket({"model": glm}))
+        assert agent.llm.default_timeout == 600
+
+    async def test_ticket_model_uses_configured_model_timeout(self) -> None:
+        glm = "rits/zai-org/glm-5-3"
+        config = _make_config({"llm": {"model_timeouts": {glm: 900}}})
+        agent, _ = await _run_override(config, _make_ticket({"model": glm}))
+        assert agent.llm.default_timeout == 900
+
+    async def test_ticket_other_model_does_not_inherit_glm_timeout(self) -> None:
+        config = _make_config({"llm": {"model": "rits/zai-org/glm-5-3"}})
+        agent, _ = await _run_override(config, _make_ticket({"model": "other"}))
+        assert agent.llm.default_timeout == 120
+
     async def test_timeout_as_string_coerced(self) -> None:
         """Numeric string timeout is coerced to float."""
         config = _make_config()

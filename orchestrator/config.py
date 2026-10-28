@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +63,11 @@ def _load_config_file(*, strict: bool = False) -> dict:
 
 
 class OrchestratorConfig:
+    # Exact gateway model IDs: slow reasoning models can need more time per call.
+    _BUILTIN_MODEL_TIMEOUTS: dict[str, float] = {
+        "rits/zai-org/glm-5-3": 600.0,
+    }
+
     _BUILTIN_AGENT_ITERATIONS: dict[str, int] = {
         "review": 50,
         "platform": 10,
@@ -186,7 +192,7 @@ class OrchestratorConfig:
         self.ssh_key_vault_secret = os.environ.get("SSH_KEY_VAULT_SECRET") or cfg.get(
             "ssh_key_vault_secret"
         )
-        self._agent_models: dict[str, dict[str, str]] = cfg.get("agent_models", {})
+        self._agent_models: dict[str, dict[str, Any]] = cfg.get("agent_models", {})
         if "default" in self._agent_models:
             logger.warning(
                 "agent_models.default is deprecated and "
@@ -242,6 +248,10 @@ class OrchestratorConfig:
             "timeout",
             120.0,
         )
+        self._model_timeouts = llm_cfg.get("model_timeouts", {})
+        if not isinstance(self._model_timeouts, dict):
+            logger.warning("llm.model_timeouts must be an object; ignoring it")
+            self._model_timeouts = {}
 
         # Max output tokens for a single LLM completion. Applies
         # to agents without a more specific override (see
@@ -322,7 +332,7 @@ class OrchestratorConfig:
         # guidance summary classification) without LLM calls.
         self.introspection_llm: bool = introspection_cfg.get("llm", True)
 
-    def get_agent_llm_config(self, agent_type: str) -> dict[str, str]:
+    def get_agent_llm_config(self, agent_type: str) -> dict[str, Any]:
         """Get LLM provider/model config for an agent type.
 
         Layers (later wins per-key):
@@ -363,6 +373,41 @@ class OrchestratorConfig:
         if base.get("provider") == "openai" and "api" not in base:
             base["api"] = self.llm_api
         return base
+
+    @staticmethod
+    def _configured_timeout(value: Any, source: str) -> float | None:
+        """Parse a timeout without logging potentially sensitive values."""
+        if value is None:
+            return None
+        try:
+            if isinstance(value, bool):
+                raise TypeError("timeout must not be boolean")
+            timeout = float(value)
+            if not math.isfinite(timeout) or timeout < 0:
+                raise ValueError("timeout must be finite and non-negative")
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("Invalid %s; using the next timeout default", source)
+            return None
+        return timeout
+
+    def get_agent_llm_timeout(
+        self, agent_type: str, *, model: str | None = None
+    ) -> float:
+        """Resolve timeout by agent, selected model, then global default."""
+        agent_cfg = self._agent_models.get(agent_type, {})
+        timeout = self._configured_timeout(
+            agent_cfg.get("timeout"), f"agent_models.{agent_type}.timeout"
+        )
+        if timeout is not None:
+            return timeout
+        if model is None:
+            model = self.get_agent_llm_config(agent_type).get("model") or self.llm_model
+        timeout = self._configured_timeout(
+            self._model_timeouts.get(model), f"llm.model_timeouts[{model!r}]"
+        )
+        if timeout is not None:
+            return timeout
+        return self._BUILTIN_MODEL_TIMEOUTS.get(model, self.llm_timeout)
 
     def get_agent_max_iterations(self, agent_type: str) -> int | None:
         """Get max_iterations for an agent type.
@@ -698,7 +743,7 @@ def build_redacted_config(
         except (ValueError, TypeError):
             continue
 
-    safe_agent_models: dict[str, dict[str, str]] = {}
+    safe_agent_models: dict[str, dict[str, Any]] = {}
     for k, v in config._agent_models.items():
         if not isinstance(v, dict):
             continue
@@ -707,6 +752,16 @@ def build_redacted_config(
             "model": str(v.get("model", "")),
             "api_key_secret_configured": v.get("api_key_secret") is not None,
         }
+        if "timeout" in v:
+            safe_agent_models[str(k)]["timeout"] = config.get_agent_llm_timeout(k)
+
+    safe_model_timeouts: dict[str, float] = dict(config._BUILTIN_MODEL_TIMEOUTS)
+    for model, value in config._model_timeouts.items():
+        if not isinstance(model, str):
+            continue
+        timeout = config._configured_timeout(value, f"llm.model_timeouts[{model!r}]")
+        if timeout is not None:
+            safe_model_timeouts[model] = timeout
 
     snapshot: dict = {
         "instance_name": config.instance_name,
@@ -741,6 +796,7 @@ def build_redacted_config(
             "api": config.llm_api,
             "api_key_secret_configured": config.llm_api_key_secret is not None,
             "timeout": config.llm_timeout,
+            "model_timeouts": safe_model_timeouts,
             "max_tokens": config.llm_max_tokens,
             "reasoning_effort": config.llm_reasoning_effort,
         },

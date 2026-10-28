@@ -301,6 +301,7 @@ overridden by `agent_models`.
 | `gemini_api_key` | string | — | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | API key for Gemini provider |
 | `api_key_secret` | string | — | — | Secret path resolved through the configured secrets provider for agents using the global provider |
 | `timeout` | float | `120` | `LLM_TIMEOUT` | Per-request timeout in seconds. `0` disables. |
+| `model_timeouts` | object | `{}` | — | Overrides for built-in request-timeout defaults, keyed by exact model ID. `0` disables the timeout for that model. |
 | `max_tokens` | int | `8000` | `LLM_MAX_TOKENS` | Maximum output-token budget per completion. Reasoning tokens share this budget where supported. |
 | `reasoning_effort` | string | — | `LLM_REASONING_EFFORT` | Global reasoning effort level: `"low"`, `"medium"`, `"high"`. Provider-specific values also accepted (e.g. Claude's `"xhigh"`/`"max"`, Gemini's `"minimal"`). Startup validation probes each model with its configured effort; an incompatible combination (e.g. `reasoning_effort` on a model without extended thinking) logs an error naming the affected agents. |
 
@@ -430,12 +431,34 @@ only when you want a specific agent to use a different model.
 2. `llm.*` — global default
 
 Each override object supports `provider`, `model`, `api`, `api_key_secret`,
-`reasoning_effort`, and `max_tokens` keys. The `api` key is honored both at
-startup validation and at runtime when the override selects the `openai`
+`reasoning_effort`, `max_tokens`, and `timeout` keys. The `api` key is honored
+both at startup validation and at runtime when the override selects the `openai`
 provider. A per-agent
 `reasoning_effort` is probed at startup alongside the model; if the model
 does not support it, the log names the affected agent(s) and suggests
 removing `reasoning_effort` or switching models.
+
+Timeouts are resolved in order: ticket `llm_override.timeout`, agent
+`agent_models.<type>.timeout`, configured `llm.model_timeouts` for the selected
+model, the built-in model default, then global `llm.timeout`. The exact EnMaaS
+model `rits/zai-org/glm-5-3` has a built-in 600-second default. An administrator
+can override it in `config.json`:
+
+```json
+{
+    "llm": {
+        "timeout": 120,
+        "model_timeouts": {
+            "rits/zai-org/glm-5-3": 900
+        }
+    }
+}
+```
+
+An agent may set its own `timeout` beside its model to override that model's
+default. Values are per-request seconds; `0` disables the timeout. Invalid
+model and agent timeouts are ignored with a warning. The startup model probe
+retains its separate 10-second limit.
 
 > **Breaking change:** `agent_models.default` and built-in per-agent
 > model overrides have been removed. All agents now use `llm.model`
@@ -499,9 +522,9 @@ Supported fields:
 | `max_tokens` | int | Maximum output tokens |
 | `timeout` | float | LLM call timeout in seconds (0 = no timeout) |
 
-When `timeout` is omitted, the global `llm.timeout` from config
-applies. When the entire `llm_override` block is omitted, the
-per-agent model configuration applies normally.
+When `timeout` is omitted, the per-agent timeout, selected-model timeout, or
+global `llm.timeout` applies in that order. When the entire `llm_override`
+block is omitted, the per-agent model configuration applies normally.
 
 This override is cleared after the agent completes.
 

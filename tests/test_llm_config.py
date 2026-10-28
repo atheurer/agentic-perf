@@ -5,7 +5,10 @@ from __future__ import annotations
 import logging
 from unittest.mock import patch
 
+import pytest
+
 from orchestrator.config import OrchestratorConfig
+from orchestrator.main import _make_llm_factory
 
 
 class TestModelConfigLayering:
@@ -118,3 +121,98 @@ class TestModelConfigLayering:
         result = config.get_agent_llm_config("triage")
         assert result["model"] == "claude-sonnet-4-6"
         assert "agent_models.default is deprecated" in caplog.text
+
+
+class TestAgentTimeout:
+    def test_builtin_timeout_follows_model_across_agents(self, monkeypatch):
+        monkeypatch.delenv("LLM_TIMEOUT", raising=False)
+        glm = "rits/zai-org/glm-5-3"
+        config = OrchestratorConfig(
+            raw_config={
+                "llm": {"provider": "mock", "model": glm, "timeout": 120},
+                "agent_models": {
+                    "review": {"model": glm},
+                    "triage": {"model": "another-model"},
+                },
+            }
+        )
+        factory = _make_llm_factory(config)
+        assert factory("review").default_timeout == 600
+        assert factory("benchmark").default_timeout == 600
+        assert factory("triage").default_timeout == 120
+
+    @pytest.mark.parametrize("configured", [0, 900])
+    def test_configured_model_timeout_overrides_builtin(self, configured, monkeypatch):
+        monkeypatch.delenv("LLM_TIMEOUT", raising=False)
+        glm = "rits/zai-org/glm-5-3"
+        config = OrchestratorConfig(
+            raw_config={
+                "llm": {
+                    "provider": "mock",
+                    "model": glm,
+                    "model_timeouts": {glm: configured},
+                },
+            }
+        )
+        assert _make_llm_factory(config)("benchmark").default_timeout == configured
+
+    def test_per_agent_timeout_overrides_model_default(self, monkeypatch):
+        monkeypatch.delenv("LLM_TIMEOUT", raising=False)
+        glm = "rits/zai-org/glm-5-3"
+        config = OrchestratorConfig(
+            raw_config={
+                "llm": {"provider": "mock", "model": glm, "model_timeouts": {glm: 900}},
+                "agent_models": {"review": {"timeout": 300}},
+            }
+        )
+        factory = _make_llm_factory(config)
+        assert factory("review").default_timeout == 300
+        assert factory("benchmark").default_timeout == 900
+
+    def test_invalid_configured_model_timeout_falls_back_to_builtin(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.delenv("LLM_TIMEOUT", raising=False)
+        glm = "rits/zai-org/glm-5-3"
+        config = OrchestratorConfig(
+            raw_config={"llm": {"model": glm, "model_timeouts": {glm: -1}}}
+        )
+        assert _make_llm_factory(config)("review").default_timeout == 600
+        assert "Invalid llm.model_timeouts" in caplog.text
+
+    def test_factory_uses_per_agent_timeout_and_global_fallback(self, monkeypatch):
+        monkeypatch.delenv("LLM_TIMEOUT", raising=False)
+        config = OrchestratorConfig(
+            raw_config={
+                "llm": {"provider": "mock", "timeout": 120},
+                "agent_models": {
+                    "review": {"model": "glm", "timeout": 600},
+                    "introspection": {"timeout": 0},
+                },
+            }
+        )
+        factory = _make_llm_factory(config)
+        assert factory("review").default_timeout == 600
+        assert factory("triage").default_timeout == 120
+        assert factory("introspection").default_timeout == 0
+
+    @pytest.mark.parametrize(
+        "value", [True, False, -1, "bad", float("nan"), float("inf"), [], {}]
+    )
+    def test_invalid_timeout_warns_and_uses_global(self, value, monkeypatch, caplog):
+        monkeypatch.delenv("LLM_TIMEOUT", raising=False)
+        config = OrchestratorConfig(
+            raw_config={
+                "llm": {"provider": "mock", "timeout": 120},
+                "agent_models": {"review": {"timeout": value}},
+            }
+        )
+        assert _make_llm_factory(config)("review").default_timeout == 120
+        assert "Invalid agent_models.review.timeout" in caplog.text
+
+    def test_numeric_string_is_accepted(self, monkeypatch):
+        monkeypatch.delenv("LLM_TIMEOUT", raising=False)
+        config = OrchestratorConfig(
+            raw_config={"agent_models": {"review": {"timeout": "600"}}}
+        )
+        assert _make_llm_factory(config)("review").default_timeout == 600
