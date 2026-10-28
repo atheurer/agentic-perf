@@ -34,3 +34,12 @@ directory exemptions are rejected.
 The filesystem, HTTP, SSH, and subprocess inventories remain complementary.
 They inventory execution primitives; this policy ensures a new agent action
 cannot become visible to an LLM without the correlated tool audit contract.
+
+Kernel transitions add a second approval kind, `kernel_change`. It binds to
+the immutable intent record `prepare_kernel_change` persists under
+`custom_fields.kernel_change_intents`, carries the intent digest in both
+digest fields, and is consumed by whichever kernel tool performs the
+intent's first mutating action (`install_kernel`, `select_default_kernel`
+or `reboot_hosts_and_verify`). Later actions verify the consumed binding
+and the intent's recorded progress; a consumed approval cannot be spent by
+the other kind, and expired approvals are rejected at consumption.

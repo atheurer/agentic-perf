@@ -1244,16 +1244,18 @@ async def test_each_registered_mcp_name_gets_a_correlated_audit_pair() -> None:
             middleware._record = original_record
             middleware.ticket_id = original_ticket_id
             middleware.agent_id = original_agent_id
+        from agents.mcp_audit import _PROTECTED_TOOLS as _protected
+
         expected_terminal = (
             LifecycleState.REJECTED
-            if tool_name in {"execute_benchmark"}
+            if tool_name in _protected
             else LifecycleState.RESPONSE_SENT
         )
         assert [event.lifecycle.state for event in events] == [
             LifecycleState.REQUEST_RECEIVED,
             expected_terminal,
         ], registration.key
-        if tool_name in {"execute_benchmark"}:
+        if tool_name in _protected:
             assert result.is_error
         else:
             assert result == {"policy_probe": tool_name}

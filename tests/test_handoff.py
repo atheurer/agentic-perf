@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.handoff import check_handoff
 
 
@@ -541,4 +543,142 @@ class TestHostIdentityEnforcement:
             }
         }
         ok, reason = check_handoff("awaiting_provision", ticket)
+        assert ok, reason
+
+
+class TestKernelTransitionHandoff:
+    """Benchmark handoff must verify kernel transition state."""
+
+    @pytest.mark.parametrize("missing_host", [None, "10.0.0.2"])
+    def test_verified_transition_requires_every_host(self, missing_host):
+        ticket = {
+            "custom_fields": {
+                "provisioning_complete": True,
+                # Upstream #1169 requires actionable, allocated hosts and a
+                # verification record before any benchmark handoff.
+                "hosts_provisioned": ["10.0.0.1", "10.0.0.2"],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.100",
+                    "targets": ["10.0.0.1", "10.0.0.2"],
+                },
+                "provisioning_verification": {
+                    "status": "verified",
+                    "details": "harness verified on all hosts",
+                },
+                "execution_plan": {
+                    "current_step": 3,
+                    "steps": [
+                        {
+                            "id": 2,
+                            "agent_type": "provision",
+                            "params": {
+                                "kernel": {
+                                    "release": "5.14.0-503.14.1.el9_5.x86_64",
+                                },
+                            },
+                        },
+                        {"id": 3, "agent_type": "benchmark", "params": {}},
+                    ],
+                },
+                "kernel_transitions": {
+                    "2": {
+                        "state": "verified",
+                        "kernel": "5.14.0-503.14.1.el9_5.x86_64",
+                        "kernel_spec": {
+                            "release": "5.14.0-503.14.1.el9_5.x86_64",
+                            "package": "kernel",
+                        },
+                        "requested_hosts": ["10.0.0.1", "10.0.0.2"],
+                        "reboot_policy": "always",
+                        "addresses": {host: host for host in ["10.0.0.1", "10.0.0.2"]},
+                        "hosts": {
+                            host: {
+                                "state": "verified",
+                                "post_boot_id": "boot",
+                                "pre_boot_id": "previous-boot",
+                                "reboot_issued": True,
+                                "reboot_pending": False,
+                                "observed_kernel": "5.14.0-503.14.1.el9_5.x86_64",
+                            }
+                            for host in ["10.0.0.1", "10.0.0.2"]
+                        },
+                    },
+                },
+            }
+        }
+        if missing_host:
+            ticket["custom_fields"]["kernel_transitions"]["2"]["hosts"].pop(
+                missing_host
+            )
+        ok, reason = check_handoff("executing_benchmark", ticket)
+        assert ok is (missing_host is None), reason
+
+    def test_partial_failure_blocks(self):
+        ticket = {
+            "custom_fields": {
+                "provisioning_complete": True,
+                # Upstream #1169 requires actionable, allocated hosts and a
+                # verification record before any benchmark handoff.
+                "hosts_provisioned": ["10.0.0.1", "10.0.0.2"],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.100",
+                    "targets": ["10.0.0.1", "10.0.0.2"],
+                },
+                "provisioning_verification": {
+                    "status": "verified",
+                    "details": "harness verified on all hosts",
+                },
+                "execution_plan": {
+                    "current_step": 3,
+                    "steps": [
+                        {
+                            "id": 2,
+                            "agent_type": "provision",
+                            "params": {
+                                "kernel": {
+                                    "release": "5.14.0-503.14.1.el9_5.x86_64",
+                                },
+                            },
+                        },
+                        {"id": 3, "agent_type": "benchmark", "params": {}},
+                    ],
+                },
+                "kernel_transitions": {
+                    "2": {"state": "partial_failure"},
+                },
+            }
+        }
+        ok, reason = check_handoff("executing_benchmark", ticket)
+        assert not ok
+        assert "partial_failure" in reason
+
+    def test_no_kernel_step_unaffected(self):
+        ticket = {
+            "custom_fields": {
+                "provisioning_complete": True,
+                # Upstream #1169 requires actionable, allocated hosts and a
+                # verification record before any benchmark handoff.
+                "hosts_provisioned": ["10.0.0.1", "10.0.0.2"],
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.100",
+                    "targets": ["10.0.0.1", "10.0.0.2"],
+                },
+                "provisioning_verification": {
+                    "status": "verified",
+                    "details": "harness verified on all hosts",
+                },
+                "execution_plan": {
+                    "current_step": 2,
+                    "steps": [
+                        {
+                            "id": 1,
+                            "agent_type": "provision",
+                            "params": {"label": "harness"},
+                        },
+                        {"id": 2, "agent_type": "benchmark", "params": {}},
+                    ],
+                },
+            }
+        }
+        ok, reason = check_handoff("executing_benchmark", ticket)
         assert ok, reason

@@ -506,6 +506,141 @@ def ticket_controller_host(ticket: dict[str, Any]) -> str | None:
     return None
 
 
+FORBIDDEN_REBOOT_HOSTS = frozenset(
+    {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "0.0.0.0",
+    }
+)
+
+
+def normalize_address(address: str) -> str:
+    """Use one identity for IPv4 and IPv4-mapped IPv6 literals."""
+    import ipaddress
+
+    parsed = ipaddress.ip_address(address)
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        return str(parsed.ipv4_mapped)
+    return str(parsed)
+
+
+def resolve_addrs(host: str) -> frozenset[str]:
+    """Resolve a hostname to a set of IP address strings."""
+    import socket
+
+    addrs: set[str] = set()
+    try:
+        for info in socket.getaddrinfo(host, None):
+            addrs.add(normalize_address(info[4][0]))
+    except (socket.gaierror, OSError):
+        pass
+    cleaned = host.strip().lower()
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(cleaned)
+        addrs.add(normalize_address(cleaned))
+    except ValueError:
+        pass
+    return frozenset(addrs)
+
+
+def _self_addrs() -> frozenset[str]:
+    """Compute the set of addresses that identify this host."""
+    import socket
+
+    addrs: set[str] = {"127.0.0.1", "::1", "0.0.0.0"}
+    try:
+        addrs.update(resolve_addrs(socket.gethostname()))
+    except Exception:
+        pass
+    try:
+        addrs.update(resolve_addrs(socket.getfqdn()))
+    except Exception:
+        pass
+    return frozenset(addrs)
+
+
+def _is_local_bind_address(address: str) -> bool:
+    """Check local ownership without sending packets or relying on hostname DNS.
+
+    A successful ephemeral UDP bind proves local ownership. Nonlocal-bind
+    sysctls may cause conservative refusals; unexpected OS errors also refuse.
+    """
+    import errno
+    import socket
+
+    try:
+        normalized = normalize_address(address)
+        family = socket.AF_INET6 if ":" in normalized else socket.AF_INET
+        literal, _, zone = normalized.partition("%")
+        if family == socket.AF_INET6:
+            scope = (
+                int(zone)
+                if zone.isdigit()
+                else socket.if_nametoindex(zone)
+                if zone
+                else 0
+            )
+            target = (literal, 0, 0, scope)
+        else:
+            target = (literal, 0)
+        with socket.socket(family, socket.SOCK_DGRAM) as probe:
+            probe.bind(target)
+        return True
+    except OSError as exc:
+        return exc.errno != errno.EADDRNOTAVAIL
+    except ValueError:
+        return True
+
+
+def is_self_host(host: str) -> bool:
+    """Return True if *host* resolves to the orchestrator itself.
+
+    Uses address resolution rather than string comparison to catch
+    aliases, IPs, and alternate DNS names. Fails closed: an
+    unresolvable host is treated as potentially self.
+    """
+    import socket
+
+    if host.strip().lower() in FORBIDDEN_REBOOT_HOSTS:
+        return True
+    try:
+        own = socket.gethostname()
+        if host.strip().lower() == own.lower():
+            return True
+        fqdn = socket.getfqdn()
+        if host.strip().lower() == fqdn.lower():
+            return True
+    except Exception:
+        pass
+    host_addrs = resolve_addrs(host)
+    if not host_addrs:
+        return True
+    if any(_is_local_address(addr) for addr in host_addrs):
+        return True
+    return bool(host_addrs & _self_addrs()) or any(
+        _is_local_bind_address(address) for address in host_addrs
+    )
+
+
+def _is_local_address(addr: str) -> bool:
+    """True for loopback or unspecified addresses (127.0.0.2, ::, ...).
+
+    A literal allowlist misses the rest of 127.0.0.0/8 and IPv6 loopback
+    spellings; address properties do not.
+    """
+    import ipaddress
+
+    try:
+        parsed = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    return parsed.is_loopback or parsed.is_unspecified
+
+
 def _controller_relative_path(path: str) -> str | None:
     """Normalize a path learned from controller documentation.
 

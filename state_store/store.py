@@ -412,6 +412,238 @@ class TicketStore:
         except Exception:
             logger.exception("failed to persist state mutation trace")
 
+    @staticmethod
+    def _contains_kernel_reserved(value: object) -> bool:
+        if isinstance(value, dict):
+            return any(
+                key
+                in {"kernel_transitions", "kernel_change_intents", "approval_requests"}
+                or TicketStore._contains_kernel_reserved(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, list):
+            return any(TicketStore._contains_kernel_reserved(item) for item in value)
+        return False
+
+    @staticmethod
+    def _validate_kernel_binding(ticket: Ticket, intent: dict) -> None:
+        from agents.provisioning.kernel import (
+            canonicalize_targets,
+            current_kernel_step,
+            require_full_coverage,
+            step_kernel_hosts,
+        )
+        from providers.rhel_kernel import compute_intent_digest, host_reboot_pending
+
+        view = ticket.model_dump(mode="json")
+        step = current_kernel_step(view)
+        if ticket.status.value != "awaiting_provision" or step is None:
+            raise ValueError("kernel action requires the current provisioning step")
+        step_id, spec = step
+        old_transition = ticket.custom_fields.get("kernel_transitions", {}).get(
+            str(step_id), {}
+        )
+        if any(
+            host_reboot_pending(record)
+            for record in old_transition.get("hosts", {}).values()
+        ):
+            raise ValueError("previous kernel reboot requires reconciliation")
+        policy = ticket.custom_fields.get("directives", {}).get(
+            "kernel_reboot_policy", "always"
+        )
+        if (
+            policy not in ("always", "if_needed")
+            or intent.get("reboot_policy") != policy
+        ):
+            raise ValueError("kernel reboot policy changed or is missing")
+        if intent.get("step_id") != step_id or intent.get("kernel") != spec.to_dict():
+            raise ValueError(
+                "kernel intent no longer matches current step/specification"
+            )
+        cache: dict[str, frozenset[str]] = {}
+        hosts = intent.get("hosts", [])
+        allowed, refused, _, pins = canonicalize_targets(
+            hosts, view, resolution_cache=cache
+        )
+        covered, _ = require_full_coverage(allowed, refused, view)
+        plan_hosts = step_kernel_hosts(view)
+        if plan_hosts is not None:
+            selected, rejected, _, _ = canonicalize_targets(
+                plan_hosts, view, resolution_cache=cache
+            )
+            plan_covered, _ = require_full_coverage(selected, rejected, view)
+            covered = covered and plan_covered
+        if not covered or set(hosts) != set(allowed) or intent.get("addresses") != pins:
+            raise ValueError("kernel assigned targets or approved addresses changed")
+        digest = compute_intent_digest(
+            ticket.id,
+            step_id,
+            hosts,
+            spec.to_dict(),
+            intent.get("actions_required", []),
+            pins,
+            policy,
+        )
+        if digest != intent.get("intent_digest"):
+            raise ValueError("kernel intent digest mismatch")
+
+    def kernel_control(
+        self,
+        ticket_id: str,
+        kind: str,
+        record_id: str,
+        expected_version: int,
+        record: dict,
+        *,
+        session_id: uuid.UUID | None = None,
+        epoch: int | None = None,
+        claim_id: str | None = None,
+        actor: str = "",
+    ) -> dict:
+        """Fenced, durable compare-and-swap for provisioning-owned evidence."""
+        with self._lock:
+            ticket = self._resolve(ticket_id)
+            if session_id is None or epoch is None or not claim_id:
+                raise ValueError("kernel control requires an active provisioning claim")
+            self._validate_mutation_fence(
+                ticket_id, session_id, epoch, claim_id, leader_only=False
+            )
+            if ticket.status.value != "awaiting_provision":
+                raise ValueError("kernel control requires awaiting_provision")
+            if kind not in ("intent", "transition"):
+                raise ValueError("unknown kernel control record kind")
+            field = (
+                "kernel_change_intents" if kind == "intent" else "kernel_transitions"
+            )
+            container = ticket.custom_fields.get(field, {})
+            records = container.get("records", {}) if kind == "intent" else container
+            previous = records.get(record_id, {})
+            if int(previous.get("record_version", 0)) != expected_version:
+                raise ValueError("kernel record version conflict")
+            candidate = deepcopy(record)
+            if kind == "intent":
+                if candidate.get("intent_id") != record_id:
+                    raise ValueError("kernel intent identity mismatch")
+                self._validate_kernel_binding(ticket, candidate)
+                mutable = {
+                    "progress",
+                    "approval_request_id",
+                    "updated_at",
+                    "record_version",
+                }
+                if previous and {
+                    k: v for k, v in candidate.items() if k not in mutable
+                } != {k: v for k, v in previous.items() if k not in mutable}:
+                    raise ValueError("kernel intent binding is immutable")
+            else:
+                from agents.provisioning.kernel import (
+                    canonicalize_targets,
+                    current_kernel_step,
+                    require_full_coverage,
+                )
+                from providers.rhel_kernel import (
+                    host_reboot_pending,
+                    host_verification_proved,
+                    transition_state,
+                )
+
+                view = ticket.model_dump(mode="json")
+                step = current_kernel_step(view)
+                if (
+                    step is None
+                    or str(step[0]) != record_id
+                    or candidate.get("kernel") != step[1].release
+                    or candidate.get("kernel_spec") != step[1].to_dict()
+                    or candidate.get("package", "kernel") != step[1].package
+                ):
+                    raise ValueError("kernel transition does not match current step")
+                allowed, refused, _, pins = canonicalize_targets(
+                    candidate.get("requested_hosts", []), view
+                )
+                covered, _ = require_full_coverage(allowed, refused, view)
+                if not covered or candidate.get("addresses") != pins:
+                    raise ValueError("kernel transition target binding mismatch")
+                policy = ticket.custom_fields.get("directives", {}).get(
+                    "kernel_reboot_policy", "always"
+                )
+                if candidate.get("reboot_policy") != policy or policy not in (
+                    "always",
+                    "if_needed",
+                ):
+                    raise ValueError("kernel transition policy mismatch")
+                changed_binding = previous and (
+                    previous.get("kernel_spec") != candidate.get("kernel_spec")
+                    or previous.get("reboot_policy") != policy
+                )
+                if changed_binding:
+                    if any(
+                        host_reboot_pending(r)
+                        for r in previous.get("hosts", {}).values()
+                    ):
+                        raise ValueError(
+                            "previous kernel reboot requires reconciliation"
+                        )
+                    candidate["previous_transitions"] = deepcopy(
+                        previous.get("previous_transitions", [])
+                    ) + [
+                        {
+                            k: v
+                            for k, v in previous.items()
+                            if k != "previous_transitions"
+                        }
+                    ]
+                elif previous:
+                    candidate["previous_transitions"] = deepcopy(
+                        previous.get("previous_transitions", [])
+                    )
+                for host, old in previous.get("hosts", {}).items():
+                    if host_reboot_pending(old) and not changed_binding:
+                        new = candidate.get("hosts", {}).get(host, {})
+                        if new.get("pre_boot_id") != old.get("pre_boot_id"):
+                            raise ValueError("issued reboot boot identity is immutable")
+                        if not host_reboot_pending(new) and not (
+                            old.get("pre_boot_id")
+                            and new.get("post_boot_id")
+                            and old["pre_boot_id"] != new["post_boot_id"]
+                        ):
+                            raise ValueError("issued reboot remains unresolved")
+                for evidence in candidate.get("hosts", {}).values():
+                    if evidence.get("state") in ("verified", "already_verified") and (
+                        evidence.get("observed_kernel") != step[1].release
+                        or not evidence.get("post_boot_id")
+                        or not host_verification_proved(evidence, policy)
+                    ):
+                        raise ValueError(
+                            "verified kernel host lacks live boot evidence"
+                        )
+                if candidate.get("state") != transition_state(
+                    candidate.get("hosts", {}), allowed
+                ):
+                    raise ValueError(
+                        "kernel transition state does not match host evidence"
+                    )
+            candidate["record_version"] = expected_version + 1
+            working = ticket.model_copy(deep=True)
+            updated = deepcopy(records)
+            updated[record_id] = candidate
+            working.custom_fields[field] = (
+                {"records": updated} if kind == "intent" else updated
+            )
+            working.updated_at = datetime.now(timezone.utc)
+            self._persist_iteration_ticket(working)
+            self._audit_log(
+                "kernel_control",
+                ticket_id,
+                {
+                    "actor": actor,
+                    "kind": kind,
+                    "record_id": record_id,
+                    "record_version": expected_version + 1,
+                },
+            )
+            self._trace_mutation(ticket_id, "kernel_control")
+            return deepcopy(candidate)
+
     def create_ticket(
         self,
         request: CreateTicketRequest,
@@ -422,6 +654,8 @@ class TicketStore:
         with self._lock:
             self._global_seq += 1
             custom_fields = dict(request.custom_fields)
+            if self._contains_kernel_reserved(custom_fields):
+                raise ValueError("kernel control and approval fields are server-owned")
             if ITERATION_BUDGET_FIELD in custom_fields:
                 raise ValueError("iteration budget records are reserved")
             protected = _VALIDATION_RESERVED_FIELDS.intersection(custom_fields)
@@ -982,6 +1216,8 @@ class TicketStore:
             self._validate_mutation_fence(
                 ticket_id, session_id, epoch, claim_id, leader_only=leader_only
             )
+            if self._contains_kernel_reserved(fields):
+                raise ValueError("kernel control and approval fields are server-owned")
             durable_grant = fields.get("max_iterations_override") is not None
             if durable_grant and "global_max_iterations_override" in fields:
                 raise ValueError(
@@ -1448,24 +1684,79 @@ class TicketStore:
                 )
                 raise ValueError(f"approval rejected: {rejection_reason}")
             fields = ticket.custom_fields
-            manifest = fields.get("benchmark_validations", {})
-            records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
-            validation = records.get(request.validation_id)
-            if not isinstance(validation, dict):
-                legacy = fields.get("validated_run_file", {})
-                validation = legacy if isinstance(legacy, dict) else None
-            if (
-                not isinstance(validation, dict)
-                or validation.get("validation_id") != request.validation_id
-                or validation.get("state", "executable") != "executable"
-                or validation.get("runfile_fingerprint")
-                != request.presented_run_file_digest
-                or validation.get("execution_intent_digest")
-                != request.execution_intent_digest
-            ):
-                raise ValueError(
-                    "approval does not match an executable validation record"
+            if request.kind == "kernel_change":
+                # A kernel change binds to the immutable intent record the
+                # provisioning server persisted; both digests carry the
+                # intent digest so the shared resolve/consume paths work
+                # unchanged.
+                intents = fields.get("kernel_change_intents", {})
+                intent_records = (
+                    intents.get("records", {}) if isinstance(intents, dict) else {}
                 )
+                intent = intent_records.get(request.validation_id)
+                from providers.rhel_kernel import KernelSpec, compute_intent_digest
+
+                valid_intent = False
+                if isinstance(intent, dict):
+                    try:
+                        pins = intent["addresses"]
+                        hosts = intent["hosts"]
+                        actions = intent["actions_required"]
+                        kernel = KernelSpec.parse(intent["kernel"]).to_dict()
+                        valid_intent = (
+                            isinstance(pins, dict)
+                            and set(pins) == set(hosts)
+                            and intent.get("reboot_policy") in ("always", "if_needed")
+                            and kernel == intent["kernel"]
+                            and actions
+                            == [
+                                a
+                                for a in ("install", "select_default", "reboot")
+                                if a in actions
+                            ]
+                            and compute_intent_digest(
+                                str(ticket.id),
+                                intent["step_id"],
+                                hosts,
+                                kernel,
+                                actions,
+                                pins,
+                                intent.get("reboot_policy"),
+                            )
+                            == intent.get("intent_digest")
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        valid_intent = False
+                if (
+                    not valid_intent
+                    or intent.get("intent_id") != request.validation_id
+                    or intent.get("intent_digest") != request.presented_run_file_digest
+                    or intent.get("intent_digest") != request.execution_intent_digest
+                ):
+                    raise ValueError(
+                        "approval does not match a persisted kernel change intent"
+                    )
+            else:
+                manifest = fields.get("benchmark_validations", {})
+                records = (
+                    manifest.get("records", {}) if isinstance(manifest, dict) else {}
+                )
+                validation = records.get(request.validation_id)
+                if not isinstance(validation, dict):
+                    legacy = fields.get("validated_run_file", {})
+                    validation = legacy if isinstance(legacy, dict) else None
+                if (
+                    not isinstance(validation, dict)
+                    or validation.get("validation_id") != request.validation_id
+                    or validation.get("state", "executable") != "executable"
+                    or validation.get("runfile_fingerprint")
+                    != request.presented_run_file_digest
+                    or validation.get("execution_intent_digest")
+                    != request.execution_intent_digest
+                ):
+                    raise ValueError(
+                        "approval does not match an executable validation record"
+                    )
             raw = ticket.custom_fields.setdefault("approval_requests", {})
             if not isinstance(raw, dict):
                 raise ValueError("approval request state is malformed")
@@ -1476,6 +1767,7 @@ class TicketStore:
                 existing = ApprovalRequest.model_validate(value)
                 if (
                     existing.status == "pending"
+                    and existing.kind == request.kind
                     and existing.validation_id == request.validation_id
                     and existing.presented_run_file_digest
                     == request.presented_run_file_digest
@@ -1618,6 +1910,9 @@ class TicketStore:
         """Atomically spend an approved request exactly once."""
         with self._lock:
             ticket = self._resolve(ticket_id)
+            if request.kind == "kernel_change":
+                # Publish the reservation only after strict durable persistence.
+                ticket = ticket.model_copy(deep=True)
             raw = ticket.custom_fields.get("approval_requests", {})
             value = raw.get(approval_request_id) if isinstance(raw, dict) else None
             if not isinstance(value, dict):
@@ -1629,8 +1924,25 @@ class TicketStore:
                 current = ApprovalRequest.model_validate(value)
             if current.status != "approved":
                 raise ValueError("approval request is not approved")
-            if current.consumed_at is not None:
+            kernel_action = request.kernel_action
+            is_kernel = request.kind == "kernel_change"
+            reserve_reboot = is_kernel and kernel_action == "reboot"
+            if is_kernel and kernel_action is None:
+                raise ValueError("kernel action is required")
+            if not is_kernel and kernel_action is not None:
+                raise ValueError("only kernel approvals can authorize kernel actions")
+            if (reserve_reboot and current.kernel_reboot_reserved) or (
+                current.consumed_at is not None and not is_kernel
+            ):
                 raise ValueError("approval request was already consumed")
+            if current.kind != request.kind:
+                raise ValueError(
+                    f"approval kind mismatch: {current.kind} != {request.kind}"
+                )
+            if current.expires_at is not None and current.expires_at <= datetime.now(
+                timezone.utc
+            ):
+                raise ValueError("approval request expired")
             for key in (
                 "validation_id",
                 "presented_run_file_digest",
@@ -1667,15 +1979,43 @@ class TicketStore:
                     or datetime.fromisoformat(claim["expires"]) <= self._lease_now()
                 ):
                     raise ValueError("approval requires the active ticket claim")
+            if is_kernel:
+                intent = (
+                    ticket.custom_fields.get("kernel_change_intents", {})
+                    .get("records", {})
+                    .get(current.validation_id, {})
+                )
+                self._validate_kernel_binding(ticket, intent)
+                actions = intent.get("actions_required", [])
+                progress = intent.get("progress", {})
+                if (
+                    intent.get("intent_digest") != current.execution_intent_digest
+                    or kernel_action not in actions
+                    or progress.get(kernel_action) == "done"
+                    or (reserve_reboot and progress.get(kernel_action) != "pending")
+                    or any(
+                        progress.get(a) != "done"
+                        for a in actions[: actions.index(kernel_action)]
+                    )
+                ):
+                    raise ValueError("kernel intent changed or requires reconciliation")
+                # The approval-owned flag cannot be revived by mutable progress.
             consumed = current.model_copy(
                 update={
-                    "consumed_at": datetime.now(timezone.utc),
+                    "consumed_at": current.consumed_at or datetime.now(timezone.utc),
+                    "kernel_reboot_reserved": current.kernel_reboot_reserved
+                    or reserve_reboot,
                     "record_version": current.record_version + 1,
                 }
             )
             raw[approval_request_id] = consumed.model_dump(mode="json")
             ticket.updated_at = datetime.now(timezone.utc)
-            self._persist_ticket(ticket)
+            if is_kernel:
+                # Reuse the protected ticket writer: it reconciles replacement
+                # followed by audit failure before any later ticket mutation.
+                self._persist_iteration_ticket(ticket)
+            else:
+                self._persist_ticket(ticket)
             self._audit_log(
                 "approval_consumed",
                 ticket_id,

@@ -19,6 +19,19 @@ from providers.iteration_budget import ITERATION_BUDGET_FIELD
 from providers.tracing import PayloadDescriptor
 
 
+def contains_kernel_reserved(value: object) -> bool:
+    """Reject caller-supplied control records, including nested import payloads."""
+    if isinstance(value, dict):
+        return any(
+            key in {"kernel_change_intents", "kernel_transitions", "approval_requests"}
+            or contains_kernel_reserved(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(contains_kernel_reserved(item) for item in value)
+    return False
+
+
 class TicketStatus(str, Enum):
     NEW = "new"
     TRIAGE_PENDING = "triage_pending"
@@ -186,7 +199,8 @@ class ApprovalRequest(BaseModel):
 
     approval_request_id: str = Field(pattern=r"^apr-[a-f0-9]{32}$")
     ticket_id: str
-    kind: Literal["benchmark_run_file"] = "benchmark_run_file"
+    kind: Literal["benchmark_run_file", "kernel_change"] = "benchmark_run_file"
+    kernel_reboot_reserved: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_by: str = ""
     waiter_owner: str | None = None
@@ -213,6 +227,7 @@ class ApprovalRequest(BaseModel):
 
 
 class CreateApprovalRequest(BaseModel):
+    kind: Literal["benchmark_run_file", "kernel_change"] = "benchmark_run_file"
     validation_id: str = Field(min_length=1, max_length=255)
     presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -240,6 +255,8 @@ class ResolveApprovalRequest(BaseModel):
 class ConsumeApprovalRequest(BaseModel):
     """Execution-side single-use capability check for an approval."""
 
+    kind: Literal["benchmark_run_file", "kernel_change"] = "benchmark_run_file"
+    kernel_action: Literal["install", "select_default", "reboot"] | None = None
     validation_id: str = Field(min_length=1, max_length=255)
     presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -286,6 +303,8 @@ class CreateTicketRequest(BaseModel):
 
     @model_validator(mode="after")
     def _reject_reserved_validation_fields(self) -> "CreateTicketRequest":
+        if contains_kernel_reserved(self.custom_fields):
+            raise ValueError("kernel control and approval fields are server-owned")
         if ITERATION_BUDGET_FIELD in self.custom_fields:
             raise ValueError("iteration budget records are reserved")
         protected = _VALIDATION_RESERVED_FIELDS.intersection(self.custom_fields)
@@ -301,6 +320,15 @@ class TransitionRequest(BaseModel):
     # reviewed resume is an explicit, auditable opt-in rather than an
     # incidental transition from awaiting_customer_guidance.
     reviewed_resume: bool = False
+
+
+class KernelControlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["intent", "transition"]
+    record_id: str = Field(min_length=1, max_length=255)
+    expected_version: StrictInt = Field(ge=0)
+    record: dict[str, Any]
 
 
 class UpdateFieldsRequest(BaseModel):
@@ -442,7 +470,7 @@ class CreateValidationRequest(BaseModel):
     """Create one immutable benchmark-validation record using a manifest CAS."""
 
     record: ValidationRecordV1
-    expected_version: int = Field(ge=0)
+    expected_version: StrictInt = Field(ge=0)
 
 
 class SupersedeValidationRequest(BaseModel):
@@ -451,7 +479,7 @@ class SupersedeValidationRequest(BaseModel):
     validation_id: str
     replacement_validation_id: str | None = None
     reason: InvalidationReason
-    expected_version: int = Field(ge=0)
+    expected_version: StrictInt = Field(ge=0)
 
 
 class AddCommentRequest(BaseModel):

@@ -17,7 +17,9 @@ operations in parallel.
 Tools that take uniform parameters across hosts use `hosts: list[str]`:
   check_platform_contract, ensure_prerequisites, install_harness,
   check_existing_install, verify_harness_install, update_install,
-  uninstall_harness, install_k3s, ensure_harness_installed
+  uninstall_harness, install_k3s, ensure_harness_installed,
+  get_kernel_inventory, prepare_kernel_change, install_kernel,
+  select_default_kernel, reboot_hosts_and_verify, verify_kernel_state
 
 Install-related tools also accept `controller_host` — set this to the
 controller's IP when the harness uses a dedicated controller so the
@@ -118,6 +120,16 @@ installs the harness when it is missing, then verifies it, in one batched call.
       submission. If verification shows tuning did NOT take
       effect, do NOT report provisioning_complete=true — call
       request_clarification instead.
+
+12. **Kernel transitions.** Kernel steps run deterministically unless the
+    ticket explicitly selects `kernel_step_mode: "llm"`. Only call kernel
+    tools when the current plan step has `params.kernel`. For such a step,
+    call `get_skill_context(subject="platform/kernel")`, then read the
+    returned kernel guidance ref. The kernel tools enforce full assigned
+    host coverage, immutable approval binding, and live verification.
+    Follow the returned approval and recovery instructions. A paused or
+    indeterminate transition requires reconciliation or a user decision;
+    never submit provisioning complete without verified evidence.
 
 Important:
 - Installation can take several minutes — be patient.
