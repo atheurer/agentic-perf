@@ -86,6 +86,7 @@ class Dispatcher:
         self._vault_config = vault_config
         self._redactor = redactor
         self._tasks: dict[str, asyncio.Task] = {}
+        self._cleanup_counts: dict[str, int] = {}
         self._agents: dict[str, Any] = {}
         self._renewal_tasks: dict[str, asyncio.Task] = {}
         self._claim_ids: dict[str, str] = {}
@@ -106,6 +107,8 @@ class Dispatcher:
         self._trace = TraceRecorder(client=trace_client)
 
     def is_active(self, ticket_id: str) -> bool:
+        if getattr(self, "_cleanup_counts", {}).get(ticket_id, 0):
+            return True
         task = self._tasks.get(ticket_id)
         if task is None:
             return False
@@ -128,6 +131,8 @@ class Dispatcher:
 
     def try_claim(self, ticket_id: str, status: str) -> bool:
         """Attempt to claim a ticket via the state store. Returns True on success."""
+        if getattr(self, "_cleanup_counts", {}).get(ticket_id, 0):
+            return False
         try:
             with httpx.Client(timeout=10.0, headers=self._auth_headers()) as client:
                 r = client.post(
@@ -461,31 +466,42 @@ class Dispatcher:
         return sum(1 for tid in self._tasks if statuses.get(tid) == status)
 
     async def mark_done(self, ticket_id: str) -> None:
-        self._tasks.pop(ticket_id, None)
-        getattr(self, "_task_statuses", {}).pop(ticket_id, None)
-        self._agents.pop(ticket_id, None)
-        getattr(self, "_stopped_tickets", set()).discard(ticket_id)
-        self.stop_renewal(ticket_id)
-        await self.release_claim(ticket_id)
-        getattr(self, "_claim_ids", {}).pop(ticket_id, None)
-        self.clear_handoff_blocked(ticket_id)
-        if self._redactor:
-            self._redactor.deregister_ticket(ticket_id)
-        self.clear_quota_blocked(ticket_id)
-        # Some focused integrations construct a dispatcher without running
-        # __init__. Cleanup remains valid when tracing was not configured.
-        context = getattr(self, "_trace_contexts", {}).pop(ticket_id, None)
-        if context is not None:
-            self._previous_invocations[ticket_id] = context
-            self._trace.record(
-                context,
-                ActionType.DISPATCH,
-                LifecycleState.COMPLETED,
-                phase="cleanup",
-                duration_ms=0,
-            )
-        if self.events is not None:
-            self.events.unregister_ticket_owner(ticket_id)
+        counts = getattr(self, "_cleanup_counts", None)
+        if counts is None:
+            counts = self._cleanup_counts = {}
+        counts[ticket_id] = counts.get(ticket_id, 0) + 1
+        try:
+            self._agents.pop(ticket_id, None)
+            getattr(self, "_stopped_tickets", set()).discard(ticket_id)
+            self.stop_renewal(ticket_id)
+            await self.release_claim(ticket_id)
+            getattr(self, "_claim_ids", {}).pop(ticket_id, None)
+            self.clear_handoff_blocked(ticket_id)
+            if self._redactor:
+                self._redactor.deregister_ticket(ticket_id)
+            self.clear_quota_blocked(ticket_id)
+            # Some focused integrations construct a dispatcher without running
+            # __init__. Cleanup remains valid when tracing was not configured.
+            context = getattr(self, "_trace_contexts", {}).pop(ticket_id, None)
+            if context is not None:
+                self._previous_invocations[ticket_id] = context
+                self._trace.record(
+                    context,
+                    ActionType.DISPATCH,
+                    LifecycleState.COMPLETED,
+                    phase="cleanup",
+                    duration_ms=0,
+                )
+            if self.events is not None:
+                self.events.unregister_ticket_owner(ticket_id)
+            # A ticket must remain active until its old claim and tracing state
+            # are gone; otherwise this cleanup can erase a new dispatch's claim.
+            self._tasks.pop(ticket_id, None)
+            getattr(self, "_task_statuses", {}).pop(ticket_id, None)
+        finally:
+            counts[ticket_id] -= 1
+            if not counts[ticket_id]:
+                counts.pop(ticket_id)
         # Note: introspection is NOT stopped here. It runs
         # across the full ticket lifecycle and self-stops on
         # terminal status. Stopping it on every agent handoff
