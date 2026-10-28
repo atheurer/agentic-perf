@@ -1974,10 +1974,138 @@ async def test_chat_audit_cancellation_emits_terminal_and_preserves_parent() -> 
         reset_trace_context(token)
     assert [event.lifecycle.state for event in events] == [
         LifecycleState.STARTED,
-        LifecycleState.CANCELLED,
+        LifecycleState.INDETERMINATE,
     ]
+    assert events[-1].outcome.value == "indeterminate"
     assert {event.trace_id for event in events} == {parent.trace_id}
     assert {event.parent_action_id for event in events} == {parent.action_id}
+
+
+@pytest.mark.asyncio
+async def test_chat_audit_cancellation_waits_for_terminal_delivery() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatToolAudit
+
+    events = []
+    handler_started = asyncio.Event()
+    terminal_started = asyncio.Event()
+    finish_terminal = asyncio.Event()
+
+    async def record(event):
+        state = event.lifecycle.state
+        if state == LifecycleState.INDETERMINATE:
+            terminal_started.set()
+            await finish_terminal.wait()
+        events.append(state)
+
+    async def handler():
+        handler_started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(
+        ChatToolAudit(
+            AsyncMock(),
+            "http://state-store.invalid",
+            "service-token",
+            record=record,
+        ).invoke("start_ticket", {"ticket_id": "PERF-policy"}, handler)
+    )
+    await handler_started.wait()
+    task.cancel()
+    await terminal_started.wait()
+
+    assert not task.done()
+    assert events == [LifecycleState.STARTED]
+
+    finish_terminal.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == [LifecycleState.STARTED, LifecycleState.INDETERMINATE]
+
+
+@pytest.mark.asyncio
+async def test_chat_audit_normal_terminal_survives_cancellation() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatToolAudit
+
+    events = []
+    terminal_started = asyncio.Event()
+    finish_terminal = asyncio.Event()
+
+    async def record(event):
+        state = event.lifecycle.state
+        if state == LifecycleState.COMPLETED:
+            terminal_started.set()
+            await finish_terminal.wait()
+        events.append(state)
+
+    task = asyncio.create_task(
+        ChatToolAudit(
+            AsyncMock(),
+            "http://state-store.invalid",
+            "service-token",
+            record=record,
+        ).invoke(
+            "start_ticket",
+            {"ticket_id": "PERF-policy"},
+            AsyncMock(return_value='{"status": "started"}'),
+        )
+    )
+    await terminal_started.wait()
+    task.cancel()
+
+    assert not task.done()
+    assert events == [LifecycleState.STARTED]
+
+    finish_terminal.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == [LifecycleState.STARTED, LifecycleState.COMPLETED]
+
+
+@pytest.mark.asyncio
+async def test_chat_audit_cancellation_during_start_records_terminal() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from agents.chat.tools import ChatToolAudit
+
+    events = []
+    start_started = asyncio.Event()
+    finish_start = asyncio.Event()
+    handler = AsyncMock(return_value='{"status": "unexpected"}')
+
+    async def record(event):
+        if event.lifecycle.state == LifecycleState.STARTED:
+            start_started.set()
+            await finish_start.wait()
+        events.append(event)
+
+    task = asyncio.create_task(
+        ChatToolAudit(
+            AsyncMock(),
+            "http://state-store.invalid",
+            "service-token",
+            record=record,
+        ).invoke("start_ticket", {"ticket_id": "PERF-policy"}, handler)
+    )
+    await start_started.wait()
+    task.cancel()
+    assert not task.done()
+
+    finish_start.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [event.lifecycle.state for event in events] == [
+        LifecycleState.STARTED,
+        LifecycleState.CANCELLED,
+    ]
+    handler.assert_not_awaited()
 
 
 @pytest.mark.asyncio

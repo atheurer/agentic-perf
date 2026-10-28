@@ -8,6 +8,7 @@ create tickets, send interjections, etc.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -25,7 +26,13 @@ from providers.tracing import (
 )
 
 from .prompts import CHAT_SYSTEM_PROMPT
-from .tools import CHAT_TOOLS, DESTRUCTIVE_TOOLS, ChatToolAudit, execute_tool
+from .tools import (
+    CHAT_TOOLS,
+    DESTRUCTIVE_TOOLS,
+    ChatAuditUnavailable,
+    ChatToolAudit,
+    execute_tool,
+)
 
 # Default fallback values if provider doesn't expose them
 _DEFAULT_MAX_TOKENS = 4096
@@ -91,6 +98,14 @@ _DEFAULT_MAX_TOOL_ROUNDS = 10
 
 # Maximum conversation history entries before truncation.
 _MAX_HISTORY = 100
+_CHAT_BUSY_MESSAGE = (
+    "A previous chat request is still finishing. Please try again shortly."
+)
+_CHAT_INDETERMINATE_MESSAGE = (
+    "A previous chat action was interrupted and its outcome is uncertain. "
+    "This chat is paused to prevent the action from being repeated. "
+    "Clear the chat session before continuing."
+)
 
 
 @dataclass
@@ -233,6 +248,8 @@ class ChatAgent:
         # ingestion is intentionally service-only, so the embedded state-store
         # supplies its deployment token instead.
         self._audit_token = audit_token
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._indeterminate_sessions: set[str] = set()
 
     async def handle_message(
         self,
@@ -259,22 +276,73 @@ class ChatAgent:
             Optional ticket ID for context-aware chat on
             the ticket detail page.
         """
-        # Every web request has a root context before it can reach
-        # ChatToolAudit.  Destructive confirmation actions persist this root in
-        # the session so their later confirmation/cancellation is still a
-        # child of the original request rather than an unrelated trace.
-        root = new_trace_context(ticket_id=ticket_context, agent_id="chat-agent")
-        token = bind_trace_context(root)
+        lock = self._session_locks.setdefault(user, asyncio.Lock())
+        if lock.locked():
+            return _CHAT_BUSY_MESSAGE
+        await lock.acquire()
         try:
-            return await self._handle_message(
-                user,
-                message,
-                auth_token,
-                ticket_context=ticket_context,
-                readonly=readonly,
-            )
+            if user in self._indeterminate_sessions:
+                return _CHAT_INDETERMINATE_MESSAGE
+
+            # Every web request has a root context before it can reach
+            # ChatToolAudit. Destructive confirmations retain this root.
+            root = new_trace_context(ticket_id=ticket_context, agent_id="chat-agent")
+            token = bind_trace_context(root)
+            try:
+                return await self._handle_message(
+                    user,
+                    message,
+                    auth_token,
+                    ticket_context=ticket_context,
+                    readonly=readonly,
+                )
+            finally:
+                reset_trace_context(token)
         finally:
-            reset_trace_context(token)
+            lock.release()
+
+    @staticmethod
+    def _cancellation_requested() -> bool:
+        task = asyncio.current_task()
+        return task is not None and task.cancelling() > 0
+
+    @staticmethod
+    def _remove_trailing_tool_use(session: ChatSession) -> None:
+        if not session.messages or session.messages[-1].get("role") != "assistant":
+            return
+        content = session.messages[-1].get("content")
+        if isinstance(content, list) and any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content
+        ):
+            session.messages.pop()
+
+    @staticmethod
+    def _remove_confirmation_exchange(session: ChatSession) -> None:
+        if len(session.messages) < 3:
+            return
+        tail = session.messages[-3:]
+        if (
+            tail[0].get("role") == "assistant"
+            and tail[1].get("role") == "user"
+            and tail[2].get("role") == "assistant"
+        ):
+            del session.messages[-3:]
+
+    def _mark_tool_outcome_indeterminate(
+        self,
+        user: str,
+        session: ChatSession,
+        *,
+        confirmation_exchange: bool,
+    ) -> None:
+        if confirmation_exchange:
+            self._remove_confirmation_exchange(session)
+        else:
+            self._remove_trailing_tool_use(session)
+        session.pending_action = None
+        self._indeterminate_sessions.add(user)
+        session.add_assistant_message(_CHAT_INDETERMINATE_MESSAGE)
 
     async def handle_message_stream(
         self,
@@ -314,19 +382,40 @@ class ChatAgent:
         # Check for pending action confirmation
         if session.pending_action and _is_confirmation(message):
             action = session.pending_action
+            try:
+                result = await execute_tool(
+                    action["tool"],
+                    action["input"],
+                    self._client,
+                    self._store_url,
+                    auth_token,
+                    audit=ChatToolAudit(
+                        self._client, self._store_url, self._audit_token or ""
+                    ),
+                    tool_call_id=action.get("tool_call_id"),
+                    parent_context=action.get("trace_context"),
+                )
+            except asyncio.CancelledError:
+                self._mark_tool_outcome_indeterminate(
+                    user, session, confirmation_exchange=True
+                )
+                raise
+            except ChatAuditUnavailable as exc:
+                if "outcome is indeterminate" in str(exc):
+                    self._mark_tool_outcome_indeterminate(
+                        user, session, confirmation_exchange=True
+                    )
+                    return _CHAT_INDETERMINATE_MESSAGE
+                return (
+                    "The action could not be started because audit recording is "
+                    "unavailable. No action was attempted; you can retry or cancel."
+                )
+            if self._cancellation_requested():
+                self._mark_tool_outcome_indeterminate(
+                    user, session, confirmation_exchange=True
+                )
+                raise asyncio.CancelledError
             session.pending_action = None
-            result = await execute_tool(
-                action["tool"],
-                action["input"],
-                self._client,
-                self._store_url,
-                auth_token,
-                audit=ChatToolAudit(
-                    self._client, self._store_url, self._audit_token or ""
-                ),
-                tool_call_id=action.get("tool_call_id"),
-                parent_context=action.get("trace_context"),
-            )
             parsed = json.loads(result)
             if "error" in parsed:
                 response_text = f"Action failed: {parsed['error']}"
@@ -344,7 +433,6 @@ class ChatAgent:
             return response_text
         elif session.pending_action and _is_cancellation(message):
             action = session.pending_action
-            session.pending_action = None
             await ChatToolAudit(
                 self._client, self._store_url, self._audit_token or ""
             ).reject(
@@ -353,6 +441,10 @@ class ChatAgent:
                 tool_call_id=action.get("tool_call_id"),
                 parent_context=action.get("trace_context"),
             )
+            session.pending_action = None
+            if self._cancellation_requested():
+                self._remove_confirmation_exchange(session)
+                raise asyncio.CancelledError
             # Remove the entire confirmation exchange (3 msgs)
             if len(session.messages) >= 3:
                 session.messages = session.messages[:-3]
@@ -376,6 +468,8 @@ class ChatAgent:
                 parent_context=action.get("trace_context"),
             )
             session.pending_action = None
+            if self._cancellation_requested():
+                raise asyncio.CancelledError
 
         # Add context prefix for ticket-scoped chat.
         # Auto-fetch ticket details so the agent can diagnose
@@ -388,6 +482,8 @@ class ChatAgent:
                     f"{self._store_url}/api/v1/tickets/{ticket_context}",
                     headers={"Authorization": f"Bearer {auth_token}"},
                 )
+                if self._cancellation_requested():
+                    raise asyncio.CancelledError
                 if r.status_code == 200:
                     t = r.json()
                     cf = t.get("custom_fields", {})
@@ -422,6 +518,8 @@ class ChatAgent:
                             f"{last.get('body', '')}"
                         )
             except Exception:
+                if self._cancellation_requested():
+                    raise asyncio.CancelledError
                 pass
 
             # Always prefix with the current ticket so the
@@ -503,6 +601,8 @@ class ChatAgent:
                         messages=session.messages,
                         tools=[],
                     )
+                    if self._cancellation_requested():
+                        raise asyncio.CancelledError
                     session.record_usage(response.usage)
                     text = response.text or (
                         "I wasn't able to fully complete your "
@@ -511,6 +611,8 @@ class ChatAgent:
                         "for more details."
                     )
                 except Exception:
+                    if self._cancellation_requested():
+                        raise asyncio.CancelledError
                     text = (
                         "I ran out of time processing your "
                         "request. Here's a tip: for ticket "
@@ -526,7 +628,11 @@ class ChatAgent:
                     messages=session.messages,
                     tools=available_tools,
                 )
+                if self._cancellation_requested():
+                    raise asyncio.CancelledError
             except Exception as exc:
+                if self._cancellation_requested():
+                    raise asyncio.CancelledError from exc
                 # LLM call failed (timeout, rate limit, etc.)
                 logger.warning(
                     "Chat LLM call failed on round %d: %s",
@@ -553,12 +659,16 @@ class ChatAgent:
                         messages=session.messages,
                         tools=[],
                     )
+                    if self._cancellation_requested():
+                        raise asyncio.CancelledError
                     session.record_usage(response.usage)
                     text = response.text or (
                         "I wasn't able to use my tools for "
                         "this request. Could you try rephrasing?"
                     )
                 except Exception as retry_exc:
+                    if self._cancellation_requested():
+                        raise asyncio.CancelledError from retry_exc
                     logger.warning(
                         "Chat retry without tools also failed: %s",
                         _safe_exception_summary(retry_exc),
@@ -624,17 +734,41 @@ class ChatAgent:
                     session.add_assistant_message(confirm_msg)
                     return confirm_msg
 
-                result = await execute_tool(
-                    tc.name,
-                    tc.input,
-                    self._client,
-                    self._store_url,
-                    auth_token,
-                    audit=ChatToolAudit(
-                        self._client, self._store_url, self._audit_token or ""
-                    ),
-                    tool_call_id=tc.id,
-                )
+                try:
+                    result = await execute_tool(
+                        tc.name,
+                        tc.input,
+                        self._client,
+                        self._store_url,
+                        auth_token,
+                        audit=ChatToolAudit(
+                            self._client, self._store_url, self._audit_token or ""
+                        ),
+                        tool_call_id=tc.id,
+                    )
+                except asyncio.CancelledError:
+                    self._mark_tool_outcome_indeterminate(
+                        user, session, confirmation_exchange=False
+                    )
+                    raise
+                except ChatAuditUnavailable as exc:
+                    if "outcome is indeterminate" in str(exc) or tool_results:
+                        self._mark_tool_outcome_indeterminate(
+                            user, session, confirmation_exchange=False
+                        )
+                        return _CHAT_INDETERMINATE_MESSAGE
+                    self._remove_trailing_tool_use(session)
+                    message_text = (
+                        "I couldn't start the requested action because audit "
+                        "recording is unavailable. No action was attempted."
+                    )
+                    session.add_assistant_message(message_text)
+                    return message_text
+                if self._cancellation_requested():
+                    self._mark_tool_outcome_indeterminate(
+                        user, session, confirmation_exchange=False
+                    )
+                    raise asyncio.CancelledError
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -695,4 +829,9 @@ class ChatAgent:
         return usage
 
     def clear_session(self, user: str) -> bool:
-        return self._sessions.delete(user)
+        lock = self._session_locks.get(user)
+        if lock is not None and lock.locked():
+            return False
+        self._indeterminate_sessions.discard(user)
+        self._sessions.delete(user)
+        return True

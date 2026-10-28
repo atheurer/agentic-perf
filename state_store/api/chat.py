@@ -12,6 +12,7 @@ import json
 import logging
 from typing import Any
 
+import anyio
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
@@ -20,6 +21,7 @@ from ..auth import Principal
 
 logger = logging.getLogger(__name__)
 _CHAT_TASK_CLEANUP_TIMEOUT_SECONDS = 2.0
+_CHAT_TASKS_AWAITING_CLEANUP: set[asyncio.Task[str]] = set()
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -58,23 +60,40 @@ def _consume_chat_task_result(task: asyncio.Task[str]) -> None:
         pass
     except Exception:
         logger.exception("Chat task failed after its response stream closed")
+    finally:
+        _CHAT_TASKS_AWAITING_CLEANUP.discard(task)
 
 
 async def _cancel_chat_task(task: asyncio.Task[str]) -> None:
-    """Cancel chat work on stream exit and bound time spent awaiting cleanup."""
+    """Cancel once, then wait a bounded time for audit cleanup to finish."""
     if task.done():
         return
 
     task.cancel()
-    done, _ = await asyncio.wait({task}, timeout=_CHAT_TASK_CLEANUP_TIMEOUT_SECONDS)
+    with anyio.CancelScope(shield=True):
+        done, _ = await asyncio.wait({task}, timeout=_CHAT_TASK_CLEANUP_TIMEOUT_SECONDS)
     if done:
         return
 
-    # A task can suppress cancellation while waiting on an uncooperative
-    # dependency. Request cancellation again and consume its eventual result.
-    logger.warning("Chat task did not stop before SSE cleanup timed out")
-    task.cancel()
+    # Do not cancel again: the child may be persisting its terminal audit event.
+    # Keep a strong reference until it finishes, and reject later user work via
+    # ChatAgent's per-session in-flight guard.
+    logger.warning("Chat task is still cleaning up after SSE stream closed")
+    _CHAT_TASKS_AWAITING_CLEANUP.add(task)
     task.add_done_callback(_consume_chat_task_result)
+
+
+class _ChatStreamingResponse(StreamingResponse):
+    """Close the SSE iterator even when the ASGI server send fails."""
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            close_iterator = getattr(self.body_iterator, "aclose", None)
+            if close_iterator is not None:
+                with anyio.CancelScope(shield=True):
+                    await close_iterator()
 
 
 def _get_principal(request: Request) -> Principal:
@@ -290,7 +309,7 @@ async def send_message_stream(
         usage = agent.get_usage(user)
         yield f"data: {json.dumps({'done': True, 'usage': usage})}\n\n"
 
-    return StreamingResponse(
+    return _ChatStreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -318,5 +337,9 @@ async def clear_session(request: Request):
     """Clear the current user's chat session."""
     agent = _get_chat_agent(request)
     user = _get_user(request)
-    agent.clear_session(user)
+    if not agent.clear_session(user):
+        raise HTTPException(
+            status_code=409,
+            detail="A chat request is still finishing; try clearing the session again shortly.",
+        )
     return {"status": "cleared"}

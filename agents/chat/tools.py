@@ -13,6 +13,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+import anyio
 import httpx
 
 from providers.llm.base import ToolDefinition
@@ -204,6 +205,24 @@ class ChatToolAudit:
                     "audit ingestion unavailable; chat tool was not attempted"
                 ) from exc
 
+    async def _emit_cancellation_safe(self, **kwargs: Any) -> bool:
+        """Finish one audit send before allowing caller cancellation to escape."""
+        delivery = asyncio.create_task(self._emit(**kwargs))
+        cancellation_requested = False
+        with anyio.CancelScope(shield=True):
+            while True:
+                try:
+                    await asyncio.shield(delivery)
+                    break
+                except asyncio.CancelledError:
+                    if delivery.cancelled():
+                        raise
+                    cancellation_requested = True
+                    if delivery.done():
+                        break
+        delivery.result()
+        return cancellation_requested
+
     async def invoke(
         self,
         tool_name: str,
@@ -233,34 +252,75 @@ class ChatToolAudit:
             ),
         )
         timer = MonotonicTimer()
-        await self._emit(
-            context,
-            LifecycleState.STARTED,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            required=True,
-        )
+        try:
+            cancelled_during_start = await self._emit_cancellation_safe(
+                context=context,
+                state=LifecycleState.STARTED,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                required=True,
+            )
+        except asyncio.CancelledError:
+            # The start send may have reached ingestion before cancellation.
+            # Record a terminal outcome before propagating it; no handler ran.
+            try:
+                await self._emit_cancellation_safe(
+                    context=context,
+                    state=LifecycleState.CANCELLED,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    timer=timer,
+                    outcome=OperationOutcome.CANCELLED,
+                    error=asyncio.CancelledError(),
+                    required=True,
+                )
+            except ChatAuditUnavailable as audit_error:
+                raise ChatAuditUnavailable(
+                    "chat tool outcome is indeterminate; audit terminal was not persisted"
+                ) from audit_error
+            raise
+        if cancelled_during_start:
+            try:
+                await self._emit_cancellation_safe(
+                    context=context,
+                    state=LifecycleState.CANCELLED,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    timer=timer,
+                    outcome=OperationOutcome.CANCELLED,
+                    error=asyncio.CancelledError(),
+                    required=True,
+                )
+            except ChatAuditUnavailable as audit_error:
+                raise ChatAuditUnavailable(
+                    "chat tool outcome is indeterminate; audit terminal was not persisted"
+                ) from audit_error
+            raise asyncio.CancelledError
         try:
             result = await handler()
         except BaseException as exc:
-            state = (
-                LifecycleState.CANCELLED
-                if isinstance(exc, asyncio.CancelledError)
-                else LifecycleState.FAILED
+            uncertain_effect = (
+                isinstance(exc, asyncio.CancelledError)
+                and tool_name in _CHAT_MUTATION_CONTRACTS
             )
-            outcome = (
-                OperationOutcome.CANCELLED
-                if state == LifecycleState.CANCELLED
-                else OperationOutcome.FAILURE
-            )
+            if uncertain_effect:
+                # A cancellation can arrive after a remote mutation was sent.
+                state = LifecycleState.INDETERMINATE
+                outcome = OperationOutcome.INDETERMINATE
+            elif isinstance(exc, asyncio.CancelledError):
+                state = LifecycleState.CANCELLED
+                outcome = OperationOutcome.CANCELLED
+            else:
+                state = LifecycleState.FAILED
+                outcome = OperationOutcome.FAILURE
             try:
                 # The handler has already crossed its effect boundary.  Never
                 # quietly return an ordinary handler failure when its terminal
                 # audit outcome could not be persisted: callers must treat the
                 # operation as indeterminate and reconcile it.
-                await self._emit(
-                    context,
-                    state,
+                terminal_interrupted = await self._emit_cancellation_safe(
+                    context=context,
+                    state=state,
                     tool_name=tool_name,
                     tool_input=tool_input,
                     timer=timer,
@@ -272,6 +332,8 @@ class ChatToolAudit:
                 raise ChatAuditUnavailable(
                     "chat tool outcome is indeterminate; audit terminal was not persisted"
                 ) from audit_error
+            if terminal_interrupted and not isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError from exc
             raise
         failed = False
         try:
@@ -280,9 +342,9 @@ class ChatToolAudit:
         except (TypeError, json.JSONDecodeError):
             pass
         try:
-            await self._emit(
-                context,
-                LifecycleState.FAILED if failed else LifecycleState.COMPLETED,
+            terminal_interrupted = await self._emit_cancellation_safe(
+                context=context,
+                state=(LifecycleState.FAILED if failed else LifecycleState.COMPLETED),
                 tool_name=tool_name,
                 tool_input=tool_input,
                 timer=timer,
@@ -295,6 +357,10 @@ class ChatToolAudit:
             raise ChatAuditUnavailable(
                 "chat tool outcome is indeterminate; audit terminal was not persisted"
             ) from audit_error
+        if terminal_interrupted:
+            raise asyncio.CancelledError(
+                "chat tool completed while its response was cancelled"
+            )
         return result
 
     async def reject(

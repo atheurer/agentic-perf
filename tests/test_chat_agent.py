@@ -487,6 +487,126 @@ class TestSearchFiltering:
 
 
 class TestHandleMessage:
+    async def test_cancelled_tool_reconciles_history_and_blocks_follow_up(self):
+        from unittest.mock import patch
+
+        import pytest
+
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        llm = AsyncMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        response = MagicMock()
+        response.text = None
+        response.tool_calls = [
+            ToolCall(
+                id="toolu-read",
+                name="get_ticket",
+                input={"ticket_id": "PERF-1"},
+            )
+        ]
+        response.raw_content = [{"type": "tool_use", "id": "toolu-read"}]
+        response.usage = {}
+        llm.complete = AsyncMock(return_value=response)
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        tool_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        finish_tool = asyncio.Event()
+
+        async def cancellation_resistant_tool(*_args, **_kwargs):
+            tool_started.set()
+            try:
+                await finish_tool.wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await finish_tool.wait()
+            return '{"id": "PERF-1"}'
+
+        with patch("agents.chat.agent.execute_tool", cancellation_resistant_tool):
+            task = asyncio.create_task(
+                agent.handle_message("alice", "inspect ticket", "token")
+            )
+            await tool_started.wait()
+            task.cancel()
+            await cancellation_seen.wait()
+
+            assert "still finishing" in await agent.handle_message(
+                "alice", "do something else", "token"
+            )
+            assert agent.clear_session("alice") is False
+            finish_tool.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        session = agent._sessions.get_or_create("alice")
+        assert session.pending_action is None
+        assert all(
+            not (
+                message.get("role") == "assistant"
+                and isinstance(message.get("content"), list)
+                and any(
+                    isinstance(block, dict) and block.get("type") == "tool_use"
+                    for block in message["content"]
+                )
+            )
+            for message in session.messages
+        )
+        assert "outcome is uncertain" in session.messages[-1]["content"]
+        assert (
+            "clear the chat session"
+            in (await agent.handle_message("alice", "retry it", "token")).lower()
+        )
+        assert llm.complete.await_count == 1
+        assert agent.clear_session("alice") is True
+
+    async def test_confirmation_remains_pending_until_action_finishes(self):
+        from unittest.mock import patch
+
+        import pytest
+
+        from agents.chat.agent import ChatAgent
+
+        llm = AsyncMock()
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        session = agent._sessions.get_or_create("alice")
+        session.messages = [
+            {"role": "user", "content": "create a ticket"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tc"}]},
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tc"}],
+            },
+            {"role": "assistant", "content": "Please confirm."},
+        ]
+        session.pending_action = {
+            "tool": "create_ticket",
+            "input": {"summary": "test"},
+            "tool_call_id": "tc",
+        }
+        tool_started = asyncio.Event()
+
+        async def blocked_tool(*_args, **_kwargs):
+            tool_started.set()
+            await asyncio.Event().wait()
+
+        with patch("agents.chat.agent.execute_tool", blocked_tool):
+            task = asyncio.create_task(agent.handle_message("alice", "yes", "token"))
+            await tool_started.wait()
+            assert session.pending_action is not None
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert session.pending_action is None
+        assert len(session.messages) == 2
+        assert "outcome is uncertain" in session.messages[-1]["content"]
+
     async def test_failed_round_zero_retry_logs_sanitized_exception(self, caplog):
         from agents.chat.agent import ChatAgent
 
@@ -835,6 +955,7 @@ class TestChatAPI:
             def __init__(self):
                 self.started = asyncio.Event()
                 self.cancelled = asyncio.Event()
+                self.release = asyncio.Event()
                 self.task = None
 
             async def handle_message(self, **_kwargs):
@@ -844,7 +965,7 @@ class TestChatAPI:
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
                     self.cancelled.set()
-                    await asyncio.Event().wait()
+                    await self.release.wait()
 
         agent = SlowCleanupAgent()
         response = await chat_api.send_message_stream(
@@ -862,9 +983,181 @@ class TestChatAPI:
         assert agent.cancelled.is_set()
         assert loop.time() - started_at < 0.2
         assert agent.task is not None
+        assert not agent.task.done()
+        assert agent.task in chat_api._CHAT_TASKS_AWAITING_CLEANUP
+        agent.release.set()
         completed, _ = await asyncio.wait({agent.task}, timeout=0.2)
         assert completed == {agent.task}
-        assert agent.task.cancelled()
+        await asyncio.sleep(0)
+        assert agent.task not in chat_api._CHAT_TASKS_AWAITING_CLEANUP
+
+    async def test_asgi_24_send_failure_closes_chat_stream(self):
+        import pytest
+        from starlette.requests import ClientDisconnect
+
+        from state_store.api.chat import ChatMessageRequest, send_message_stream
+
+        class BlockingAgent:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.cancelled = asyncio.Event()
+
+            async def handle_message(self, **_kwargs):
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    raise
+
+        agent = BlockingAgent()
+        response = await send_message_stream(
+            ChatMessageRequest(message="hello"), self._chat_request(agent)
+        )
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message["body"]:
+                await agent.started.wait()
+                raise OSError("client disconnected")
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "method": "POST",
+            "path": "/api/v1/chat/message/stream",
+            "headers": [],
+        }
+        with pytest.raises(ClientDisconnect):
+            await response(scope, receive, send)
+
+        assert agent.started.is_set()
+        assert agent.cancelled.is_set()
+
+    async def test_asgi_20_disconnect_cancels_chat_stream(self):
+        from state_store.api.chat import ChatMessageRequest, send_message_stream
+
+        class BlockingAgent:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.cancelled = asyncio.Event()
+                self.finished = asyncio.Event()
+
+            async def handle_message(self, **_kwargs):
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    raise
+                finally:
+                    self.finished.set()
+
+        agent = BlockingAgent()
+        response = await send_message_stream(
+            ChatMessageRequest(message="hello"), self._chat_request(agent)
+        )
+
+        async def receive():
+            await agent.started.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            return None
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.0"},
+            "method": "POST",
+            "path": "/api/v1/chat/message/stream",
+            "headers": [],
+        }
+        await asyncio.wait_for(response(scope, receive, send), timeout=0.5)
+
+        assert agent.cancelled.is_set()
+        assert agent.finished.is_set()
+
+    async def test_stream_cleanup_does_not_interrupt_delayed_audit_terminal(
+        self, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        import pytest
+
+        import state_store.api.chat as chat_api
+        from agents.chat.agent import ChatAgent
+        from providers.llm.base import ToolCall
+
+        monkeypatch.setattr(chat_api, "_CHAT_TASK_CLEANUP_TIMEOUT_SECONDS", 0.01)
+        llm = MagicMock()
+        llm.max_tokens = 4096
+        llm.timeout = 60
+        llm.complete = AsyncMock()
+        llm_response = MagicMock()
+        llm_response.text = None
+        llm_response.tool_calls = [
+            ToolCall(
+                id="toolu-read",
+                name="get_ticket",
+                input={"ticket_id": "PERF-1"},
+            )
+        ]
+        llm_response.raw_content = [{"type": "tool_use", "id": "toolu-read"}]
+        llm_response.usage = {}
+        llm.complete.return_value = llm_response
+        agent = ChatAgent(
+            llm=llm, store_url="http://localhost:8090", audit_token="service-token"
+        )
+        tool_started = asyncio.Event()
+        terminal_started = asyncio.Event()
+        finish_terminal = asyncio.Event()
+        events = []
+        worker_task = None
+
+        async def post(_url, **kwargs):
+            state = kwargs["json"]["lifecycle"]["state"]
+            if state == "cancelled":
+                terminal_started.set()
+                await finish_terminal.wait()
+            events.append(state)
+            response = MagicMock()
+            response.raise_for_status = MagicMock()
+            return response
+
+        async def blocked_dispatch(*_args, **_kwargs):
+            nonlocal worker_task
+            worker_task = asyncio.current_task()
+            tool_started.set()
+            await asyncio.Event().wait()
+
+        agent._client.post = post
+        response = await chat_api.send_message_stream(
+            chat_api.ChatMessageRequest(message="inspect ticket"),
+            self._chat_request(agent),
+        )
+        stream = response.body_iterator
+
+        with patch("agents.chat.tools._dispatch_tool", blocked_dispatch):
+            assert await anext(stream) == ": heartbeat\n\n"
+            await tool_started.wait()
+            await asyncio.wait_for(stream.aclose(), timeout=0.2)
+            await asyncio.wait_for(terminal_started.wait(), timeout=0.2)
+
+            assert worker_task is not None
+            assert worker_task in chat_api._CHAT_TASKS_AWAITING_CLEANUP
+            assert events == ["started"]
+
+            finish_terminal.set()
+            with pytest.raises(asyncio.CancelledError):
+                await worker_task
+
+        assert events == ["started", "cancelled"]
+        session = agent._sessions.get_or_create("default")
+        assert "outcome is uncertain" in session.messages[-1]["content"]
+        await asyncio.sleep(0)
+        assert worker_task not in chat_api._CHAT_TASKS_AWAITING_CLEANUP
 
 
 class TestBenchmarkCatalog:
