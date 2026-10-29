@@ -138,22 +138,46 @@ def build_available_command(spec: KernelSpec) -> str:
     return f"dnf -q list --available {spec.nevra} 2>&1"
 
 
-def build_repo_setup_command(spec: KernelSpec) -> str:
+def build_repo_setup_command(
+    spec: KernelSpec,
+    *,
+    gpg_key_path: str = "",
+    ca_cert_path: str = "",
+) -> str:
     """Idempotent dnf repo file for spec.repo_url (call before install).
 
     The URL goes through a single-quoted printf, which the KernelSpec
-    validation guarantees to be injection-safe. sslverify=0 because lab
-    compose servers commonly present private CA chains; gpgcheck=0 for
-    the same reason. `dnf clean metadata` makes a previously-failed
-    metadata download retry cleanly.
+    validation guarantees to be injection-safe.
+
+    Trust model (review blocker on #1230): a repository is only written
+    when the URL is approved by organization configuration AND the
+    verification material is deployed. With a deployed GPG key the repo
+    is gpgcheck=1; with a deployed CA bundle sslverify points at it.
+    Blind gpgcheck=0/sslverify=0 is never emitted -- a user-controlled
+    or MITM repository must not be able to run package scriptlets as
+    root on benchmark hosts.
     """
     if not spec.repo_url:
         raise ValueError("kernel spec has no repo_url")
+    if not gpg_key_path:
+        raise ValueError(
+            "repository trust requires a deployed GPG key path "
+            "(approved_repositories[gpg_key_secret]); refusing to write "
+            "an unauthenticated repository"
+        )
+    if not ca_cert_path:
+        raise ValueError(
+            "repository trust requires a deployed CA bundle path "
+            "(approved_repositories[ca_secret]); refusing to write a "
+            "repository without TLS verification"
+        )
     return (
-        f"printf '%s\\n' '[agentic-perf-kernel]'"
+        f"printf '%s\n' '[agentic-perf-kernel]'"
         f" 'name=agentic-perf kernel repository'"
         f" 'baseurl={spec.repo_url}'"
-        f" 'enabled=1' 'gpgcheck=0' 'sslverify=0'"
+        f" 'enabled=1' 'gpgcheck=1'"
+        f" 'gpgkey=file://{gpg_key_path}'"
+        f" 'sslcacert={ca_cert_path}'"
         f" > {_REPO_FILE}"
         f" && dnf clean metadata >/dev/null 2>&1;"
         f" dnf -q list --available {spec.nevra} >/dev/null 2>&1"

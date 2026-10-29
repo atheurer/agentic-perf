@@ -3491,6 +3491,114 @@ def _actions_for_host(spec: KernelSpec, inventory: dict[str, Any]) -> dict[str, 
     }
 
 
+async def _resolve_repository_trust(repo_url: str) -> dict[str, Any]:
+    """Match a repo URL against the organization's approved repositories.
+
+    Expected shape in the harness private config (e.g.
+    private-skills/crucible.json)::
+
+        "approved_repositories": [
+            {
+                "url_prefix": "https://download.eng.rdu.redhat.com/rhel-9/composes/",
+                "gpg_key_secret": "rhel-compose-gpg-key",
+                "ca_secret": "rhel-lab-ca-bundle",
+                "description": "RDU3 RHEL composes"
+            }
+        ]
+
+    The secrets resolve through the normal secrets provider (local
+    files under ~/.agentic-perf/secrets/ or the configured vault) and
+    are never exposed to the LLM. Returns {"approved": bool,
+    "entry": <matched entry>}.
+    """
+    provider = _skill_provider
+    get_all = getattr(provider, "get_all_private_config", None)
+    config = {}
+    if get_all is not None:
+        try:
+            config = await get_all("crucible") or {}
+        except Exception:
+            config = {}
+    approved: list[Any] = []
+    if isinstance(config, dict):
+        # The private config may nest the list under "provisioning" or
+        # expose it at the suite top level, depending on the file layout.
+        nested = config.get("provisioning")
+        if isinstance(nested, dict):
+            approved = nested.get("approved_repositories") or []
+        if not approved:
+            approved = config.get("approved_repositories") or []
+    for entry in approved:
+        prefix = entry.get("url_prefix", "")
+        if prefix and repo_url.startswith(prefix):
+            return {"approved": True, "entry": entry}
+    return {"approved": False}
+
+
+async def _deploy_repository_trust(
+    target: str, trust: dict[str, Any]
+) -> tuple[str, str]:
+    """Deploy the approved entry's GPG key and CA bundle to a host.
+
+    Materializes the secrets as root-only files under /etc/pki so the
+    repo file can reference them. Returns (gpg_key_path, ca_cert_path);
+    empty paths mean deployment failed.
+    """
+    entry = trust.get("entry") or {}
+    gpg_secret = entry.get("gpg_key_secret")
+    ca_secret = entry.get("ca_secret")
+    if not gpg_secret or not ca_secret:
+        return "", ""
+    deployed: list[str] = []
+    paths: dict[str, str] = {}
+    for kind, secret_name, remote in (
+        ("gpg", gpg_secret, "/etc/pki/agentic-perf/kernel-repo-gpg.key"),
+        ("ca", ca_secret, "/etc/pki/agentic-perf/kernel-repo-ca.pem"),
+    ):
+        try:
+            content = await _read_secret(secret_name)
+        except Exception:
+            return "", ""
+        if not content:
+            return "", ""
+        result = await _ssh.run(
+            target,
+            f"mkdir -p /etc/pki/agentic-perf && chmod 755 /etc/pki/agentic-perf"
+            f" && cat > {remote} << 'AGENTIC_PERF_TRUST_EOF'\n"
+            f"{content}\nAGENTIC_PERF_TRUST_EOF\n"
+            f"chmod 644 {remote}",
+            timeout=30,
+            mutating=True,
+        )
+        if result.exit_code != 0:
+            return "", ""
+        paths[kind] = remote
+        deployed.append(remote)
+    if len(deployed) != 2:
+        return "", ""
+    return paths["gpg"], paths["ca"]
+
+
+async def _read_secret(secret_name: str) -> str:
+    """Read a secret's text content through the server's secrets provider."""
+    global _secrets_provider
+    await _ensure_init()
+    provider = _secrets_provider
+    if provider is None:
+        return ""
+    get = getattr(provider, "get_secret", None)
+    if get is None:
+        return ""
+    value = get(secret_name)
+    if asyncio.iscoroutine(value):
+        value = await value
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 async def _install_kernel_one(
     host: str, spec: KernelSpec, address: str | None = None
 ) -> dict[str, Any]:
@@ -3522,14 +3630,43 @@ async def _install_kernel_one(
         }
 
     # A step-supplied repo_url bootstraps the repository the kernel comes
-    # from (fresh lab hosts have no compose repos). The availability probe
-    # inside the command fails the install early with a clear message if
-    # the repo is unreachable, before any package action.
+    # from (fresh lab hosts have no compose repos). Trust model (review
+    # blocker on #1230): the URL must match an organization-approved
+    # repository entry, and the entry's GPG key + CA bundle must be
+    # deployed to the host before any repo file is written. Unverified
+    # repositories are refused — package scriptlets run as root.
     if spec.repo_url:
         from providers.rhel_kernel import build_repo_setup_command
 
+        trust = await _resolve_repository_trust(spec.repo_url)
+        if not trust.get("approved"):
+            return {
+                "host": host,
+                "state": "install_failed",
+                "error": (
+                    f"repository {spec.repo_url!r} is not in the "
+                    "organization's approved_repositories configuration; "
+                    "add an entry with gpg_key_secret and ca_secret before "
+                    "using it"
+                ),
+                "before": before.to_dict(),
+            }
+        gpg_path, ca_path = await _deploy_repository_trust(target, trust)
+        if not gpg_path or not ca_path:
+            return {
+                "host": host,
+                "state": "install_failed",
+                "error": (
+                    "repository trust material could not be deployed to "
+                    f"{host}; refusing unverified dnf access"
+                ),
+                "before": before.to_dict(),
+            }
         repo_result = await _ssh.run(
-            target, build_repo_setup_command(spec), timeout=300, mutating=True
+            target,
+            build_repo_setup_command(spec, gpg_key_path=gpg_path, ca_cert_path=ca_path),
+            timeout=300,
+            mutating=True,
         )
         if repo_result.exit_code != 0:
             return {
