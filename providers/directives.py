@@ -47,10 +47,6 @@ _CORE_DIRECTIVES: set[str] = {
     "release",
     # Harness selection
     "harness",
-    # Fleet
-    "fleet",
-    "convergence_strategy",
-    "failure_policy",
     # Behavior
     "skip_teardown",
     "disable_hitl_timeout",
@@ -73,19 +69,14 @@ _CORE_ALIASES: dict[str, str] = {
 }
 
 _CORE_DESCRIPTIONS: dict[str, str] = {
-    "board_selector": "Jumpstarter board label selector — pass through verbatim from user input",
-    "resource_provider": "Resource provider: 'jumpstarter', 'quads', 'aws', or 'user_provided'",
+    "resource_provider": "Resource provider: 'jumpstarter', 'quads', 'aws', 'psap-cc', or 'user_provided'",
     "endpoint_type": "Host connection type (default: 'remotehosts')",
-    "exclude_hosts": "Host names to exclude from allocation (list)",
     "image_version": "OS image version (e.g. 'AutoSD-10', 'RHIVOS-2')",
     "image_name": "Image variant name (e.g. 'qa', 'ps', 'fusa-minimal')",
     "image_type": "Image type: 'regular' or 'ostree'",
     "image_server": "Base URL of the image download server",
     "release": "Release path (e.g. 'monthly/autosd10-202608', 'nightly')",
     "harness": "Benchmark harness to use (e.g. 'boot-time', 'crucible')",
-    "fleet": "Enable fleet investigation mode (bool)",
-    "convergence_strategy": "Fleet convergence strategy",
-    "failure_policy": "Fleet failure handling: 'continue' or 'stop'",
     "skip_teardown": "Skip resource teardown after completion (bool)",
     "disable_hitl_timeout": "Disable HITL timeout for manual investigation (bool)",
     "review_mode": "Review agent mode",
@@ -95,7 +86,7 @@ _CORE_DESCRIPTIONS: dict[str, str] = {
     "update_harness": "Update harness packages on target before benchmark (bool)",
     "jumpstarter_serial": "Enable Jumpstarter serial capture mode (bool)",
     "user_pre_run_approval": "Require user approval before executing the benchmark (bool, default true)",
-    "on_existing_install": "Policy for pre-existing installations: 'reuse', 'skip', or 'reinstall'",
+    "on_existing_install": "Policy for pre-existing installations: 'reinstall', 'update', 'skip', or 'ask_user'",
     "firewall_policy": "Firewall configuration policy for the benchmark environment",
     "test_interfaces": "Network interfaces to use for the benchmark test",
 }
@@ -433,9 +424,9 @@ def format_directive_schema_for_prompt(
         keys: set of canonical directive key names to include.
             Use get_recognized_directives() for the full set.
 
-    Only keys that have a registered description are included.
-    Keys without descriptions are omitted to avoid confusing
-    the LLM with unexplained names.
+    All keys are included. Keys with registered descriptions
+    show the description; keys without descriptions appear as
+    bare entries so the LLM knows they are recognized.
 
     Returns a string suitable for injection into an agent's
     system prompt, listing canonical keys with descriptions
