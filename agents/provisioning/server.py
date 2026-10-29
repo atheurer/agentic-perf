@@ -3491,6 +3491,54 @@ def _actions_for_host(spec: KernelSpec, inventory: dict[str, Any]) -> dict[str, 
     }
 
 
+def _url_within_prefix(url: str, prefix: str) -> bool:
+    """Path-boundary approval check (review round 2, blocker).
+
+    Both URLs are parsed and canonicalized: scheme and host must match
+    exactly (no userinfo tricks), the approved prefix's path must sit at
+    the URL's path root as complete components (so ``/approved`` never
+    approves ``/approvedevil/``), and dot-segments are resolved before
+    comparison (so ``/approved/../unapproved`` cannot escape). A prefix
+    without a trailing slash is treated as a component boundary anyway.
+    Query strings and fragments are ignored — approval is about where
+    the packages live, not the fetch parameters.
+    """
+    import posixpath
+    from urllib.parse import urlsplit
+
+    def _canonical(raw: str) -> tuple[str, str, list[str]] | None:
+        try:
+            parts = urlsplit(raw.strip())
+            if not parts.scheme or not parts.hostname:
+                return None
+            # Userinfo in either URL is rejected outright: it has no
+            # legitimate role in a package repository URL and enables
+            # host-confusion bypasses (user@approved/ vs approved/).
+            if parts.username or parts.password:
+                return None
+            # Resolve dot-segments (../ and ./) and normalize; unlike
+            # urljoin's "." resolution this preserves every component.
+            path = posixpath.normpath(parts.path or "/")
+            if not path.startswith("/"):
+                path = "/" + path
+            segments = [s for s in path.split("/") if s]
+            return parts.scheme.lower(), (parts.hostname or "").lower(), segments
+        except ValueError:
+            return None
+
+    url_c = _canonical(url)
+    prefix_c = _canonical(prefix)
+    if url_c is None or prefix_c is None:
+        return False
+    url_scheme, url_host, url_segments = url_c
+    p_scheme, p_host, prefix_segments = prefix_c
+    if url_scheme != p_scheme or url_host != p_host:
+        return False
+    if len(url_segments) < len(prefix_segments):
+        return False
+    return url_segments[: len(prefix_segments)] == prefix_segments
+
+
 async def _resolve_repository_trust(repo_url: str) -> dict[str, Any]:
     """Match a repo URL against the organization's approved repositories.
 
@@ -3530,7 +3578,9 @@ async def _resolve_repository_trust(repo_url: str) -> dict[str, Any]:
             approved = config.get("approved_repositories") or []
     for entry in approved:
         prefix = entry.get("url_prefix", "")
-        if prefix and repo_url.startswith(prefix):
+        if not prefix:
+            continue
+        if _url_within_prefix(repo_url, prefix):
             return {"approved": True, "entry": entry}
     return {"approved": False}
 
