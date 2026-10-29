@@ -39,22 +39,22 @@ class KernelSpec:
             raise ValueError("kernel release must not be empty")
         if len(self.release) > _MAX_RELEASE_LEN:
             raise ValueError(f"kernel release exceeds {_MAX_RELEASE_LEN} chars")
-        if not KERNEL_RELEASE_RE.match(self.release):
+        if not KERNEL_RELEASE_RE.fullmatch(self.release):
             raise ValueError(
                 f"kernel release {self.release!r} does not match"
                 f" {KERNEL_RELEASE_RE.pattern}"
             )
-        if not _PACKAGE_NAME_RE.match(self.package):
+        if not _PACKAGE_NAME_RE.fullmatch(self.package):
             raise ValueError(
                 f"package name {self.package!r} contains invalid characters"
             )
         for cp in self.companion_packages:
-            if not KERNEL_RELEASE_RE.match(cp):
+            if not KERNEL_RELEASE_RE.fullmatch(cp):
                 raise ValueError(f"companion package {cp!r} is not a valid release")
         if self.repo_url:
             if len(self.repo_url) > 512:
                 raise ValueError("repo_url exceeds 512 chars")
-            if not _REPO_URL_RE.match(self.repo_url):
+            if not _REPO_URL_RE.fullmatch(self.repo_url):
                 raise ValueError(
                     f"repo_url {self.repo_url!r} is not a plain http(s) URL"
                 )
@@ -115,7 +115,7 @@ def build_probe_command() -> str:
 
 
 def build_inventory_command(package: str = "kernel") -> str:
-    if not _PACKAGE_NAME_RE.match(package):
+    if not _PACKAGE_NAME_RE.fullmatch(package):
         raise ValueError(f"invalid package name: {package!r}")
     return (
         "echo @@uname; uname -r;"

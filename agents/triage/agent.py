@@ -1402,8 +1402,11 @@ class TriageAgent(AgentBase):
         # form. Code owns the topology; the LLM only supplied the intent
         # and the releases. An invalid directive pauses for guidance
         # instead of silently running a single-kernel ticket.
+        # Key presence, not truthiness: an empty mapping or other falsy
+        # value is malformed input and must pause with guidance, not
+        # silently fall through to the ordinary single-benchmark plan.
         kernel_comparison = directives.get("kernel_comparison")
-        if kernel_comparison:
+        if "kernel_comparison" in directives:
             from providers.kernel_plan import build_kernel_comparison_plan
 
             new_plan, plan_err = build_kernel_comparison_plan(
