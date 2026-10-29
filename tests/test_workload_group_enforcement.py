@@ -178,7 +178,6 @@ def _ticket_with_plan(monkeypatch, *, steps_results=None, mv_params=None):
         "_skill_provider",
         SimpleNamespace(default_harness="crucible"),
     )
-    monkeypatch.setenv("EXECUTION_PLAN_STEP_ID", "5")
     return ticket, record
 
 
@@ -210,18 +209,44 @@ def test_matching_fingerprint_passes(monkeypatch):
     assert benchmark_server._check_workload_group_drift(ticket, "val-788") == ""
 
 
-def test_no_prior_fingerprint_is_not_drift(monkeypatch):
-    """Older tickets never recorded fingerprints — nothing to compare."""
+def test_no_plan_at_all_skips_group_check(monkeypatch):
+    """External/legacy runs without an execution plan are out of scope
+    for group enforcement (the group marker itself comes from the plan)."""
     ticket, _ = _ticket_with_plan(monkeypatch, steps_results={})
+    ticket["custom_fields"]["execution_plan"]["steps"] = []
+    ticket["custom_fields"]["execution_plan"].pop("current_step", None)
     assert benchmark_server._check_workload_group_drift(ticket, "val-788") == ""
 
 
-def test_group_check_skipped_without_step_env(monkeypatch):
+def test_missing_current_step_fails_closed(monkeypatch):
+    """Review round 2: no env-var bypass. A kernel-comparison ticket
+    whose executing step cannot be determined is a rejection."""
     ticket, _ = _ticket_with_plan(
         monkeypatch, steps_results={"runfile_fingerprint": "0" * 64}
     )
-    monkeypatch.delenv("EXECUTION_PLAN_STEP_ID", raising=False)
-    assert benchmark_server._check_workload_group_drift(ticket, "val-788") == ""
+    del ticket["custom_fields"]["execution_plan"]["current_step"]
+    drift = benchmark_server._check_workload_group_drift(ticket, "val-788")
+    assert drift
+    assert "refusing" in drift.lower()
+
+
+def test_unknown_current_step_fails_closed(monkeypatch):
+    ticket, _ = _ticket_with_plan(
+        monkeypatch, steps_results={"runfile_fingerprint": "0" * 64}
+    )
+    ticket["custom_fields"]["execution_plan"]["current_step"] = 99
+    drift = benchmark_server._check_workload_group_drift(ticket, "val-788")
+    assert drift
+    assert "does not match any plan step" in drift
+
+
+def test_missing_prior_fingerprint_fails_closed(monkeypatch):
+    """Feature-created plans must establish identity on every group step;
+    a prior step with no fingerprint is a rejection, not a bypass."""
+    ticket, _ = _ticket_with_plan(monkeypatch, steps_results={})
+    drift = benchmark_server._check_workload_group_drift(ticket, "val-788")
+    assert drift
+    assert "no recorded runfile fingerprint" in drift
 
 
 def test_plan_mv_params_mismatch_detected(monkeypatch):
@@ -294,7 +319,6 @@ def _wire_execute(monkeypatch, tmp_path, *, plan_ticket, record_run_file):
         "_skill_provider",
         SimpleNamespace(default_harness="crucible"),
     )
-    monkeypatch.setenv("EXECUTION_PLAN_STEP_ID", "5")
     monkeypatch.setenv("TICKET_ID", "T-WG")
 
     class _Result:
@@ -339,8 +363,18 @@ def _wire_execute(monkeypatch, tmp_path, *, plan_ticket, record_run_file):
     return record
 
 
-def _group_plan_ticket(step_results=None, mv_params=None, prior_fingerprint=None):
-    """A kernel-ab plan at the candidate benchmark step (id 5)."""
+def _group_plan_ticket(
+    step_results=None,
+    mv_params=None,
+    prior_fingerprint=None,
+    mark_prior_complete=True,
+):
+    """A kernel-ab plan at the candidate benchmark step (id 5).
+
+    With ``mark_prior_complete=False`` the executing step becomes the
+    group's FIRST benchmark (id 2) — no prior fingerprint exists, so the
+    mv_params gate is exercised in isolation.
+    """
     prior = (
         {
             "runfile_fingerprint": prior_fingerprint,
@@ -366,8 +400,11 @@ def _group_plan_ticket(step_results=None, mv_params=None, prior_fingerprint=None
                     "workload_group": "kernel-ab",
                     "kernel_role": "baseline",
                 },
-                "status": "completed",
-                "results": dict(prior, run_id="run-1"),
+                **(
+                    {"status": "completed", "results": dict(prior, run_id="run-1")}
+                    if mark_prior_complete
+                    else {"status": "pending", "results": {}}
+                ),
             },
             {
                 "id": 4,
@@ -434,8 +471,18 @@ async def test_execute_rejects_plan_mv_params_mismatch_through_the_real_path(
     tmp_path, monkeypatch
 ):
     """Plan says seconds=30; the validated run file omits mv-params
-    entirely (the exact observed failure)."""
-    ticket = _group_plan_ticket(mv_params={"seconds": "30"})
+    entirely (the exact observed failure). The executing step is the
+    group's FIRST benchmark, so the mv_params gate fires in isolation
+    (no prior fingerprint exists yet)."""
+    ticket = _group_plan_ticket(
+        mv_params={"seconds": "30"},
+        mark_prior_complete=False,
+    )
+    ticket["custom_fields"]["execution_plan"]["current_step"] = 3
+    ticket["custom_fields"]["execution_plan"]["steps"][3]["status"] = "in_progress"
+    ticket["custom_fields"]["execution_plan"]["steps"][3]["params"]["mv_params"] = {
+        "seconds": "30"
+    }
     _wire_execute(
         monkeypatch, tmp_path, plan_ticket=ticket, record_run_file=_run_file()
     )
@@ -505,3 +552,17 @@ class _RejectingSSH:
             stderr="",
             exit_code=0,
         )
+
+
+def test_extra_mv_params_rejected(monkeypatch):
+    """The run file must not vary parameters the plan does not name."""
+    ticket, _ = _ticket_with_plan(monkeypatch)
+    # Inject an extra varied parameter into the validated run file.
+    record = ticket["custom_fields"]["benchmark_validations"]["records"]["val-788"]
+    record["run_file"]["benchmarks"][0]["mv-params"]["sets"][0]["params"].append(
+        {"arg": "cpu", "vals": ["0-63"]}
+    )
+    error = benchmark_server._check_plan_mv_params(ticket, "val-788", {"seconds": "30"})
+    assert error
+    assert "cpu" in error
+    assert "does not name" in error
