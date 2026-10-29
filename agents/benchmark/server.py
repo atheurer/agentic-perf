@@ -3389,6 +3389,51 @@ async def execute_benchmark(
             await pause_for_reconciliation("execution intent preparation failed")
             return json.dumps({"status": "indeterminate", "operation_id": intent_key})
 
+    # Workload-group immutability (#998): benchmark steps in the same
+    # workload_group must execute an identical runfile, and a plan step
+    # that names mv_params must see them verbatim in the validated run
+    # file. Checked here — immediately before the approval gate and any
+    # side effect — because a mismatch means the LLM rebuilt the run file
+    # differently than planned (observed in PERF-E47D0F45: one run
+    # silently executed the sleep benchmark's 600s default instead of the
+    # planned 30s, making the A/B comparison invalid).
+    drift = _check_workload_group_drift(active_check, validation_id)
+    if drift:
+        rejection = {
+            "status": "rejected",
+            "reason_code": "workload_drift",
+            "message": drift,
+        }
+        if operation_guard and operation_owned:
+            await operation_guard.terminalize(
+                operation_record,
+                "fail",
+                {"outcome": "workload_drift", "benchmark_result": rejection},
+            )
+            await operation_guard.close()
+        return json.dumps(rejection)
+    step_params = plan_step_params(active_check)
+    plan_mv = (step_params or {}).get("mv_params")
+    if plan_mv:
+        mv_error = _check_plan_mv_params(active_check, validation_id, plan_mv)
+        if mv_error:
+            rejection = {
+                "status": "rejected",
+                "reason_code": "runfile_params_mismatch",
+                "message": mv_error,
+            }
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record,
+                    "fail",
+                    {
+                        "outcome": "runfile_params_mismatch",
+                        "benchmark_result": rejection,
+                    },
+                )
+                await operation_guard.close()
+            return json.dumps(rejection)
+
     # Claim the execution intent before creating an automatic approval. The
     # acquired lease remains held through approval consumption and execution.
     if (
