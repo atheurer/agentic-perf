@@ -2724,11 +2724,15 @@ def read_artifact_file_impl(
 
     try:
         resolved = resolved.resolve()
-        artifacts_resolved = ARTIFACT_DIR.resolve()
+        # When ticket_id is provided, scope to that ticket's subtree
+        if ticket_id:
+            scoped_dir = (ARTIFACT_DIR / ticket_id).resolve()
+        else:
+            scoped_dir = ARTIFACT_DIR.resolve()
         # Use is_relative_to for proper path-component containment.
         # String prefix matching would allow sibling directories
         # like "artifacts-archive/" to pass.
-        if not resolved.is_relative_to(artifacts_resolved):
+        if not resolved.is_relative_to(scoped_dir):
             return json.dumps(
                 {"error": "Access denied: path is outside the artifacts directory"}
             )

@@ -1222,7 +1222,7 @@ class ResourceAgent(AgentBase):
         mcp_tools = [
             t for t in await mcp.list_tools() if t.name != "get_accumulated_metadata"
         ]
-        self.tools = mcp_tools + self.tools
+        self._install_mcp_tools(mcp_tools)
 
         try:
             await super().run(ticket_id)

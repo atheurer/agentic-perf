@@ -1754,15 +1754,16 @@ async def run_agent_task(
                                     f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/comments",
                                     json={"author": "system", "body": reason},
                                 )
-                                await _fc.post(
+                                _tr = await _fc.post(
                                     f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}/transition",
                                     json={"status": "coordinating_fleet"},
                                 )
-                                _fleet_routed = True
-                                logger.info(
-                                    "Fleet crash recovery: routed %s to coordinator",
-                                    ticket_id,
-                                )
+                                if _tr.status_code == 200:
+                                    _fleet_routed = True
+                                    logger.info(
+                                        "Fleet crash recovery: routed %s to coordinator",
+                                        ticket_id,
+                                    )
                 except Exception:
                     logger.debug(
                         "Fleet crash routing failed for %s, falling back to HITL",
