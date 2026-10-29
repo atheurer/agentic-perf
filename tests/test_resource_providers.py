@@ -221,6 +221,39 @@ class TestQuadsResourceProvider:
         )
 
     @pytest.mark.asyncio
+    async def test_check_available_reports_unavailable_os_before_host_search(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = AsyncMock()
+        mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
+
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.check_available({"os": "RHEL 10.1"})
+
+        assert result["status"] == "failed"
+        assert result["available_count"] == 0
+        assert result["options"] == []
+        assert result["available_os"] == ["RHEL 10.0"]
+        assert "RHEL 10.1" in result["error"]
+        mock_client.get_available.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_check_available_includes_resolved_os_with_host_options(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = AsyncMock()
+        mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
+        mock_client.get_available.return_value = [
+            {"hostname": "host1.example.com", "cores": 32}
+        ]
+
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.check_available({"os": "rhel  10.0"})
+
+        assert result["available_count"] == 1
+        assert result["os"] == "RHEL 10.0"
+
+    @pytest.mark.asyncio
     async def test_reserve(self):
         from providers.resource.quads import QuadsResourceProvider
 

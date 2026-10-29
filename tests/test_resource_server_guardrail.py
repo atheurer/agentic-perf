@@ -525,6 +525,45 @@ async def test_status_only_reservation_failure_does_not_set_flag():
 
 
 @pytest.mark.asyncio
+async def test_quads_unavailable_os_is_definitive_no_allocation_failure():
+    """Unavailable QUADS OS releases do not create an unknown-allocation marker."""
+    import agents.resource.server as srv
+    from providers.resource.quads import QuadsResourceProvider
+
+    mock_client = AsyncMock()
+    mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
+    provider = QuadsResourceProvider(mock_client)
+    provider.record_availability_context(
+        [{"options": [{"hostname": "host-01"}]}],
+        {"ticket_id": "PERF-TEST", "required_hosts": []},
+    )
+    registry = MagicMock()
+    registry.get_provider = AsyncMock(return_value=provider)
+
+    srv._initialized = True
+    srv._registry = registry
+    srv._ticket = {"id": "PERF-TEST", "custom_fields": {}}
+
+    raw = await srv.reserve_resources(
+        provider="quads",
+        selection={"hostnames": ["host-01"], "os": "RHEL 10.1"},
+        description="test",
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "failed"
+    assert result["allocation_unknown"] is False
+    assert result["retry_blocked"] is False
+    assert result["allocation_attempted"] is False
+    assert result["available_os"] == ["RHEL 10.0"]
+    assert srv._reservation_uncertain is False
+    assert srv._resources_allocated is False
+    assert srv._ticket["custom_fields"]["resource_reservation_outcome_unknown"] is False
+    mock_client.create_assignment.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_quads_caller_ticket_key_cannot_replace_missing_active_context(
     monkeypatch,
 ):

@@ -10,6 +10,16 @@ from .base import ResourceProvider
 logger = logging.getLogger(__name__)
 
 
+class QuadsOSUnavailableError(ValueError):
+    def __init__(self, requested_os: str, available_os: list[str]) -> None:
+        super().__init__(
+            f"Requested QUADS OS {requested_os!r} is unavailable. "
+            f"Available OS choices: {', '.join(available_os) or '(none returned)'}"
+        )
+        self.requested_os = requested_os
+        self.available_os = available_os
+
+
 class QuadsResourceProvider(ResourceProvider):
     """ResourceProvider adapter for the QUADS bare-metal self-service system.
 
@@ -29,43 +39,40 @@ class QuadsResourceProvider(ResourceProvider):
     def _normalize_os_name(value: str) -> str:
         return " ".join(value.split()).casefold()
 
+    @staticmethod
+    def _os_entry_name(entry: dict[str, Any]) -> str | None:
+        os_name = (
+            entry.get("Title")
+            or entry.get("name")
+            or entry.get("title")
+            or entry.get("os")
+        )
+        return os_name if isinstance(os_name, str) else None
+
+    @classmethod
+    def _available_os_names(cls, available_os: list[dict[str, Any]]) -> list[str]:
+        return sorted(
+            os_name
+            for entry in available_os
+            if isinstance(entry, dict)
+            for os_name in [cls._os_entry_name(entry)]
+            if os_name is not None
+        )
+
     async def _resolve_os_type(self, requested_os: str) -> str:
         available_os = await self._client.get_os_list()
         for entry in available_os:
             if not isinstance(entry, dict):
                 continue
-            os_name = (
-                entry.get("Title")
-                or entry.get("name")
-                or entry.get("title")
-                or entry.get("os")
-            )
-            if not isinstance(os_name, str):
+            os_name = self._os_entry_name(entry)
+            if os_name is None:
                 continue
             if self._normalize_os_name(os_name) == self._normalize_os_name(
                 requested_os
             ):
                 return os_name
-        available_names = sorted(
-            str(
-                entry.get("Title")
-                or entry.get("name")
-                or entry.get("title")
-                or entry.get("os")
-            )
-            for entry in available_os
-            if isinstance(entry, dict)
-            and isinstance(
-                entry.get("Title")
-                or entry.get("name")
-                or entry.get("title")
-                or entry.get("os"),
-                str,
-            )
-        )
-        raise ValueError(
-            f"Requested QUADS OS {requested_os!r} is unavailable. "
-            f"Available OS choices: {', '.join(available_names) or '(none returned)'}"
+        raise QuadsOSUnavailableError(
+            requested_os, self._available_os_names(available_os)
         )
 
     @staticmethod
@@ -191,6 +198,36 @@ class QuadsResourceProvider(ResourceProvider):
         return cls(client)
 
     async def check_available(self, requirements: dict[str, Any]) -> dict[str, Any]:
+        requested_os = requirements.get("os")
+        if requested_os is not None:
+            if not isinstance(requested_os, str) or not requested_os.strip():
+                return {
+                    "provider": self.provider_name,
+                    "available_count": 0,
+                    "options": [],
+                    "status": "failed",
+                    "error": "QUADS OS requirement must be a nonempty string",
+                    "message": (
+                        "No host search was performed for an invalid OS request."
+                    ),
+                }
+            try:
+                os_type = await self._resolve_os_type(requested_os.strip())
+            except QuadsOSUnavailableError as exc:
+                return {
+                    "provider": self.provider_name,
+                    "available_count": 0,
+                    "options": [],
+                    "status": "failed",
+                    "error": str(exc),
+                    "available_os": exc.available_os,
+                    "message": (
+                        "The requested OS is not available from QUADS. Choose an "
+                        "available release or request user clarification."
+                    ),
+                }
+        else:
+            os_type = None
         hosts = await self._client.get_available(
             model_filter=requirements.get("model_filter"),
             vendor_filter=requirements.get("nic_vendor")
@@ -225,6 +262,7 @@ class QuadsResourceProvider(ResourceProvider):
             "provider": self.provider_name,
             "available_count": len(hosts),
             "options": hosts,
+            **({"os": os_type} if os_type is not None else {}),
             "message": f"{len(hosts)} bare-metal hosts available from Scale Lab QUADS",
         }
 
