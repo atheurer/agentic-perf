@@ -49,12 +49,23 @@ A host is available when `cloud.name == "cloud01"` and `can_self_schedule == tru
 curl -s -k -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"description": "short description", "owner": "<owner>", "qinq": 0, "wipe": "true"}' \
+  -d '{"description": "short description", "owner": "<owner>", "qinq": 0, "ostype": "<os>", "wipe": true}' \
   "https://$API_HOST/api/v3/assignments/self"
 ```
 
 Response includes `cloud.name` (e.g. `cloud23`) and `id` (assignment ID).
-The `wipe: true` flag reprovisiones the host with the selected OS.
+The `ostype` value must exactly match an available OS. Discover the current
+choices before choosing one:
+
+```bash
+curl -s "https://$API_HOST/api/v3/hosts/os_list"
+```
+
+The `wipe` flag controls reprovisioning: omit it or set it to `true` for the
+default clean install, or set it explicitly to `false` only when the user asks
+to preserve the current disk contents. If QUADS reports that the requested OS
+is unavailable, report the exact QUADS error and available OS choices rather
+than silently substituting another OS.
 
 ### 4. Schedule each host into the assignment
 

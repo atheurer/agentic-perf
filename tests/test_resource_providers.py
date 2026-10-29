@@ -249,7 +249,65 @@ class TestQuadsResourceProvider:
         assert result["provider_metadata"]["assignment_id"] == 42
         assert result["provider_metadata"]["cloud_name"] == "cloud01"
         assert result["hosts"] == ["host1.example.com"]
-        mock_client.create_assignment.assert_awaited_once_with("PERF-TEST")
+        mock_client.create_assignment.assert_awaited_once_with(
+            "PERF-TEST", os_type=None, wipe=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_reserve_passes_requested_os_and_wipe_choice(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = AsyncMock()
+        mock_client.ssh_key_path = "/fake/key"
+        mock_client.get_os_list.return_value = [
+            {"Title": "RHEL 10.0"},
+            {"Title": "Fedora 44"},
+        ]
+        mock_client.create_assignment.return_value = {
+            "id": 43,
+            "cloud_name": "cloud02",
+            "ticket": "T-124",
+        }
+        mock_client.schedule_host.return_value = {"end": "2026-06-15T00:00"}
+        mock_client.poll_until_validated.return_value = {"validated": True}
+        mock_client.setup_ssh.return_value = {"status": "success"}
+
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.reserve(
+            selection={
+                "hostnames": ["host1.example.com"],
+                "os": "rhel  10.0",
+                "wipe": False,
+            },
+            description="test assignment",
+            ticket_id="PERF-TEST",
+        )
+
+        assert result["provider_metadata"]["os"] == "RHEL 10.0"
+        assert result["provider_metadata"]["wipe"] is False
+        mock_client.create_assignment.assert_awaited_once_with(
+            "PERF-TEST", os_type="RHEL 10.0", wipe=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_reserve_rejects_unavailable_os_before_assignment(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = AsyncMock()
+        mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
+
+        provider = QuadsResourceProvider(mock_client)
+        with pytest.raises(ValueError, match="Requested QUADS OS .* unavailable"):
+            await provider.reserve(
+                selection={
+                    "hostnames": ["host1.example.com"],
+                    "os": "RHEL 10.1",
+                },
+                description="test assignment",
+                ticket_id="PERF-TEST",
+            )
+
+        mock_client.create_assignment.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reserve_max_hosts(self):
@@ -2632,8 +2690,14 @@ class TestProviderCorrectAutoReservation:
                         {"roles": ["target"]},
                     ],
                     "hostnames": ["host-a", "host-b"],
+                    "os": "RHEL 10.0",
+                    "wipe": False,
                 },
-                {"hostnames": ["host-a", "host-b"]},
+                {
+                    "hostnames": ["host-a", "host-b"],
+                    "os": "RHEL 10.0",
+                    "wipe": False,
+                },
             ),
             ("psap-cc", {"cluster_id": "cluster-7"}, {"cluster_id": "cluster-7"}),
             (
@@ -2746,7 +2810,7 @@ class TestProviderCorrectAutoReservation:
                     "provider_metadata": {"assignment_id": 73},
                     "hosts": ["host-a", "host-b"],
                 },
-                {"hostnames": ["host-a", "host-b"]},
+                {"hostnames": ["host-a", "host-b"], "wipe": True},
                 "73",
                 {"controller": "host-a", "targets": ["host-b"]},
                 True,

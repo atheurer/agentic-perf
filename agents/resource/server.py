@@ -1012,9 +1012,9 @@ async def reserve_resources(
             }
         )
     # Inject OS from ticket required_hosts when the LLM doesn't
-    # include it in the selection — ensures AMI resolution fires
-    # in the provider regardless of LLM behavior.
-    if provider == "aws" and not selection.get("ami") and not selection.get("os"):
+    # include it in the selection — ensures provider-specific OS
+    # resolution fires regardless of LLM behavior.
+    if provider in {"aws", "quads"} and not selection.get("os"):
         os_name = _infer_os_from_ticket()
         if os_name:
             selection = dict(selection)
