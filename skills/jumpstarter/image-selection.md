@@ -178,3 +178,10 @@ When resolving a conflict, add a ticket comment explaining your
 choice and which source won — e.g., "Resolved image/mode: selected
 regular — authoritative `RHIVOS Mode=package` in run_metadata
 overrides the 'ostree' token in the test name."
+
+The `image_server` directive should be the **root server URL**
+(e.g., `https://autosd.sig.centos.org/`), not a full release
+path. The resolver appends the version and release path
+automatically. If a user provides a full URL including the
+version and release, the resolver will detect the overlap and
+strip it, but the preferred form is the server root.
