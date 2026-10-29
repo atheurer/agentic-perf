@@ -284,7 +284,14 @@ class ProvisioningAgent(AgentBase):
             f"Approved addresses: {json.dumps(intent.get('addresses', {}), sort_keys=True)}\n"
             f"Actions: {', '.join(intent.get('actions_required', []))}\n"
             f"Reboot policy: {intent.get('reboot_policy', 'missing')}\n"
-            f"Intent digest: {digest}\n\n"
+            + (
+                f"Package source: {kernel.get('repo_url')}\n"
+                "(from the organization's approved_repositories; installed "
+                "with GPG and TLS verification)\n"
+                if kernel.get("repo_url")
+                else ""
+            )
+            + f"Intent digest: {digest}\n\n"
             f"{summary or ''}\n\n"
             "Reply approve / request changes / reject, or use the structured "
             "approval action."
@@ -530,6 +537,12 @@ class ProvisioningAgent(AgentBase):
         summary = (
             f"Plan step {step_id}: {spec.nevra} on {', '.join(hosts)}; "
             f"actions: {', '.join(actions)}; reboot policy: {reboot_policy}."
+            + (
+                f" Package source: {spec.repo_url} (approved_repositories; "
+                "GPG+TLS verified)."
+                if spec.repo_url
+                else ""
+            )
         )
         # The approval endpoint requires a trusted fence context with an
         # invocation id AND a tool-call id.  The model loop derives one per
@@ -643,11 +656,12 @@ class ProvisioningAgent(AgentBase):
                 )
                 return
 
-        # Repository cleanup: the step-supplied repo_url is an
-        # unauthenticated package source that must not outlive the
+        # Repository cleanup: the step-supplied repo_url is a
+        # ticket-scoped package source that must not outlive the
         # ticket. Remove it when the LAST kernel step of the plan
         # completes — later kernel steps may still need it to install
-        # their own release (review major on #1230).
+        # their own release (review major on #1230; round 2 hardened
+        # the failure path).
         plan = cf.get("execution_plan") or {}
         later_kernel_steps = [
             s
@@ -663,15 +677,20 @@ class ProvisioningAgent(AgentBase):
                 hosts=hosts,
             )
             if cleanup.get("status") not in ("ok", "already_clean"):
-                # A failed cleanup must not fail the transition itself —
-                # the kernel is verified and the benchmark can run — but
-                # it must be visible for operator follow-up.
-                await self._add_comment(
+                # Fail closed (review round 2): an unremoved repository
+                # is an unverified package source left behind for the
+                # next ticket on these hosts. Stop the step instead of
+                # warning and proceeding — the kernel is verified, but
+                # the ticket cannot complete until an operator removes
+                # the repo or a cleanup retry succeeds.
+                await self._kernel_step_stop(
                     ticket_id,
-                    "**Warning:** automatic repository cleanup did not "
-                    "complete; the ticket repository file may remain on "
-                    f"{', '.join(hosts)} and should be removed manually.",
+                    "repository cleanup failed after the kernel "
+                    "transition; the ticket repo file may remain on "
+                    f"{', '.join(hosts)}",
+                    cleanup,
                 )
+                return
 
         # Hand the result to the normal completion path: it derives the
         # verification from the checkpoint and advances the plan.

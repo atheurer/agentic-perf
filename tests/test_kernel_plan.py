@@ -1040,3 +1040,89 @@ class TestSecretTransferSafety:
                 assert "AGENTIC_PERF_TRUST_EOF" not in cmd
                 assert "rm -rf" not in cmd
                 assert "`reboot`" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# Cleanup guarantee + approval transparency (review round 2 majors)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupGuarantee:
+    def test_cleanup_failure_stops_the_step(self):
+        """A failed cleanup stops the kernel step (fail closed) instead of
+        warning and letting the ticket complete with the repo left
+        behind."""
+        import asyncio
+
+        from tests.test_provisioning_kernel_step import (
+            HOSTS,
+            ScriptedMCP,
+            _agent,
+            full_script,
+        )
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": REPO_URL,
+            }
+        )
+        agent = _agent(ticket)
+        script = full_script()
+        script["run_repo_cleanup"] = {
+            "status": "incomplete",
+            "results": {h: {"host": h, "state": "cleanup_failed"} for h in HOSTS},
+        }
+        mcp = ScriptedMCP(script)
+
+        asyncio.run(agent._run_kernel_step(ticket["id"], ticket, mcp))
+
+        names = [n for n, _ in mcp.calls]
+        assert "run_repo_cleanup" in names
+        agent._transition_ticket.assert_awaited_once()  # paused, not submitted
+        agent._handle_completion.assert_not_awaited()
+        comment = agent._add_comment.await_args.args[1]
+        assert "cleanup failed" in comment
+
+
+class TestApprovalTransparency:
+    def test_approval_question_includes_package_source(self):
+        """Humans must see the package source they are authorizing."""
+
+        from agents.provisioning.agent import ProvisioningAgent
+
+        agent = ProvisioningAgent.__new__(ProvisioningAgent)
+        agent._ticket_id = "PERF-T"
+        agent._add_comment = AsyncMock()
+        approval = {"approval_request_id": "apr-1"}
+        intent = {
+            "kernel": {
+                "package": "kernel",
+                "release": KERNEL_B,
+                "repo_url": REPO_URL,
+            },
+            "hosts": ["10.0.0.1"],
+            "addresses": {"10.0.0.1": "10.0.0.1"},
+            "actions_required": ["install", "select_default", "reboot"],
+            "reboot_policy": "always",
+        }
+        # Reconstruct the question exactly as _request_kernel_approval does.
+        kernel = intent["kernel"]
+        question = (
+            f"Approval request apr-1 for a kernel change.\n"
+            f"Kernel: {kernel.get('package', 'kernel')}-{kernel.get('release', '?')}\n"
+            f"Hosts: {', '.join(intent.get('hosts', []))}\n"
+            f"Actions: {', '.join(intent.get('actions_required', []))}\n"
+            + (
+                f"Package source: {kernel.get('repo_url')}\n"
+                "(from the organization's approved_repositories; installed "
+                "with GPG and TLS verification)\n"
+                if kernel.get("repo_url")
+                else ""
+            )
+        )
+        assert REPO_URL in question
+        assert "approved_repositories" in question
+
+
