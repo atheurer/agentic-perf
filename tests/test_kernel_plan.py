@@ -896,3 +896,88 @@ class TestRepoCleanup:
 
         names = [n for n, _ in mcp.calls]
         assert "run_repo_cleanup" not in names
+
+
+# ---------------------------------------------------------------------------
+# Path-safe repository allowlist matching (review round 2, blocker)
+# ---------------------------------------------------------------------------
+
+
+class TestUrlPrefixMatching:
+    @pytest.fixture
+    def matcher(self):
+        import agents.provisioning.server as srv
+
+        return srv._url_within_prefix
+
+    def test_exact_and_nested_paths_approved(self, matcher):
+        prefix = "https://download.eng.rdu.redhat.com/rhel-9/composes/"
+        assert matcher(REPO_URL, prefix) is True
+        assert matcher(
+            "https://download.eng.rdu.redhat.com/rhel-9/composes/RHEL-9/RHEL-9.10.0/x/os/",
+            prefix,
+        )
+        assert matcher(
+            "https://download.eng.rdu.redhat.com/rhel-9/composes", prefix
+        )  # prefix without trailing slash still bounds by component
+
+    def test_sibling_path_bypass_rejected(self, matcher):
+        prefix = "https://host/approved/"
+        assert matcher("https://host/approvedevil/x", prefix) is False
+
+    def test_dot_segment_escape_rejected(self, matcher):
+        prefix = "https://host/approved/"
+        assert matcher("https://host/approved/../unapproved/x", prefix) is False
+        # (percent-encoded dot segments are resolved by the server/dnf
+        # side; literal dot segments are the escape vector handled here)
+
+    def test_prefix_without_slash_does_not_approve_siblings(self, matcher):
+        assert matcher("https://host/approvedevil/", "https://host/approved") is False
+        assert matcher("https://host/approved/x", "https://host/approved") is True
+
+    def test_host_confusion_rejected(self, matcher):
+        prefix = "https://host/approved/"
+        assert matcher("https://other/approved/x", prefix) is False
+        assert matcher("https://host.evil/approved/x", prefix) is False
+        assert matcher("http://host/approved/x", prefix) is False  # scheme
+
+    def test_userinfo_trick_rejected(self, matcher):
+        prefix = "https://host/approved/"
+        assert matcher("https://evil@host/approved/x", prefix) is False
+
+    def test_malformed_urls_rejected(self, matcher):
+        assert matcher("not a url", "https://host/") is False
+        assert matcher("https://host/x", "not a url") is False
+
+    def test_shorter_url_than_prefix_rejected(self, matcher):
+        assert matcher("https://host/", "https://host/approved/") is False
+
+    @pytest.mark.asyncio
+    async def test_resolver_uses_boundary_matching(self, monkeypatch):
+        """The trust resolver refuses a sibling-path URL even though it
+        string-starts-with the approved prefix."""
+        import agents.provisioning.server as srv
+        from tests.conftest import MockSkillProvider
+
+        provider = MockSkillProvider(
+            private_config={
+                "crucible": {
+                    "approved_repositories": [
+                        {
+                            "url_prefix": REPO_URL,
+                            "gpg_key_secret": "g",
+                            "ca_secret": "c",
+                        }
+                    ]
+                }
+            }
+        )
+        srv._skill_provider = provider
+        sibling = REPO_URL.replace(
+            "RHEL-9.10.0-20260907.1", "RHEL-9.10.0-20260999.9-EVIL"
+        )
+        trust = await srv._resolve_repository_trust(sibling)
+        assert trust["approved"] is False
+        # And the real URL still approves:
+        trust = await srv._resolve_repository_trust(REPO_URL)
+        assert trust["approved"] is True
