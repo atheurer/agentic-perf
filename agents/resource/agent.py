@@ -158,7 +158,7 @@ def _auto_reservation_selection(
             "os",
             "root_volume_gb",
         },
-        "quads": {"hostnames", "duration_hours"},
+        "quads": {"hostnames", "duration_hours", "os", "wipe"},
         "psap-cc": {"cluster_id", "duration_hours"},
     }
     if provider not in allowed_fields:
@@ -470,7 +470,7 @@ def _explicit_provider_selection(
             "os",
             "root_volume_gb",
         },
-        "quads": {"hostnames", "duration_hours"},
+        "quads": {"hostnames", "duration_hours", "os", "wipe"},
         "psap-cc": {"cluster_id", "duration_hours"},
     }.get(provider, set())
     selection: dict[str, Any] = {}

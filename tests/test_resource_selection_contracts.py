@@ -109,19 +109,20 @@ def test_quads_selection_must_cover_ticket_hosts_and_match_eligible_options():
             ],
         )
 
-    assert (
-        validate_reservation_selection(
-            "quads",
-            valid_selection,
-            required_hosts=required_hosts,
-            eligible_hostnames_by_requirement=[
-                {"host-01.example.com"},
-                {"host-02.example.com"},
-                {"host-03.example.com"},
-            ],
-        )
-        == valid_selection
-    )
+    assert validate_reservation_selection(
+        "quads",
+        {**valid_selection, "wipe": False},
+        required_hosts=required_hosts,
+        eligible_hostnames_by_requirement=[
+            {"host-01.example.com"},
+            {"host-02.example.com"},
+            {"host-03.example.com"},
+        ],
+    ) == {**valid_selection, "wipe": False}
+    assert validate_reservation_selection("quads", valid_selection) == {
+        **valid_selection,
+        "wipe": True,
+    }
 
 
 @pytest.mark.asyncio

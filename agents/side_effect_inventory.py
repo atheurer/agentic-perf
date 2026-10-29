@@ -557,6 +557,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/resource/psap_cc.py", "terminate", "cloud_resource"),
     ("providers/resource/quads.py", "<module>", "cloud_resource"),
     ("providers/resource/quads.py", "_context_key", "cloud_resource"),
+    ("providers/resource/quads.py", "_normalize_os_name", "cloud_resource"),
+    ("providers/resource/quads.py", "_resolve_os_type", "cloud_resource"),
     ("providers/resource/quads.py", "check_available", "cloud_resource"),
     ("providers/resource/quads.py", "cleanup_ssh_keys", "cloud_resource"),
     ("providers/resource/quads.py", "close", "cloud_resource"),
@@ -3328,6 +3330,18 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/resource/quads.py:_context_key",
+        "2027-12-31",
+    ),
+    ("providers/resource/quads.py", "_normalize_os_name", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:_normalize_os_name",
+        "2027-12-31",
+    ),
+    ("providers/resource/quads.py", "_resolve_os_type", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:_resolve_os_type",
         "2027-12-31",
     ),
     ("providers/resource/quads.py", "check_available", "cloud_resource"): (

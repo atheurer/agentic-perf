@@ -26,6 +26,49 @@ class QuadsResourceProvider(ResourceProvider):
         self._availability_context_key: str | None = None
 
     @staticmethod
+    def _normalize_os_name(value: str) -> str:
+        return " ".join(value.split()).casefold()
+
+    async def _resolve_os_type(self, requested_os: str) -> str:
+        available_os = await self._client.get_os_list()
+        for entry in available_os:
+            if not isinstance(entry, dict):
+                continue
+            os_name = (
+                entry.get("Title")
+                or entry.get("name")
+                or entry.get("title")
+                or entry.get("os")
+            )
+            if not isinstance(os_name, str):
+                continue
+            if self._normalize_os_name(os_name) == self._normalize_os_name(
+                requested_os
+            ):
+                return os_name
+        available_names = sorted(
+            str(
+                entry.get("Title")
+                or entry.get("name")
+                or entry.get("title")
+                or entry.get("os")
+            )
+            for entry in available_os
+            if isinstance(entry, dict)
+            and isinstance(
+                entry.get("Title")
+                or entry.get("name")
+                or entry.get("title")
+                or entry.get("os"),
+                str,
+            )
+        )
+        raise ValueError(
+            f"Requested QUADS OS {requested_os!r} is unavailable. "
+            f"Available OS choices: {', '.join(available_names) or '(none returned)'}"
+        )
+
+    @staticmethod
     def _context_key(ticket_context: dict[str, Any]) -> str:
         return json.dumps(
             ticket_context, sort_keys=True, separators=(",", ":"), default=str
@@ -221,12 +264,19 @@ class QuadsResourceProvider(ResourceProvider):
     ) -> dict[str, Any]:
         selection = self.validate_reservation_selection(selection)
         hostnames = selection["hostnames"]
+        os_type = (
+            await self._resolve_os_type(selection["os"])
+            if selection.get("os") is not None
+            else None
+        )
 
         ticket_key = ticket_id.strip() if isinstance(ticket_id, str) else ""
         if not ticket_key:
             raise ValueError("QUADS reservation requires an Agentic Perf ticket key")
         logger.info("[quads-provider] Creating assignment for ticket: %s", ticket_key)
-        assignment = await self._client.create_assignment(ticket_key)
+        assignment = await self._client.create_assignment(
+            ticket_key, os_type=os_type, wipe=selection["wipe"]
+        )
         logger.info(
             f"[quads-provider] Assignment created: id={assignment['id']} "
             f"cloud={assignment['cloud_name']}"
@@ -263,6 +313,8 @@ class QuadsResourceProvider(ResourceProvider):
                 "assignment_id": assignment["id"],
                 "cloud_name": assignment["cloud_name"],
                 "ticket": assignment.get("ticket"),
+                "os": os_type,
+                "wipe": selection["wipe"],
                 "ssh_setup": ssh_result,
             },
             "message": f"Reserved {len(hostnames)} hosts via QUADS",
