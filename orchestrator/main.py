@@ -1365,7 +1365,7 @@ async def run_agent_task(
             agent.set_fence_context(
                 dispatcher._session_id,
                 dispatcher._fencing_epoch,
-                dispatcher._claim_ids.get(ticket_id),
+                claim_id,
             )
 
         if getattr(agent, "trace_context", None) is None:
