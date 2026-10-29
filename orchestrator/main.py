@@ -36,6 +36,7 @@ from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import (
     TraceContext,
+    TraceDeliveryError,
     bind_trace_context,
     current_trace_context,
     new_trace_context,
@@ -616,6 +617,8 @@ PLAN_AGENT_STATUS = {
     "analyze": "analyzing",
     "synthesis": "synthesizing_results",
     "build_image": "building_image",
+    "gathering_context": "gathering_context",
+    "evaluate": "evaluating_convergence",
 }
 # Triage advances the ticket itself instead of using the execution-plan loop,
 # but it needs the same no-progress retry protection as plan-managed stages.
@@ -1640,7 +1643,7 @@ async def run_agent_task(
             agent.set_fence_context(
                 dispatcher._session_id,
                 dispatcher._fencing_epoch,
-                dispatcher._claim_ids.get(ticket_id),
+                claim_id,
             )
 
         if getattr(agent, "trace_context", None) is None:
@@ -1966,6 +1969,15 @@ async def run_agent_task(
         logger.info(
             f"Agent cleanly unwound after ticket drift on "
             f"{ticket_id} (status={status}) — no transition needed"
+        )
+    except TraceDeliveryError as exc:
+        success = False
+        logger.warning(
+            "Trace delivery failed for %s (status=%s); leaving stage incomplete "
+            "for retry: %s",
+            ticket_id,
+            status,
+            exc,
         )
     except Exception as e:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")

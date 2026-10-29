@@ -445,6 +445,112 @@ async def test_agent_crash_guidance_transition_carries_ticket_claim() -> None:
     assert transition.await_args.kwargs["claim_id"] == "claim-2"
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        "awaiting_hardware",
+        "executing_benchmark",
+        "gathering_context",
+        "evaluating_convergence",
+    ],
+)
+@pytest.mark.parametrize("task_timeout", [0, 5])
+@pytest.mark.parametrize("missing_snapshot", [False, True])
+async def test_trace_delivery_failure_before_launch_preserves_stage_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    task_timeout: float,
+    missing_snapshot: bool,
+) -> None:
+    import orchestrator.main as main
+    from providers.execution import AuditedSubprocessRunner
+    from providers.tracing import TraceDeliveryError, new_trace_context
+
+    ticket_id = "PERF-trace-retry"
+    ticket = {"id": ticket_id, "status": status, "custom_fields": {}}
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    response = MagicMock(status_code=200)
+    response.json.side_effect = lambda: deepcopy(ticket)
+    read_count = 0
+    snapshot_read = 2 if status == "executing_benchmark" else 1
+
+    async def read_ticket(url: str) -> MagicMock:
+        nonlocal read_count
+        read_count += 1
+        if missing_snapshot and read_count == snapshot_read:
+            raise httpx.ConnectError(
+                "snapshot unavailable", request=httpx.Request("GET", url)
+            )
+        return response
+
+    client.get = AsyncMock(side_effect=read_ticket)
+
+    async def patch_fields(url: str, *, json: dict) -> httpx.Response:
+        ticket["custom_fields"].update(deepcopy(json["fields"]))
+        return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+    client.patch = AsyncMock(side_effect=patch_fields)
+    monkeypatch.setattr(main, "AuditedAsyncHTTPClient", lambda **_kwargs: client)
+    monkeypatch.setattr(main, "_pending_retry_writes", {})
+    monkeypatch.setattr(main, "_retry_write_locks", {})
+    spawn = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    emit = AsyncMock(
+        side_effect=TraceDeliveryError("trace acknowledgement unavailable")
+    )
+    runner = AuditedSubprocessRunner(emit)
+
+    async def run_agent(_ticket_id: str) -> None:
+        await runner.run(["benchmark-command"], mutating=True)
+
+    agent = MagicMock()
+    agent.trace_context = new_trace_context(ticket_id=ticket_id, agent_id="test")
+    agent.run = AsyncMock(side_effect=run_agent)
+    agent.close = AsyncMock()
+    dispatcher = MagicMock()
+    dispatcher._claim_ids = {ticket_id: "claim-trace-retry"}
+    dispatcher._trace_contexts = {}
+    dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
+    dispatcher.create_agent.return_value = agent
+    dispatcher.store_url = "http://store"
+    dispatcher.events = None
+    dispatcher.is_deposed.return_value = False
+    dispatcher.mark_done = AsyncMock()
+    advance = AsyncMock()
+    guidance = AsyncMock()
+    monkeypatch.setattr(main, "_advance_plan", advance)
+    monkeypatch.setattr(main, "_transition_to_guidance", guidance)
+
+    await main.run_agent_task(
+        dispatcher, status, ticket_id, agent_task_timeout=task_timeout
+    )
+
+    emit.assert_awaited_once()
+    assert emit.await_args.args[0].lifecycle.state.value == "requested"
+    spawn.assert_not_awaited()
+    advance.assert_not_awaited()
+    if missing_snapshot:
+        guidance.assert_awaited_once()
+    else:
+        guidance.assert_not_awaited()
+    assert ticket["status"] == status
+    retry = ticket["custom_fields"][RETRY_STATE_FIELD]["dispatch"]
+    assert retry["status"] == status
+    assert retry["attempts"] == 1
+    assert retry["exhausted"] is missing_snapshot
+    if missing_snapshot:
+        assert retry["next_retry_at"] is None
+    else:
+        assert retry["next_retry_at"] > main.time.time()
+    assert retry_is_suppressed(
+        ticket["custom_fields"], "dispatch", status, now=main.time.time()
+    )
+    agent.close.assert_awaited_once()
+    dispatcher.mark_done.assert_awaited_once_with(ticket_id)
+
+
 @pytest.mark.asyncio
 async def test_paused_status_clears_retry_limit_for_later_resume() -> None:
     import orchestrator.main as main

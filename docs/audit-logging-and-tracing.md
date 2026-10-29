@@ -142,6 +142,17 @@ context exists or would recursively audit the trace transport itself.
    Persistence is retried at five-second intervals; a successful write or
    status change clears the corresponding pending state. A restart during an
    outage can recover only the last successfully stored retry metadata.
+
+   Trace-delivery failures are retryable only while the dispatched status and
+   all custom fields remain unchanged against an independently copied snapshot.
+   Any changed field, including benchmark run IDs, result status, output paths,
+   or nested results, may represent committed work even without plan progress.
+   The orchestrator first records an exhausted dispatch guard for the observed
+   status and then requests customer guidance. The guard prevents dispatch if
+   the guidance transition cannot be delivered. Committed work and plan state
+   require reconciliation before resuming; neither mutation replay nor stage
+   completion is inferred from the trace failure. A missing pre-dispatch
+   custom-fields snapshot also requires this conservative pause.
 3. **Start record.** The agent/tool/API boundary emits a `STARTED` event with
    action and operation descriptors. The event contains metadata and digests,
    not secret payloads.
