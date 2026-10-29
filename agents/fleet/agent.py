@@ -210,7 +210,7 @@ class FleetCoordinatorAgent:
 
         if not platform_ready:
             # Platform provisioning failed — record partial.
-            diag = self._get_latest_diagnostic(ticket)
+            diag = self._get_latest_diagnostic(ticket, board)
             await record_host_result(
                 self._update_fields,
                 ticket_id,
@@ -250,7 +250,7 @@ class FleetCoordinatorAgent:
             elif benchmark_status:
                 reason = f"unexpected benchmark status: {benchmark_status}"
             else:
-                diagnostic = self._get_latest_diagnostic(ticket)
+                diagnostic = self._get_latest_diagnostic(ticket, board)
                 reason = diagnostic[:500] if diagnostic else "benchmark did not execute"
             await record_host_result(
                 self._update_fields,
@@ -299,13 +299,29 @@ class FleetCoordinatorAgent:
             f"Fleet: {progress['tested']} tested, acquiring next board",
         )
 
-    def _get_latest_diagnostic(self, ticket: dict[str, Any]) -> str:
-        """Extract the most recent failure diagnostic."""
+    def _get_latest_diagnostic(
+        self,
+        ticket: dict[str, Any],
+        board: str = "",
+    ) -> str:
+        """Extract the most recent failure diagnostic for this board.
+
+        Scans comments in reverse for failure indicators, but only
+        considers comments that reference the current board name to
+        avoid picking up diagnostics from a prior fleet iteration.
+        Falls back to any failure comment if no board-specific match.
+        """
+        board_match = ""
+        any_match = ""
         for comment in reversed(ticket.get("comments", [])):
             body = comment.get("body", "")
             if "Failed" in body or "Diagnostics" in body:
-                return body[:500]
-        return ""
+                if not any_match:
+                    any_match = body[:500]
+                if board and board in body:
+                    board_match = body[:500]
+                    break
+        return board_match or any_match
 
     # --- HTTP helpers ---
 
