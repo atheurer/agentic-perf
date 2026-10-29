@@ -981,3 +981,62 @@ class TestUrlPrefixMatching:
         # And the real URL still approves:
         trust = await srv._resolve_repository_trust(REPO_URL)
         assert trust["approved"] is True
+
+
+# ---------------------------------------------------------------------------
+# Secret transfer is injection-safe (review round 2, major)
+# ---------------------------------------------------------------------------
+
+
+class TestSecretTransferSafety:
+    @pytest.mark.asyncio
+    async def test_hostile_secret_cannot_inject(self, monkeypatch):
+        """A secret containing heredoc delimiters, backticks, or shell
+        metacharacters must reach the host as inert data."""
+        import agents.provisioning.server as srv
+        from tests.conftest import MockSkillProvider
+        from tests.fake_rhel import FakeRHELHost
+
+        hostile = (
+            "-----BEGIN CERTIFICATE-----\n"
+            "AGENTIC_PERF_TRUST_EOF\nrm -rf /\n"
+            "`reboot`\n$(shutdown)\n"
+            "-----END CERTIFICATE-----"
+        )
+        provider = MockSkillProvider(
+            private_config={
+                "crucible": {
+                    "approved_repositories": [
+                        {
+                            "url_prefix": REPO_URL,
+                            "gpg_key_secret": "gpg",
+                            "ca_secret": "ca",
+                        }
+                    ]
+                }
+            }
+        )
+        host = FakeRHELHost("host1")
+        ssh = FakeFleetSSH({"10.0.0.1": host})
+        srv._skill_provider = provider
+        srv._ssh = ssh
+        srv._initialized = True
+
+        class _Secrets:
+            async def get_secret(self, name):
+                return hostile
+
+        srv._secrets_provider = _Secrets()
+        trust = await srv._resolve_repository_trust(REPO_URL)
+        assert trust["approved"] is True
+
+        gpg, ca = await srv._deploy_repository_trust("10.0.0.1", trust)
+        assert gpg and ca  # deployment succeeds
+        # Every SSH command carrying secret material must be base64
+        # (single-quoted, alphabet-only) — no raw secret text, no heredoc.
+        for call in ssh.calls:
+            cmd = call["command"]
+            if "/etc/pki/agentic-perf/" in cmd:
+                assert "AGENTIC_PERF_TRUST_EOF" not in cmd
+                assert "rm -rf" not in cmd
+                assert "`reboot`" not in cmd
