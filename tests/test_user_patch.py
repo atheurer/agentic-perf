@@ -56,6 +56,48 @@ def app(multi_user_env):
     return app
 
 
+class TestPostUserValidation:
+    def test_negative_max_requests_per_hour_returns_422(self, admin_client):
+        r = admin_client.post(
+            "/api/v1/users",
+            json={
+                "username": "neg-rate",
+                "service_account": True,
+                "allowed_sources": ["test"],
+                "max_requests_per_hour": -1,
+            },
+        )
+        assert r.status_code == 422
+        assert "non-negative" in r.json()["detail"].lower()
+
+
+class TestUpdateUserRollback:
+    def test_write_failure_restores_prior_values(self, tmp_path, monkeypatch):
+        store = UserStore(persist_path=tmp_path / "users.json")
+        store.create_user(
+            "svc-rollback",
+            service_account=True,
+            allowed_sources=["original-src"],
+            max_requests_per_hour=100,
+        )
+
+        def _boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(store, "_write_locked", _boom)
+
+        with pytest.raises(OSError, match="disk full"):
+            store.update_user(
+                "svc-rollback",
+                allowed_sources=["new-src"],
+                max_requests_per_hour=999,
+            )
+
+        user = store.get_user("svc-rollback")
+        assert user.allowed_sources == ["original-src"]
+        assert user.max_requests_per_hour == 100
+
+
 class TestPatchUserValidation:
     def test_negative_max_requests_per_hour_returns_422(self, admin_client):
         admin_client.post(
