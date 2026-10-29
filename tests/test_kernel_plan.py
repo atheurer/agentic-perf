@@ -677,3 +677,46 @@ class TestWhitespaceRejection:
             {"release": KERNEL_B, "package": "kernel", "repo_url": REPO_URL}
         )
         assert spec.release == KERNEL_B
+
+
+# ---------------------------------------------------------------------------
+# Topology: ambiguous plans pause instead of silently discarding steps
+# ---------------------------------------------------------------------------
+
+
+class TestTopologySafety:
+    def test_multiple_benchmark_steps_rejected(self):
+        plan = default_plan()
+        plan["steps"].append({"id": 5, "agent_type": "benchmark", "params": {}})
+        _, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert normalized_plan_is_none(err)
+
+    def test_intermediate_provision_before_benchmark_is_preserved(self):
+        """Steps before the single benchmark are head content — the
+        transform keeps them (no silent loss, no pause needed)."""
+        plan = default_plan()
+        plan["steps"].insert(2, {"id": 2, "agent_type": "provision", "params": {}})
+        plan["steps"][3]["id"] = 3
+        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert err == ""
+        agent_types = [s["agent_type"] for s in new_plan["steps"]]
+        assert agent_types.count("provision") >= 3  # original + config + 2 kernel steps
+        # every original head step survived
+        assert new_plan["steps"][0]["agent_type"] == "resource"
+        assert new_plan["steps"][1]["agent_type"] == "provision"
+        assert new_plan["steps"][2]["agent_type"] == "provision"
+
+    def test_step_between_benchmarks_would_pause(self):
+        """Multiple benchmarks (steps between first and last benchmark)
+        are the ambiguous case: the transform must refuse."""
+        plan = default_plan()
+        plan["steps"].append(
+            {"id": 5, "agent_type": "provision", "params": {}}
+        )
+        plan["steps"].append({"id": 6, "agent_type": "benchmark", "params": {}})
+        _, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert normalized_plan_is_none(err)
+
+
+def normalized_plan_is_none(err):
+    return err and "does not support" in err

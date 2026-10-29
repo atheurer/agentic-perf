@@ -171,6 +171,26 @@ def build_kernel_comparison_plan(
             "execution plan already progressed past the first benchmark step; "
             "the kernel_comparison directive must be present at submission time"
         )
+    if len(bench_indexes) > 1 or last_bench - first_bench > 0:
+        # Anything between (or beyond) a single benchmark step — extra
+        # benchmarks, intermediate provisioning/configuration steps —
+        # would be silently discarded by the A/B transform. Ambiguous or
+        # unsupported topologies must pause for guidance, never silently
+        # select one workload (review major on #1230).
+        return None, (
+            "the execution plan has a topology the kernel comparison "
+            "transform does not support: it expects exactly one benchmark "
+            "step with no steps between it and the preceding provision "
+            "step, but found "
+            + (
+                f"{len(bench_indexes)} benchmark steps"
+                if len(bench_indexes) > 1
+                else "intermediate steps between the resource/provision "
+                "steps and the benchmark step"
+            )
+            + ". Simplify the ticket's request or remove the "
+            "kernel_comparison directive."
+        )
     template = steps[first_bench]
 
     head = [dict(s) for s in steps[:first_bench]]
