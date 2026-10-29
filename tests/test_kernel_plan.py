@@ -470,7 +470,9 @@ class TestRunnerNotFoundHandling:
         HOSTS, ScriptedMCP, _agent = _runner_imports()
         ticket = runner_ticket(with_repo=True)
         agent = _agent(ticket)
-        mcp = ScriptedMCP(not_found_script())
+        script = not_found_script()
+        script["run_repo_cleanup"] = {"status": "ok"}
+        mcp = ScriptedMCP(script)
 
         await agent._run_kernel_step(ticket["id"], ticket, mcp)
 
@@ -481,6 +483,7 @@ class TestRunnerNotFoundHandling:
             "install_kernel",
             "select_default_kernel",
             "reboot_hosts_and_verify",
+            "run_repo_cleanup",
         ]
         comment = agent._add_comment.await_args.args[1]
         assert "repo_url" in comment
@@ -710,9 +713,7 @@ class TestTopologySafety:
         """Multiple benchmarks (steps between first and last benchmark)
         are the ambiguous case: the transform must refuse."""
         plan = default_plan()
-        plan["steps"].append(
-            {"id": 5, "agent_type": "provision", "params": {}}
-        )
+        plan["steps"].append({"id": 5, "agent_type": "provision", "params": {}})
         plan["steps"].append({"id": 6, "agent_type": "benchmark", "params": {}})
         _, err = build_kernel_comparison_plan(plan, dict(GOOD))
         assert normalized_plan_is_none(err)
@@ -720,3 +721,122 @@ class TestTopologySafety:
 
 def normalized_plan_is_none(err):
     return err and "does not support" in err
+
+
+# ---------------------------------------------------------------------------
+# Repository cleanup after the final kernel step (review major)
+# ---------------------------------------------------------------------------
+
+
+class TestRepoCleanup:
+    def test_cleanup_command_removes_repo_and_verifies(self):
+        from providers.rhel_kernel import build_repo_cleanup_command
+
+        cmd = build_repo_cleanup_command()
+        assert "rm -f /etc/yum.repos.d/agentic-perf-kernel.repo" in cmd
+        assert "test ! -e" in cmd
+
+    @pytest.mark.asyncio
+    async def test_cleanup_removes_repo_on_fake_host(self):
+        """The fake RHEL host removes the repo file on the cleanup command
+        and the repo-served packages become unavailable again."""
+        from providers.rhel_kernel import (
+            KernelSpec,
+            build_repo_cleanup_command,
+            build_repo_setup_command,
+        )
+        from tests.fake_rhel import FakeRHELHost
+
+        host = FakeRHELHost(
+            "host1",
+            running=KERNEL_A,
+            installed=[KERNEL_A],
+            available=[],
+            repo_packages=[KERNEL_B],
+        )
+        spec = KernelSpec(release=KERNEL_B, repo_url=REPO_URL)
+        setup = host.handle(build_repo_setup_command(spec))
+        assert setup.exit_code == 0
+        assert host._repo_configured is True
+
+        cleanup = host.handle(build_repo_cleanup_command())
+        assert cleanup.exit_code == 0
+        assert host._repo_configured is False
+        # The previously repo-served release is no longer installable.
+        probe = host.handle(
+            f"dnf -q list --available kernel-{KERNEL_B} >/dev/null 2>&1"
+        )
+        assert probe.exit_code != 0
+
+    @pytest.mark.asyncio
+    async def test_cleanup_is_idempotent(self):
+        from providers.rhel_kernel import build_repo_cleanup_command
+        from tests.fake_rhel import FakeRHELHost
+
+        host = FakeRHELHost("host1")
+        first = host.handle(build_repo_cleanup_command())
+        second = host.handle(build_repo_cleanup_command())
+        assert first.exit_code == 0
+        assert second.exit_code == 0
+
+    def test_runner_cleans_up_on_final_kernel_step(self):
+        """Scripted: the runner calls run_repo_cleanup when no later
+        kernel step exists in the plan."""
+
+        from tests.test_provisioning_kernel_step import (
+            ScriptedMCP,
+            _agent,
+            full_script,
+        )
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": REPO_URL,
+            }
+        )  # current_step=2, only kernel step
+        agent = _agent(ticket)
+        script = full_script()
+        script["run_repo_cleanup"] = {"status": "ok"}
+        mcp = ScriptedMCP(script)
+
+        import asyncio
+
+        asyncio.run(agent._run_kernel_step(ticket["id"], ticket, mcp))
+
+        names = [n for n, _ in mcp.calls]
+        assert "run_repo_cleanup" in names
+        # Cleanup runs after the reboot, before submit.
+        assert names.index("run_repo_cleanup") > names.index("reboot_hosts_and_verify")
+
+    def test_runner_skips_cleanup_when_later_kernel_step_exists(self):
+        import asyncio
+
+        from tests.test_provisioning_kernel_step import (
+            ScriptedMCP,
+            _agent,
+            full_script,
+        )
+
+        ticket = kernel_step_ticket()
+        plan = ticket["custom_fields"]["execution_plan"]
+        plan["steps"].append(
+            {
+                "id": 3,
+                "agent_type": "provision",
+                "params": {
+                    "label": "kernel-C",
+                    "kernel": {"release": KERNEL_A, "package": "kernel"},
+                },
+            }
+        )
+        agent = _agent(ticket)
+        script = full_script()
+        script["run_repo_cleanup"] = {"status": "ok"}
+        mcp = ScriptedMCP(script)
+
+        asyncio.run(agent._run_kernel_step(ticket["id"], ticket, mcp))
+
+        names = [n for n, _ in mcp.calls]
+        assert "run_repo_cleanup" not in names

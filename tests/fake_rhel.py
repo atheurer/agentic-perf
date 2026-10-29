@@ -92,6 +92,13 @@ class FakeRHELHost:
                 stdout="Error: No matching Packages to list", stderr="", exit_code=1
             )
 
+        if "rm -f /etc/yum.repos.d/agentic-perf-kernel.repo" in command:
+            # Repo cleanup (build_repo_cleanup_command): the ticket's
+            # unauthenticated package source must not outlive the ticket.
+            self._repo_configured = False
+            self.repo_packages = []
+            return SSHResult(stdout="", stderr="", exit_code=0)
+
         if "dnf -q list --available" in command:
             return self._handle_available(command)
 
