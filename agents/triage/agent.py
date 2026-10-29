@@ -1333,9 +1333,16 @@ class TriageAgent(AgentBase):
             # The resource agent validates SSH, inventories hosts, and
             # populates assigned_hardware_ips.  If the LLM omitted it
             # (e.g. user-provided hosts), prepend one so the pipeline
-            # doesn't skip host validation.  "analyze" is the only
-            # valid non-resource first step (data-only investigation).
-            if steps[0]["agent_type"] not in ("resource", "analyze"):
+            # doesn't skip host validation.  Data-only agents can
+            # start a plan without a resource step.
+            _NO_RESOURCE_PREFIXES = (
+                "resource",
+                "analyze",
+                "gathering_context",
+                "evaluate",
+                "synthesis",
+            )
+            if steps[0]["agent_type"] not in _NO_RESOURCE_PREFIXES:
                 steps.insert(
                     0,
                     {
@@ -1528,6 +1535,9 @@ class TriageAgent(AgentBase):
             _TRIAGE_EXIT_STATUSES = {
                 "resource": "awaiting_hardware",
                 "analyze": "analyzing",
+                "gathering_context": "gathering_context",
+                "evaluate": "evaluating_convergence",
+                "synthesis": "synthesizing_results",
                 "build_image": "building_image",
             }
             first_step_type = steps[0]["agent_type"]
