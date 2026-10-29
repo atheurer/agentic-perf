@@ -40,6 +40,7 @@ from providers.resource.base import (
     has_reservation_metadata,
     reservation_failed,
 )
+from providers.resource.quads import QuadsOSUnavailableError
 from providers.resource.selection import ReservationSelectionError
 from providers.skills.private import PrivateSkillProvider
 from providers.tracing import (
@@ -1154,6 +1155,23 @@ async def reserve_resources(
                 "[resource] Failed to persist cancellation uncertainty marker"
             )
         raise
+    except QuadsOSUnavailableError as exc:
+        result = {
+            "status": "failed",
+            "provider": provider,
+            "allocation_unknown": False,
+            "retry_blocked": False,
+            "provider_call_started": True,
+            "allocation_attempted": False,
+            "error": str(exc),
+            "available_os": exc.available_os,
+            "provider_metadata": {},
+            "message": (
+                "No QUADS assignment was created because the requested OS is "
+                "unavailable. Choose an available release or request user "
+                "clarification."
+            ),
+        }
     except Exception as exc:
         # A provider can allocate resources before a later setup step raises.
         # Mark the outcome unknown to prevent duplicate allocations and
