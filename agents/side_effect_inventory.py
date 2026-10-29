@@ -4426,8 +4426,8 @@ INVENTORY_DISPOSITIONS = {
         "2027-12-31",
     ),
     ("state_store/api/users.py", "update_user", "mutating_http_state"): (
-        "audited",
-        "platform-maintainers",
+        "system_only",
+        "state-store-maintainers",
         "state_store/api/users.py:update_user",
         "2027-12-31",
     ),
