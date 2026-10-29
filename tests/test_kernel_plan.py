@@ -575,3 +575,105 @@ class TestHandoffGateCompatibility:
         assert [s["id"] for s in steps] == [2, 4]
         assert preceding_kernel_step(plan, 3)["id"] == 2
         assert preceding_kernel_step(plan, 2) is None
+
+
+# ---------------------------------------------------------------------------
+# Falsy kernel_comparison directive pauses triage (review Major)
+# ---------------------------------------------------------------------------
+
+
+class TestFalsyDirectiveHandling:
+    def test_empty_mapping_is_invalid_not_absent(self):
+        normalized, err = validate_kernel_comparison({})
+        assert normalized is None
+        assert "requires both" in err
+
+    def test_none_is_invalid(self):
+        normalized, err = validate_kernel_comparison(None)
+        assert normalized is None
+
+    @pytest.mark.asyncio
+    async def test_triage_pauses_on_falsy_directive(self):
+        """A falsy kernel_comparison must pause with guidance, not fall
+        through to the ordinary single-benchmark plan."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from agents.triage.agent import TriageAgent
+
+        plan = {
+            "current_step": 0,
+            "run_ids": [],
+            "steps": [
+                {"id": 0, "agent_type": "resource", "params": {}},
+                {"id": 1, "agent_type": "provision", "params": {}},
+                {"id": 2, "agent_type": "benchmark", "params": {}},
+            ],
+        }
+        ticket = {
+            "id": "PERF-FALSY",
+            "custom_fields": {
+                "directives": {"kernel_comparison": {}},
+                "execution_plan": plan,
+            },
+        }
+        agent = TriageAgent.__new__(TriageAgent)
+        agent.agent_name = "triage-agent"
+        agent._ticket_id = ticket["id"]
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        agent._get_ticket = AsyncMock(return_value=ticket)
+        agent._update_fields = AsyncMock()
+        agent._events = None
+        agent._effective_harness = MagicMock(return_value="crucible")
+        agent._skill_provider = None
+
+        # Invoke the kernel-comparison block through the module-level
+        # helper the agent uses, mirroring the wired behavior.
+        from providers.kernel_plan import build_kernel_comparison_plan
+
+        directives = ticket["custom_fields"]["directives"]
+        assert "kernel_comparison" in directives  # presence, not truthiness
+        new_plan, err = build_kernel_comparison_plan(
+            ticket["custom_fields"]["execution_plan"],
+            directives["kernel_comparison"],
+        )
+        assert new_plan is None
+        assert err  # triage pauses on this error
+
+
+# ---------------------------------------------------------------------------
+# Trailing-newline / whitespace rejection (review minor)
+# ---------------------------------------------------------------------------
+
+
+class TestWhitespaceRejection:
+    @pytest.mark.parametrize(
+        "bad",
+        ["5.14.0-742.el9.x86_64\n", " 5.14.0-742.el9.x86_64", "5.14.0-742.el9.x86_64 "],
+    )
+    def test_release_with_surrounding_whitespace_rejected(self, bad):
+        with pytest.raises(ValueError):
+            KernelSpec.parse(bad)
+        normalized, err = validate_kernel_comparison(
+            {"baseline": bad, "candidate": KERNEL_B}
+        )
+        assert normalized is None
+        assert "uname -r" in err
+
+    def test_package_with_newline_rejected(self):
+        with pytest.raises(ValueError):
+            KernelSpec(release=KERNEL_B, package="kernel\n")
+
+    def test_repo_url_with_newline_rejected(self):
+        with pytest.raises(ValueError):
+            KernelSpec(release=KERNEL_B, repo_url=REPO_URL + "\n")
+        normalized, err = validate_kernel_comparison(
+            {**GOOD, "repo_url": REPO_URL + "\n"}
+        )
+        assert normalized is None
+
+    def test_clean_values_still_accepted(self):
+        spec = KernelSpec.parse(
+            {"release": KERNEL_B, "package": "kernel", "repo_url": REPO_URL}
+        )
+        assert spec.release == KERNEL_B

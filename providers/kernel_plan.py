@@ -48,31 +48,48 @@ def validate_kernel_comparison(directive: Any) -> tuple[dict[str, Any] | None, s
     """
     if not isinstance(directive, dict):
         return None, "kernel_comparison directive must be a mapping"
-    baseline = str(directive.get("baseline") or "").strip()
-    candidate = str(directive.get("candidate") or "").strip()
+    baseline = directive.get("baseline")
+    if not isinstance(baseline, str) or not baseline:
+        return None, (
+            "kernel_comparison requires both 'baseline' and 'candidate' releases"
+        )
+    candidate = directive.get("candidate")
+    if not isinstance(candidate, str) or not candidate:
+        return None, (
+            "kernel_comparison requires both 'baseline' and 'candidate' releases"
+        )
     if not baseline or not candidate:
         return (
             None,
             "kernel_comparison requires both 'baseline' and 'candidate' releases",
         )
     for name, release in (("baseline", baseline), ("candidate", candidate)):
-        if len(release) > _MAX_RELEASE_LEN or not KERNEL_RELEASE_RE.match(release):
+        if len(release) > _MAX_RELEASE_LEN or not KERNEL_RELEASE_RE.fullmatch(release):
             return None, (
                 f"kernel_comparison.{name} release {release!r} is not an exact "
                 "uname -r style release string (VERSION-RELEASE.ARCH)"
             )
-    order = str(directive.get("order") or "AB").upper()
+    order_raw = directive.get("order")
+    order = (str(order_raw) if order_raw else "AB").upper()
     if order not in _VALID_ORDERS:
         return None, (
             f"kernel_comparison.order {order!r} is not one of "
             f"{', '.join(_VALID_ORDERS)}"
         )
-    package = str(directive.get("package") or "kernel")
-    if not _PACKAGE_NAME_RE.match(package):
+    package = directive.get("package")
+    if package is None:
+        package = "kernel"
+    if not isinstance(package, str):
         return None, f"kernel_comparison.package {package!r} is not a package name"
-    repo_url = str(directive.get("repo_url") or "").strip()
+    if not _PACKAGE_NAME_RE.fullmatch(package):
+        return None, f"kernel_comparison.package {package!r} is not a package name"
+    repo_url = directive.get("repo_url")
+    if repo_url is None:
+        repo_url = ""
+    if not isinstance(repo_url, str):
+        return None, ("kernel_comparison.repo_url must be a plain http(s) URL string")
     if repo_url:
-        if len(repo_url) > MAX_REPO_URL_LEN or not _REPO_URL_RE.match(repo_url):
+        if len(repo_url) > MAX_REPO_URL_LEN or not _REPO_URL_RE.fullmatch(repo_url):
             return None, (
                 "kernel_comparison.repo_url must be a plain http(s) URL "
                 "with no whitespace or quotes"
