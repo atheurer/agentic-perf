@@ -4597,6 +4597,59 @@ async def _capture_environment_one(
     }
 
 
+async def _run_repo_cleanup_one(
+    host: str, address: str | None = None
+) -> dict[str, Any]:
+    """Remove the ticket repository file from one host (idempotent)."""
+    from providers.rhel_kernel import build_repo_cleanup_command
+
+    target = address or host
+    result = await _ssh.run(
+        target, build_repo_cleanup_command(), timeout=60, mutating=True
+    )
+    if result.exit_code != 0:
+        return {
+            "host": host,
+            "state": "cleanup_failed",
+            "error": result.stderr or result.stdout,
+        }
+    return {"host": host, "state": "clean"}
+
+
+@mcp.tool()
+async def run_repo_cleanup(hosts: list[str]) -> str:
+    """Remove this ticket's kernel repository file from the assigned hosts. Idempotent; runs at the end of the final kernel transition so the unauthenticated package source does not outlive the ticket."""
+    await _ensure_init()
+    from agents.provisioning.kernel import canonicalize_targets
+    from agents.server_utils import assert_ticket_active
+
+    active = await assert_ticket_active(expected_status="awaiting_provision")
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+    ticket = active.get("ticket", active)
+    allowed, refused, requested_as, addresses = canonicalize_targets(hosts, ticket)
+    results: dict[str, Any] = dict(refused)
+    raw = await asyncio.gather(
+        *[_run_repo_cleanup_one(h, addresses.get(h)) for h in allowed],
+        return_exceptions=True,
+    )
+    for host, result in zip(allowed, raw):
+        if isinstance(result, Exception):
+            results[host] = {"host": host, "state": "error", "error": str(result)}
+        else:
+            results[host] = result
+        results[host]["requested_as"] = requested_as.get(host, host)
+    summary = _summarize(results)
+    states = {r.get("state") for r in results.values() if isinstance(r, dict)}
+    if states <= {"clean"} and allowed:
+        summary["status"] = "ok"
+    elif not allowed:
+        summary["status"] = "already_clean"
+    else:
+        summary["status"] = "incomplete"
+    return json.dumps(summary)
+
+
 @mcp.tool()
 async def capture_environment_fingerprint(
     hosts: list[str],

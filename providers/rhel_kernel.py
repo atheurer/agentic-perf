@@ -167,6 +167,22 @@ def build_install_command(spec: KernelSpec) -> str:
     return f"dnf install -y {' '.join(parts)} 2>&1"
 
 
+def build_repo_cleanup_command() -> str:
+    """Remove the ticket's repository file and refresh metadata (idempotent).
+
+    The repo written by build_repo_setup_command must not outlive the
+    ticket that created it: it is an unauthenticated package source
+    (gpgcheck=0/sslverify=0 for lab composes), and a later ticket on the
+    same host could otherwise consume it unknowingly. Called when the
+    final kernel step of a plan completes.
+    """
+    return (
+        f"rm -f {_REPO_FILE}"
+        f" && dnf clean metadata >/dev/null 2>&1;"
+        f" test ! -e {_REPO_FILE}"
+    )
+
+
 def build_select_command(spec: KernelSpec) -> str:
     return (
         f"test -f {spec.vmlinuz}"

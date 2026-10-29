@@ -220,6 +220,7 @@ TOOL_AUDIT_POLICY = (
         "agents/provisioning/server.py:install_kernel",
         "agents/provisioning/server.py:select_default_kernel",
         "agents/provisioning/server.py:verify_kernel_state",
+        "agents/provisioning/server.py:run_repo_cleanup",
     ),
     *_read_only(
         "agents/resource/server.py:get_skill_context",

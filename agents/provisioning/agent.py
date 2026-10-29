@@ -643,6 +643,36 @@ class ProvisioningAgent(AgentBase):
                 )
                 return
 
+        # Repository cleanup: the step-supplied repo_url is an
+        # unauthenticated package source that must not outlive the
+        # ticket. Remove it when the LAST kernel step of the plan
+        # completes — later kernel steps may still need it to install
+        # their own release (review major on #1230).
+        plan = cf.get("execution_plan") or {}
+        later_kernel_steps = [
+            s
+            for s in (plan.get("steps") or [])
+            if isinstance(s, dict)
+            and s.get("id", -1) > step_id
+            and (s.get("params") or {}).get("kernel")
+        ]
+        if spec.repo_url and not later_kernel_steps:
+            cleanup = await self._kernel_tool(
+                mcp,
+                "run_repo_cleanup",
+                hosts=hosts,
+            )
+            if cleanup.get("status") not in ("ok", "already_clean"):
+                # A failed cleanup must not fail the transition itself —
+                # the kernel is verified and the benchmark can run — but
+                # it must be visible for operator follow-up.
+                await self._add_comment(
+                    ticket_id,
+                    "**Warning:** automatic repository cleanup did not "
+                    "complete; the ticket repository file may remain on "
+                    f"{', '.join(hosts)} and should be removed manually.",
+                )
+
         # Hand the result to the normal completion path: it derives the
         # verification from the checkpoint and advances the plan.
         completion = LLMResponse(
