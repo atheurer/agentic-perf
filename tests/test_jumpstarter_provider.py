@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -325,6 +326,133 @@ class TestNameSelector:
         )
         assert result["status"] == "rejected"
         assert "not found" in result["error"]
+
+    @pytest.mark.parametrize(
+        "unavailable",
+        [
+            {"online": False},
+            {"status": "LEASED"},
+            {"status": SimpleNamespace(name="LEASED")},
+            {"enabled": False},
+            {"pool": "private"},
+        ],
+    )
+    async def test_compound_selector_pins_only_available_exporters(
+        self, unavailable: dict
+    ) -> None:
+        busy = self._make_exporter("board-busy", **unavailable)
+        excluded = self._make_exporter("board-excluded")
+        free = self._make_exporter("board-free")
+        provider = self._make_provider([busy, excluded, free])
+        provider._service.CreateLease.return_value = SimpleNamespace(
+            name="test-lease", exporter_name="board-free"
+        )
+        provider._service.GetExporter.return_value = free
+        selection = {"jumpstarter_selector": "board-type=qc8775,!name=board-excluded"}
+
+        availability = await provider.check_available(selection)
+        assert [device["name"] for device in availability["devices"]] == ["board-free"]
+        await provider.reserve(selection)
+
+        lease_args = provider._service.CreateLease.await_args.kwargs
+        assert lease_args["exporter_name"] == "board-free"
+        assert lease_args["selector"] == "board-type=qc8775,enabled=true,pool=open"
+
+    @pytest.mark.parametrize(
+        "unavailable",
+        [
+            {"online": False},
+            {"status": "LEASED"},
+            {"enabled": False},
+            {"pool": "private"},
+        ],
+    )
+    async def test_compound_selector_rejects_when_no_available_exporter_matches(
+        self, unavailable: dict
+    ) -> None:
+        provider = self._make_provider(
+            [
+                self._make_exporter("board-busy", **unavailable),
+                self._make_exporter("board-excluded"),
+            ]
+        )
+
+        result = await provider.reserve(
+            {"jumpstarter_selector": "board-type=qc8775,!name=board-excluded"}
+        )
+
+        assert result["status"] == "rejected"
+        assert "No available boards" in result["error"]
+        provider._service.CreateLease.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "exporter_name", ["board-busy", "board-excluded", "missing"]
+    )
+    async def test_compound_selector_rejects_invalid_explicit_exporter(
+        self, exporter_name: str
+    ) -> None:
+        provider = self._make_provider(
+            [
+                self._make_exporter("board-busy", status="LEASED"),
+                self._make_exporter("board-excluded"),
+                self._make_exporter("board-free"),
+            ]
+        )
+
+        result = await provider.reserve(
+            {
+                "jumpstarter_selector": "board-type=qc8775,!name=board-excluded",
+                "exporter_name": exporter_name,
+            }
+        )
+
+        assert result["status"] == "rejected"
+        provider._service.CreateLease.assert_not_awaited()
+
+    async def test_compound_selector_preserves_available_explicit_exporter(
+        self,
+    ) -> None:
+        provider = self._make_provider(
+            [self._make_exporter("board-free-1"), self._make_exporter("board-free-2")]
+        )
+        provider._service.CreateLease.return_value = SimpleNamespace(name="test-lease")
+
+        await provider.reserve(
+            {
+                "jumpstarter_selector": "board-type=qc8775,!name=board-excluded",
+                "exporter_name": "board-free-2",
+            }
+        )
+
+        assert (
+            provider._service.CreateLease.await_args.kwargs["exporter_name"]
+            == "board-free-2"
+        )
+
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            "!name=board-excluded",
+            "!board-type=other",
+            "name=board-free,!name=board-excluded",
+        ],
+    )
+    async def test_locally_resolved_selector_uses_only_controller_labels(
+        self, selector: str
+    ) -> None:
+        provider = self._make_provider(
+            [
+                self._make_exporter("board-excluded", board_type="other"),
+                self._make_exporter("board-free"),
+            ]
+        )
+        provider._service.CreateLease.return_value = SimpleNamespace(name="test-lease")
+
+        await provider.reserve({"jumpstarter_selector": selector})
+
+        lease_args = provider._service.CreateLease.await_args.kwargs
+        assert lease_args["exporter_name"] == "board-free"
+        assert lease_args["selector"] == "enabled=true,pool=open"
 
 
 # --- Reserve ---

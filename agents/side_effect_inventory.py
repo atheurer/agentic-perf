@@ -449,6 +449,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/resource/aws.py", "terminate", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "<module>", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "_ensure_connected", "cloud_resource"),
+    ("providers/resource/jumpstarter.py", "_exporter_device", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "_is_enabled", "cloud_resource"),
     (
         "providers/resource/jumpstarter.py",
@@ -3109,6 +3110,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/resource/jumpstarter.py:_is_enabled",
+        "2027-12-31",
+    ),
+    ("providers/resource/jumpstarter.py", "_exporter_device", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter.py:_exporter_device",
         "2027-12-31",
     ),
     (

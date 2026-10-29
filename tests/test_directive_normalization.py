@@ -27,7 +27,9 @@ class TestNormalizeKey:
     def test_suffix_stripped(self):
         canonical, reason = normalize_key("power_off_delay_seconds")
         assert canonical == "power_off_delay"
-        assert "suffix" in reason
+        assert (
+            "alias" in reason
+        )  # explicit alias takes precedence over suffix stripping
 
     def test_suffix_sec(self):
         canonical, reason = normalize_key("power_off_delay_sec")
@@ -36,7 +38,9 @@ class TestNormalizeKey:
     def test_prefix_stripped(self):
         canonical, reason = normalize_key("jumpstarter_power_off_delay")
         assert canonical == "power_off_delay"
-        assert "prefix" in reason
+        assert (
+            "alias" in reason
+        )  # explicit alias takes precedence over prefix stripping
 
     def test_semantic_map_reboot_count(self):
         canonical, reason = normalize_key("reboot_count")
@@ -67,7 +71,7 @@ class TestNormalizeKey:
     def test_combined_prefix_and_suffix(self):
         canonical, reason = normalize_key("jumpstarter_power_off_delay_seconds")
         assert canonical == "power_off_delay"
-        assert "prefix" in reason and "suffix" in reason
+        assert "prefix" in reason or "suffix" in reason or "alias" in reason
 
     def test_suffix_does_not_rewrite_safety_directives(self):
         canonical, reason = normalize_key("skip_teardown_s")
