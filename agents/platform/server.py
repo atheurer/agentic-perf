@@ -120,108 +120,20 @@ async def _provision_jumpstarter(
     boot_wait: int = 60,
 ) -> str:
     """Run deterministic Jumpstarter provisioning."""
-    flash_info = cf.get("jumpstarter_flash", {})
-    metadata = cf.get("resource_provider_metadata", {})
-
-    if flash_info.get("error"):
-        return json.dumps(
-            {
-                "success": False,
-                "error": flash_info["error"],
-                "available_variants": flash_info.get("available_variants", []),
-            }
-        )
-
-    # Get the flash URL(s) from flash_targets (structured)
-    # or fall back to parsing flash_command (string).
-    flash_targets = flash_info.get("flash_targets", [])
-    if flash_targets:
-        if len(flash_targets) == 1:
-            # Single-partition boards (EBBR) — one image URL.
-            flash_url = flash_targets[0].get("url", "")
-        else:
-            # Multi-partition boards (SA8775P) — pass a dict
-            # of {partition: url} to provision_jumpstarter.
-            flash_url = {
-                t["partition"]: t["url"]
-                for t in flash_targets
-                if t.get("partition") and t.get("url")
-            }
-    else:
-        flash_command = flash_info.get("flash_command", "")
-        if not flash_command:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": ("No flash_targets or flash_command in jumpstarter_flash"),
-                }
-            )
-        # Fallback: extract URL from command string
-        flash_url = ""
-        for part in flash_command.split():
-            if part.startswith("http"):
-                flash_url = part
-                break
-        if not flash_url:
-            flash_url = flash_command.replace("j storage flash ", "").strip()
-
-    ssh_public_key = flash_info.get("ssh_public_key", "")
-    ssh_key_path = flash_info.get("ssh_key_path", "") or cf.get("ssh_key_path", "")
-
-    # Derive public key from private key path if not
-    # explicitly provided — the resource agent sets
-    # ssh_key_path at the ticket level, not in flash_info.
-    if not ssh_public_key and ssh_key_path:
-        pub_path = (
-            Path(ssh_key_path)
-            .expanduser()
-            .with_suffix(Path(ssh_key_path).suffix + ".pub")
-        )
-        if pub_path.exists():
-            ssh_public_key = pub_path.read_text().strip()
-    board_name = metadata.get("exporter_name", "")
-    lease_id = metadata.get("lease_id", "")
-    selector = metadata.get("selector", "")
-    lease_duration_seconds = metadata.get("duration_seconds")
-
     from providers.resource.jumpstarter_provision import (
-        provision_jumpstarter,
+        prepare_and_provision,
     )
 
-    # Resolve the ticket artifact directory for flash diagnostics and the
-    # optional serial capture log.
-    directives = cf.get("directives", {})
-    serial_enabled = directives.get("serial_capture", False)
-    ticket_id = ticket_id or cf.get("ticket_id", "") or metadata.get("ticket_id", "")
-    artifact_dir = ""
-    if ticket_id:
-        from paths import create_artifact_dir
-
-        artifact_dir = str(create_artifact_dir(ticket_id, "platform-provision"))
-
-    provision_kwargs: dict[str, Any] = {
-        "lease_name": lease_id,
-        "flash_url": flash_url,
-        "ssh_public_key": ssh_public_key,
-        "ssh_key_path": ssh_key_path,
-        "board_name": board_name,
-        "selector": selector,
-        "serial_capture": serial_enabled,
-        "artifact_dir": artifact_dir,
-        "ticket_id": ticket_id,
-    }
-    # The resource agent owns the requested lease duration. Preserve it when
-    # reopening the lease for provisioning instead of letting a local default
-    # shorten a long-running benchmark reservation.
-    if isinstance(lease_duration_seconds, int) and lease_duration_seconds > 0:
-        provision_kwargs["lease_duration_seconds"] = lease_duration_seconds
-
-    result = await provision_jumpstarter(**provision_kwargs)
+    ticket_id = (
+        ticket_id
+        or cf.get("ticket_id", "")
+        or (cf.get("resource_provider_metadata") or {}).get("ticket_id", "")
+    )
+    result, artifact_dir = await prepare_and_provision(cf, ticket_id=ticket_id)
 
     # Track infrastructure failures to block speculative variant retries.
     global _last_infra_error, _last_infra_variant
     if result.infrastructure_error:
-        # Capture a short summary for the rejection message.
         _last_infra_error = next(
             (d for d in result.diagnostics if "INFRASTRUCTURE_ERROR" in d),
             "infrastructure failure (see diagnostics)",
@@ -231,20 +143,7 @@ async def _provision_jumpstarter(
         _last_infra_error = None
         _last_infra_variant = None
 
-    return json.dumps(
-        {
-            "success": result.success,
-            "ip": result.ip,
-            "board_name": result.board_name,
-            "ssh_user": result.ssh_user,
-            "ssh_key_path": result.ssh_key_path,
-            "diagnostics": result.diagnostics,
-            "flash_duration_s": result.flash_duration_s,
-            "boot_duration_s": result.boot_duration_s,
-            "serial_log_path": result.serial_log_path,
-            "infrastructure_error": result.infrastructure_error,
-        }
-    )
+    return json.dumps(result.to_tool_response(artifact_dir=artifact_dir))
 
 
 async def _provision_ready_host(cf: dict[str, Any]) -> str:
@@ -386,6 +285,28 @@ def get_platform_tools() -> list[ToolDefinition]:
             },
         ),
     ]
+
+
+@mcp.tool()
+async def read_artifact_file(
+    path: str,
+    offset: int = 0,
+    limit: int = 200,
+) -> str:
+    """Read lines from a local artifact file (flash diagnostics,
+    serial capture, provision logs).  Use this to inspect full
+    output when the tool result was truncated.
+
+    Args:
+        path: Absolute path to the artifact file, or a path relative
+            to the ticket's artifact directory.
+        offset: 0-based line number to start reading from.
+        limit: Maximum number of lines to return (max 500).
+    """
+    from agents.server_utils import read_artifact_file_impl
+
+    tid = _ticket.get("id", "") if _ticket else ""
+    return read_artifact_file_impl(path, offset, limit, ticket_id=tid)
 
 
 if __name__ == "__main__":
