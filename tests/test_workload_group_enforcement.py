@@ -186,7 +186,9 @@ def test_workload_drift_is_detected(monkeypatch):
         monkeypatch,
         steps_results={"runfile_fingerprint": "0" * 64},
     )
-    drift = benchmark_server._check_workload_group_drift(ticket, "val-788")
+    drift = benchmark_server._check_workload_group_drift(
+        ticket, benchmark_server._runfile_fingerprint(_run_file())
+    )
     assert drift
     assert "workload group 'kernel-ab'" in drift
     assert "identical run file" in drift
@@ -198,15 +200,12 @@ def test_matching_fingerprint_passes(monkeypatch):
         steps_results={"runfile_fingerprint": None},
     )[1]
     # Same fingerprint as this validation.
+    fingerprint = benchmark_server._runfile_fingerprint(record["run_file"])
     ticket = _ticket_with_plan(
         monkeypatch,
-        steps_results={
-            "runfile_fingerprint": benchmark_server._runfile_fingerprint(
-                record["run_file"]
-            )
-        },
+        steps_results={"runfile_fingerprint": fingerprint},
     )[0]
-    assert benchmark_server._check_workload_group_drift(ticket, "val-788") == ""
+    assert benchmark_server._check_workload_group_drift(ticket, fingerprint) == ""
 
 
 def test_no_plan_at_all_skips_group_check(monkeypatch):
@@ -258,24 +257,31 @@ def test_plan_mv_params_mismatch_detected(monkeypatch):
     ticket["custom_fields"]["benchmark_validations"]["records"]["val-788"]["run_file"][
         "benchmarks"
     ][0]["mv-params"] = {}
-    error = benchmark_server._check_plan_mv_params(ticket, "val-788", {"seconds": "30"})
+    stripped = ticket["custom_fields"]["benchmark_validations"]["records"]["val-788"][
+        "run_file"
+    ]
+    error = benchmark_server._check_plan_mv_params(ticket, stripped, {"seconds": "30"})
     assert error
     assert "seconds" in error
     assert "['30']" in error
 
 
 def test_plan_mv_params_match_passes(monkeypatch):
-    ticket, _ = _ticket_with_plan(monkeypatch, mv_params={"seconds": "30"})
+    ticket, record = _ticket_with_plan(monkeypatch, mv_params={"seconds": "30"})
     assert (
-        benchmark_server._check_plan_mv_params(ticket, "val-788", {"seconds": "30"})
+        benchmark_server._check_plan_mv_params(
+            ticket, record["run_file"], {"seconds": "30"}
+        )
         == ""
     )
 
 
 def test_plan_mv_params_list_form_passes(monkeypatch):
-    ticket, _ = _ticket_with_plan(monkeypatch, mv_params={"seconds": ["30"]})
+    ticket, record = _ticket_with_plan(monkeypatch, mv_params={"seconds": "30"})
     assert (
-        benchmark_server._check_plan_mv_params(ticket, "val-788", {"seconds": ["30"]})
+        benchmark_server._check_plan_mv_params(
+            ticket, record["run_file"], {"seconds": ["30"]}
+        )
         == ""
     )
 
@@ -283,7 +289,10 @@ def test_plan_mv_params_list_form_passes(monkeypatch):
 def test_plan_mv_params_ignored_when_step_has_none(monkeypatch):
     """Steps without mv_params (non-kernel-ab tickets) are unaffected."""
     ticket, _ = _ticket_with_plan(monkeypatch)
-    assert benchmark_server._check_plan_mv_params(ticket, "val-788", None) == ""
+    record = ticket["custom_fields"]["benchmark_validations"]["records"]["val-788"]
+    assert (
+        benchmark_server._check_plan_mv_params(ticket, record["run_file"], None) == ""
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -556,13 +565,14 @@ class _RejectingSSH:
 
 def test_extra_mv_params_rejected(monkeypatch):
     """The run file must not vary parameters the plan does not name."""
-    ticket, _ = _ticket_with_plan(monkeypatch)
+    ticket, record = _ticket_with_plan(monkeypatch)
     # Inject an extra varied parameter into the validated run file.
-    record = ticket["custom_fields"]["benchmark_validations"]["records"]["val-788"]
     record["run_file"]["benchmarks"][0]["mv-params"]["sets"][0]["params"].append(
         {"arg": "cpu", "vals": ["0-63"]}
     )
-    error = benchmark_server._check_plan_mv_params(ticket, "val-788", {"seconds": "30"})
+    error = benchmark_server._check_plan_mv_params(
+        ticket, record["run_file"], {"seconds": "30"}
+    )
     assert error
     assert "cpu" in error
     assert "does not name" in error

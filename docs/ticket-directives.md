@@ -150,7 +150,7 @@ human approval before touching the hosts.
 | `candidate` | yes | Exact `uname -r` release of kernel B (e.g. `5.14.0-742.el9.x86_64`) |
 | `order` | no | `AB` (default), `ABBA`, or `BAAB` — run order across the plan |
 | `package` | no | RPM package providing the kernel (default `kernel`) |
-| `repo_url` | no | http(s) URL of a dnf repository serving the packages; the install step configures it on the hosts (with `sslverify=0`) before `dnf install`. Without it, the releases must already be installed or available. |
+| `repo_url` | no | http(s) URL of a dnf repository serving the packages; the install step verifies the URL against the organization's `approved_repositories` configuration, deploys the entry's GPG key and TLS CA bundle to the hosts, and writes the repository with `gpgcheck=1` before `dnf install`. Without a matching approved entry — or without this directive, if the releases are not already installed — the kernel step stops with guidance. |
 
 Example description text for a ticket:
 
