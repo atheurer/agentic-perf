@@ -130,7 +130,11 @@ def start_orchestrator(
                 "state_store": {"url": store_url},
                 "llm": {"provider": "mock"},
                 "poll_interval": 0.05,
-                "orchestrator_lease": {"ttl_seconds": 30, "renew_interval": 1},
+                "orchestrator_lease": {
+                    "ttl_seconds": 30,
+                    "renew_interval": 1,
+                    "max_attempts": 1,
+                },
                 "max_concurrent_agents": 1,
             }
         ),
@@ -435,7 +439,7 @@ def lease_worker() -> None:
             bind_trace_context(
                 new_trace_context(ticket_id="control", agent_id="orchestrator")
             )
-            lease = await client.acquire()
+            lease = await client.acquire(max_attempts=1)
             Path(os.environ["FAULT_RESULT"]).write_text(
                 json.dumps({"status": "winner", "lease": lease})
             )
