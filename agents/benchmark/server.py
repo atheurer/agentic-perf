@@ -2833,15 +2833,11 @@ async def _autoconsume_runfile_approval(
 
 
 def plan_step_params(ticket: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the current plan step's params when the step is knowable."""
+    """Return the current plan step's params from the ticket's plan state."""
     cf = ticket.get("custom_fields") or {}
     plan = cf.get("execution_plan") or {}
-    step_id_env = os.environ.get("EXECUTION_PLAN_STEP_ID", "")
-    if not step_id_env:
-        return None
-    try:
-        current_id = int(step_id_env)
-    except ValueError:
+    current_id = _resolve_current_step_id(ticket)
+    if current_id is None:
         return None
     steps = plan.get("steps") or []
     step = next(
@@ -2896,7 +2892,32 @@ def _check_plan_mv_params(
                 f"run file mv-params does not match the plan: plan requires "
                 f"{key}={expected_vals!r}, run file has {actual!r} (or omits it)"
             )
+    # Strict both directions (review round 2): the run file must not vary
+    # anything the plan did not name — an extra varied parameter makes the
+    # A/B runs differ in an untracked dimension.
+    extras = sorted(set(runfile_params) - {str(k) for k in plan_mv_params})
+    if extras:
+        return (
+            f"run file varies parameters the plan does not name: "
+            f"{', '.join(extras)}. A kernel-comparison run file may only "
+            "vary the parameters the plan's mv_params specifies."
+        )
     return ""
+
+
+def _resolve_current_step_id(ticket: dict[str, Any]) -> int | None:
+    """Derive the executing step from the ticket's own plan state.
+
+    The authoritative source is ``execution_plan.current_step`` — in-band,
+    written by the orchestrator when the plan advances. Returns None only
+    when the ticket carries no plan at all (external/legacy runs).
+    """
+    cf = ticket.get("custom_fields") or {}
+    plan = cf.get("execution_plan") or {}
+    current = plan.get("current_step")
+    if isinstance(current, int) and not isinstance(current, bool):
+        return current
+    return None
 
 
 def _check_workload_group_drift(
@@ -2909,21 +2930,31 @@ def _check_workload_group_drift(
     runfile fingerprint their execution used (written by the orchestrator's
     step-results capture), and this execution's validated runfile must
     match. Returns "" when the check passes or does not apply.
+
+    Fail-closed (review round 2): the current step comes from the ticket's
+    own ``execution_plan.current_step``, never an environment variable.
+    A kernel-comparison ticket whose executing step cannot be determined
+    is a rejection, not a bypass.
     """
     cf = ticket.get("custom_fields") or {}
     plan = cf.get("execution_plan") or {}
-    step_id_env = os.environ.get("EXECUTION_PLAN_STEP_ID", "")
-    current_id: int | None
-    try:
-        current_id = int(step_id_env) if step_id_env else None
-    except ValueError:
-        current_id = None
+    if not plan.get("steps"):
+        return ""  # no plan: external run, group enforcement does not apply
+    current_id = _resolve_current_step_id(ticket)
     if current_id is None:
-        return ""
+        return (
+            "the executing plan step could not be determined from the "
+            "ticket's execution_plan.current_step; refusing to run a "
+            "workload-group benchmark without a verified step identity"
+        )
     steps = plan.get("steps") or []
     current = next((s for s in steps if s.get("id") == current_id), None)
     if not isinstance(current, dict):
-        return ""
+        return (
+            f"execution_plan.current_step {current_id} does not match any "
+            "plan step; refusing to run a workload-group benchmark "
+            "without a verified step identity"
+        )
     group = (current.get("params") or {}).get("workload_group")
     if not group:
         return ""
@@ -2945,9 +2976,16 @@ def _check_workload_group_drift(
         results = step.get("results") or {}
         prior = results.get("runfile_fingerprint")
         if not prior:
-            # Nothing recorded (older ticket or capture not yet deployed)
-            # — nothing to compare against.
-            continue
+            # A feature-created plan must establish identity on every
+            # group step: a missing fingerprint means the earlier run's
+            # identity was never proven, so comparison enforcement cannot
+            # be satisfied (review round 2 — no silent bypass).
+            return (
+                f"step {step.get('id')} in workload group {group!r} has no "
+                "recorded runfile fingerprint; the earlier run's identity "
+                "is unproven. Re-run the earlier benchmark step so its "
+                "configuration is recorded before executing this step."
+            )
         if prior != this_fingerprint:
             return (
                 f"step {current_id} runfile fingerprint {this_fingerprint[:12]}... "
