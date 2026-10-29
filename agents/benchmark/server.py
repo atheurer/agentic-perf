@@ -2848,7 +2848,7 @@ def plan_step_params(ticket: dict[str, Any]) -> dict[str, Any] | None:
 
 def _check_plan_mv_params(
     ticket: dict[str, Any],
-    validation_id: str | None,
+    run_file: dict[str, Any] | None,
     plan_mv_params: dict[str, Any] | None,
 ) -> str:
     """Return a reason when the validated runfile does not match the plan's mv_params.
@@ -2860,15 +2860,12 @@ def _check_plan_mv_params(
     that would otherwise silently run the harness default (600s instead of
     the planned 30s in PERF-E47D0F45).
     """
-    cf = ticket.get("custom_fields") or {}
-    manifest = cf.get("benchmark_validations") or {}
-    records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
-    record = records.get(validation_id) if validation_id else None
-    if not isinstance(record, dict):
-        return ""
+    # Harness-neutral: the run file under execution is passed in
+    # directly (from the validation record for crucible, or the
+    # caller-supplied file for generic adapters).
     if not plan_mv_params:
         return ""
-    run_file = record.get("run_file") or {}
+    run_file = run_file or {}
     benchmarks = run_file.get("benchmarks") or []
     mv_params = benchmarks[0].get("mv-params") if benchmarks else None
     if not isinstance(mv_params, dict):
@@ -2921,7 +2918,7 @@ def _resolve_current_step_id(ticket: dict[str, Any]) -> int | None:
 
 
 def _check_workload_group_drift(
-    ticket: dict[str, Any], validation_id: str | None
+    ticket: dict[str, Any], runfile_fingerprint: str | None
 ) -> str:
     """Return a drift reason when this execution would break group identity.
 
@@ -2959,12 +2956,11 @@ def _check_workload_group_drift(
     if not group:
         return ""
 
-    manifest = cf.get("benchmark_validations") or {}
-    records = manifest.get("records", {}) if isinstance(manifest, dict) else {}
-    record = records.get(validation_id) if validation_id else None
-    if not isinstance(record, dict):
-        return ""
-    this_fingerprint = record.get("runfile_fingerprint", "")
+    # Harness-neutral: the caller supplies the fingerprint of the run
+    # file actually being executed — from the validation record (crucible)
+    # or from the caller-supplied run file (generic adapters). This keeps
+    # the identity checks from being Crucible-only (review round 2).
+    this_fingerprint = runfile_fingerprint or ""
     if not this_fingerprint:
         return ""
 
@@ -3435,7 +3431,29 @@ async def execute_benchmark(
     # differently than planned (observed in PERF-E47D0F45: one run
     # silently executed the sleep benchmark's 600s default instead of the
     # planned 30s, making the A/B comparison invalid).
-    drift = _check_workload_group_drift(active_check, validation_id)
+    # Harness-neutral run-file identity: crucible resolves the run file
+    # from the validation record; generic adapters execute the
+    # caller-supplied run_file directly. Both must satisfy the same
+    # group-identity and plan-parameter checks (review round 2).
+    if run_file is not None:
+        effective_run_file = run_file
+        effective_fingerprint = _runfile_fingerprint(run_file)
+    else:
+        cf_exec = active_check.get("custom_fields") or {}
+        manifest_exec = cf_exec.get("benchmark_validations") or {}
+        records_exec = (
+            manifest_exec.get("records", {}) if isinstance(manifest_exec, dict) else {}
+        )
+        record_exec = records_exec.get(validation_id) if validation_id else None
+        effective_run_file = (
+            record_exec.get("run_file") if isinstance(record_exec, dict) else None
+        )
+        effective_fingerprint = (
+            record_exec.get("runfile_fingerprint")
+            if isinstance(record_exec, dict)
+            else None
+        )
+    drift = _check_workload_group_drift(active_check, effective_fingerprint)
     if drift:
         rejection = {
             "status": "rejected",
@@ -3453,7 +3471,7 @@ async def execute_benchmark(
     step_params = plan_step_params(active_check)
     plan_mv = (step_params or {}).get("mv_params")
     if plan_mv:
-        mv_error = _check_plan_mv_params(active_check, validation_id, plan_mv)
+        mv_error = _check_plan_mv_params(active_check, effective_run_file, plan_mv)
         if mv_error:
             rejection = {
                 "status": "rejected",

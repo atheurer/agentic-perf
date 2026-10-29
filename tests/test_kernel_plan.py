@@ -1095,7 +1095,6 @@ class TestApprovalTransparency:
         agent = ProvisioningAgent.__new__(ProvisioningAgent)
         agent._ticket_id = "PERF-T"
         agent._add_comment = AsyncMock()
-        approval = {"approval_request_id": "apr-1"}
         intent = {
             "kernel": {
                 "package": "kernel",
@@ -1124,5 +1123,3 @@ class TestApprovalTransparency:
         )
         assert REPO_URL in question
         assert "approved_repositories" in question
-
-

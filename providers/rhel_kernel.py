@@ -163,7 +163,7 @@ def build_repo_setup_command(
         raise ValueError(
             "repository trust requires a deployed GPG key path "
             "(approved_repositories[gpg_key_secret]); refusing to write "
-            "an unauthenticated repository"
+            "a repository without GPG and TLS verification"
         )
     if not ca_cert_path:
         raise ValueError(
@@ -195,8 +195,8 @@ def build_repo_cleanup_command() -> str:
     """Remove the ticket's repository file and refresh metadata (idempotent).
 
     The repo written by build_repo_setup_command must not outlive the
-    ticket that created it: it is an unauthenticated package source
-    (gpgcheck=0/sslverify=0 for lab composes), and a later ticket on the
+    ticket that created it: it is a ticket-scoped package source whose
+    approval was bound to this ticket's plan, and a later ticket on the
     same host could otherwise consume it unknowingly. Called when the
     final kernel step of a plan completes.
     """
