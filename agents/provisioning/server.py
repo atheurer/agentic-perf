@@ -3611,12 +3611,16 @@ async def _deploy_repository_trust(
             return "", ""
         if not content:
             return "", ""
+        # The secret bytes are base64-encoded and decoded on the host —
+        # no secret text is interpolated into the remote shell, so a
+        # secret containing shell metacharacters or a heredoc delimiter
+        # cannot inject commands (review round 2, major).
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
         result = await _ssh.run(
             target,
             f"mkdir -p /etc/pki/agentic-perf && chmod 755 /etc/pki/agentic-perf"
-            f" && cat > {remote} << 'AGENTIC_PERF_TRUST_EOF'\n"
-            f"{content}\nAGENTIC_PERF_TRUST_EOF\n"
-            f"chmod 644 {remote}",
+            f" && printf '%s' '{encoded}' | base64 -d > {remote}"
+            f" && chmod 644 {remote}",
             timeout=30,
             mutating=True,
         )
