@@ -3491,6 +3491,168 @@ def _actions_for_host(spec: KernelSpec, inventory: dict[str, Any]) -> dict[str, 
     }
 
 
+def _url_within_prefix(url: str, prefix: str) -> bool:
+    """Path-boundary approval check (review round 2, blocker).
+
+    Both URLs are parsed and canonicalized: scheme and host must match
+    exactly (no userinfo tricks), the approved prefix's path must sit at
+    the URL's path root as complete components (so ``/approved`` never
+    approves ``/approvedevil/``), and dot-segments are resolved before
+    comparison (so ``/approved/../unapproved`` cannot escape). A prefix
+    without a trailing slash is treated as a component boundary anyway.
+    Query strings and fragments are ignored — approval is about where
+    the packages live, not the fetch parameters.
+    """
+    import posixpath
+    from urllib.parse import urlsplit
+
+    def _canonical(raw: str) -> tuple[str, str, list[str]] | None:
+        try:
+            parts = urlsplit(raw.strip())
+            if not parts.scheme or not parts.hostname:
+                return None
+            # Userinfo in either URL is rejected outright: it has no
+            # legitimate role in a package repository URL and enables
+            # host-confusion bypasses (user@approved/ vs approved/).
+            if parts.username or parts.password:
+                return None
+            # Resolve dot-segments (../ and ./) and normalize; unlike
+            # urljoin's "." resolution this preserves every component.
+            path = posixpath.normpath(parts.path or "/")
+            if not path.startswith("/"):
+                path = "/" + path
+            segments = [s for s in path.split("/") if s]
+            return parts.scheme.lower(), (parts.hostname or "").lower(), segments
+        except ValueError:
+            return None
+
+    url_c = _canonical(url)
+    prefix_c = _canonical(prefix)
+    if url_c is None or prefix_c is None:
+        return False
+    url_scheme, url_host, url_segments = url_c
+    p_scheme, p_host, prefix_segments = prefix_c
+    if url_scheme != p_scheme or url_host != p_host:
+        return False
+    if len(url_segments) < len(prefix_segments):
+        return False
+    return url_segments[: len(prefix_segments)] == prefix_segments
+
+
+async def _resolve_repository_trust(repo_url: str) -> dict[str, Any]:
+    """Match a repo URL against the organization's approved repositories.
+
+    Expected shape in the harness private config (e.g.
+    private-skills/crucible.json)::
+
+        "approved_repositories": [
+            {
+                "url_prefix": "https://download.eng.rdu.redhat.com/rhel-9/composes/",
+                "gpg_key_secret": "rhel-compose-gpg-key",
+                "ca_secret": "rhel-lab-ca-bundle",
+                "description": "RDU3 RHEL composes"
+            }
+        ]
+
+    The secrets resolve through the normal secrets provider (local
+    files under ~/.agentic-perf/secrets/ or the configured vault) and
+    are never exposed to the LLM. Returns {"approved": bool,
+    "entry": <matched entry>}.
+    """
+    provider = _skill_provider
+    get_all = getattr(provider, "get_all_private_config", None)
+    config = {}
+    if get_all is not None:
+        try:
+            config = await get_all("crucible") or {}
+        except Exception:
+            config = {}
+    approved: list[Any] = []
+    if isinstance(config, dict):
+        # The private config may nest the list under "provisioning" or
+        # expose it at the suite top level, depending on the file layout.
+        nested = config.get("provisioning")
+        if isinstance(nested, dict):
+            approved = nested.get("approved_repositories") or []
+        if not approved:
+            approved = config.get("approved_repositories") or []
+    for entry in approved:
+        prefix = entry.get("url_prefix", "")
+        if not prefix:
+            continue
+        if _url_within_prefix(repo_url, prefix):
+            return {"approved": True, "entry": entry}
+    return {"approved": False}
+
+
+async def _deploy_repository_trust(
+    target: str, trust: dict[str, Any]
+) -> tuple[str, str]:
+    """Deploy the approved entry's GPG key and CA bundle to a host.
+
+    Materializes the secrets as root-only files under /etc/pki so the
+    repo file can reference them. Returns (gpg_key_path, ca_cert_path);
+    empty paths mean deployment failed.
+    """
+    entry = trust.get("entry") or {}
+    gpg_secret = entry.get("gpg_key_secret")
+    ca_secret = entry.get("ca_secret")
+    if not gpg_secret or not ca_secret:
+        return "", ""
+    deployed: list[str] = []
+    paths: dict[str, str] = {}
+    for kind, secret_name, remote in (
+        ("gpg", gpg_secret, "/etc/pki/agentic-perf/kernel-repo-gpg.key"),
+        ("ca", ca_secret, "/etc/pki/agentic-perf/kernel-repo-ca.pem"),
+    ):
+        try:
+            content = await _read_secret(secret_name)
+        except Exception:
+            return "", ""
+        if not content:
+            return "", ""
+        # The secret bytes are base64-encoded and decoded on the host —
+        # no secret text is interpolated into the remote shell, so a
+        # secret containing shell metacharacters or a heredoc delimiter
+        # cannot inject commands (review round 2, major).
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        result = await _ssh.run(
+            target,
+            f"mkdir -p /etc/pki/agentic-perf && chmod 755 /etc/pki/agentic-perf"
+            f" && printf '%s' '{encoded}' | base64 -d > {remote}"
+            f" && chmod 644 {remote}",
+            timeout=30,
+            mutating=True,
+        )
+        if result.exit_code != 0:
+            return "", ""
+        paths[kind] = remote
+        deployed.append(remote)
+    if len(deployed) != 2:
+        return "", ""
+    return paths["gpg"], paths["ca"]
+
+
+async def _read_secret(secret_name: str) -> str:
+    """Read a secret's text content through the server's secrets provider."""
+    global _secrets_provider
+    await _ensure_init()
+    provider = _secrets_provider
+    if provider is None:
+        return ""
+    get = getattr(provider, "get_secret", None)
+    if get is None:
+        return ""
+    value = get(secret_name)
+    if asyncio.iscoroutine(value):
+        value = await value
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 async def _install_kernel_one(
     host: str, spec: KernelSpec, address: str | None = None
 ) -> dict[str, Any]:
@@ -3520,6 +3682,56 @@ async def _install_kernel_one(
             "state": "already_installed",
             "before": before.to_dict(),
         }
+
+    # A step-supplied repo_url bootstraps the repository the kernel comes
+    # from (fresh lab hosts have no compose repos). Trust model (review
+    # blocker on #1230): the URL must match an organization-approved
+    # repository entry, and the entry's GPG key + CA bundle must be
+    # deployed to the host before any repo file is written. Unverified
+    # repositories are refused — package scriptlets run as root.
+    if spec.repo_url:
+        from providers.rhel_kernel import build_repo_setup_command
+
+        trust = await _resolve_repository_trust(spec.repo_url)
+        if not trust.get("approved"):
+            return {
+                "host": host,
+                "state": "install_failed",
+                "error": (
+                    f"repository {spec.repo_url!r} is not in the "
+                    "organization's approved_repositories configuration; "
+                    "add an entry with gpg_key_secret and ca_secret before "
+                    "using it"
+                ),
+                "before": before.to_dict(),
+            }
+        gpg_path, ca_path = await _deploy_repository_trust(target, trust)
+        if not gpg_path or not ca_path:
+            return {
+                "host": host,
+                "state": "install_failed",
+                "error": (
+                    "repository trust material could not be deployed to "
+                    f"{host}; refusing unverified dnf access"
+                ),
+                "before": before.to_dict(),
+            }
+        repo_result = await _ssh.run(
+            target,
+            build_repo_setup_command(spec, gpg_key_path=gpg_path, ca_cert_path=ca_path),
+            timeout=300,
+            mutating=True,
+        )
+        if repo_result.exit_code != 0:
+            return {
+                "host": host,
+                "state": "install_failed",
+                "error": (
+                    "kernel repository bootstrap failed: "
+                    f"{repo_result.stderr or repo_result.stdout}"
+                ),
+                "before": before.to_dict(),
+            }
 
     result = await _ssh.run(
         target, build_install_command(spec), timeout=900, mutating=True
@@ -4574,6 +4786,59 @@ async def _capture_environment_one(
         "snapshot": snapshot,
         "fingerprint": environment_fingerprint(snapshot),
     }
+
+
+async def _run_repo_cleanup_one(
+    host: str, address: str | None = None
+) -> dict[str, Any]:
+    """Remove the ticket repository file from one host (idempotent)."""
+    from providers.rhel_kernel import build_repo_cleanup_command
+
+    target = address or host
+    result = await _ssh.run(
+        target, build_repo_cleanup_command(), timeout=60, mutating=True
+    )
+    if result.exit_code != 0:
+        return {
+            "host": host,
+            "state": "cleanup_failed",
+            "error": result.stderr or result.stdout,
+        }
+    return {"host": host, "state": "clean"}
+
+
+@mcp.tool()
+async def run_repo_cleanup(hosts: list[str]) -> str:
+    """Remove this ticket's kernel repository file from the assigned hosts. Idempotent; runs at the end of the final kernel transition so the unauthenticated package source does not outlive the ticket."""
+    await _ensure_init()
+    from agents.provisioning.kernel import canonicalize_targets
+    from agents.server_utils import assert_ticket_active
+
+    active = await assert_ticket_active(expected_status="awaiting_provision")
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+    ticket = active.get("ticket", active)
+    allowed, refused, requested_as, addresses = canonicalize_targets(hosts, ticket)
+    results: dict[str, Any] = dict(refused)
+    raw = await asyncio.gather(
+        *[_run_repo_cleanup_one(h, addresses.get(h)) for h in allowed],
+        return_exceptions=True,
+    )
+    for host, result in zip(allowed, raw):
+        if isinstance(result, Exception):
+            results[host] = {"host": host, "state": "error", "error": str(result)}
+        else:
+            results[host] = result
+        results[host]["requested_as"] = requested_as.get(host, host)
+    summary = _summarize(results)
+    states = {r.get("state") for r in results.values() if isinstance(r, dict)}
+    if states <= {"clean"} and allowed:
+        summary["status"] = "ok"
+    elif not allowed:
+        summary["status"] = "already_clean"
+    else:
+        summary["status"] = "incomplete"
+    return json.dumps(summary)
 
 
 @mcp.tool()

@@ -6,6 +6,15 @@ agentic-perf validator enforces its own run-file contract; pass the exact file
 that validated to execute_benchmark, and do not modify it between validation
 and execution.
 
+Set mv-params explicitly from the plan step's `mv_params`. Every multiplex
+parameter the plan names must appear in the run file's
+`benchmarks[0].mv-params.sets[0].params` with the same values — execute_benchmark
+rejects the run otherwise (`runfile_params_mismatch`). Omitting a parameter is
+not a shortcut: the benchmark's multiplex default applies (the sleep benchmark
+runs 600 seconds when `seconds` is unset, not the 30 the ticket described),
+and benchmark steps in the same `workload_group` must run identical run files
+(`workload_drift` is rejected at execution).
+
 Do not copy a generic run-file example's parameters into every benchmark. In
 particular, per-ID remotehost configuration is benchmark-specific. For a
 normal Crucible uperf client, peer discovery comes from Crucible's endpoint

@@ -17,6 +17,12 @@ from typing import Any
 KERNEL_RELEASE_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9._+~]+$")
 _PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 _MAX_RELEASE_LEN = 96
+# A repo URL is interpolated into a single-quoted printf argument on a
+# remote shell, so it must not contain a single quote, whitespace, or any
+# character that survives single-quoting (backslash). Everything else
+# common in URLs (?, &, =, %, $) is safe inside single quotes.
+_REPO_URL_RE = re.compile(r"^https?://[^'\s\\]+$")
+_REPO_FILE = "/etc/yum.repos.d/agentic-perf-kernel.repo"
 
 
 @dataclass(frozen=True)
@@ -26,24 +32,32 @@ class KernelSpec:
     release: str
     package: str = "kernel"
     companion_packages: tuple[str, ...] = ()
+    repo_url: str = ""
 
     def __post_init__(self) -> None:
         if not self.release:
             raise ValueError("kernel release must not be empty")
         if len(self.release) > _MAX_RELEASE_LEN:
             raise ValueError(f"kernel release exceeds {_MAX_RELEASE_LEN} chars")
-        if not KERNEL_RELEASE_RE.match(self.release):
+        if not KERNEL_RELEASE_RE.fullmatch(self.release):
             raise ValueError(
                 f"kernel release {self.release!r} does not match"
                 f" {KERNEL_RELEASE_RE.pattern}"
             )
-        if not _PACKAGE_NAME_RE.match(self.package):
+        if not _PACKAGE_NAME_RE.fullmatch(self.package):
             raise ValueError(
                 f"package name {self.package!r} contains invalid characters"
             )
         for cp in self.companion_packages:
-            if not KERNEL_RELEASE_RE.match(cp):
+            if not KERNEL_RELEASE_RE.fullmatch(cp):
                 raise ValueError(f"companion package {cp!r} is not a valid release")
+        if self.repo_url:
+            if len(self.repo_url) > 512:
+                raise ValueError("repo_url exceeds 512 chars")
+            if not _REPO_URL_RE.fullmatch(self.repo_url):
+                raise ValueError(
+                    f"repo_url {self.repo_url!r} is not a plain http(s) URL"
+                )
 
     @classmethod
     def parse(cls, raw: dict | str) -> KernelSpec:
@@ -60,6 +74,7 @@ class KernelSpec:
             release=release,
             package=package,
             companion_packages=companions,
+            repo_url=str(raw.get("repo_url") or ""),
         )
 
     @property
@@ -81,6 +96,8 @@ class KernelSpec:
         }
         if self.companion_packages:
             d["companion_packages"] = list(self.companion_packages)
+        if self.repo_url:
+            d["repo_url"] = self.repo_url
         return d
 
 
@@ -98,7 +115,7 @@ def build_probe_command() -> str:
 
 
 def build_inventory_command(package: str = "kernel") -> str:
-    if not _PACKAGE_NAME_RE.match(package):
+    if not _PACKAGE_NAME_RE.fullmatch(package):
         raise ValueError(f"invalid package name: {package!r}")
     return (
         "echo @@uname; uname -r;"
@@ -121,11 +138,73 @@ def build_available_command(spec: KernelSpec) -> str:
     return f"dnf -q list --available {spec.nevra} 2>&1"
 
 
+def build_repo_setup_command(
+    spec: KernelSpec,
+    *,
+    gpg_key_path: str = "",
+    ca_cert_path: str = "",
+) -> str:
+    """Idempotent dnf repo file for spec.repo_url (call before install).
+
+    The URL goes through a single-quoted printf, which the KernelSpec
+    validation guarantees to be injection-safe.
+
+    Trust model (review blocker on #1230): a repository is only written
+    when the URL is approved by organization configuration AND the
+    verification material is deployed. With a deployed GPG key the repo
+    is gpgcheck=1; with a deployed CA bundle sslverify points at it.
+    Blind gpgcheck=0/sslverify=0 is never emitted -- a user-controlled
+    or MITM repository must not be able to run package scriptlets as
+    root on benchmark hosts.
+    """
+    if not spec.repo_url:
+        raise ValueError("kernel spec has no repo_url")
+    if not gpg_key_path:
+        raise ValueError(
+            "repository trust requires a deployed GPG key path "
+            "(approved_repositories[gpg_key_secret]); refusing to write "
+            "a repository without GPG and TLS verification"
+        )
+    if not ca_cert_path:
+        raise ValueError(
+            "repository trust requires a deployed CA bundle path "
+            "(approved_repositories[ca_secret]); refusing to write a "
+            "repository without TLS verification"
+        )
+    return (
+        f"printf '%s\n' '[agentic-perf-kernel]'"
+        f" 'name=agentic-perf kernel repository'"
+        f" 'baseurl={spec.repo_url}'"
+        f" 'enabled=1' 'gpgcheck=1'"
+        f" 'gpgkey=file://{gpg_key_path}'"
+        f" 'sslcacert={ca_cert_path}'"
+        f" > {_REPO_FILE}"
+        f" && dnf clean metadata >/dev/null 2>&1;"
+        f" dnf -q list --available {spec.nevra} >/dev/null 2>&1"
+    )
+
+
 def build_install_command(spec: KernelSpec) -> str:
     parts = [spec.nevra]
     for cp in spec.companion_packages:
         parts.append(f"{spec.package}-{cp}")
     return f"dnf install -y {' '.join(parts)} 2>&1"
+
+
+def build_repo_cleanup_command() -> str:
+    """Remove the ticket's repository file and refresh metadata (idempotent).
+
+    The repo written by build_repo_setup_command must not outlive the
+    ticket that created it: it is a ticket-scoped package source whose
+    approval was bound to this ticket's plan, and a later ticket on the
+    same host could otherwise consume it unknowingly. Called when the
+    final kernel step of a plan completes.
+    """
+    return (
+        f"rm -f {_REPO_FILE}"
+        f" && dnf clean metadata >/dev/null 2>&1;"
+        f" test ! -e {_REPO_FILE}"
+    )
 
 
 def build_select_command(spec: KernelSpec) -> str:

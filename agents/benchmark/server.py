@@ -2832,6 +2832,168 @@ async def _autoconsume_runfile_approval(
     return {"status": "ok", "approval_request_id": approval_id}
 
 
+def plan_step_params(ticket: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the current plan step's params from the ticket's plan state."""
+    cf = ticket.get("custom_fields") or {}
+    plan = cf.get("execution_plan") or {}
+    current_id = _resolve_current_step_id(ticket)
+    if current_id is None:
+        return None
+    steps = plan.get("steps") or []
+    step = next(
+        (s for s in steps if isinstance(s, dict) and s.get("id") == current_id), None
+    )
+    return (step or {}).get("params") or None
+
+
+def _check_plan_mv_params(
+    ticket: dict[str, Any],
+    run_file: dict[str, Any] | None,
+    plan_mv_params: dict[str, Any] | None,
+) -> str:
+    """Return a reason when the validated runfile does not match the plan's mv_params.
+
+    The plan step's ``mv_params`` is the deterministic statement of what the
+    benchmark must vary; the LLM-built run file must carry them verbatim in
+    its ``mv-params.sets[0].params``. This is the enforcement behind "the
+    plan is the intent" — it is what catches a dropped ``seconds`` value
+    that would otherwise silently run the harness default (600s instead of
+    the planned 30s in PERF-E47D0F45).
+    """
+    # Harness-neutral: the run file under execution is passed in
+    # directly (from the validation record for crucible, or the
+    # caller-supplied file for generic adapters).
+    if not plan_mv_params:
+        return ""
+    run_file = run_file or {}
+    benchmarks = run_file.get("benchmarks") or []
+    mv_params = benchmarks[0].get("mv-params") if benchmarks else None
+    if not isinstance(mv_params, dict):
+        return (
+            "run file carries no mv-params but the plan step requires "
+            f"mv_params={plan_mv_params!r}; set the benchmark's mv-params to "
+            "the plan's values"
+        )
+    sets = mv_params.get("sets") or []
+    first_set = sets[0] if sets else {}
+    runfile_params = {
+        str(p.get("arg")): p.get("vals")
+        for p in (first_set.get("params") or [])
+        if isinstance(p, dict) and p.get("arg")
+    }
+    for key, expected in plan_mv_params.items():
+        expected_vals = expected if isinstance(expected, list) else [str(expected)]
+        actual = runfile_params.get(str(key))
+        if actual != [str(v) for v in expected_vals]:
+            return (
+                f"run file mv-params does not match the plan: plan requires "
+                f"{key}={expected_vals!r}, run file has {actual!r} (or omits it)"
+            )
+    # Strict both directions (review round 2): the run file must not vary
+    # anything the plan did not name — an extra varied parameter makes the
+    # A/B runs differ in an untracked dimension.
+    extras = sorted(set(runfile_params) - {str(k) for k in plan_mv_params})
+    if extras:
+        return (
+            f"run file varies parameters the plan does not name: "
+            f"{', '.join(extras)}. A kernel-comparison run file may only "
+            "vary the parameters the plan's mv_params specifies."
+        )
+    return ""
+
+
+def _resolve_current_step_id(ticket: dict[str, Any]) -> int | None:
+    """Derive the executing step from the ticket's own plan state.
+
+    The authoritative source is ``execution_plan.current_step`` — in-band,
+    written by the orchestrator when the plan advances. Returns None only
+    when the ticket carries no plan at all (external/legacy runs).
+    """
+    cf = ticket.get("custom_fields") or {}
+    plan = cf.get("execution_plan") or {}
+    current = plan.get("current_step")
+    if isinstance(current, int) and not isinstance(current, bool):
+        return current
+    return None
+
+
+def _check_workload_group_drift(
+    ticket: dict[str, Any], runfile_fingerprint: str | None
+) -> str:
+    """Return a drift reason when this execution would break group identity.
+
+    Benchmark steps carrying the same ``params.workload_group`` must run
+    an identical runfile: earlier completed steps in the group record the
+    runfile fingerprint their execution used (written by the orchestrator's
+    step-results capture), and this execution's validated runfile must
+    match. Returns "" when the check passes or does not apply.
+
+    Fail-closed (review round 2): the current step comes from the ticket's
+    own ``execution_plan.current_step``, never an environment variable.
+    A kernel-comparison ticket whose executing step cannot be determined
+    is a rejection, not a bypass.
+    """
+    cf = ticket.get("custom_fields") or {}
+    plan = cf.get("execution_plan") or {}
+    if not plan.get("steps"):
+        return ""  # no plan: external run, group enforcement does not apply
+    current_id = _resolve_current_step_id(ticket)
+    if current_id is None:
+        return (
+            "the executing plan step could not be determined from the "
+            "ticket's execution_plan.current_step; refusing to run a "
+            "workload-group benchmark without a verified step identity"
+        )
+    steps = plan.get("steps") or []
+    current = next((s for s in steps if s.get("id") == current_id), None)
+    if not isinstance(current, dict):
+        return (
+            f"execution_plan.current_step {current_id} does not match any "
+            "plan step; refusing to run a workload-group benchmark "
+            "without a verified step identity"
+        )
+    group = (current.get("params") or {}).get("workload_group")
+    if not group:
+        return ""
+
+    # Harness-neutral: the caller supplies the fingerprint of the run
+    # file actually being executed — from the validation record (crucible)
+    # or from the caller-supplied run file (generic adapters). This keeps
+    # the identity checks from being Crucible-only (review round 2).
+    this_fingerprint = runfile_fingerprint or ""
+    if not this_fingerprint:
+        return ""
+
+    for step in steps:
+        if not isinstance(step, dict) or step.get("id", -1) >= current_id:
+            continue
+        if (step.get("params") or {}).get("workload_group") != group:
+            continue
+        results = step.get("results") or {}
+        prior = results.get("runfile_fingerprint")
+        if not prior:
+            # A feature-created plan must establish identity on every
+            # group step: a missing fingerprint means the earlier run's
+            # identity was never proven, so comparison enforcement cannot
+            # be satisfied (review round 2 — no silent bypass).
+            return (
+                f"step {step.get('id')} in workload group {group!r} has no "
+                "recorded runfile fingerprint; the earlier run's identity "
+                "is unproven. Re-run the earlier benchmark step so its "
+                "configuration is recorded before executing this step."
+            )
+        if prior != this_fingerprint:
+            return (
+                f"step {current_id} runfile fingerprint {this_fingerprint[:12]}... "
+                f"differs from step {step.get('id')} in workload group "
+                f"{group!r} ({prior[:12]}...); benchmark steps in the same "
+                "group must execute an identical run file. Re-validate with "
+                "the exact runfile the group's earlier steps used (same "
+                "benchmark parameters, e.g. mv-params)."
+            )
+    return ""
+
+
 async def _add_execution_note(ticket_id: str, body: str) -> None:
     """Best-effort audit comment for automatic approvals."""
     from agents.server_utils import ticket_state_headers
@@ -3260,6 +3422,73 @@ async def execute_benchmark(
             await operation_guard.close()
             await pause_for_reconciliation("execution intent preparation failed")
             return json.dumps({"status": "indeterminate", "operation_id": intent_key})
+
+    # Workload-group immutability (#998): benchmark steps in the same
+    # workload_group must execute an identical runfile, and a plan step
+    # that names mv_params must see them verbatim in the validated run
+    # file. Checked here — immediately before the approval gate and any
+    # side effect — because a mismatch means the LLM rebuilt the run file
+    # differently than planned (observed in PERF-E47D0F45: one run
+    # silently executed the sleep benchmark's 600s default instead of the
+    # planned 30s, making the A/B comparison invalid).
+    # Harness-neutral run-file identity: crucible resolves the run file
+    # from the validation record; generic adapters execute the
+    # caller-supplied run_file directly. Both must satisfy the same
+    # group-identity and plan-parameter checks (review round 2).
+    if run_file is not None:
+        effective_run_file = run_file
+        effective_fingerprint = _runfile_fingerprint(run_file)
+    else:
+        cf_exec = active_check.get("custom_fields") or {}
+        manifest_exec = cf_exec.get("benchmark_validations") or {}
+        records_exec = (
+            manifest_exec.get("records", {}) if isinstance(manifest_exec, dict) else {}
+        )
+        record_exec = records_exec.get(validation_id) if validation_id else None
+        effective_run_file = (
+            record_exec.get("run_file") if isinstance(record_exec, dict) else None
+        )
+        effective_fingerprint = (
+            record_exec.get("runfile_fingerprint")
+            if isinstance(record_exec, dict)
+            else None
+        )
+    drift = _check_workload_group_drift(active_check, effective_fingerprint)
+    if drift:
+        rejection = {
+            "status": "rejected",
+            "reason_code": "workload_drift",
+            "message": drift,
+        }
+        if operation_guard and operation_owned:
+            await operation_guard.terminalize(
+                operation_record,
+                "fail",
+                {"outcome": "workload_drift", "benchmark_result": rejection},
+            )
+            await operation_guard.close()
+        return json.dumps(rejection)
+    step_params = plan_step_params(active_check)
+    plan_mv = (step_params or {}).get("mv_params")
+    if plan_mv:
+        mv_error = _check_plan_mv_params(active_check, effective_run_file, plan_mv)
+        if mv_error:
+            rejection = {
+                "status": "rejected",
+                "reason_code": "runfile_params_mismatch",
+                "message": mv_error,
+            }
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record,
+                    "fail",
+                    {
+                        "outcome": "runfile_params_mismatch",
+                        "benchmark_result": rejection,
+                    },
+                )
+                await operation_guard.close()
+            return json.dumps(rejection)
 
     # Claim the execution intent before creating an automatic approval. The
     # acquired lease remains held through approval consumption and execution.

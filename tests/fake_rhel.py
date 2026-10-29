@@ -45,6 +45,10 @@ class FakeRHELHost:
     grubby_behavior: str = "normal"
     # "normal" | "timeout" (the reboot is queued but the SSH session times out)
     reboot_behavior: str = "normal"
+    # Releases the step-supplied repository (kernel repo_url) serves. They
+    # become installable only after the repo-bootstrap command ran.
+    repo_packages: list[str] = field(default_factory=list)
+    _repo_configured: bool = field(default=False, init=False)
     # The RHEL 9.4 lab hosts have no tuned-adm: the inventory's last command
     # fails with "command not found" and exit 127 unless the command tolerates it.
     has_tuned: bool = True
@@ -76,6 +80,24 @@ class FakeRHELHost:
             if "@@rpm" in command or "@@arch" in command:
                 return self._handle_inventory(command)
             return self._handle_probe()
+
+        if "agentic-perf kernel repository" in command:
+            # Repo bootstrap (build_repo_setup_command): writes the repo
+            # file, then probes availability of the exact NEVRA.
+            self._repo_configured = True
+            for rel in self.repo_packages:
+                if rel in command:
+                    return SSHResult(stdout="", stderr="", exit_code=0)
+            return SSHResult(
+                stdout="Error: No matching Packages to list", stderr="", exit_code=1
+            )
+
+        if "rm -f /etc/yum.repos.d/agentic-perf-kernel.repo" in command:
+            # Repo cleanup (build_repo_cleanup_command): the ticket's
+            # unauthenticated package source must not outlive the ticket.
+            self._repo_configured = False
+            self.repo_packages = []
+            return SSHResult(stdout="", stderr="", exit_code=0)
 
         if "dnf -q list --available" in command:
             return self._handle_available(command)
@@ -160,7 +182,10 @@ class FakeRHELHost:
         return SSHResult(stdout=stdout, stderr="", exit_code=exit_code)
 
     def _handle_available(self, command: str) -> SSHResult:
-        for rel in self.available:
+        pool = list(self.available)
+        if self._repo_configured:
+            pool += self.repo_packages
+        for rel in pool:
             if rel in command:
                 return SSHResult(
                     stdout=f"kernel.{self.arch}  {rel}  baseos",
@@ -177,9 +202,12 @@ class FakeRHELHost:
         if self.dnf_behavior == "timeout_fails":
             return SSHResult(stdout="", stderr="Command timed out", exit_code=-1)
         installed_any = False
-        for rel in list(self.available):
+        for rel in list(self.available) + list(self.repo_packages):
             if rel in command:
-                self.available.remove(rel)
+                if rel in self.available:
+                    self.available.remove(rel)
+                elif rel in self.repo_packages:
+                    self.repo_packages.remove(rel)
                 if rel not in self.installed:
                     self.installed.append(rel)
                 installed_any = True

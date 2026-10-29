@@ -284,7 +284,14 @@ class ProvisioningAgent(AgentBase):
             f"Approved addresses: {json.dumps(intent.get('addresses', {}), sort_keys=True)}\n"
             f"Actions: {', '.join(intent.get('actions_required', []))}\n"
             f"Reboot policy: {intent.get('reboot_policy', 'missing')}\n"
-            f"Intent digest: {digest}\n\n"
+            + (
+                f"Package source: {kernel.get('repo_url')}\n"
+                "(from the organization's approved_repositories; installed "
+                "with GPG and TLS verification)\n"
+                if kernel.get("repo_url")
+                else ""
+            )
+            + f"Intent digest: {digest}\n\n"
             f"{summary or ''}\n\n"
             "Reply approve / request changes / reject, or use the structured "
             "approval action."
@@ -494,7 +501,11 @@ class ProvisioningAgent(AgentBase):
             for host, record in inventory["results"].items()
             if record.get("requested", {}).get("state") == "not_found"
         }
-        if missing:
+        # not_found is expected on a fresh host when the step supplies a
+        # repo_url: install_kernel bootstraps the repository before dnf.
+        # Without a repo_url the operator must add one first — stopping is
+        # the documented behaviour.
+        if missing and not spec.repo_url:
             await self._kernel_step_stop(
                 ticket_id,
                 f"{spec.nevra} is not installed or available on every host "
@@ -502,6 +513,13 @@ class ProvisioningAgent(AgentBase):
                 missing,
             )
             return
+        if missing and spec.repo_url:
+            await self._add_comment(
+                ticket_id,
+                f"{spec.nevra} is not yet available on "
+                f"{', '.join(sorted(missing))}; the step supplies a repo_url "
+                "so install_kernel will bootstrap the repository first.",
+            )
 
         # The tools take the release string; the plan step supplies the
         # package, and each tool re-derives the full spec from the step.
@@ -519,6 +537,12 @@ class ProvisioningAgent(AgentBase):
         summary = (
             f"Plan step {step_id}: {spec.nevra} on {', '.join(hosts)}; "
             f"actions: {', '.join(actions)}; reboot policy: {reboot_policy}."
+            + (
+                f" Package source: {spec.repo_url} (approved_repositories; "
+                "GPG+TLS verified)."
+                if spec.repo_url
+                else ""
+            )
         )
         # The approval endpoint requires a trusted fence context with an
         # invocation id AND a tool-call id.  The model loop derives one per
@@ -629,6 +653,42 @@ class ProvisioningAgent(AgentBase):
             if failed:
                 await self._kernel_step_stop(
                     ticket_id, f"{action} failed on some hosts", failed
+                )
+                return
+
+        # Repository cleanup: the step-supplied repo_url is a
+        # ticket-scoped package source that must not outlive the
+        # ticket. Remove it when the LAST kernel step of the plan
+        # completes — later kernel steps may still need it to install
+        # their own release (review major on #1230; round 2 hardened
+        # the failure path).
+        plan = cf.get("execution_plan") or {}
+        later_kernel_steps = [
+            s
+            for s in (plan.get("steps") or [])
+            if isinstance(s, dict)
+            and s.get("id", -1) > step_id
+            and (s.get("params") or {}).get("kernel")
+        ]
+        if spec.repo_url and not later_kernel_steps:
+            cleanup = await self._kernel_tool(
+                mcp,
+                "run_repo_cleanup",
+                hosts=hosts,
+            )
+            if cleanup.get("status") not in ("ok", "already_clean"):
+                # Fail closed (review round 2): an unremoved repository
+                # is an unverified package source left behind for the
+                # next ticket on these hosts. Stop the step instead of
+                # warning and proceeding — the kernel is verified, but
+                # the ticket cannot complete until an operator removes
+                # the repo or a cleanup retry succeeds.
+                await self._kernel_step_stop(
+                    ticket_id,
+                    "repository cleanup failed after the kernel "
+                    "transition; the ticket repo file may remain on "
+                    f"{', '.join(hosts)}",
+                    cleanup,
                 )
                 return
 
