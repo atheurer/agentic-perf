@@ -118,6 +118,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/provisioning/server.py", "_install_k3s_one", "ssh"),
     ("agents/provisioning/server.py", "_install_kernel_one", "ssh"),
     ("agents/provisioning/server.py", "_run_repo_cleanup_one", "ssh"),
+    ("agents/provisioning/server.py", "_deploy_repository_trust", "ssh"),
     ("agents/provisioning/server.py", "_install_packages_one", "ssh"),
     ("agents/provisioning/server.py", "_capture_environment_one", "ssh"),
     ("agents/provisioning/agent.py", "_kernel_tool", "mcp"),
@@ -1475,6 +1476,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/provisioning/server.py:_install_k3s_one",
+        "2027-12-31",
+    ),
+    ("agents/provisioning/server.py", "_deploy_repository_trust", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/provisioning/server.py:_deploy_repository_trust",
         "2027-12-31",
     ),
     ("agents/provisioning/server.py", "_run_repo_cleanup_one", "ssh"): (

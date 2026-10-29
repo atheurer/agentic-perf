@@ -101,3 +101,31 @@ printf 'CRUCIBLE_NAME="<full name>"\nCRUCIBLE_EMAIL="<email>"\n' > /root/.crucib
 The private crucible config (`~/.agentic-perf/private-skills/crucible.json`)
 can carry this in its install contract so provisioning deploys it
 automatically.
+
+## 4. Kernel repository trust (approved_repositories)
+
+Kernel A/B tickets may name a `repo_url` for the candidate kernel. The
+provisioning tool only writes a dnf repo file when the URL matches an
+`approved_repositories` entry in the harness private config
+(`~/.agentic-perf/private-skills/crucible.json`):
+
+```json
+"approved_repositories": [
+  {
+    "url_prefix": "https://download.eng.rdu.redhat.com/rhel-9/composes/",
+    "gpg_key_secret": "rhel-compose-gpg-key",
+    "ca_secret": "rhel-lab-ca-bundle"
+  }
+]
+```
+
+Both secrets must exist in `~/.agentic-perf/secrets/` (or the configured
+vault): the compose repository's GPG public key and the TLS CA bundle that
+validates the download server's certificate. The tool deploys them to the
+host under `/etc/pki/agentic-perf/` and writes the repo with `gpgcheck=1`
+and `sslcacert` set — an unauthenticated repository is refused, because
+package scriptlets run as root on the benchmark hosts.
+
+**Symptom if unconfigured:** the kernel install step stops with
+"repository ... is not in the organization's approved_repositories
+configuration". Fix: add the entry + secrets, then retry the transition.

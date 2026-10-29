@@ -260,17 +260,36 @@ class TestKernelSpecRepoUrl:
         parsed = KernelSpec.parse(spec.to_dict())
         assert parsed.repo_url == REPO_URL
 
-    def test_build_repo_setup_command(self):
+    def test_build_repo_setup_command_with_trust_material(self):
         spec = KernelSpec(release=KERNEL_B, repo_url=REPO_URL)
-        cmd = build_repo_setup_command(spec)
+        cmd = build_repo_setup_command(
+            spec, gpg_key_path="/etc/pki/k.key", ca_cert_path="/etc/pki/ca.pem"
+        )
         assert f"'baseurl={REPO_URL}'" in cmd
-        assert "sslverify=0" in cmd
-        assert "gpgcheck=0" in cmd
+        assert "gpgcheck=1" in cmd
+        assert "gpgkey=file:///etc/pki/k.key" in cmd
+        assert "sslcacert=/etc/pki/ca.pem" in cmd
+        assert "gpgcheck=0" not in cmd
+        assert "sslverify=0" not in cmd
         assert f"dnf -q list --available {spec.nevra}" in cmd
 
     def test_build_repo_setup_command_requires_url(self):
         with pytest.raises(ValueError):
-            build_repo_setup_command(KernelSpec(release=KERNEL_B))
+            build_repo_setup_command(
+                KernelSpec(release=KERNEL_B),
+                gpg_key_path="/k",
+                ca_cert_path="/c",
+            )
+
+    def test_build_repo_setup_command_refuses_unverified_repo(self):
+        """No GPG key / CA bundle: no repository file, ever."""
+        spec = KernelSpec(release=KERNEL_B, repo_url=REPO_URL)
+        with pytest.raises(ValueError, match="GPG key"):
+            build_repo_setup_command(spec, ca_cert_path="/c")
+        with pytest.raises(ValueError, match="CA bundle"):
+            build_repo_setup_command(spec, gpg_key_path="/k")
+        with pytest.raises(ValueError):
+            build_repo_setup_command(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +319,32 @@ def fresh_repo_hosts():
     return {"10.0.0.1": h1, "10.0.0.2": h2}
 
 
+REPO_TRUST_CONFIG = {
+    "crucible": {
+        "approved_repositories": [
+            {
+                "url_prefix": REPO_URL,
+                "gpg_key_secret": "test-gpg-key",
+                "ca_secret": "test-ca-bundle",
+            }
+        ]
+    }
+}
+
+
+class _TrustSecrets:
+    """Secrets provider stub serving the repo trust material."""
+
+    def __init__(self):
+        self.material = {
+            "test-gpg-key": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nkey\n-----END PGP PUBLIC KEY BLOCK-----",
+            "test-ca-bundle": "-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----",
+        }
+
+    async def get_secret(self, name: str):
+        return self.material.get(name)
+
+
 class TestInstallKernelRepoBootstrap:
     @pytest.fixture
     def repo_ticket(self):
@@ -319,7 +364,14 @@ class TestInstallKernelRepoBootstrap:
 
     @pytest.fixture
     def handlers(self, fleet_ssh):
-        return make_provisioning_handlers(fleet_ssh)
+        from tests.conftest import MockSkillProvider
+
+        provider = MockSkillProvider(private_config=REPO_TRUST_CONFIG)
+        return make_provisioning_handlers(
+            fleet_ssh,
+            skill_provider=provider,
+            secrets_provider=_TrustSecrets(),
+        )
 
     @pytest.fixture(autouse=True)
     def fake_store(self, repo_ticket):
@@ -755,7 +807,11 @@ class TestRepoCleanup:
             repo_packages=[KERNEL_B],
         )
         spec = KernelSpec(release=KERNEL_B, repo_url=REPO_URL)
-        setup = host.handle(build_repo_setup_command(spec))
+        setup = host.handle(
+            build_repo_setup_command(
+                spec, gpg_key_path="/etc/pki/k.key", ca_cert_path="/etc/pki/ca.pem"
+            )
+        )
         assert setup.exit_code == 0
         assert host._repo_configured is True
 
