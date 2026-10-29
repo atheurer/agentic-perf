@@ -2,8 +2,8 @@
 # Pre-commit hook: scoped lint + auto-discovered tests.
 #
 # Only lints staged Python files and runs tests that match
-# the changed source by naming convention. CI still runs
-# the full suite (scripts/validate.sh).
+# the changed source by naming convention. CI runs the
+# full suite with scripts/test-parallel.sh.
 #
 # Test discovery convention:
 #   source: agents/platform/agent.py
