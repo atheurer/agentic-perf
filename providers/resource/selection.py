@@ -15,6 +15,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     StrictStr,
     ValidationError,
@@ -35,6 +36,8 @@ class _SelectionModel(BaseModel):
 
 class QuadsSelection(_SelectionModel):
     hostnames: list[StrictStr] = Field(min_length=1, max_length=10)
+    os: StrictStr | None = Field(default=None, min_length=1)
+    wipe: StrictBool = Field(default=True)
 
     @model_validator(mode="after")
     def hostnames_are_distinct(self) -> QuadsSelection:
@@ -172,6 +175,7 @@ def _quads_hosts_in_requirement_order(
 def _validate_quads_selection(
     normalized: dict[str, Any], context: dict[str, Any]
 ) -> dict[str, Any]:
+    normalized.setdefault("wipe", True)
     hostnames = normalized["hostnames"]
     expected_count = _managed_host_count(context.get("required_hosts"))
     if expected_count is not None and len(hostnames) != expected_count:
@@ -231,13 +235,19 @@ def _validate_jumpstarter_selection(
 RESERVATION_SELECTION_CONTRACTS: dict[str, ReservationSelectionContract] = {
     "quads": ReservationSelectionContract(
         model=QuadsSelection,
-        valid_example={"hostnames": ["host-01.example.com", "host-02.example.com"]},
+        valid_example={
+            "hostnames": ["host-01.example.com", "host-02.example.com"],
+            "os": "RHEL 9.4",
+            "wipe": True,
+        },
         invalid_examples=(
             {"instance_specs": [{"instance_type": "m5.xlarge", "count": 2}]},
             {"hostnames": []},
             {"hostnames": ["host-01.example.com", "HOST-01.EXAMPLE.COM"]},
+            {"hostnames": ["host-01.example.com"], "os": ""},
+            {"hostnames": ["host-01.example.com"], "wipe": "false"},
         ),
-        prompt_fields=("hostnames",),
+        prompt_fields=("hostnames", "os", "wipe"),
         validator=_validate_quads_selection,
     ),
     "aws": ReservationSelectionContract(
