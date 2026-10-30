@@ -101,6 +101,258 @@ async def test_leader_lease_acquire_is_control_plane_not_ticket_audited(
     assert client.epoch == 7
 
 
+@pytest.mark.asyncio
+async def test_acquire_passes_max_attempts_from_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """max_attempts flows from OrchestratorConfig to LeaderLeaseClient.acquire."""
+    captured_kwargs: list[dict] = []
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, json):
+            return httpx.Response(
+                200,
+                json={"epoch": 1},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.httpx.AsyncClient", lambda **_kwargs: Client()
+    )
+
+    original_acquire = LeaderLeaseClient.acquire
+
+    async def spy_acquire(self, **kwargs):
+        captured_kwargs.append(kwargs)
+        return await original_acquire(self, **kwargs)
+
+    monkeypatch.setattr(LeaderLeaseClient, "acquire", spy_acquire)
+
+    config = OrchestratorConfig(
+        state_store_url="http://state-store",
+        raw_config={
+            "llm": {"provider": "mock"},
+            "orchestrator_lease": {"max_attempts": 5},
+        },
+    )
+    assert config.leader_lease_max_attempts == 5
+
+    lc = LeaderLeaseClient("http://state-store", instance_name="test")
+    await lc.acquire(max_attempts=config.leader_lease_max_attempts)
+    assert captured_kwargs[0]["max_attempts"] == 5
+
+
+@pytest.mark.asyncio
+async def test_acquire_409_then_200_retries_successfully(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A 409 on the first attempt is retried and succeeds on the second."""
+    attempt_count = 0
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, json):
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                return httpx.Response(
+                    409,
+                    json={"detail": "held"},
+                    request=httpx.Request("POST", url),
+                )
+            return httpx.Response(
+                200,
+                json={"epoch": 42},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.httpx.AsyncClient", lambda **_kwargs: Client()
+    )
+
+    lc = LeaderLeaseClient("http://state-store", instance_name="test")
+    lease = await lc.acquire(max_attempts=3, retry_interval=0)
+    assert lease["epoch"] == 42
+    assert lc.epoch == 42
+    assert attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_acquire_409_exhaustion_raises_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """409 through all max_attempts raises RuntimeError after exactly max_attempts."""
+    attempt_count = 0
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, json):
+            nonlocal attempt_count
+            attempt_count += 1
+            return httpx.Response(
+                409,
+                json={"detail": "held"},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.httpx.AsyncClient", lambda **_kwargs: Client()
+    )
+
+    lc = LeaderLeaseClient("http://state-store", instance_name="test")
+    with pytest.raises(RuntimeError, match="unavailable after 3 attempts"):
+        await lc.acquire(max_attempts=3, retry_interval=0)
+    assert attempt_count == 3
+
+
+@pytest.mark.asyncio
+async def test_acquire_500_is_immediately_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Non-409 HTTP errors (e.g. 500) are immediately fatal via raise_for_status."""
+    attempt_count = 0
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, json):
+            nonlocal attempt_count
+            attempt_count += 1
+            return httpx.Response(
+                500,
+                text="Internal Server Error",
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.httpx.AsyncClient", lambda **_kwargs: Client()
+    )
+
+    lc = LeaderLeaseClient("http://state-store", instance_name="test")
+    with pytest.raises(httpx.HTTPStatusError):
+        await lc.acquire(max_attempts=3, retry_interval=0)
+    assert attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_acquire_transport_error_then_success(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """httpx.RequestError is retried and succeeds on subsequent attempt."""
+    attempt_count = 0
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, json):
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                raise httpx.ConnectError(
+                    "connection refused",
+                    request=httpx.Request("POST", url),
+                )
+            return httpx.Response(
+                200,
+                json={"epoch": 10},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.httpx.AsyncClient", lambda **_kwargs: Client()
+    )
+
+    lc = LeaderLeaseClient("http://state-store", instance_name="test")
+    lease = await lc.acquire(max_attempts=3, retry_interval=0)
+    assert lease["epoch"] == 10
+    assert attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_acquire_cancellation_during_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """CancelledError during backoff sleep propagates immediately."""
+    attempt_count = 0
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, json):
+            nonlocal attempt_count
+            attempt_count += 1
+            return httpx.Response(
+                409,
+                json={"detail": "held"},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.httpx.AsyncClient", lambda **_kwargs: Client()
+    )
+
+    lc = LeaderLeaseClient("http://state-store", instance_name="test")
+    task = asyncio.create_task(lc.acquire(max_attempts=10, retry_interval=999))
+    # Let first attempt run and hit the sleep
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert attempt_count == 1
+
+
+def test_config_max_attempts_rejects_zero():
+    """max_attempts=0 is rejected at config load time."""
+    with pytest.raises(ValueError, match="must be an integer >= 1"):
+        OrchestratorConfig(
+            state_store_url="http://state-store",
+            raw_config={
+                "llm": {"provider": "mock"},
+                "orchestrator_lease": {"max_attempts": 0},
+            },
+        )
+
+
+def test_config_max_attempts_rejects_negative():
+    """Negative max_attempts is rejected at config load time."""
+    with pytest.raises(ValueError, match="must be an integer >= 1"):
+        OrchestratorConfig(
+            state_store_url="http://state-store",
+            raw_config={
+                "llm": {"provider": "mock"},
+                "orchestrator_lease": {"max_attempts": -1},
+            },
+        )
+
+
 def test_sigterm_uses_asyncio_shutdown_path():
     with pytest.raises(KeyboardInterrupt):
         _handle_shutdown_signal(15, None)
@@ -317,7 +569,7 @@ class _PollLoopLease:
         self.ttl_seconds = 30
         self.confirmed_deadline = asyncio.get_running_loop().time() + self.ttl_seconds
 
-    async def acquire(self):
+    async def acquire(self, **kwargs):
         self.epoch = 7
         self.confirmed_deadline = asyncio.get_running_loop().time() + self.ttl_seconds
         return {"epoch": self.epoch}
