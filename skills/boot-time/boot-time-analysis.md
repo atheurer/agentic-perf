@@ -29,6 +29,27 @@ tool reboots the target.
 | `clean_journal` | false | Delete systemd journal before each reboot |
 | `description` | "" | Human-readable test description |
 
+### Directive-Driven Parameters
+
+The following parameters are **not** passed as tool arguments.
+They are read automatically from the ticket's directives
+(`custom_fields.directives`) and applied by the execution
+logic. Do not attempt to pass them as tool parameters or
+pause for clarification — they are already configured.
+
+| Directive | Effect |
+|-----------|--------|
+| `reboot_method` | `cold` (power cycle), `warm` (SSH + cold fallback), `warm-only` (SSH, no fallback). Applied when a Jumpstarter lease is active. |
+| `power_off_delay` | Seconds between power off and power on for cold reboots (e.g., 45). Passed as `--power-off-delay` to the script. |
+| `serial_capture` | Enables serial console capture via Jumpstarter. |
+| `warm_boot_fallback_to_cold` | When `false` with `reboot_method=warm`, disables cold fallback (warm-only mode). Default: `true`. |
+| `sample_count` | Mapped to the `samples` tool parameter by the benchmark agent. |
+
+These directives are set by the triage agent based on the
+user's request and normalized by the directive framework.
+The benchmark agent passes them to the boot-time script
+automatically.
+
 ### Sample Count Guidelines
 
 - **Quick validation:** 5–10 samples

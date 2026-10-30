@@ -624,11 +624,15 @@ _LOCAL_TOOLS = [
                             "agent_type": {
                                 "type": "string",
                                 "enum": [
+                                    "analyze",
                                     "teardown",
                                     "resource",
                                     "provision",
                                     "benchmark",
                                     "review",
+                                    "evaluate",
+                                    "synthesis",
+                                    "gathering_context",
                                 ],
                             },
                             "params": {
@@ -1259,6 +1263,24 @@ class TriageAgent(AgentBase):
         if execution_model == EXECUTION_MODEL_DIRECT:
             required_hosts = _filter_direct_required_hosts(required_hosts)
 
+        # Jumpstarter boards are not SSH-accessible before
+        # provisioning — strip board names from required_hosts
+        # so the resource agent allocates via jumpstarter instead
+        # of treating them as pre-existing SSH hosts.
+        from providers.resource.jumpstarter import strip_board_selector_hosts
+
+        strip_board_selector_hosts(required_hosts, directives.get("board_selector", ""))
+        # Re-normalize directives before writing.  The orchestrator
+        # normalizes user-submitted directives before triage, but the
+        # triage LLM may produce its own directive keys using the
+        # user's original terminology (e.g. "delay_seconds" instead
+        # of "power_off_delay").  The merge above reintroduces those
+        # raw keys.  Running normalization here ensures the ticket
+        # always has canonical keys regardless of LLM output.
+        from providers.directives import normalize_directives as _norm_dir
+
+        directives, _applied, _unrec = _norm_dir(directives)
+
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
             "hypothesis": result.get("hypothesis", ""),
@@ -1311,9 +1333,16 @@ class TriageAgent(AgentBase):
             # The resource agent validates SSH, inventories hosts, and
             # populates assigned_hardware_ips.  If the LLM omitted it
             # (e.g. user-provided hosts), prepend one so the pipeline
-            # doesn't skip host validation.  "analyze" is the only
-            # valid non-resource first step (data-only investigation).
-            if steps[0]["agent_type"] not in ("resource", "analyze"):
+            # doesn't skip host validation.  Data-only agents can
+            # start a plan without a resource step.
+            _NO_RESOURCE_PREFIXES = (
+                "resource",
+                "analyze",
+                "gathering_context",
+                "evaluate",
+                "synthesis",
+            )
+            if steps[0]["agent_type"] not in _NO_RESOURCE_PREFIXES:
                 steps.insert(
                     0,
                     {
@@ -1506,6 +1535,9 @@ class TriageAgent(AgentBase):
             _TRIAGE_EXIT_STATUSES = {
                 "resource": "awaiting_hardware",
                 "analyze": "analyzing",
+                "gathering_context": "gathering_context",
+                "evaluate": "evaluating_convergence",
+                "synthesis": "synthesizing_results",
                 "build_image": "building_image",
             }
             first_step_type = steps[0]["agent_type"]

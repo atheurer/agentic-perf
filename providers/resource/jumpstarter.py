@@ -92,6 +92,87 @@ def _board_type_selector_key() -> str:
     return "board-type"
 
 
+def _parse_selector_terms(selector: str) -> list[tuple[str, str, bool]]:
+    """Parse a compound label selector into (key, value, negated) terms.
+
+    Handles::
+
+        "board-type=nxp-s32g-vnp-rdb3"           → [("board-type", "nxp-s32g-vnp-rdb3", False)]
+        "board-type=nxp,!name=board-04"           → [("board-type", "nxp", False), ("name", "board-04", True)]
+        "name=specific-board"                      → [("name", "specific-board", False)]
+    """
+    terms: list[tuple[str, str, bool]] = []
+    for part in selector.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        negated = part.startswith("!")
+        if negated:
+            part = part[1:]
+        key, _, value = part.partition("=")
+        # Backward compat: device= → name=
+        if key == _DEVICE_SELECTOR_KEY:
+            key = _NAME_SELECTOR_KEY
+        terms.append((key, value, negated))
+    return terms
+
+
+def _device_matches_selector(
+    device: dict[str, Any],
+    terms: list[tuple[str, str, bool]],
+) -> bool:
+    """Check if a device matches all selector terms.
+
+    - Positive term ``key=value``: device labels must contain key with that value,
+      OR for ``name=X`` the device name must match.
+    - Negated term ``!key=value``: device must NOT match.
+    """
+    labels = device.get("labels", {})
+    name = device.get("name", "")
+    for key, value, negated in terms:
+        if key == _NAME_SELECTOR_KEY:
+            matches = name == value
+        else:
+            matches = labels.get(key) == value
+        if negated and matches:
+            return False
+        if not negated and not matches:
+            return False
+    return True
+
+
+def strip_board_selector_hosts(
+    required_hosts: list[dict[str, Any]],
+    board_selector: str,
+) -> None:
+    """Remove host entries that match a Jumpstarter board selector.
+
+    The triage LLM often copies the board selector value into
+    required_hosts[].host, which tells the resource agent it is a
+    pre-existing SSH-accessible machine.  Jumpstarter boards are
+    not reachable until after provisioning (flash + boot).
+
+    Only strips host values that match a name extracted from the
+    selector.  Real IPs or FQDNs provided by the user are kept
+    so the resource agent treats them as user-provided.
+
+    Selector formats::
+
+        "name=nxp-s32g-vnp-rdb3-02"          → {"nxp-s32g-vnp-rdb3-02"}
+        "board-type=nxp-s32g-vnp-rdb3"       → {"nxp-s32g-vnp-rdb3"}
+        "name=board-a,board-type=rdb3"       → {"board-a", "rdb3"}
+        "nxp-s32g-vnp-rdb3-02"               → {"nxp-s32g-vnp-rdb3-02"}
+
+    Mutates *required_hosts* in place.
+    """
+    if not board_selector:
+        return
+    board_names = {part.split("=", 1)[-1] for part in board_selector.split(",")}
+    for entry in required_hosts:
+        if entry.get("host", "") in board_names:
+            entry.pop("host", None)
+
+
 class JumpstarterResourceProvider(ResourceProvider):
     """Jumpstarter lab hardware resource provider."""
 
@@ -330,24 +411,19 @@ class JumpstarterResourceProvider(ResourceProvider):
                 "available_targets": targets,
             }
 
-        key, _, value = selector.partition("=")
+        terms = _parse_selector_terms(selector)
 
-        # Backward compat: device= was a previous
-        # Jumpstarter label, now removed. Translate
-        # to name= for specific device targeting.
-        if key == _DEVICE_SELECTOR_KEY:
-            key = _NAME_SELECTOR_KEY
-
-        # name= targets a specific exporter by name
-        # rather than matching against labels.
-        if key == _NAME_SELECTOR_KEY:
+        # Single positive name= term targets a specific exporter.
+        if len(terms) == 1 and terms[0][0] == _NAME_SELECTOR_KEY and not terms[0][2]:
             return self._check_named_device(
-                value,
+                terms[0][1],
                 all_devices,
                 requirements,
             )
 
-        selector_matches = [d for d in all_devices if d["labels"].get(key) == value]
+        selector_matches = [
+            d for d in all_devices if _device_matches_selector(d, terms)
+        ]
         matching = [d for d in selector_matches if d["available"]]
 
         # Fleet exclusion: filter out already-tested hosts
@@ -556,12 +632,16 @@ class JumpstarterResourceProvider(ResourceProvider):
 
         # Handle name= selector: resolve to board-type
         # selector + exporter_name for the lease.
+        # For compound selectors, only check the first
+        # positive name= term.
         if selector:
-            key, _, value = selector.partition("=")
-            if key == _DEVICE_SELECTOR_KEY:
-                key = _NAME_SELECTOR_KEY
-            if key == _NAME_SELECTOR_KEY:
-                # Look up the device to find its board type.
+            terms = _parse_selector_terms(selector)
+            name_terms = [
+                (k, v) for k, v, neg in terms if k == _NAME_SELECTOR_KEY and not neg
+            ]
+            if name_terms and len(terms) == 1:
+                # Single name= selector: resolve to board-type for the lease
+                value = name_terms[0][1]
                 exporters = await self._service.ListExporters()
                 board_type = None
                 for e in exporters.exporters:
@@ -576,6 +656,31 @@ class JumpstarterResourceProvider(ResourceProvider):
                     }
                 selector = f"{_board_type_selector_key()}={board_type}"
                 target_exporter = value
+            # Compound selectors with negation terms: the SDK's
+            # label selector parser may not support '!' syntax.
+            # Resolve which exporters pass the full selector
+            # (including negation) and pin to a specific allowed
+            # exporter so the lease can't land on an excluded board.
+            elif any(neg for _, _, neg in terms):
+                exporters = await self._service.ListExporters()
+                all_devices = [
+                    {
+                        "name": e.name,
+                        "labels": dict(e.labels),
+                    }
+                    for e in exporters.exporters
+                ]
+                allowed = [d for d in all_devices if _device_matches_selector(d, terms)]
+                if not allowed and any(neg for _, _, neg in terms):
+                    return {
+                        "provider": "jumpstarter",
+                        "error": "No available boards match the selector after applying exclusions",
+                        "status": "rejected",
+                    }
+                if allowed and not target_exporter:
+                    target_exporter = allowed[0]["name"]
+                positive = [f"{k}={v}" for k, v, neg in terms if not neg]
+                selector = ",".join(positive) if positive else selector
 
         # Append availability labels to the selector
         # so the controller only assigns devices we
