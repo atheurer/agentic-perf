@@ -47,10 +47,6 @@ _CORE_DIRECTIVES: set[str] = {
     "release",
     # Harness selection
     "harness",
-    # Fleet
-    "fleet",
-    "convergence_strategy",
-    "failure_policy",
     # Behavior
     "skip_teardown",
     "disable_hitl_timeout",
@@ -59,6 +55,10 @@ _CORE_DIRECTIVES: set[str] = {
     "host_cleanup",
     "system_config",
     "update_harness",
+    "user_pre_run_approval",
+    "on_existing_install",
+    "firewall_policy",
+    "test_interfaces",
     # This resource directive must be known to the orchestrator even when the
     # Jumpstarter provider is imported lazily in a separate resource process.
     "jumpstarter_serial",
@@ -66,6 +66,29 @@ _CORE_DIRECTIVES: set[str] = {
 
 _CORE_ALIASES: dict[str, str] = {
     "exclude_host": "exclude_hosts",
+}
+
+_CORE_DESCRIPTIONS: dict[str, str] = {
+    "resource_provider": "Resource provider: 'jumpstarter', 'quads', 'aws', 'psap-cc', or 'user_provided'",
+    "endpoint_type": "Host connection type (default: 'remotehosts')",
+    "image_version": "OS image version (e.g. 'AutoSD-10', 'RHIVOS-2')",
+    "image_name": "Image variant name (e.g. 'qa', 'ps', 'fusa-minimal')",
+    "image_type": "Image type: 'regular' or 'ostree'",
+    "image_server": "Base URL of the image download server",
+    "release": "Release path (e.g. 'monthly/autosd10-202608', 'nightly')",
+    "harness": "Benchmark harness to use (e.g. 'boot-time', 'crucible')",
+    "skip_teardown": "Skip resource teardown after completion (bool)",
+    "disable_hitl_timeout": "Disable HITL timeout for manual investigation (bool)",
+    "review_mode": "Review agent mode",
+    "no_host_mounts": "Disable host filesystem mounts in containers (bool)",
+    "host_cleanup": "Host cleanup policy: 'required' or 'skip'",
+    "system_config": "Post-provision system configuration operations (list)",
+    "update_harness": "Update harness packages on target before benchmark (bool)",
+    "jumpstarter_serial": "Enable Jumpstarter serial capture mode (bool)",
+    "user_pre_run_approval": "Require user approval before executing the benchmark (bool, default true)",
+    "on_existing_install": "Policy for pre-existing installations: 'reinstall', 'update', 'skip', or 'ask_user'",
+    "firewall_policy": "Firewall configuration policy for the benchmark environment",
+    "test_interfaces": "Network interfaces to use for the benchmark test",
 }
 
 # ── Suffix / prefix normalization ─────────────────────────
@@ -91,20 +114,32 @@ _contributed_directives: set[str] = set()
 _contributed_aliases: dict[str, str] = {}
 
 
+_contributed_descriptions: dict[str, str] = {}
+
+
 def register_directives(
     recognized: set[str] | None = None,
     aliases: dict[str, str] | None = None,
+    descriptions: dict[str, str] | None = None,
 ) -> None:
     """Register harness-specific directives and aliases.
 
     Called by standalone harnesses (boot-time, etc.) at module
     load, or by collect_from_providers() for provider-backed
     harnesses at orchestrator startup.
+
+    Args:
+        recognized: canonical directive key names.
+        aliases: variant name → canonical key mappings.
+        descriptions: canonical key → human-readable description
+            for inclusion in agent prompts.
     """
     if recognized:
         _contributed_directives.update(recognized)
     if aliases:
         _contributed_aliases.update(aliases)
+    if descriptions:
+        _contributed_descriptions.update(descriptions)
 
 
 def collect_from_providers(skill_provider: Any) -> None:
@@ -122,11 +157,17 @@ def collect_from_providers(skill_provider: Any) -> None:
             register_directives(
                 recognized=schema.get("recognized"),
                 aliases=schema.get("aliases"),
+                descriptions=schema.get("descriptions"),
             )
 
 
 def get_recognized_directives() -> set[str]:
     """Return the full set of recognized directive keys."""
+    # Ensure standalone harness registrations have run.
+    try:
+        import providers.skills.boot_time  # noqa: F401
+    except ImportError:
+        pass
     return _CORE_DIRECTIVES | _contributed_directives
 
 
@@ -372,3 +413,91 @@ def format_normalization_report(
         for hint in unrecognized:
             parts.append(f"- ⚠️ {hint}")
     return "\n".join(parts)
+
+
+def format_directive_schema_for_prompt(
+    keys: set[str],
+) -> str:
+    """Format the directive schema as a prompt-ready string.
+
+    Args:
+        keys: set of canonical directive key names to include.
+            Use get_recognized_directives() for the full set.
+
+    All keys are included. Keys with registered descriptions
+    show the description; keys without descriptions appear as
+    bare entries so the LLM knows they are recognized.
+
+    Returns a string suitable for injection into an agent's
+    system prompt, listing canonical keys with descriptions
+    and instructing the LLM to map user intent to these keys.
+    """
+    if not keys:
+        return ""
+
+    # Merge core + contributed descriptions
+    all_descriptions = dict(_CORE_DESCRIPTIONS)
+    all_descriptions.update(_contributed_descriptions)
+
+    lines = [
+        "## Recognized Directives",
+        "",
+        "When working with ticket directives, use these EXACT",
+        "canonical key names. If the user or ticket uses a different",
+        "name for the same concept, map it to the canonical key.",
+        "",
+    ]
+    for key in sorted(keys):
+        desc = all_descriptions.get(key, "")
+        if desc:
+            lines.append(f"- **{key}**: {desc}")
+        else:
+            lines.append(f"- **{key}**")
+    lines.append("")
+    lines.append(
+        "Use ONLY these canonical keys for directives. Every "
+        "directive that affects execution has explicit code handling "
+        "it \u2014 unrecognized keys are silently ignored by tools and "
+        "harnesses. If the user's intent clearly matches a recognized "
+        "directive "
+        "but uses a different name, map it to the canonical "
+        "key (e.g. 'iterations' → 'sample_count', 'os' → "
+        "'image_version'). If the intent is ambiguous or does not "
+        "match any recognized directive, do NOT guess — include the "
+        "instruction in scoped_context for the downstream agent to "
+        "interpret instead."
+    )
+    return "\n".join(lines)
+
+
+# ── Schema description guidelines ────────────────────────
+#
+# When adding descriptions to _CORE_DESCRIPTIONS or harness
+# descriptions dicts, follow these rules:
+#
+# 1. ONLY describe directives where the LLM needs to MAP
+#    user intent to a canonical key name.  Examples:
+#      "sample_count": "Number of reboot cycles (int)"
+#      "reboot_method": "'warm' or 'cold'"
+#    These help the LLM recognize that "iterations", "cycles",
+#    or "num_reboots" all mean sample_count.
+#
+# 2. Do NOT describe directives where the VALUE must be an
+#    exact match against external data (labels, selectors,
+#    hostnames).  Examples of what to OMIT:
+#      board_selector — must match actual Jumpstarter labels
+#      exclude_hosts — must match real hostnames
+#    Including these encourages the LLM to CONSTRUCT values
+#    from description text instead of preserving user input
+#    or deferring to the agent that owns the lookup.
+#
+# 3. Do NOT describe directives that are purely internal
+#    (set by code, never by users or LLMs):
+#      jumpstarter_serial, endpoint_type, etc.
+#
+# 4. Keep descriptions short and include the type and an
+#    example value:
+#      "power_off_delay": "Seconds between power off and on (int, e.g. 20)"
+#    Not: "The number of seconds to wait after powering off
+#    the board before sending the power on command via the
+#    Jumpstarter SNMP PDU controller."
