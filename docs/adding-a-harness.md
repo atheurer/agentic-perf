@@ -89,6 +89,38 @@ ownership-required server are hidden and rejected. Use
 first-party adapter. See the
 [external MCP configuration](configuration.md#external_mcp_servers).
 
+## Subprocess progress reporting
+
+If the harness runs long-lived subprocesses during benchmark execution,
+register a progress parser so the benchmark agent can post periodic
+heartbeat comments. Without a parser, heartbeats report only file count
+and elapsed time.
+
+```python
+# In providers/skills/my_harness.py
+import re
+from providers.skills.base import register_progress_parser
+
+_ITERATION_RE = re.compile(rb"^Iteration (\d+)/\d+", re.MULTILINE)
+
+def _parse_progress(chunks: list[bytes]) -> dict[str, Any]:
+    for chunk in reversed(chunks):
+        matches = _ITERATION_RE.findall(chunk)
+        if matches:
+            return {"iterations_completed": int(matches[-1])}
+    return {}
+
+register_progress_parser("my-harness", _parse_progress)
+```
+
+The parser receives accumulated stdout byte chunks from the subprocess
+and returns a dict. Any keys present are included in the heartbeat
+message. Return an empty dict when no progress can be extracted.
+
+Heartbeats prevent the orchestrator's stale task detector from killing
+long-running benchmarks. They post every five minutes and are visible
+on the dashboard as progress comments.
+
 ## A current provider shape
 
 `providers/skills/k8s_netperf.py` is a useful reference because it supplies

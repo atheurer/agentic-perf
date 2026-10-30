@@ -8,7 +8,25 @@ canonical forms.
 
 from __future__ import annotations
 
+import re
+from typing import Any
+
 from providers.directives import register_directives
+from providers.skills.base import register_progress_parser
+
+_SAMPLE_RE = re.compile(rb"^Sample (\d+) at ", re.MULTILINE)
+
+
+def _parse_boot_time_progress(chunks: list[bytes]) -> dict[str, Any]:
+    """Extract sample count from boot-time subprocess stdout."""
+    for chunk in reversed(chunks):
+        matches = _SAMPLE_RE.findall(chunk)
+        if matches:
+            return {"samples_collected": int(matches[-1])}
+    return {}
+
+
+register_progress_parser("boot-time", _parse_boot_time_progress)
 
 register_directives(
     recognized={
