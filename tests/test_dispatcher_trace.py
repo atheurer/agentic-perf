@@ -318,6 +318,66 @@ async def test_resume_creates_a_new_invocation_linked_to_prior_dispatch() -> Non
     assert sink.events[-1].attributes["prior_invocation_id"] == str(first.invocation_id)
 
 
+async def test_handoff_waits_for_claim_cleanup_before_new_dispatch() -> None:
+    dispatcher, _ = _dispatcher()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_release(ticket_id: str) -> None:
+        assert dispatcher._claim_ids[ticket_id] == "old-claim"
+        entered.set()
+        await release.wait()
+
+    dispatcher.release_claim = slow_release
+    dispatcher._claim_ids["PERF-1"] = "old-claim"
+    cleanup = asyncio.create_task(dispatcher.mark_done("PERF-1"))
+    dispatcher.set_task("PERF-1", cleanup, "triage_pending")
+    await entered.wait()
+
+    with patch("orchestrator.dispatcher.httpx.Client") as client:
+        assert dispatcher.is_active("PERF-1")
+        assert not dispatcher.try_claim("PERF-1", "awaiting_hardware")
+        client.assert_not_called()
+    assert dispatcher._claim_ids["PERF-1"] == "old-claim"
+
+    release.set()
+    await cleanup
+    assert not dispatcher.is_active("PERF-1")
+    client = MagicMock()
+    response = client.__enter__.return_value.post.return_value
+    response.status_code = 200
+    response.json.return_value = {"claim_id": "new-claim"}
+    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
+        assert dispatcher.try_claim("PERF-1", "awaiting_hardware")
+    assert dispatcher._claim_ids["PERF-1"] == "new-claim"
+
+
+async def test_overlapping_cleanups_block_dispatch_until_both_finish() -> None:
+    dispatcher, _ = _dispatcher()
+    started = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    calls = 0
+
+    async def slow_release(ticket_id: str) -> None:
+        nonlocal calls
+        index = calls
+        calls += 1
+        started[index].set()
+        await release[index].wait()
+
+    dispatcher.release_claim = slow_release
+    first = asyncio.create_task(dispatcher.mark_done("PERF-1"))
+    second = asyncio.create_task(dispatcher.mark_done("PERF-1"))
+    await asyncio.gather(*(event.wait() for event in started))
+    release[0].set()
+    await first
+    assert dispatcher.is_active("PERF-1")
+    assert not dispatcher.try_claim("PERF-1", "awaiting_hardware")
+    release[1].set()
+    await second
+    assert not dispatcher.is_active("PERF-1")
+
+
 async def test_shutdown_cancels_and_awaits_all_dispatcher_background_work() -> None:
     dispatcher, _ = _dispatcher()
     stopped = []

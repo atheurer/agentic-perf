@@ -2715,16 +2715,13 @@ def read_artifact_file_impl(
 
     resolved = Path(path)
     if not resolved.is_absolute() and ticket_id:
-        candidate = ARTIFACT_DIR / ticket_id / path
-        if candidate.exists():
-            resolved = candidate
+        resolved = ARTIFACT_DIR / ticket_id / path
+    resolved = resolved.resolve()
 
-    if not resolved.exists():
-        return json.dumps({"error": f"File not found: {path}"})
-
+    # Containment check BEFORE existence check to avoid leaking
+    # filesystem information (an out-of-scope existing path must
+    # return the same error as a missing one).
     try:
-        resolved = resolved.resolve()
-        # When ticket_id is provided, scope to that ticket's subtree
         if ticket_id:
             scoped_dir = (ARTIFACT_DIR / ticket_id).resolve()
         else:
@@ -2733,11 +2730,12 @@ def read_artifact_file_impl(
         # String prefix matching would allow sibling directories
         # like "artifacts-archive/" to pass.
         if not resolved.is_relative_to(scoped_dir):
-            return json.dumps(
-                {"error": "Access denied: path is outside the artifacts directory"}
-            )
+            return json.dumps({"error": f"File not found: {path}"})
     except (OSError, ValueError):
-        return json.dumps({"error": f"Cannot resolve path: {path}"})
+        return json.dumps({"error": f"File not found: {path}"})
+
+    if not resolved.exists():
+        return json.dumps({"error": f"File not found: {path}"})
 
     try:
         from itertools import islice

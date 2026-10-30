@@ -137,8 +137,14 @@ async def _probe_board_after_flash_failure(
 
     # Power off/on to see if power control works
     try:
-        await to_thread.run_sync(client.power.off)
+        await asyncio.wait_for(
+            to_thread.run_sync(client.power.off, abandon_on_cancel=True),
+            timeout=30,
+        )
         diag.append("Post-flash probe: power off OK")
+    except TimeoutError:
+        diag.append("Post-flash probe: power off timed out")
+        return
     except Exception as exc:
         diag.append(f"Post-flash probe: power off failed: {exc}")
         return  # No point continuing if we can't control power
@@ -146,8 +152,14 @@ async def _probe_board_after_flash_failure(
     await asyncio.sleep(20)
 
     try:
-        await to_thread.run_sync(client.power.on)
+        await asyncio.wait_for(
+            to_thread.run_sync(client.power.on, abandon_on_cancel=True),
+            timeout=30,
+        )
         diag.append("Post-flash probe: power on OK")
+    except TimeoutError:
+        diag.append("Post-flash probe: power on timed out")
+        return
     except Exception as exc:
         diag.append(f"Post-flash probe: power on failed: {exc}")
         return

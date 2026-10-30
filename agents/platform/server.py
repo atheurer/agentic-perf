@@ -303,8 +303,11 @@ async def read_artifact_file(
         offset: 0-based line number to start reading from.
         limit: Maximum number of lines to return (max 500).
     """
+    await _ensure_init()
+
     from agents.server_utils import read_artifact_file_impl
 
+    await _ensure_init()
     tid = _ticket.get("id", "") if _ticket else ""
     return read_artifact_file_impl(path, offset, limit, ticket_id=tid)
 
