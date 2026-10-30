@@ -1,0 +1,250 @@
+"""Tests for the PATCH /users/{username} endpoint."""
+
+from __future__ import annotations
+
+import pytest
+from fastapi.testclient import TestClient
+
+from state_store.identity import UserStore
+from state_store.main import create_app
+
+
+@pytest.fixture()
+def multi_user_env(tmp_path):
+    """App, user_store, and deployment token for multi-user tests."""
+    user_store = UserStore(persist_path=tmp_path / "users.json")
+
+    from state_store.auth import make_auth_dependency
+    from state_store.main import mount_routers
+
+    app = (
+        create_app.__wrapped__(initialize_immediately=True)
+        if hasattr(create_app, "__wrapped__")
+        else create_app(initialize_immediately=True)
+    )
+
+    token = app.state.api_token
+
+    app.state.multi_user = True
+    app.state.user_store = user_store
+
+    auth = make_auth_dependency(
+        token,
+        multi_user=True,
+        user_store=user_store,
+    )
+    app.state.auth_dependency = auth
+
+    app.router.routes.clear()
+    mount_routers(app, auth)
+
+    return app, user_store, token
+
+
+@pytest.fixture()
+def admin_client(multi_user_env):
+    """TestClient authenticated with the deployment token (admin)."""
+    app, _store, deploy_token = multi_user_env
+    c = TestClient(app)
+    c.headers["Authorization"] = f"Bearer {deploy_token}"
+    return c
+
+
+@pytest.fixture()
+def app(multi_user_env):
+    app, _, _ = multi_user_env
+    return app
+
+
+class TestPostUserValidation:
+    def test_negative_max_requests_per_hour_returns_422(self, admin_client):
+        r = admin_client.post(
+            "/api/v1/users",
+            json={
+                "username": "neg-rate",
+                "service_account": True,
+                "allowed_sources": ["test"],
+                "max_requests_per_hour": -1,
+            },
+        )
+        assert r.status_code == 422
+        assert "non-negative" in r.json()["detail"].lower()
+
+
+class TestUpdateUserRollback:
+    def test_write_failure_restores_prior_values(self, tmp_path, monkeypatch):
+        store = UserStore(persist_path=tmp_path / "users.json")
+        store.create_user(
+            "svc-rollback",
+            service_account=True,
+            allowed_sources=["original-src"],
+            max_requests_per_hour=100,
+        )
+
+        def _boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(store, "_write_locked", _boom)
+
+        with pytest.raises(OSError, match="disk full"):
+            store.update_user(
+                "svc-rollback",
+                allowed_sources=["new-src"],
+                max_requests_per_hour=999,
+            )
+
+        user = store.get_user("svc-rollback")
+        assert user.allowed_sources == ["original-src"]
+        assert user.max_requests_per_hour == 100
+
+
+class TestPatchUserValidation:
+    def test_negative_max_requests_per_hour_returns_422(self, admin_client):
+        admin_client.post(
+            "/api/v1/users",
+            json={
+                "username": "alice",
+                "service_account": True,
+                "allowed_sources": ["test"],
+            },
+        )
+        r = admin_client.patch(
+            "/api/v1/users/alice",
+            json={"max_requests_per_hour": -5},
+        )
+        assert r.status_code == 422
+        assert "non-negative" in r.json()["detail"].lower()
+
+    def test_explicit_null_allowed_sources_returns_422(self, admin_client):
+        admin_client.post("/api/v1/users", json={"username": "alice"})
+        r = admin_client.patch(
+            "/api/v1/users/alice",
+            json={"allowed_sources": None},
+        )
+        assert r.status_code == 422
+        assert "allowed_sources" in r.json()["detail"]
+
+    def test_omitted_fields_are_unchanged(self, admin_client):
+        create_r = admin_client.post(
+            "/api/v1/users",
+            json={
+                "username": "alice-omit",
+                "service_account": True,
+                "allowed_sources": ["src1"],
+                "max_requests_per_hour": 100,
+            },
+        )
+        assert create_r.status_code == 200, f"create failed: {create_r.text}"
+        # Only update allowed_sources; max_requests_per_hour should stay 100
+        r = admin_client.patch(
+            "/api/v1/users/alice-omit",
+            json={"allowed_sources": ["src1", "src2"]},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["allowed_sources"] == ["src1", "src2"]
+        assert data["max_requests_per_hour"] == 100
+
+    def test_non_admin_patch_returns_403(self, admin_client, app):
+        admin_client.post(
+            "/api/v1/users",
+            json={
+                "username": "target-user",
+                "service_account": True,
+                "allowed_sources": ["test"],
+            },
+        )
+        # Create a non-admin user and authenticate as them
+        r = admin_client.post(
+            "/api/v1/users",
+            json={"username": "regular-user"},
+        )
+        token = r.json()["token"]
+        non_admin = TestClient(app)
+        non_admin.headers["Authorization"] = f"Bearer {token}"
+
+        r = non_admin.patch(
+            "/api/v1/users/target-user",
+            json={"allowed_sources": ["changed"]},
+        )
+        assert r.status_code == 403
+
+    def test_service_account_only_fields_returns_422(self, admin_client):
+        admin_client.post(
+            "/api/v1/users",
+            json={"username": "plain-user"},
+        )
+        r = admin_client.patch(
+            "/api/v1/users/plain-user",
+            json={"allowed_sources": ["src"]},
+        )
+        assert r.status_code == 422
+        assert "service account" in r.json()["detail"].lower()
+
+        r = admin_client.patch(
+            "/api/v1/users/plain-user",
+            json={"max_requests_per_hour": 10},
+        )
+        assert r.status_code == 422
+        assert "service account" in r.json()["detail"].lower()
+
+    def test_explicit_null_max_requests_clears_limit(self, admin_client):
+        admin_client.post(
+            "/api/v1/users",
+            json={
+                "username": "svc-null-rate",
+                "service_account": True,
+                "allowed_sources": ["test"],
+                "max_requests_per_hour": 100,
+            },
+        )
+        r = admin_client.patch(
+            "/api/v1/users/svc-null-rate",
+            json={"max_requests_per_hour": None},
+        )
+        assert r.status_code == 200
+        assert r.json()["max_requests_per_hour"] is None
+
+    def test_empty_allowed_sources_rejected_for_service_account(self, admin_client):
+        admin_client.post(
+            "/api/v1/users",
+            json={
+                "username": "svc-empty-src",
+                "service_account": True,
+                "allowed_sources": ["test"],
+            },
+        )
+        r = admin_client.patch(
+            "/api/v1/users/svc-empty-src",
+            json={"allowed_sources": []},
+        )
+        assert r.status_code == 422
+
+    def test_missing_user_returns_404(self, admin_client):
+        r = admin_client.patch(
+            "/api/v1/users/nonexistent-user-xyz",
+            json={"max_requests_per_hour": 10},
+        )
+        assert r.status_code == 404
+
+    def test_successful_update_returns_updated_values(self, admin_client):
+        create_r = admin_client.post(
+            "/api/v1/users",
+            json={
+                "username": "alice-update",
+                "service_account": True,
+                "allowed_sources": ["test"],
+            },
+        )
+        assert create_r.status_code == 200, f"create failed: {create_r.text}"
+        r = admin_client.patch(
+            "/api/v1/users/alice-update",
+            json={
+                "allowed_sources": ["new-source"],
+                "max_requests_per_hour": 50,
+            },
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["allowed_sources"] == ["new-source"]
+        assert data["max_requests_per_hour"] == 50
