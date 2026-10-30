@@ -64,6 +64,7 @@ async def test_lazy_ssh_initialization_preserves_active_mcp_trace_context(
         return ssh, {"custom_fields": {}}
 
     monkeypatch.setenv("TICKET_ID", "PERF-LAZY-SSH")
+    monkeypatch.setenv("STATE_STORE_URL", "http://localhost:8090")
     monkeypatch.setattr(srv, "build_ssh_from_ticket", build_ssh)
     token = bind_trace_context(request_trace)
     try:
@@ -106,6 +107,7 @@ async def test_set_ssh_context_is_idempotent(monkeypatch):
         )
     )
     monkeypatch.setattr(srv, "build_ssh_from_ticket", build_ssh)
+    monkeypatch.setenv("STATE_STORE_URL", "http://localhost:8090")
 
     first = json.loads(await srv.set_ssh_context("PERF-LAZY-SSH"))
     second = json.loads(await srv.set_ssh_context("PERF-LAZY-SSH"))
