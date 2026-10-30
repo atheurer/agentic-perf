@@ -75,6 +75,31 @@ CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
 _CRUCIBLE_ROOT = "/opt/crucible"
 _BOOT_TIME_DRAIN_TIMEOUT = 10.0
+_HEARTBEAT_INTERVAL = 300
+
+
+async def _post_heartbeat(message: str) -> None:
+    """Post a benchmark progress heartbeat. Best-effort, never raises."""
+    try:
+        from agents.server_utils import ticket_state_headers
+        from providers.execution import AuditedAsyncHTTPClient
+
+        ticket_id = os.environ.get("TICKET_ID", "")
+        if not ticket_id:
+            return
+        store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+        agent_name = os.environ.get("AGENT_NAME", "benchmark-agent")
+        headers = ticket_state_headers()
+        async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+            await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+                json={
+                    "author": f"{agent_name}/benchmark-heartbeat",
+                    "body": message,
+                },
+            )
+    except Exception:
+        logger.debug("Heartbeat post failed", exc_info=True)
 
 
 def _write_ticket_staging_file(
@@ -5728,6 +5753,11 @@ async def execute_boot_time_test(
         except OSError:
             last_file_count = 0
         last_progress_time = start_time
+        last_heartbeat_time = start_time
+        _heartbeat_tasks: set[_asyncio.Task[None]] = set()
+        from providers.skills.base import get_progress_parser
+
+        _progress_parser = get_progress_parser("boot-time")
         stall_killed = False
         timed_out = False
         drain_complete = False
@@ -5765,6 +5795,30 @@ async def execute_boot_time_test(
                     if file_count > last_file_count:
                         last_file_count = file_count
                         last_progress_time = now
+                    if now - last_heartbeat_time >= _HEARTBEAT_INTERVAL:
+                        _progress = (
+                            _progress_parser(_stdout_chunks) if _progress_parser else {}
+                        )
+
+                        elapsed = int(now - start_time)
+                        hours, remainder = divmod(elapsed, 3600)
+                        mins = remainder // 60
+
+                        # Build message: harness progress + generic stats
+                        parts = []
+                        for _pk, _pv in _progress.items():
+                            parts.append(f"{_pv} {_pk.replace('_', ' ')}")
+                        parts.append(f"{file_count} files")
+                        parts.append(f"{hours}h {mins}m elapsed")
+                        _hb_msg = f"Benchmark in progress: {', '.join(parts)}"
+                        _hb_task = _asyncio.create_task(
+                            _post_heartbeat(_hb_msg),
+                            name="benchmark-heartbeat",
+                        )
+                        _heartbeat_tasks.add(_hb_task)
+                        _hb_task.add_done_callback(_heartbeat_tasks.discard)
+                        last_heartbeat_time = now
+
                     elif now - last_progress_time >= _STALL_TIMEOUT:
                         logger.warning(
                             "[boot-time] No new artifacts for %ds (stall detected at "
@@ -5805,13 +5859,17 @@ async def execute_boot_time_test(
             for task in (communicate_task, _drain_stdout, _drain_stderr):
                 if not task.done():
                     task.cancel()
+            for hb_task in _heartbeat_tasks:
+                hb_task.cancel()
             await _asyncio.gather(
                 communicate_task,
                 _drain_stdout,
                 _drain_stderr,
                 drain_task,
+                *_heartbeat_tasks,
                 return_exceptions=True,
             )
+            _heartbeat_tasks.clear()
             for _ in range(200):
                 if proc.returncode is not None:
                     break

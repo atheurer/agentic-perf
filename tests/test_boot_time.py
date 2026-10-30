@@ -849,3 +849,54 @@ class TestRepoRegistration:
 
         config = OrchestratorConfig()
         assert "boot-time-analysis-scripts" in config.harness_repos
+
+
+class TestParseBootTimeProgress:
+    """Tests for _parse_boot_time_progress heartbeat helper."""
+
+    def test_empty_chunks(self):
+        from providers.skills.boot_time import _parse_boot_time_progress
+
+        assert _parse_boot_time_progress([]) == {}
+
+    def test_single_sample(self):
+        from providers.skills.boot_time import _parse_boot_time_progress
+
+        chunks = [b"Sample 1 at 2026-10-29T12:00:00Z (attempt 1)\n"]
+        assert _parse_boot_time_progress(chunks) == {"samples_collected": 1}
+
+    def test_multiple_samples_returns_highest(self):
+        from providers.skills.boot_time import _parse_boot_time_progress
+
+        chunks = [
+            b"Sample 1 at ts\nSample 2 at ts\n",
+            b"Sample 3 at ts\n",
+        ]
+        assert _parse_boot_time_progress(chunks) == {"samples_collected": 3}
+
+    def test_no_matching_lines(self):
+        from providers.skills.boot_time import _parse_boot_time_progress
+
+        chunks = [b"Reboot mode: warm\nBOOT_CONFIG: SAMPLES=50\n"]
+        assert _parse_boot_time_progress(chunks) == {}
+
+    def test_scans_from_end(self):
+        from providers.skills.boot_time import _parse_boot_time_progress
+
+        chunks = [b"Sample 1 at ts\n", b"no samples\n", b"Sample 42 at ts\n"]
+        assert _parse_boot_time_progress(chunks) == {"samples_collected": 42}
+
+
+class TestProgressParserRegistry:
+    """Tests for the progress parser registry."""
+
+    def test_boot_time_registered(self):
+        from providers.skills.base import get_progress_parser
+
+        parser = get_progress_parser("boot-time")
+        assert parser is not None
+
+    def test_unknown_harness_returns_none(self):
+        from providers.skills.base import get_progress_parser
+
+        assert get_progress_parser("nonexistent-harness") is None
