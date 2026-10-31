@@ -84,6 +84,29 @@ def setup_project_path() -> str:
     return root
 
 
+def _configured_crucible_source_repo() -> str | None:
+    """Resolve the effective local Crucible source repository."""
+    env_repo = os.environ.get("CRUCIBLE_SOURCE_REPO")
+    if env_repo:
+        return env_repo
+
+    from paths import CONFIG_PATH
+
+    try:
+        if not CONFIG_PATH.exists():
+            return None
+        raw_config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(raw_config, dict):
+        return None
+    configured = raw_config.get("crucible_source_repo")
+    if isinstance(configured, str) and configured:
+        return configured
+    return None
+
+
 def build_skill_provider(
     source_repo: str | None = None,
     *,
@@ -98,9 +121,11 @@ def build_skill_provider(
     organization_resolver: Any | None = None,
     ticket_id: str | None = None,
 ):
-    """Construct a MultiHarnessSkillProvider from environment variables.
+    """Construct a MultiHarnessSkillProvider from instance configuration.
 
-    Reads CRUCIBLE_HOME and ZATHRAS_HOME from env vars.
+    Reads CRUCIBLE_HOME and ZATHRAS_HOME from environment variables. When no
+    explicit source repository is supplied, resolves ``crucible_source_repo``
+    from the environment or effective instance configuration.
     """
     from providers.skills.arcaflow_plugins import ArcaflowPluginSkillProvider
     from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
@@ -120,6 +145,8 @@ def build_skill_provider(
     zathras_home = (
         zathras_home if zathras_home is not None else os.environ.get("ZATHRAS_HOME", "")
     )
+    if source_repo is None:
+        source_repo = _configured_crucible_source_repo()
 
     harnesses: dict[str, Any] = {
         "kube-burner": KubeBurnerSkillProvider(),
@@ -152,8 +179,8 @@ def build_skill_provider(
         harnesses["crucible"] = CrucibleCatalogSkillProvider(
             build_crucible_context_gateway(
                 catalog_only=True,
+                source_repo=source_repo,
                 source_url=source_url,
-                source_epoch=source_epoch,
             )
         )
 

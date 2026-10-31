@@ -999,7 +999,7 @@ stops automatically when the ticket reaches a terminal status. See
 | `ssh_key` | string | — | `SSH_KEY` | Path to SSH private key for remote host access |
 | `ssh_key_vault_secret` | string | — | `SSH_KEY_VAULT_SECRET` | Vault secret name for SSH key fallback (see below) |
 | `crucible_home` | string | `"/opt/crucible"` | `CRUCIBLE_HOME` | Path to crucible installation |
-| `crucible_source_repo` | string | skill-cache checkout when present | `CRUCIBLE_SOURCE_REPO` | Core Crucible source checkout used for triage-time ecosystem discovery; independent of the execution controller |
+| `crucible_source_repo` | string | skill-cache checkout when present | `CRUCIBLE_SOURCE_REPO` | Core Crucible source checkout used by the orchestrator and agent subprocesses for catalog discovery; catalog-only discovery reads this checkout directly, while runtime context remains ticket-pinned |
 | `crucible_source_repo_url` | string | `https://github.com/perftool-incubator/crucible.git` | `CRUCIBLE_SOURCE_REPO_URL` | Source URL used to refresh the triage catalog when no explicit checkout is configured |
 | `zathras_home` | string | `""` | `ZATHRAS_HOME` | Path to zathras installation |
 | `max_concurrent_agents` | int | `8` | `MAX_CONCURRENT_AGENTS` | Maximum agents running at once; excess tickets wait for a later poll cycle. |
