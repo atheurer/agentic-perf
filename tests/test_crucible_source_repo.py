@@ -105,7 +105,7 @@ def test_build_skill_provider_passes_configured_crucible_source_repo(
     build_skill_provider(catalog_only=True)
 
     assert captured["source_repo"] == source_repo
-    assert "source_epoch" not in captured
+    assert captured["source_epoch"] is None
 
 
 def test_explicit_crucible_source_repo_overrides_config(
@@ -184,6 +184,122 @@ def test_missing_configured_crucible_source_repo_fails_clearly(
         build_skill_provider(catalog_only=True)
 
 
+def test_empty_explicit_crucible_source_repo_fails_clearly() -> None:
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        build_skill_provider(catalog_only=True, source_repo="")
+
+
+def test_malformed_crucible_catalog_fails_clearly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    source_repo = tmp_path / "crucible"
+    source_repo.mkdir()
+    (source_repo / "config").mkdir()
+    (source_repo / "config" / "repos.json").write_text(
+        json.dumps({"official": "invalid"}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="invalid catalog"):
+        build_skill_provider(catalog_only=True, source_repo=str(source_repo))
+
+
+async def test_empty_configured_crucible_catalog_does_not_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    from providers.skills.crucible import CrucibleCatalogFetcher
+
+    source_repo = _write_crucible_source(tmp_path / "crucible", {})
+    monkeypatch.setattr(
+        "providers.skills.private.PrivateSkillProvider", _PrivateSkillProviderStub
+    )
+
+    def fail_remote_fetch(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("an explicit local catalog must not fall back to remote")
+
+    monkeypatch.setattr(CrucibleCatalogFetcher, "read_json", fail_remote_fetch)
+
+    provider = build_skill_provider(
+        crucible_home=str(tmp_path / "controller"),
+        catalog_only=True,
+        source_repo=source_repo,
+    )
+    benchmarks = await provider.get_provider("crucible").list_benchmarks()
+
+    assert benchmarks == []
+
+
+def test_remote_catalog_only_discovery_uses_ticket_epoch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("paths.CONFIG_PATH", config_path)
+    monkeypatch.setattr("paths.SKILL_SOURCE_EPOCH_DIR", tmp_path / "epochs")
+    monkeypatch.setenv("TICKET_ID", "PERF-REMOTE-CATALOG")
+    monkeypatch.setattr(
+        "providers.skills.private.PrivateSkillProvider", _PrivateSkillProviderStub
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_gateway(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        "agents.server_utils.build_crucible_context_gateway", fake_gateway
+    )
+
+    build_skill_provider(catalog_only=True)
+
+    assert captured["source_repo"] is None
+    assert captured["source_epoch"] is not None
+
+
+def test_harness_repos_environment_overrides_other_source_urls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"crucible_source_repo_url": "https://config.example/crucible.git"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("paths.CONFIG_PATH", config_path)
+    monkeypatch.setenv("CRUCIBLE_SOURCE_REPO_URL", "https://env.example/crucible.git")
+    monkeypatch.setenv(
+        "HARNESS_REPOS",
+        json.dumps({"crucible": "https://harness.example/crucible.git"}),
+    )
+
+    from agents.server_utils import _configured_crucible_source_repo_url
+
+    assert (
+        _configured_crucible_source_repo_url() == "https://harness.example/crucible.git"
+    )
+
+
+def test_source_repo_url_environment_works_without_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.setattr("paths.CONFIG_PATH", tmp_path / "missing-config.json")
+    monkeypatch.setenv("CRUCIBLE_SOURCE_REPO_URL", "https://env.example/crucible.git")
+
+    from agents.server_utils import _configured_crucible_source_repo_url
+
+    assert _configured_crucible_source_repo_url() == "https://env.example/crucible.git"
+
+
+def test_invalid_harness_repos_fails_in_orchestrator_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from orchestrator.config import ConfigFileError, OrchestratorConfig
+
+    monkeypatch.setenv("HARNESS_REPOS", "{invalid")
+
+    with pytest.raises(ConfigFileError, match="Invalid HARNESS_REPOS"):
+        OrchestratorConfig(raw_config={})
+
+
 async def test_catalog_only_uses_local_repo_with_ticket_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
@@ -235,3 +351,46 @@ async def test_catalog_only_uses_local_repo_with_ticket_id(
     assert [benchmark.name for benchmark in benchmarks] == ["local-only"]
     assert benchmarks[0].supported_params == {"params": {"ifname": {"role": "all"}}}
     assert set(benchmarks[0].roles) == {"client", "server"}
+
+
+async def test_triage_server_uses_configured_crucible_source_repo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    from agents.triage import server as triage_server
+
+    source_repo = _write_crucible_source(
+        tmp_path / "crucible",
+        {
+            "official": [
+                {
+                    "name": "triage-local-only",
+                    "type": "benchmark",
+                    "repository": "https://github.com/example/bench-triage.git",
+                    "checkout": {"target": "main"},
+                }
+            ]
+        },
+    )
+    benchmark = (
+        tmp_path / "crucible" / "subprojects" / "benchmarks" / "triage-local-only"
+    )
+    benchmark.mkdir(parents=True)
+    (benchmark / "multiplex.json").write_text("{}", encoding="utf-8")
+    (benchmark / "rickshaw.json").write_text("{}", encoding="utf-8")
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"crucible_source_repo": source_repo}), encoding="utf-8"
+    )
+    monkeypatch.setattr("paths.CONFIG_PATH", config_path)
+    monkeypatch.setattr("paths.SKILL_SOURCE_EPOCH_DIR", tmp_path / "epochs")
+    monkeypatch.setenv("TICKET_ID", "PERF-TRIAGE-CATALOG")
+    monkeypatch.setattr(
+        "providers.skills.private.PrivateSkillProvider", _PrivateSkillProviderStub
+    )
+    monkeypatch.setattr(triage_server, "_skill_provider", None)
+
+    provider = await triage_server._get_provider()
+    benchmarks = await provider.get_provider("crucible").list_benchmarks()
+
+    assert [benchmark.name for benchmark in benchmarks] == ["triage-local-only"]
