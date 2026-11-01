@@ -179,7 +179,11 @@ class OrchestratorConfig:
             or cfg.get("zathras_home", "")
         )
         default_repos = {
-            "crucible": "https://github.com/perftool-incubator/crucible.git",
+            "crucible": (
+                os.environ.get("CRUCIBLE_SOURCE_REPO_URL")
+                or cfg.get("crucible_source_repo_url")
+                or "https://github.com/perftool-incubator/crucible.git"
+            ),
             "crucible-examples": "https://github.com/perftool-incubator/crucible-examples.git",
             "zathras": "https://github.com/redhat-performance/zathras.git",
             "kube-burner": "https://github.com/kube-burner/kube-burner.git",
@@ -195,8 +199,10 @@ class OrchestratorConfig:
         if env_repos:
             try:
                 default_repos.update(json.loads(env_repos))
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                raise ConfigFileError(
+                    "Invalid HARNESS_REPOS environment variable"
+                ) from exc
         default_repos.update(cfg.get("harness_repos", {}))
         self.harness_repos: dict[str, str] = default_repos
         self.instance_name: str = get_instance_name()

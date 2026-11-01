@@ -26,6 +26,8 @@ from providers.execution import AuditedAsyncHTTPClient
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CRUCIBLE_SOURCE_REPO_URL = "https://github.com/perftool-incubator/crucible.git"
+
 
 def _state_store_token() -> str:
     """Return this instance's state-store token for ticket-owned MCP tools."""
@@ -84,6 +86,114 @@ def setup_project_path() -> str:
     return root
 
 
+def _read_instance_config() -> dict[str, Any] | None:
+    from paths import CONFIG_PATH
+
+    if not CONFIG_PATH.exists():
+        return None
+    try:
+        raw_config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid agentic-perf configuration: {CONFIG_PATH}") from exc
+
+    if not isinstance(raw_config, dict):
+        raise ValueError(f"Invalid agentic-perf configuration: {CONFIG_PATH}")
+    return raw_config
+
+
+def _validated_crucible_source_repo(source_repo: str) -> str:
+    repository = Path(source_repo).expanduser()
+    catalog_path = repository / "config" / "repos.json"
+    if not repository.is_dir():
+        raise ValueError(
+            f"Configured Crucible source repository is not a directory: {source_repo}"
+        )
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Configured Crucible source repository has no valid config/repos.json: {source_repo}"
+        ) from exc
+    if not isinstance(catalog, dict):
+        raise ValueError(
+            f"Configured Crucible source repository has an invalid catalog: {source_repo}"
+        )
+    for group in ("official", "unofficial"):
+        entries = catalog.get(group, [])
+        if not isinstance(entries, list):
+            raise ValueError(
+                f"Configured Crucible source repository has an invalid catalog: {source_repo}"
+            )
+        for entry in entries:
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("name"), str)
+                or not entry["name"]
+                or not isinstance(entry.get("type"), str)
+                or not entry["type"]
+            ):
+                raise ValueError(
+                    f"Configured Crucible source repository has an invalid catalog: {source_repo}"
+                )
+    return str(repository)
+
+
+def _configured_crucible_source_repo() -> str | None:
+    """Resolve the effective local Crucible source repository."""
+    env_repo = os.environ.get("CRUCIBLE_SOURCE_REPO")
+    if env_repo:
+        return _validated_crucible_source_repo(env_repo)
+
+    raw_config = _read_instance_config()
+    if raw_config is None:
+        return None
+    configured = raw_config.get("crucible_source_repo")
+    if configured is None:
+        return None
+    if not isinstance(configured, str) or not configured:
+        raise ValueError("Configured crucible_source_repo must be a non-empty string")
+    return _validated_crucible_source_repo(configured)
+
+
+def _configured_crucible_source_repo_url() -> str | None:
+    """Resolve the Crucible repository URL from the effective configuration."""
+    env_repos = os.environ.get("HARNESS_REPOS")
+    if env_repos:
+        try:
+            configured_repos = json.loads(env_repos)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Invalid HARNESS_REPOS environment variable") from exc
+        if not isinstance(configured_repos, dict):
+            raise ValueError("Invalid HARNESS_REPOS environment variable")
+        configured = configured_repos.get("crucible")
+        if configured is not None:
+            if not isinstance(configured, str) or not configured:
+                raise ValueError("Configured crucible repository URL must be non-empty")
+            return configured
+
+    env_url = os.environ.get("CRUCIBLE_SOURCE_REPO_URL")
+    if env_url:
+        return env_url
+
+    raw_config = _read_instance_config()
+    if raw_config is None:
+        return DEFAULT_CRUCIBLE_SOURCE_REPO_URL
+    harness_repos = raw_config.get("harness_repos")
+    if isinstance(harness_repos, dict):
+        configured = harness_repos.get("crucible")
+        if configured is not None:
+            if not isinstance(configured, str) or not configured:
+                raise ValueError("Configured crucible repository URL must be non-empty")
+            return configured
+
+    configured = raw_config.get("crucible_source_repo_url")
+    if configured is not None and (not isinstance(configured, str) or not configured):
+        raise ValueError(
+            "Configured crucible_source_repo_url must be a non-empty string"
+        )
+    return configured or DEFAULT_CRUCIBLE_SOURCE_REPO_URL
+
+
 def build_skill_provider(
     source_repo: str | None = None,
     *,
@@ -98,9 +208,11 @@ def build_skill_provider(
     organization_resolver: Any | None = None,
     ticket_id: str | None = None,
 ):
-    """Construct a MultiHarnessSkillProvider from environment variables.
+    """Construct a MultiHarnessSkillProvider from instance configuration.
 
-    Reads CRUCIBLE_HOME and ZATHRAS_HOME from env vars.
+    Reads CRUCIBLE_HOME and ZATHRAS_HOME from environment variables. When no
+    explicit source repository is supplied, resolves ``crucible_source_repo``
+    from the environment or effective instance configuration.
     """
     from providers.skills.arcaflow_plugins import ArcaflowPluginSkillProvider
     from providers.skills.benchmark_runner import BenchmarkRunnerSkillProvider
@@ -120,6 +232,14 @@ def build_skill_provider(
     zathras_home = (
         zathras_home if zathras_home is not None else os.environ.get("ZATHRAS_HOME", "")
     )
+    if source_repo is None:
+        source_repo = _configured_crucible_source_repo()
+    elif source_repo:
+        source_repo = _validated_crucible_source_repo(source_repo)
+    else:
+        raise ValueError("Configured crucible_source_repo must be a non-empty string")
+    if source_url is None:
+        source_url = _configured_crucible_source_repo_url()
 
     harnesses: dict[str, Any] = {
         "kube-burner": KubeBurnerSkillProvider(),
@@ -152,8 +272,9 @@ def build_skill_provider(
         harnesses["crucible"] = CrucibleCatalogSkillProvider(
             build_crucible_context_gateway(
                 catalog_only=True,
+                source_repo=source_repo,
                 source_url=source_url,
-                source_epoch=source_epoch,
+                source_epoch=source_epoch if source_repo is None else None,
             )
         )
 
@@ -270,7 +391,11 @@ def build_crucible_context_gateway(
     home = crucible_home or os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
     cache = repo_cache or RepoCache()
     trusted_ticket_id = os.environ.get("TICKET_ID", "")
-    if source_epoch is None and trusted_ticket_id:
+    if (
+        source_epoch is None
+        and trusted_ticket_id
+        and (not catalog_only or source_repo is None)
+    ):
         from paths import SKILL_SOURCE_EPOCH_DIR
         from providers.skills.source_epoch import SourceEpoch
 
@@ -281,10 +406,7 @@ def build_crucible_context_gateway(
     core_repository = source_url or (
         cache.get_origin("crucible") if hasattr(cache, "get_origin") else None
     )
-    core_repository = core_repository or os.environ.get(
-        "CRUCIBLE_SOURCE_REPO_URL",
-        "https://github.com/perftool-incubator/crucible.git",
-    )
+    core_repository = core_repository or DEFAULT_CRUCIBLE_SOURCE_REPO_URL
     if resolve_source:
         logger.warning(
             "resolve_source is ignored; Crucible repositories are not cloned"

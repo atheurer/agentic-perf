@@ -667,7 +667,11 @@ class CrucibleContextGateway:
             # Triage has no authoritative controller yet, so it may use the
             # bounded GitHub catalog.  This is the only mode that may fetch
             # the remote catalog.
-            entries = self._source_repo_entries() or self._remote_repo_entries()
+            entries = (
+                self._source_repo_entries()
+                if self._source_repo is not None
+                else self._remote_repo_entries()
+            )
         else:
             # Runtime/context resolution must not silently switch authority
             # to GitHub when the installed controller lacks metadata.
