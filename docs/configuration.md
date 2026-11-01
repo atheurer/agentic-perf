@@ -1009,6 +1009,10 @@ stops automatically when the ticket reaches a terminal status. See
 | `tool_rate_limit.min_interval_sec` | float | `0` | — | Minimum delay between tool calls. |
 | `tool_spill_threshold` | int | `4096` | — | Tool-result size in bytes above which results are spilled to workspace files. |
 
+A configured `crucible_source_repo` must be a directory containing a valid
+`config/repos.json`. Invalid or missing configured repositories fail provider
+construction instead of silently falling back to the remote catalog.
+
 ### investigation_records — Investigation Record Backend
 
 Investigation tools use the file backend by default. The registry currently

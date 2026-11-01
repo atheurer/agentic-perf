@@ -84,27 +84,80 @@ def setup_project_path() -> str:
     return root
 
 
+def _read_instance_config() -> dict[str, Any] | None:
+    from paths import CONFIG_PATH
+
+    if not CONFIG_PATH.exists():
+        return None
+    try:
+        raw_config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid agentic-perf configuration: {CONFIG_PATH}") from exc
+
+    if not isinstance(raw_config, dict):
+        raise ValueError(f"Invalid agentic-perf configuration: {CONFIG_PATH}")
+    return raw_config
+
+
+def _validated_crucible_source_repo(source_repo: str) -> str:
+    repository = Path(source_repo).expanduser()
+    catalog_path = repository / "config" / "repos.json"
+    if not repository.is_dir():
+        raise ValueError(
+            f"Configured Crucible source repository is not a directory: {source_repo}"
+        )
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Configured Crucible source repository has no valid config/repos.json: {source_repo}"
+        ) from exc
+    if not isinstance(catalog, dict):
+        raise ValueError(
+            f"Configured Crucible source repository has an invalid catalog: {source_repo}"
+        )
+    return str(repository)
+
+
 def _configured_crucible_source_repo() -> str | None:
     """Resolve the effective local Crucible source repository."""
     env_repo = os.environ.get("CRUCIBLE_SOURCE_REPO")
     if env_repo:
-        return env_repo
+        return _validated_crucible_source_repo(env_repo)
 
-    from paths import CONFIG_PATH
-
-    try:
-        if not CONFIG_PATH.exists():
-            return None
-        raw_config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-
-    if not isinstance(raw_config, dict):
+    raw_config = _read_instance_config()
+    if raw_config is None:
         return None
     configured = raw_config.get("crucible_source_repo")
-    if isinstance(configured, str) and configured:
-        return configured
-    return None
+    if configured is None:
+        return None
+    if not isinstance(configured, str) or not configured:
+        raise ValueError("Configured crucible_source_repo must be a non-empty string")
+    return _validated_crucible_source_repo(configured)
+
+
+def _configured_crucible_source_repo_url() -> str | None:
+    """Resolve the Crucible repository URL from the effective configuration."""
+    env_url = os.environ.get("CRUCIBLE_SOURCE_REPO_URL")
+    if env_url:
+        return env_url
+
+    raw_config = _read_instance_config()
+    if raw_config is None:
+        return None
+    harness_repos = raw_config.get("harness_repos")
+    if isinstance(harness_repos, dict):
+        configured = harness_repos.get("crucible")
+        if isinstance(configured, str) and configured:
+            return configured
+    configured = raw_config.get("crucible_source_repo_url")
+    if configured is None:
+        return None
+    if not isinstance(configured, str) or not configured:
+        raise ValueError(
+            "Configured crucible_source_repo_url must be a non-empty string"
+        )
+    return configured
 
 
 def build_skill_provider(
@@ -147,6 +200,10 @@ def build_skill_provider(
     )
     if source_repo is None:
         source_repo = _configured_crucible_source_repo()
+    elif source_repo:
+        source_repo = _validated_crucible_source_repo(source_repo)
+    if source_url is None:
+        source_url = _configured_crucible_source_repo_url()
 
     harnesses: dict[str, Any] = {
         "kube-burner": KubeBurnerSkillProvider(),
@@ -297,7 +354,7 @@ def build_crucible_context_gateway(
     home = crucible_home or os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
     cache = repo_cache or RepoCache()
     trusted_ticket_id = os.environ.get("TICKET_ID", "")
-    if source_epoch is None and trusted_ticket_id:
+    if source_epoch is None and trusted_ticket_id and not catalog_only:
         from paths import SKILL_SOURCE_EPOCH_DIR
         from providers.skills.source_epoch import SourceEpoch
 
