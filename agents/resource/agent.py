@@ -1250,14 +1250,37 @@ class ResourceAgent(AgentBase):
         ticket = await self._get_ticket(ticket_id)
         fields = ticket.get("custom_fields", {})
         directives = fields.get("directives", {})
+        is_aborted = bool(fields.get("abort_requested"))
 
-        async def pause_teardown(message: str) -> None:
+        async def pause_teardown(message: str) -> bool:
+            """Handle a teardown failure.
+
+            For aborted tickets, logs the failure and adds a closure
+            comment so the caller can fall through to close.
+            For non-aborted tickets, transitions to HITL.
+
+            Returns True if the caller should continue to close,
+            False if the caller should return (HITL pause).
+            """
+            if is_aborted:
+                logger.warning(
+                    "[resource-agent] Teardown failed for aborted ticket %s, "
+                    "closing anyway",
+                    ticket_id,
+                )
+                await self._add_comment(
+                    ticket_id,
+                    f"{message}\n\n"
+                    "Ticket was aborted \u2014 closing despite incomplete teardown.",
+                )
+                return True
             if ticket.get("status") != "awaiting_customer_guidance":
                 await self._transition_ticket(
                     ticket_id,
                     "awaiting_customer_guidance",
                     comment=message,
                 )
+            return False
 
         skip_teardown = directives.get("skip_teardown")
         if skip_teardown is None:
@@ -1300,20 +1323,20 @@ class ResourceAgent(AgentBase):
                 host_cleanup,
             )
             if not teardown_confirmed:
-                await pause_teardown(
+                if not await pause_teardown(
                     "Resource teardown could not confirm release; allocation "
                     "details were retained for manual reconciliation."
-                )
-                return
+                ):
+                    return
         else:
             if host_cleanup == "required":
                 await self._run_host_cleanup(ticket_id, fields)
             if not await self._terminate_all(ticket_id, fields):
-                await pause_teardown(
+                if not await pause_teardown(
                     "Resource teardown could not confirm release; allocation "
                     "details were retained for manual reconciliation."
-                )
-                return
+                ):
+                    return
 
         # Clear the transient flag
         if selective:
