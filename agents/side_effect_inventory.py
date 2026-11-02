@@ -13,6 +13,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/base.py", "_execute_tool", "mcp"),
     ("agents/base.py", "_transition_ticket", "mutating_http_state"),
     ("agents/base.py", "_update_fields", "mutating_http_state"),
+    ("agents/benchmark/agent.py", "_system_prompt", "filesystem"),
     ("agents/benchmark/agent.py", "_request_benchmark_approval", "mutating_http_state"),
     ("agents/benchmark/agent.py", "_resolve_benchmark_approval", "mutating_http_state"),
     ("agents/benchmark/agent.py", "_cancel_execution_after_cancellation", "mcp"),
@@ -855,6 +856,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/base.py:_update_fields",
+        "2027-12-31",
+    ),
+    ("agents/benchmark/agent.py", "_system_prompt", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/agent.py:_system_prompt",
         "2027-12-31",
     ),
     (
