@@ -89,6 +89,30 @@ ownership-required server are hidden and rejected. Use
 first-party adapter. See the
 [external MCP configuration](configuration.md#external_mcp_servers).
 
+## Pre-execution approval
+
+The benchmark agent's pre-execution approval step is code-driven.
+If the harness registers `present_runfile_for_approval` as an owned
+tool (via `owner_harness`), the agent includes the full
+validate → approve → execute flow in its prompt. If the tool is
+not present, the agent skips the approval step and proceeds
+directly to execution.
+
+To add approval support to a new harness:
+
+1. Implement a validation tool that produces a `validation_id`
+2. Register `present_runfile_for_approval` and
+   `resolve_benchmark_approval` with `owner_harness` set to
+   your harness name
+3. The benchmark agent will automatically include the approval
+   flow when your harness is selected
+
+The `user_pre_run_approval` directive provides user-level control:
+
+- **`true`** — always pause for approval (even without validation tools)
+- **`false`** — skip approval (auto-approve when validation exists)
+- **unset** — pause if validation tools exist, skip otherwise
+
 ## A current provider shape
 
 `providers/skills/k8s_netperf.py` is a useful reference because it supplies

@@ -26,7 +26,13 @@ from providers.skills.base import EXECUTION_MODEL_CONTROLLER, EXECUTION_MODEL_DI
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import current_trace_context
 
-from .prompts import BENCHMARK_BASE_PROMPT
+from .prompts import (
+    APPROVAL_STEP_AUTO,
+    APPROVAL_STEP_EXPLICIT,
+    APPROVAL_STEP_PAUSE,
+    APPROVAL_STEP_SKIP,
+    BENCHMARK_BASE_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -687,6 +693,25 @@ class BenchmarkAgent(AgentBase):
         harness_fragment = self._load_prompt_fragment(prompts_dir, harness)
 
         prompt = BENCHMARK_BASE_PROMPT
+
+        # Determine approval step based on tool availability and directives
+        has_approval_tools = any(
+            t.name == "present_runfile_for_approval" for t in getattr(self, "tools", [])
+        )
+        approval_directive = directives.get("user_pre_run_approval")
+
+        if has_approval_tools:
+            if approval_directive is False:
+                approval_step = APPROVAL_STEP_AUTO
+            else:
+                approval_step = APPROVAL_STEP_PAUSE
+        elif approval_directive is True:
+            approval_step = APPROVAL_STEP_EXPLICIT
+        else:
+            approval_step = APPROVAL_STEP_SKIP
+
+        prompt = prompt.replace("{approval_step}", approval_step)
+
         if harness == "crucible":
             prompt += "\n\n" + skill_context_prompt("harness/crucible")
         elif harness == "kube-burner":

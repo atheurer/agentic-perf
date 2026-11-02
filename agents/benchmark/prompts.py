@@ -67,17 +67,7 @@ gateway when available, otherwise the supported harness documentation tools.
    supports every harness. Save a `validation_id` only when a successful
    validation call returns one; never invent one.
 
-7. **Present for approval** — Check directives for
-   `user_pre_run_approval` (default: true). If false, go straight to
-   execute: `execute_benchmark` creates and consumes the durable
-   run-file approval automatically (no human pause). If true (or
-   unset), a validation ID is available, call
-   `present_runfile_for_approval(validation_id, benchmark, summary)`. If
-   approval is required but this harness has no validation ID, use
-   `request_clarification` to show the complete exact run-file and planned
-   execution, explain the available validation limits, and ask whether to
-   proceed or stop. Do not describe that reply as immutable run-file
-   approval.
+{approval_step}
 
 8. **Execute** — Call the appropriate execution tool for the harness.
 
@@ -87,13 +77,6 @@ gateway when available, otherwise the supported harness documentation tools.
    - Never submit "completed" unless results are present
    - **Your job ends after submitting.** Do NOT analyze results —
      that is the review agent's responsibility.
-
-### Run-file approval replies
-
-`present_runfile_for_approval` pauses and returns the user's reply.
-Interpret it semantically — natural approvals include "go for it" or
-"looks good." If authorized, resolve as `approved`; if edits requested,
-resolve as `changes_requested`.
 
 ### When to ask for guidance
 
@@ -112,4 +95,38 @@ for the observed symptoms before attributing to any specific cause.
 For each explanation, note what evidence supports or contradicts it.
 Do not assume the ticket's hypothesis is correct — evaluate it
 against alternatives with equal rigor.
+"""
+
+APPROVAL_STEP_PAUSE = """\
+7. **Present for approval** — Call
+   `present_runfile_for_approval(validation_id, benchmark, summary)`
+   and wait for the user's decision.
+
+### Run-file approval replies
+
+`present_runfile_for_approval` pauses and returns the user's reply.
+Interpret it semantically — natural approvals include "go for it" or
+"looks good." If authorized, resolve as `approved`; if edits requested,
+resolve as `changes_requested`.\
+"""
+
+APPROVAL_STEP_AUTO = """\
+7. **Automatic approval** — The user has opted out of pre-run
+   approval. The execution tool creates and consumes the durable
+   run-file approval automatically. Proceed directly to execution
+   without a human pause.\
+"""
+
+APPROVAL_STEP_SKIP = """\
+7. **Proceed to execution** — This harness does not use run-file
+   validation or approval. Proceed directly to the execution step.\
+"""
+
+APPROVAL_STEP_EXPLICIT = """\
+7. **Present for approval** — The user has explicitly requested
+   pre-run approval. Use `request_clarification` to show the
+   complete planned execution (target host, parameters, sample
+   count, and any directives that affect execution) and ask
+   whether to proceed or stop. Do not describe this as immutable
+   run-file approval.\
 """
