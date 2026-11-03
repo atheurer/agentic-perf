@@ -294,6 +294,7 @@ TOOL_AUDIT_POLICY = (
     ),
     *_side_effecting(
         "state_store.ticket_transition",
+        "agents/analyze/agent.py:request_clarification",
         "agents/benchmark/agent.py:submit_benchmark_result",
         "agents/benchmark/agent.py:present_runfile_for_approval",
         "agents/benchmark/agent.py:resolve_benchmark_approval",
