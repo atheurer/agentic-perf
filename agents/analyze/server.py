@@ -134,9 +134,13 @@ async def list_skill_docs(category: str) -> str:
 
 @mcp.tool()
 async def get_ticket_results(ticket_id: str) -> str:
-    """Retrieve benchmark results, KPIs, and evaluation findings
-    from a prior ticket. Use this to compare results across
-    investigations or reference earlier work."""
+    """Retrieve benchmark results, KPIs, evaluation findings, and
+    artifact paths from a prior ticket. Use this to compare results
+    across investigations or reference earlier work.
+
+    Always returns artifact_base_path and artifact_run_dirs when
+    artifacts exist on disk, regardless of whether output_dir was
+    persisted in custom_fields."""
     from providers.execution import AuditedAsyncHTTPClient
 
     async with AuditedAsyncHTTPClient(timeout=30) as client:
@@ -160,7 +164,24 @@ async def get_ticket_results(ticket_id: str) -> str:
         "analysis_result": cf.get("analysis_result"),
         "verdict": cf.get("verdict"),
         "review_summary": cf.get("review_summary"),
+        # Artifact paths for cross-ticket analysis
+        "output_dir": cf.get("output_dir"),
+        "output_dirs": cf.get("output_dirs"),
     }
+
+    # Always provide the artifact base path — even when output_dir
+    # wasn't persisted, artifacts may exist on disk at the standard
+    # location.
+    from paths import ARTIFACT_DIR
+
+    artifact_base = ARTIFACT_DIR / ticket_id
+    if artifact_base.exists():
+        result["artifact_base_path"] = str(artifact_base)
+        # List run directories so the caller knows what's available
+        run_dirs = sorted([str(d) for d in artifact_base.iterdir() if d.is_dir()])
+        if run_dirs:
+            result["artifact_run_dirs"] = run_dirs
+
     return json.dumps(result, default=str)
 
 
@@ -232,6 +253,86 @@ async def search_tickets(
         {"count": len(matches), "tickets": matches},
         default=str,
     )
+
+
+@mcp.tool()
+async def list_benchmark_artifacts(output_dir: str) -> str:
+    """List available artifacts in a benchmark output directory.
+
+    Use get_ticket_results to discover artifact paths for a ticket,
+    then pass output_dir or artifact_run_dirs entries to this tool
+    to list available files.
+
+    Args:
+        output_dir: Path to the benchmark output directory.
+    """
+    path = Path(output_dir)
+    if not path.exists():
+        return json.dumps({"error": f"Directory not found: {output_dir}"})
+
+    artifacts = []
+    for f in sorted(path.rglob("*")):
+        if f.is_file():
+            rel = str(f.relative_to(path))
+            artifacts.append(
+                {
+                    "path": rel,
+                    "size_bytes": f.stat().st_size,
+                }
+            )
+
+    return json.dumps(
+        {
+            "output_dir": output_dir,
+            "count": len(artifacts),
+            "artifacts": artifacts,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+async def read_benchmark_artifact(
+    output_dir: str,
+    filename: str,
+    offset: int = 0,
+    limit: int = 200,
+) -> str:
+    """Read a specific artifact file from a benchmark output directory.
+
+    Args:
+        output_dir: Path to the benchmark output directory.
+        filename: Relative path within the output directory.
+        offset: Line number to start reading from (0-based).
+        limit: Maximum number of lines to return (default 200).
+    """
+    path = Path(output_dir) / filename
+
+    try:
+        path.resolve().relative_to(Path(output_dir).resolve())
+    except ValueError:
+        return json.dumps({"error": "Path traversal not allowed"})
+
+    if not path.exists():
+        return json.dumps({"error": f"File not found: {filename}"})
+
+    try:
+        content = path.read_text(errors="replace")
+        lines = content.splitlines()
+        total = len(lines)
+        limit = min(limit, 500)
+        selected = lines[offset : offset + limit]
+        return json.dumps(
+            {
+                "filename": filename,
+                "total_lines": total,
+                "offset": offset,
+                "lines_returned": len(selected),
+                "content": "\n".join(selected),
+            }
+        )
+    except Exception as e:
+        return json.dumps({"error": f"Read failed: {e}"})
 
 
 @mcp.tool()
