@@ -145,10 +145,13 @@ What to put in the ticket:
   including any specifics they provided (board, OS, samples,
   benchmark type, goals)
 - **directives**: only set directives the user explicitly
-  mentioned (e.g. harness, board_selector, image_version,
-  image_name, endpoint_type). Do NOT invent directives the
-  user didn't mention. See the ticket-directives docs for
-  the full list of supported fields.
+  mentioned. Do NOT invent directives the user didn't
+  mention. Common directives include:
+  - harness, board_selector, image_version, image_name,
+    release, resource_provider, endpoint_type
+  - reboot_method, power_off_delay, serial_capture
+  - sample_count
+  See the ticket-directives docs for the full list.
 - **samples**: set as a top-level custom field
   (`custom_fields.samples`), not inside directives.
 
