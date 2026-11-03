@@ -240,7 +240,11 @@ class QuadsClient:
         return results
 
     async def create_assignment(
-        self, description: str, owner: str | None = None
+        self,
+        description: str,
+        owner: str | None = None,
+        os_type: str | None = None,
+        wipe: bool = True,
     ) -> dict[str, Any]:
         description = " ".join(description.split())
         # QUADS uses this field as a Jira title; bound arbitrary caller text.
@@ -257,7 +261,8 @@ class QuadsClient:
                 "description": description,
                 "owner": owner or self.owner,
                 "qinq": 0,
-                "wipe": "true",
+                "wipe": wipe,
+                **({"ostype": os_type} if os_type is not None else {}),
             },
         )
         data = r.json()
@@ -266,6 +271,14 @@ class QuadsClient:
             "cloud_name": data["cloud"]["name"],
             "ticket": data.get("ticket"),
         }
+
+    async def get_os_list(self) -> list[dict[str, Any]]:
+        r = await self._client.get(f"{self._base_url}/api/v3/hosts/os_list")
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            raise ValueError("QUADS OS list response must be an array")
+        return data
 
     async def schedule_host(
         self, cloud_name: str, hostname: str, duration_hours: int = 36

@@ -221,6 +221,39 @@ class TestQuadsResourceProvider:
         )
 
     @pytest.mark.asyncio
+    async def test_check_available_reports_unavailable_os_before_host_search(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = AsyncMock()
+        mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
+
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.check_available({"os": "RHEL 10.1"})
+
+        assert result["status"] == "failed"
+        assert result["available_count"] == 0
+        assert result["options"] == []
+        assert result["available_os"] == ["RHEL 10.0"]
+        assert "RHEL 10.1" in result["error"]
+        mock_client.get_available.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_check_available_includes_resolved_os_with_host_options(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = AsyncMock()
+        mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
+        mock_client.get_available.return_value = [
+            {"hostname": "host1.example.com", "cores": 32}
+        ]
+
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.check_available({"os": "rhel  10.0"})
+
+        assert result["available_count"] == 1
+        assert result["os"] == "RHEL 10.0"
+
+    @pytest.mark.asyncio
     async def test_reserve(self):
         from providers.resource.quads import QuadsResourceProvider
 
@@ -249,7 +282,108 @@ class TestQuadsResourceProvider:
         assert result["provider_metadata"]["assignment_id"] == 42
         assert result["provider_metadata"]["cloud_name"] == "cloud01"
         assert result["hosts"] == ["host1.example.com"]
-        mock_client.create_assignment.assert_awaited_once_with("PERF-TEST")
+        mock_client.create_assignment.assert_awaited_once_with(
+            "PERF-TEST", os_type=None, wipe=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_reserve_passes_requested_os_and_wipe_choice(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = AsyncMock()
+        mock_client.ssh_key_path = "/fake/key"
+        mock_client.get_os_list.return_value = [
+            {"Title": "RHEL 10.0"},
+            {"Title": "Fedora 44"},
+        ]
+        mock_client.create_assignment.return_value = {
+            "id": 43,
+            "cloud_name": "cloud02",
+            "ticket": "T-124",
+        }
+        mock_client.schedule_host.return_value = {"end": "2026-06-15T00:00"}
+        mock_client.poll_until_validated.return_value = {"validated": True}
+        mock_client.setup_ssh.return_value = {"status": "success"}
+
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.reserve(
+            selection={
+                "hostnames": ["host1.example.com"],
+                "os": "rhel  10.0",
+                "wipe": False,
+            },
+            description="test assignment",
+            ticket_id="PERF-TEST",
+        )
+
+        assert result["provider_metadata"]["os"] == "RHEL 10.0"
+        assert result["provider_metadata"]["wipe"] is False
+        mock_client.create_assignment.assert_awaited_once_with(
+            "PERF-TEST", os_type="RHEL 10.0", wipe=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_reserve_rejects_unavailable_os_before_assignment(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = AsyncMock()
+        mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
+
+        provider = QuadsResourceProvider(mock_client)
+        with pytest.raises(ValueError, match="Requested QUADS OS .* unavailable"):
+            await provider.reserve(
+                selection={
+                    "hostnames": ["host1.example.com"],
+                    "os": "RHEL 10.1",
+                },
+                description="test assignment",
+                ticket_id="PERF-TEST",
+            )
+
+        mock_client.create_assignment.assert_not_awaited()
+
+    def test_availability_recommendation_preserves_os_diagnostics(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        provider = QuadsResourceProvider(MagicMock())
+        result = {
+            "provider": "quads",
+            "available_count": 0,
+            "options": [],
+            "status": "failed",
+            "error": "Requested QUADS OS 'RHEL 10.1' is unavailable.",
+            "available_os": ["RHEL 10.0"],
+            "message": "Choose an available release.",
+        }
+
+        recommendation = provider.availability_recommendation(
+            {"os": "RHEL 10.1"}, result, {"ticket_id": "PERF-TEST"}
+        )
+
+        assert recommendation["status"] == "failed"
+        assert recommendation["error"] == result["error"]
+        assert recommendation["available_os"] == result["available_os"]
+        assert recommendation["message"] == result["message"]
+
+    @pytest.mark.asyncio
+    async def test_os_catalog_failure_is_definitive_before_assignment(self):
+        from providers.resource.quads import (
+            QuadsOSResolutionError,
+            QuadsResourceProvider,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get_os_list.side_effect = RuntimeError("catalog unavailable")
+
+        provider = QuadsResourceProvider(mock_client)
+        with pytest.raises(QuadsOSResolutionError, match="catalog unavailable"):
+            await provider.reserve(
+                selection={"hostnames": ["host1.example.com"], "os": "RHEL 10.0"},
+                description="test assignment",
+                ticket_id="PERF-TEST",
+            )
+
+        mock_client.create_assignment.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_reserve_max_hosts(self):
@@ -1908,6 +2042,41 @@ class TestProviderCorrectAutoReservation:
 
         old_provider.terminate.assert_awaited_once_with("42", old_metadata)
 
+    @pytest.mark.parametrize(
+        ("requested", "saved", "changed"),
+        [
+            ("RHEL 10.0", "RHEL 10.0", False),
+            ("RHEL 10.1", "RHEL 10.0", True),
+            (False, False, False),
+            (True, False, True),
+        ],
+    )
+    def test_changed_quads_os_or_wipe_releases_existing_assignment(
+        self, requested, saved, changed
+    ):
+        from agents.resource.agent import _provider_selection_changed
+
+        key = "os" if isinstance(requested, str) else "wipe"
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "quads",
+                "resource_reservation_id": "42",
+                "resource_provider_metadata": {
+                    "assignment_id": 42,
+                    "reservation_selections": [
+                        {"hostnames": ["host-old.example.com"], key: saved}
+                    ],
+                },
+                "hostnames": ["host-old.example.com"],
+                key: requested,
+            },
+        }
+
+        assert (
+            _provider_selection_changed("quads", ticket["custom_fields"], {}) is changed
+        )
+
     @pytest.mark.asyncio
     async def test_quads_role_requirements_reuse_saved_assignment(self):
         ticket = {
@@ -2632,8 +2801,14 @@ class TestProviderCorrectAutoReservation:
                         {"roles": ["target"]},
                     ],
                     "hostnames": ["host-a", "host-b"],
+                    "os": "RHEL 10.0",
+                    "wipe": False,
                 },
-                {"hostnames": ["host-a", "host-b"]},
+                {
+                    "hostnames": ["host-a", "host-b"],
+                    "os": "RHEL 10.0",
+                    "wipe": False,
+                },
             ),
             ("psap-cc", {"cluster_id": "cluster-7"}, {"cluster_id": "cluster-7"}),
             (
@@ -2746,7 +2921,7 @@ class TestProviderCorrectAutoReservation:
                     "provider_metadata": {"assignment_id": 73},
                     "hosts": ["host-a", "host-b"],
                 },
-                {"hostnames": ["host-a", "host-b"]},
+                {"hostnames": ["host-a", "host-b"], "wipe": True},
                 "73",
                 {"controller": "host-a", "targets": ["host-b"]},
                 True,

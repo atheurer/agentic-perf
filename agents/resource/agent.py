@@ -158,7 +158,7 @@ def _auto_reservation_selection(
             "os",
             "root_volume_gb",
         },
-        "quads": {"hostnames", "duration_hours"},
+        "quads": {"hostnames", "duration_hours", "os", "wipe"},
         "psap-cc": {"cluster_id", "duration_hours"},
     }
     if provider not in allowed_fields:
@@ -470,7 +470,7 @@ def _explicit_provider_selection(
             "os",
             "root_volume_gb",
         },
-        "quads": {"hostnames", "duration_hours"},
+        "quads": {"hostnames", "duration_hours", "os", "wipe"},
         "psap-cc": {"cluster_id", "duration_hours"},
     }.get(provider, set())
     selection: dict[str, Any] = {}
@@ -590,6 +590,43 @@ def _duration_requirement_changed(
     return False
 
 
+def _saved_requirement_values(metadata: dict[str, Any], key: str) -> list[Any] | None:
+    records = _saved_selection_records(metadata)
+    if records:
+        if any(key not in record for record in records):
+            return None
+        return [record[key] for record in records]
+    if key in metadata:
+        return [metadata[key]]
+    return None
+
+
+def _quads_os_requirement_changed(requested: Any, metadata: dict[str, Any]) -> bool:
+    if requested is None:
+        return False
+    if not isinstance(requested, str) or not requested.strip():
+        return True
+    saved_values = _saved_requirement_values(metadata, "os")
+    if saved_values is None:
+        return True
+    requested_os = requested.strip().casefold()
+    return any(
+        not isinstance(value, str) or value.strip().casefold() != requested_os
+        for value in saved_values
+    )
+
+
+def _quads_wipe_requirement_changed(requested: Any, metadata: dict[str, Any]) -> bool:
+    if requested is None:
+        return False
+    if not isinstance(requested, bool):
+        return True
+    saved_values = _saved_requirement_values(metadata, "wipe")
+    if saved_values is None:
+        return True
+    return any(value is not requested for value in saved_values)
+
+
 def _provider_selection_changed(
     provider: str, fields: dict[str, Any], directives: dict[str, Any]
 ) -> bool:
@@ -675,6 +712,10 @@ def _provider_selection_changed(
         if _duration_requirement_changed(
             requested.get("duration_hours"), metadata, "duration_hours"
         ):
+            return True
+        if _quads_os_requirement_changed(requested.get("os"), metadata):
+            return True
+        if _quads_wipe_requirement_changed(requested.get("wipe"), metadata):
             return True
         requested_hostnames = requested.get("hostnames")
         if requested_hostnames is not None:

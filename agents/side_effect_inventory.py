@@ -175,6 +175,16 @@ INVENTORIED_SIDE_EFFECTS = (
     ),
     ("agents/resource/agent.py", "_prepare_selection_via_resource_tool", "mcp"),
     ("agents/resource/agent.py", "_provider_selection_changed", "cloud_resource"),
+    (
+        "agents/resource/agent.py",
+        "_quads_os_requirement_changed",
+        "cloud_resource",
+    ),
+    (
+        "agents/resource/agent.py",
+        "_quads_wipe_requirement_changed",
+        "cloud_resource",
+    ),
     ("agents/resource/agent.py", "_reconcile_provider_directive", "cloud_resource"),
     ("agents/resource/agent.py", "_reservation_id_from_metadata", "cloud_resource"),
     ("agents/resource/agent.py", "_requested_aws_specs", "cloud_resource"),
@@ -182,6 +192,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/resource/agent.py", "_run_selective_teardown", "cloud_resource"),
     ("agents/resource/agent.py", "_run_teardown", "cloud_resource"),
     ("agents/resource/agent.py", "_saved_aws_specs", "cloud_resource"),
+    ("agents/resource/agent.py", "_saved_requirement_values", "cloud_resource"),
     ("agents/resource/agent.py", "_saved_selection_records", "cloud_resource"),
     ("agents/resource/agent.py", "_selection_sources", "cloud_resource"),
     ("agents/resource/agent.py", "_system_prompt", "cloud_resource"),
@@ -202,6 +213,8 @@ INVENTORIED_SIDE_EFFECTS = (
         "cloud_resource",
     ),
     ("agents/resource/server.py", "_infer_os_from_ticket", "cloud_resource"),
+    ("agents/resource/server.py", "_quads_managed_os_values", "cloud_resource"),
+    ("agents/resource/server.py", "_quads_ticket_requirements", "cloud_resource"),
     ("agents/resource/server.py", "get_skill_context", "cloud_resource"),
     (
         "agents/resource/server.py",
@@ -557,7 +570,12 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/resource/psap_cc.py", "reserve", "cloud_resource"),
     ("providers/resource/psap_cc.py", "terminate", "cloud_resource"),
     ("providers/resource/quads.py", "<module>", "cloud_resource"),
+    ("providers/resource/quads.py", "__init__", "cloud_resource"),
+    ("providers/resource/quads.py", "_available_os_names", "cloud_resource"),
     ("providers/resource/quads.py", "_context_key", "cloud_resource"),
+    ("providers/resource/quads.py", "_normalize_os_name", "cloud_resource"),
+    ("providers/resource/quads.py", "_os_entry_name", "cloud_resource"),
+    ("providers/resource/quads.py", "_resolve_os_type", "cloud_resource"),
     ("providers/resource/quads.py", "check_available", "cloud_resource"),
     ("providers/resource/quads.py", "cleanup_ssh_keys", "cloud_resource"),
     ("providers/resource/quads.py", "close", "cloud_resource"),
@@ -1772,6 +1790,26 @@ INVENTORY_DISPOSITIONS = {
         "agents/resource/agent.py:_jumpstarter_selector_changed",
         "2027-12-31",
     ),
+    (
+        "agents/resource/agent.py",
+        "_quads_os_requirement_changed",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/agent.py:_quads_os_requirement_changed",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/agent.py",
+        "_quads_wipe_requirement_changed",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/agent.py:_quads_wipe_requirement_changed",
+        "2027-12-31",
+    ),
     ("agents/resource/agent.py", "_request_human_input", "cloud_resource"): (
         "audited",
         "observability-maintainers",
@@ -1852,6 +1890,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/agent.py:_saved_aws_specs",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/agent.py",
+        "_saved_requirement_values",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/agent.py:_saved_requirement_values",
         "2027-12-31",
     ),
     (
@@ -1974,6 +2022,26 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/server.py:_infer_os_from_ticket",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_quads_managed_os_values",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_quads_managed_os_values",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_quads_ticket_requirements",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_quads_ticket_requirements",
         "2027-12-31",
     ),
     ("agents/resource/server.py", "get_skill_context", "cloud_resource"): (
@@ -3332,10 +3400,40 @@ INVENTORY_DISPOSITIONS = {
         "providers/resource/quads.py:<module>",
         "2027-12-31",
     ),
+    ("providers/resource/quads.py", "__init__", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:__init__",
+        "2027-12-31",
+    ),
+    ("providers/resource/quads.py", "_available_os_names", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:_available_os_names",
+        "2027-12-31",
+    ),
     ("providers/resource/quads.py", "_context_key", "cloud_resource"): (
         "audited",
         "observability-maintainers",
         "providers/resource/quads.py:_context_key",
+        "2027-12-31",
+    ),
+    ("providers/resource/quads.py", "_normalize_os_name", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:_normalize_os_name",
+        "2027-12-31",
+    ),
+    ("providers/resource/quads.py", "_os_entry_name", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:_os_entry_name",
+        "2027-12-31",
+    ),
+    ("providers/resource/quads.py", "_resolve_os_type", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:_resolve_os_type",
         "2027-12-31",
     ),
     ("providers/resource/quads.py", "check_available", "cloud_resource"): (
