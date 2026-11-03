@@ -343,6 +343,13 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
     require_write_access(_get_principal(request), ticket, _is_multi_user(request))
 
     fields = body.fields
+    if (
+        "foreman_reinstall_state" in fields
+        and _get_principal(request).kind != "service"
+    ):
+        raise HTTPException(
+            status_code=403, detail="Foreman checkpoints require service authentication"
+        )
     normalization_report: str | None = None
     if "directives" in fields:
         try:

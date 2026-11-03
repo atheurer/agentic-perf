@@ -60,6 +60,27 @@ natural-language description.
 
 ## Available Directives
 
+### Platform OS Reinstall
+
+`platform_reinstall` requests an explicit post-allocation reinstall using a
+platform provider, independently of the initial reservation OS. For example:
+
+```json
+{
+  "platform_reinstall": {
+    "provider": "foreman",
+    "os": "RHEL 10.0",
+    "reserve_without_os": true
+  }
+}
+```
+
+Set `reserve_without_os` only when the initial QUADS reservation must omit an
+OS choice. It does not disable QUADS' normal wipe behavior. Optional `roles`
+limits the reinstall to the named host roles; omit it when the request applies
+to all allocated hosts. Actual installability is checked against the selected
+Foreman deployment and target host.
+
 ### Benchmark
 
 | Directive | Description | Examples |

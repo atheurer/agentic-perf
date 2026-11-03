@@ -63,6 +63,31 @@ class QuadsResourceProvider(ResourceProvider):
             if os_name is not None
         )
 
+    async def discover_os_catalog(self) -> dict[str, Any]:
+        """Return current reservation catalog names, not host compatibility."""
+        from datetime import datetime, timezone
+        from urllib.parse import urlsplit
+
+        try:
+            entries = await self._client.get_os_list()
+        except Exception:
+            raise QuadsOSResolutionError("QUADS OS catalog lookup failed") from None
+        if not isinstance(entries, list) or any(
+            not isinstance(entry, dict)
+            or not isinstance(self._os_entry_name(entry), str)
+            or not self._os_entry_name(entry).strip()
+            for entry in entries
+        ):
+            raise QuadsOSResolutionError("QUADS OS catalog response is invalid")
+        return {
+            "source": "quads",
+            "site": urlsplit(f"https://{self._client.api_host}").hostname,
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+            "choices": sorted(
+                {name for name in self._available_os_names(entries) if name.strip()}
+            ),
+        }
+
     async def _resolve_os_type(self, requested_os: str) -> str:
         try:
             available_os = await self._client.get_os_list()
@@ -89,6 +114,36 @@ class QuadsResourceProvider(ResourceProvider):
         return json.dumps(
             ticket_context, sort_keys=True, separators=(",", ":"), default=str
         )
+
+    def normalize_availability_inputs(
+        self,
+        requirements: dict[str, Any] | None,
+        requested_hosts: list[dict[str, Any]] | None,
+        ticket_hosts: list[dict[str, Any]] | None,
+        ticket_context: dict[str, Any],
+    ) -> tuple[
+        dict[str, Any] | None, list[dict[str, Any]] | None, list[dict[str, Any]] | None
+    ]:
+        if ticket_context.get("reserve_without_os") is not True:
+            return requirements, requested_hosts, ticket_hosts
+
+        def without_os(
+            hosts: list[dict[str, Any]] | None,
+        ) -> list[dict[str, Any]] | None:
+            if not isinstance(hosts, list):
+                return hosts
+            return [
+                {key: value for key, value in host.items() if key != "os"}
+                if isinstance(host, dict) and not host.get("host")
+                else host
+                for host in hosts
+            ]
+
+        if isinstance(requirements, dict):
+            requirements = {
+                key: value for key, value in requirements.items() if key != "os"
+            }
+        return requirements, without_os(requested_hosts), without_os(ticket_hosts)
 
     def required_hosts_for_availability(
         self,
@@ -313,6 +368,7 @@ class QuadsResourceProvider(ResourceProvider):
         ticket_id: str | None = None,
     ) -> dict[str, Any]:
         selection = self.validate_reservation_selection(selection)
+        self._client.validate_ssh_identity()
         hostnames = selection["hostnames"]
         os_type = (
             await self._resolve_os_type(selection["os"])

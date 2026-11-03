@@ -32,6 +32,7 @@ mcp = create_ticket_mcp("platform-agent")
 # and does not leak between tickets.
 _ticket: dict[str, Any] = {}
 _initialized = False
+_ssh: Any = None
 
 # Track infrastructure failures to block speculative variant retries.
 # Once a provisioning attempt fails with an infrastructure error, further
@@ -43,13 +44,13 @@ _last_infra_variant: str | None = None
 
 async def _ensure_init():
     """Lazily initialize from env vars on first tool call."""
-    global _initialized, _ticket
+    global _initialized, _ticket, _ssh
     if _initialized:
         return
 
     from agents.server_utils import build_ssh_from_ticket
 
-    _, _ticket = await build_ssh_from_ticket()
+    _ssh, _ticket = await build_ssh_from_ticket()
     _initialized = True
 
 
@@ -83,6 +84,25 @@ async def provision_platform(
 
     cf = _ticket.get("custom_fields", {})
     prov = provider or cf.get("resource_provider", "")
+    reinstall = cf.get("directives", {}).get("platform_reinstall")
+    if reinstall is not None:
+        from agents.platform.foreman_workflow import provision_foreman
+        from providers.foreman import ForemanError
+
+        try:
+            return json.dumps(await provision_foreman(_ticket, _ssh))
+        except ForemanError as exc:
+            return json.dumps(
+                {"success": False, "category": exc.category, "error": str(exc)}
+            )
+        except Exception:
+            return json.dumps(
+                {
+                    "success": False,
+                    "category": "internal",
+                    "error": "Foreman platform setup failed; inspect the ticket checkpoint.",
+                }
+            )
 
     if prov == "jumpstarter":
         # Block speculative variant changes after infrastructure errors.

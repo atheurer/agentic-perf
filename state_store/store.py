@@ -654,6 +654,8 @@ class TicketStore:
         with self._lock:
             self._global_seq += 1
             custom_fields = dict(request.custom_fields)
+            if "foreman_reinstall_state" in custom_fields:
+                raise ValueError("Foreman reinstall checkpoints are server-owned")
             if self._contains_kernel_reserved(custom_fields):
                 raise ValueError("kernel control and approval fields are server-owned")
             if ITERATION_BUDGET_FIELD in custom_fields:
@@ -1218,6 +1220,20 @@ class TicketStore:
             )
             if self._contains_kernel_reserved(fields):
                 raise ValueError("kernel control and approval fields are server-owned")
+            if "foreman_reinstall_state" in fields:
+                claim = ticket.custom_fields.get("claim")
+                if (
+                    session_id is None
+                    or epoch is None
+                    or not claim_id
+                    or leader_only
+                    or ticket.status != TicketStatus.PREPARING_PLATFORM
+                    or not isinstance(claim, dict)
+                    or claim.get("status") != TicketStatus.PREPARING_PLATFORM.value
+                ):
+                    raise ValueError(
+                        "Foreman checkpoint requires an active platform claim"
+                    )
             durable_grant = fields.get("max_iterations_override") is not None
             if durable_grant and "global_max_iterations_override" in fields:
                 raise ValueError(

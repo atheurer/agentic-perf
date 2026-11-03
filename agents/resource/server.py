@@ -35,6 +35,7 @@ from agents.server_utils import (
 )
 from agents.skill_gateway import SKILL_GATEWAY_TOOL_DESCRIPTION, skill_context_gateway
 from paths import get_default_ssh_key
+from providers.directives import reserve_without_os_requested
 from providers.resource.base import (
     ResourceProvider,
     has_reservation_metadata,
@@ -196,12 +197,33 @@ def _reservation_ticket_context(
     """Return the explicit ticket context passed to provider contract hooks."""
     fields = ticket_fields if isinstance(ticket_fields, dict) else {}
     required_hosts = fields.get("required_hosts")
-    return {
+    context = {
         "ticket_id": ticket_id
         or os.environ.get("TICKET_ID", "")
         or _ticket.get("id", ""),
         "required_hosts": required_hosts if isinstance(required_hosts, list) else [],
     }
+    if reserve_without_os_requested(fields.get("directives")):
+        context["reserve_without_os"] = True
+    return context
+
+
+def _quads_reserve_without_os(fields: Any) -> bool:
+    return isinstance(fields, dict) and reserve_without_os_requested(
+        fields.get("directives")
+    )
+
+
+def _without_reservation_os(hosts: Any) -> Any:
+    """Remove a model-inferred OS from managed-host availability requests."""
+    if not isinstance(hosts, list):
+        return hosts
+    return [
+        {key: value for key, value in host.items() if key != "os"}
+        if isinstance(host, dict) and not host.get("host")
+        else host
+        for host in hosts
+    ]
 
 
 def _resolve_quads_ticket_key(ticket_id: str | None) -> str | None:
@@ -655,6 +677,28 @@ async def list_resource_providers() -> str:
 
 
 @mcp.tool()
+async def discover_quads_os_catalog() -> str:
+    """Discover QUADS reservation OS names before allocation.
+
+    These names do not establish post-allocation host or Foreman compatibility.
+    An unavailable catalog is reported as unknown, not as an empty catalog.
+    """
+    await _ensure_init()
+    try:
+        provider = await _registry.get_provider("quads")
+        catalog = await provider.discover_os_catalog()
+    except Exception:
+        return json.dumps(
+            {
+                "status": "unknown",
+                "source": "quads",
+                "error": "QUADS OS catalog lookup failed",
+            }
+        )
+    return json.dumps({"status": "ok", **catalog})
+
+
+@mcp.tool()
 async def check_available_resources(
     provider: str,
     requirements: dict | None = None,
@@ -729,6 +773,9 @@ async def check_available_resources(
     ticket_hosts = ticket_fields.get("required_hosts")
     ticket_context = _reservation_ticket_context(ticket_id, ticket_fields)
     if isinstance(prov, ResourceProvider):
+        requirements, required_hosts, ticket_hosts = prov.normalize_availability_inputs(
+            requirements, required_hosts, ticket_hosts, ticket_context
+        )
         required_hosts = prov.required_hosts_for_availability(
             required_hosts,
             ticket_hosts if isinstance(ticket_hosts, list) else None,
@@ -891,6 +938,15 @@ async def prepare_reservation_selection(
             ticket_fields = {}
         ticket_hosts = ticket_fields.get("required_hosts")
         ticket_context = _reservation_ticket_context(ticket_id, ticket_fields)
+        if provider == "quads" and _quads_reserve_without_os(ticket_fields):
+            if _quads_ticket_requirements().get("os") is not None:
+                raise ReservationSelectionError(
+                    "Ticket specifies both a QUADS reservation OS and "
+                    "reserve_without_os; resolve the conflicting request."
+                )
+            selection = {key: value for key, value in selection.items() if key != "os"}
+            required_hosts = _without_reservation_os(required_hosts)
+            ticket_hosts = _without_reservation_os(ticket_hosts)
         effective_hosts = prov.required_hosts_for_availability(
             required_hosts if isinstance(required_hosts, list) else None,
             ticket_hosts if isinstance(ticket_hosts, list) else None,
@@ -954,7 +1010,7 @@ def _quads_managed_os_values() -> set[str]:
 
 
 def _quads_ticket_requirements() -> dict[str, Any]:
-    """Collect authoritative QUADS OS/wipe settings from ticket data."""
+    """Collect authoritative QUADS host, OS and wipe settings from ticket data."""
     custom_fields = _ticket.get("custom_fields", {})
     directives = custom_fields.get("directives", {})
     sources: list[dict[str, Any]] = []
@@ -963,14 +1019,18 @@ def _quads_ticket_requirements() -> dict[str, Any]:
             value = source.get(key)
             if isinstance(value, dict):
                 nested = value.get("quads")
-                sources.append(nested if isinstance(nested, dict) else value)
+                selected = nested if isinstance(nested, dict) else value
+                sources.append(selected)
         sources.append(source)
 
     requirements: dict[str, Any] = {}
     for source in sources:
-        for key in ("os", "wipe"):
+        for key in ("os", "wipe", "hostnames"):
             if key in source and source[key] is not None:
                 requirements[key] = source[key]
+    explicit = custom_fields.get("quads_selection")
+    if isinstance(explicit, dict) and "hostnames" in explicit:
+        requirements["hostnames"] = explicit["hostnames"]
     return requirements
 
 
@@ -1046,8 +1106,29 @@ async def reserve_resources(
                 ),
             }
         )
+    omit_quads_os = provider == "quads" and _quads_reserve_without_os(
+        _ticket.get("custom_fields", {})
+    )
     if provider == "quads":
-        managed_os_values = _quads_managed_os_values()
+        ticket_requirements = _quads_ticket_requirements()
+        if omit_quads_os and ticket_requirements.get("os") is not None:
+            return json.dumps(
+                {
+                    "status": "invalid_selection",
+                    "provider": provider,
+                    "invalid_selection": True,
+                    "allocation_unknown": False,
+                    "retry_blocked": False,
+                    "provider_call_started": False,
+                    "error": (
+                        "Ticket specifies both a QUADS reservation OS and "
+                        "reserve_without_os; resolve the conflicting request."
+                    ),
+                }
+            )
+        if omit_quads_os:
+            selection = {key: value for key, value in selection.items() if key != "os"}
+        managed_os_values = set() if omit_quads_os else _quads_managed_os_values()
         if len(managed_os_values) > 1:
             return json.dumps(
                 {
@@ -1069,8 +1150,7 @@ async def reserve_resources(
                 }
             )
 
-        ticket_requirements = _quads_ticket_requirements()
-        for key in ("os", "wipe"):
+        for key in ("os", "wipe", "hostnames"):
             if key not in ticket_requirements:
                 continue
             if key in selection and selection[key] != ticket_requirements[key]:
@@ -1090,7 +1170,7 @@ async def reserve_resources(
     # Inject OS from ticket required_hosts when the LLM doesn't
     # include it in the selection — ensures provider-specific OS
     # resolution fires regardless of LLM behavior.
-    if provider in {"aws", "quads"} and not selection.get("os"):
+    if provider in {"aws", "quads"} and not selection.get("os") and not omit_quads_os:
         os_name = _infer_os_from_ticket()
         if os_name:
             selection = dict(selection)

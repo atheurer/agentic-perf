@@ -178,6 +178,12 @@ class TestPlatformAgent:
 
         with (
             patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={"custom_fields": {}},
+            ),
+            patch.object(
                 agent, "_update_fields", new_callable=AsyncMock
             ) as mock_fields,
             patch.object(agent, "_add_comment", new_callable=AsyncMock),
@@ -199,6 +205,86 @@ class TestPlatformAgent:
             assert fields["platform_board"] == "rcar-05"
             agent._transition_ticket.assert_called_once()
             assert agent._transition_ticket.call_args[0][1] == "awaiting_provision"
+
+    @pytest.mark.asyncio
+    async def test_reinstall_cannot_be_declared_ready_by_model(self):
+        agent = self._make_agent()
+        response = AsyncMock()
+        response.text = ""
+        response.tool_calls = [
+            MagicMock(
+                name="submit_platform_result",
+                input={"platform_ready": True, "hosts_provisioned": ["host.example"]},
+            )
+        ]
+        ticket = {
+            "custom_fields": {
+                "directives": {
+                    "platform_reinstall": {"provider": "foreman", "os": "RHEL 10.0"}
+                }
+            }
+        }
+        with (
+            patch.object(
+                agent, "_get_ticket", new_callable=AsyncMock, return_value=ticket
+            ),
+            patch.object(agent, "_update_fields", new_callable=AsyncMock) as fields,
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(
+                agent, "_transition_ticket", new_callable=AsyncMock
+            ) as transition,
+        ):
+            await agent._handle_completion("T-1", response)
+        assert fields.call_args.args[1]["platform_ready"] is False
+        assert transition.call_args.args[1] == "awaiting_customer_guidance"
+
+    @pytest.mark.asyncio
+    async def test_reinstall_completion_uses_reverified_host_not_model_identity(self):
+        from agents.platform.foreman_workflow import request_fingerprint
+
+        agent = self._make_agent()
+        agent._mcp = MagicMock()
+        agent._mcp.call_tool = AsyncMock(return_value='{"success": true}')
+        cf = {
+            "resource_provider": "quads",
+            "resource_provider_metadata": {
+                "assignment_id": 42,
+                "cloud_name": "cloud02",
+            },
+            "assigned_hardware_ips": {"controller": "host.example", "targets": []},
+            "directives": {
+                "platform_reinstall": {"provider": "foreman", "os": "RHEL 10.0"}
+            },
+        }
+        cf["foreman_reinstall_state"] = {
+            "fingerprint": request_fingerprint(cf),
+            "status": "verified",
+            "hosts": {"host.example": {"phase": "verified"}},
+        }
+        response = AsyncMock()
+        response.text = ""
+        response.tool_calls = [
+            MagicMock(
+                name="submit_platform_result",
+                input={"platform_ready": True, "hosts_provisioned": ["wrong.example"]},
+            )
+        ]
+        with (
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={"custom_fields": cf},
+            ),
+            patch.object(agent, "_update_fields", new_callable=AsyncMock) as fields,
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(agent, "_plan_controls_next_transition", return_value=False),
+            patch.object(agent, "_transition_ticket", new_callable=AsyncMock),
+        ):
+            await agent._handle_completion("T-1", response)
+        assert fields.call_args.args[1]["platform_ready"] is True
+        assert fields.call_args.args[1]["hosts_provisioned"] == ["host.example"]
+        agent._mcp.call_tool.assert_awaited_once_with("provision_platform", {})
 
     @pytest.mark.asyncio
     async def test_handle_completion_failure(self):

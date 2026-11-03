@@ -8,6 +8,23 @@ to be consumed.  Each tuple is (relative path, enclosing symbol, category).
 from __future__ import annotations
 
 INVENTORIED_SIDE_EFFECTS = (
+    ("providers/resource/quads.py", "normalize_availability_inputs", "cloud_resource"),
+    ("providers/resource/quads.py", "without_os", "cloud_resource"),
+    ("agents/platform/agent.py", "_handle_completion", "mcp"),
+    ("agents/platform/foreman_workflow.py", "_monitor_host", "ssh"),
+    ("agents/platform/foreman_workflow.py", "_save_state", "mutating_http_state"),
+    ("agents/platform/foreman_workflow.py", "provision_foreman", "ssh"),
+    ("agents/resource/server.py", "discover_quads_os_catalog", "cloud_resource"),
+    ("providers/resource/quads.py", "discover_os_catalog", "cloud_resource"),
+    ("agents/resource/server.py", "_quads_reserve_without_os", "cloud_resource"),
+    ("agents/resource/server.py", "_without_reservation_os", "cloud_resource"),
+    ("providers/foreman.py", "set_build", "mutating_http_state"),
+    (
+        "providers/resource/quads_foreman.py",
+        "derive_quads_credentials",
+        "cloud_resource",
+    ),
+    ("providers/resource/quads_foreman.py", "verify_quads_ownership", "cloud_resource"),
     ("agents/analyze/agent.py", "_prefetch_cited_runs", "mcp"),
     ("agents/base.py", "_add_comment", "mutating_http_state"),
     ("agents/base.py", "_execute_tool", "mcp"),
@@ -840,6 +857,96 @@ INVENTORIED_SIDE_EFFECTS = (
 
 # Exact review disposition for every checked-in boundary.
 INVENTORY_DISPOSITIONS = {
+    (
+        "providers/resource/quads.py",
+        "normalize_availability_inputs",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:normalize_availability_inputs",
+        "2027-12-31",
+    ),
+    ("providers/resource/quads.py", "without_os", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:without_os",
+        "2027-12-31",
+    ),
+    ("agents/platform/agent.py", "_handle_completion", "mcp"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/agent.py:_handle_completion",
+        "2027-12-31",
+    ),
+    ("agents/platform/foreman_workflow.py", "_monitor_host", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/foreman_workflow.py:_monitor_host",
+        "2027-12-31",
+    ),
+    ("agents/platform/foreman_workflow.py", "_save_state", "mutating_http_state"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/foreman_workflow.py:_save_state",
+        "2027-12-31",
+    ),
+    ("agents/platform/foreman_workflow.py", "provision_foreman", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/foreman_workflow.py:provision_foreman",
+        "2027-12-31",
+    ),
+    ("agents/resource/server.py", "discover_quads_os_catalog", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:discover_quads_os_catalog",
+        "2027-12-31",
+    ),
+    ("providers/resource/quads.py", "discover_os_catalog", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:discover_os_catalog",
+        "2027-12-31",
+    ),
+    ("agents/resource/server.py", "_quads_reserve_without_os", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_quads_reserve_without_os",
+        "2027-12-31",
+    ),
+    ("agents/resource/server.py", "_without_reservation_os", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_without_reservation_os",
+        "2027-12-31",
+    ),
+    ("providers/foreman.py", "set_build", "mutating_http_state"): (
+        "audited",
+        "observability-maintainers",
+        "providers/foreman.py:set_build",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/quads_foreman.py",
+        "derive_quads_credentials",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads_foreman.py:derive_quads_credentials",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/quads_foreman.py",
+        "verify_quads_ownership",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads_foreman.py:verify_quads_ownership",
+        "2027-12-31",
+    ),
     ("cli.py", "_emit_user_reply", "mutating_http_state"): (
         "audited",
         "orchestration-maintainers",

@@ -122,6 +122,46 @@ async def _complete_triage_result(
     return agent, ticket, updated_fields
 
 
+@pytest.mark.asyncio
+async def test_post_allocation_reinstall_stays_separate_from_reservation():
+    request = {
+        "provider": "foreman",
+        "os": "RHEL 10.0",
+        "reserve_without_os": True,
+    }
+    _agent, ticket, fields = await _complete_triage_result(
+        {
+            "benchmark_suite": "uperf",
+            "absent_suite": False,
+            "required_hosts": [{"roles": ["client"], "os": "RHEL 10.0"}],
+            "directives": {"platform_reinstall": request},
+        },
+        _make_provider(),
+    )
+    assert ticket["status"] == "awaiting_hardware"
+    assert fields["directives"]["platform_reinstall"] == request
+    assert fields["required_hosts"] == [{"roles": ["client"]}]
+
+
+@pytest.mark.asyncio
+async def test_user_reinstall_directive_survives_triage():
+    request = {"provider": "foreman", "os": "RHEL 9.4"}
+    _agent, _ticket, fields = await _complete_triage_result(
+        {
+            "benchmark_suite": "uperf",
+            "absent_suite": False,
+            "required_hosts": [{"roles": ["client"], "os": "RHEL 8.9"}],
+            "directives": {
+                "platform_reinstall": {"provider": "foreman", "os": "RHEL 10.0"}
+            },
+        },
+        _make_provider(),
+        custom_fields={"directives": {"platform_reinstall": request}},
+    )
+    assert fields["directives"]["platform_reinstall"] == request
+    assert fields["required_hosts"][0]["os"] == "RHEL 8.9"
+
+
 class TestHarnessValidation:
     """Reject harness names that don't exist in the registry."""
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import shlex
 import ssl
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,13 @@ class QuadsClient:
             logger.warning(
                 "QUADS API using plaintext HTTP — credentials are not encrypted in transit"
             )
+
+    @property
+    def uses_https(self) -> bool:
+        """Whether allocation and ownership queries use authenticated TLS."""
+        from urllib.parse import urlsplit
+
+        return urlsplit(self._base_url).scheme == "https"
 
     @classmethod
     async def from_secrets(
@@ -300,6 +309,35 @@ class QuadsClient:
             "end": data.get("end", end_str),
         }
 
+    async def get_host_cloud(self, hostname: str) -> str | None:
+        """Return the current QUADS cloud, or None when not reported."""
+        from urllib.parse import quote
+
+        response = await self._client.get(
+            f"{self._base_url}/api/v3/hosts/{quote(hostname, safe='')}"
+        )
+        response.raise_for_status()
+        data = response.json()
+        cloud = data.get("cloud") if isinstance(data, dict) else None
+        return cloud.get("name") if isinstance(cloud, dict) else None
+
+    async def get_foreman_assignment_identity(
+        self, assignment_id: int
+    ) -> dict[str, Any]:
+        """Fetch allocation identity for internal authorization only."""
+        response = await self._client.get(
+            f"{self._base_url}/api/v3/assignments/{assignment_id}"
+        )
+        response.raise_for_status()
+        data = response.json()
+        cloud = data.get("cloud")
+        return {
+            "active": data.get("active"),
+            "validated": data.get("validated"),
+            "cloud": cloud.get("name") if isinstance(cloud, dict) else None,
+            "ticket": data.get("ticket"),
+        }
+
     async def get_assignment_status(self, assignment_id: int) -> dict[str, Any]:
         r = await self._client.get(
             f"{self._base_url}/api/v3/assignments/{assignment_id}"
@@ -350,32 +388,22 @@ class QuadsClient:
             "response": r.json() if r.content else {},
         }
 
-    async def setup_ssh(self, hosts: list[str]) -> dict[str, Any]:
+    def validate_ssh_identity(self) -> None:
+        """Require an existing key pair before reserving or bootstrapping hosts."""
         key_path = Path(self.ssh_key_path)
-        if not key_path.exists():
-            proc = await AuditedSubprocessRunner().start(
-                [
-                    "ssh-keygen",
-                    "-t",
-                    "ed25519",
-                    "-f",
-                    str(key_path),
-                    "-N",
-                    "",
-                    "-q",
-                    "-C",
-                    "host-key-do-not-remove",
-                ],
-                mutating=True,
-            )
-            await proc.wait()
-
         pubkey_path = Path(f"{self.ssh_key_path}.pub")
-        if not pubkey_path.exists():
-            return {
-                "status": "failed",
-                "message": f"Public key not found: {pubkey_path}",
-            }
+        missing = [str(path) for path in (key_path, pubkey_path) if not path.is_file()]
+        if missing:
+            raise ValueError(f"SSH identity files not found: {', '.join(missing)}")
+
+    async def setup_ssh(self, hosts: list[str]) -> dict[str, Any]:
+        try:
+            self.validate_ssh_identity()
+            for host in hosts:
+                self._validate_ssh_hostname(host)
+        except ValueError as exc:
+            return {"status": "failed", "message": str(exc)}
+        pubkey_path = Path(f"{self.ssh_key_path}.pub")
         pubkey = pubkey_path.read_text().strip()
 
         for host in hosts:
@@ -388,12 +416,12 @@ class QuadsClient:
             try:
                 result = await self._copy_ssh_key(host, pubkey)
                 results[host] = result
-            except Exception as e:
-                results[host] = f"failed: {e}"
+            except Exception:
+                results[host] = "failed: SSH key bootstrap failed"
 
         return {
             "status": "success"
-            if all("ok" in v for v in results.values())
+            if all(v == "ok" for v in results.values())
             else "partial",
             "ssh_key_path": self.ssh_key_path,
             "hosts": results,
@@ -437,18 +465,26 @@ class QuadsClient:
             "hosts": results,
         }
 
-    async def _copy_ssh_key(self, host: str, pubkey: str) -> str:
-        remote_cmd = (
-            f"mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
-            f"echo '{pubkey}' >> ~/.ssh/authorized_keys && "
-            f"chmod 600 ~/.ssh/authorized_keys && echo KEY_COPIED"
-        )
-        ssh_cmd = (
-            f"ssh -o StrictHostKeyChecking=no "
-            f"-o PreferredAuthentications=password "
-            f'root@{host} "{remote_cmd}"'
-        )
+    @staticmethod
+    def _validate_ssh_hostname(host: str) -> None:
+        if (
+            not isinstance(host, str)
+            or len(host) > 253
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", host)
+        ):
+            raise ValueError("Invalid QUADS host identity for SSH")
 
+    async def _copy_ssh_key(self, host: str, pubkey: str) -> str:
+        self._validate_ssh_hostname(host)
+        if not pubkey or "\n" in pubkey or "\r" in pubkey:
+            raise ValueError("Invalid SSH public key")
+        key = shlex.quote(pubkey)
+        remote_cmd = (
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
+            "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && "
+            f"(grep -Fqx -- {key} ~/.ssh/authorized_keys || "
+            f"printf '%s\\n' {key} >> ~/.ssh/authorized_keys) && echo KEY_COPIED"
+        )
         proc = await AuditedSubprocessRunner().run(
             [
                 "python3",
@@ -456,21 +492,28 @@ class QuadsClient:
                 (
                     "import pexpect, sys\n"
                     "password = sys.stdin.readline().rstrip('\\n')\n"
-                    f"child = pexpect.spawn('/bin/bash', ['-c', {ssh_cmd!r}],"
-                    " timeout=30)\n"
-                    "child.expect('[Pp]assword')\n"
-                    "child.sendline(password)\n"
-                    "child.expect(pexpect.EOF)\n"
-                    "out = child.before.decode()\n"
-                    "print('ok' if 'KEY_COPIED' in out else"
-                    " f'unexpected: {out}')\n"
+                    "try:\n"
+                    " child = pexpect.spawn('/usr/bin/ssh', sys.argv[1:], timeout=30, echo=False)\n"
+                    " child.expect('[Pp]assword')\n"
+                    " child.sendline(password)\n"
+                    " child.expect(pexpect.EOF)\n"
+                    " print('ok' if b'KEY_COPIED' in child.before else 'failed')\n"
+                    "except Exception:\n"
+                    " print('failed')\n"
                 ),
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "PreferredAuthentications=password",
+                "-o",
+                "ConnectTimeout=10",
+                f"root@{host}",
+                remote_cmd,
             ],
             stdin=self.default_root_password.encode() + b"\n",
             mutating=True,
         )
-        stdout, stderr = proc.stdout, proc.stderr
-        output = stdout.decode().strip()
-        if "ok" in output:
+        output = proc.stdout.decode(errors="replace").strip()
+        if proc.returncode == 0 and output == "ok":
             return "ok"
-        return f"failed: {output} {stderr.decode().strip()}"
+        return "failed: SSH key bootstrap failed"
