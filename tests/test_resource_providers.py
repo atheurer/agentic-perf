@@ -258,6 +258,7 @@ class TestQuadsResourceProvider:
         from providers.resource.quads import QuadsResourceProvider
 
         mock_client = AsyncMock()
+        mock_client.validate_ssh_identity = MagicMock()
         mock_client.ssh_key_path = "/fake/key"
         mock_client.create_assignment.return_value = {
             "id": 42,
@@ -291,6 +292,7 @@ class TestQuadsResourceProvider:
         from providers.resource.quads import QuadsResourceProvider
 
         mock_client = AsyncMock()
+        mock_client.validate_ssh_identity = MagicMock()
         mock_client.ssh_key_path = "/fake/key"
         mock_client.get_os_list.return_value = [
             {"Title": "RHEL 10.0"},
@@ -327,6 +329,7 @@ class TestQuadsResourceProvider:
         from providers.resource.quads import QuadsResourceProvider
 
         mock_client = AsyncMock()
+        mock_client.validate_ssh_identity = MagicMock()
         mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
 
         provider = QuadsResourceProvider(mock_client)
@@ -373,6 +376,7 @@ class TestQuadsResourceProvider:
         )
 
         mock_client = AsyncMock()
+        mock_client.validate_ssh_identity = MagicMock()
         mock_client.get_os_list.side_effect = RuntimeError("catalog unavailable")
 
         provider = QuadsResourceProvider(mock_client)

@@ -115,7 +115,7 @@ class PlatformAgent(AgentBase):
         provider = cf.get("resource_provider", "unknown")
         metadata = cf.get("resource_provider_metadata", {})
         flash_info = cf.get("jumpstarter_flash") or {}
-        cf.get("directives", {})
+        directives = cf.get("directives", {})
 
         content = f"## Platform Setup for {ticket['id']}\n\n"
         content += f"- **Provider:** {provider}\n"
@@ -145,6 +145,15 @@ class PlatformAgent(AgentBase):
                     f"\nCall provision_platform to flash "
                     f"and boot the board.\n"
                 )
+        elif isinstance(directives, dict) and "platform_reinstall" in directives:
+            ips = cf.get("assigned_hardware_ips", {})
+            content += (
+                f"- **Hosts:** {json.dumps(ips)}\n"
+                f"- **Requested platform reinstall:** "
+                f"{json.dumps(directives['platform_reinstall'])}\n"
+                "\nCall provision_platform to execute the requested reinstall; "
+                "submit success only if the tool reports success.\n"
+            )
         else:
             ips = cf.get("assigned_hardware_ips", {})
             content += (
@@ -187,6 +196,37 @@ class PlatformAgent(AgentBase):
         platform_ready = result.get("platform_ready", False)
         hosts = result.get("hosts_provisioned", [])
         ticket: dict[str, Any] | None = None
+        if platform_ready:
+            ticket = await self._get_ticket(ticket_id)
+            directives = ticket.get("custom_fields", {}).get("directives", {})
+            if isinstance(directives, dict) and "platform_reinstall" in directives:
+                from agents.platform.foreman_workflow import (
+                    reinstall_verified,
+                    selected_hosts,
+                )
+
+                # Only durable, code-verified results authorize handoff.
+                if not reinstall_verified(ticket.get("custom_fields", {})):
+                    platform_ready = False
+                    result["diagnostics"] = "Foreman reinstall has not been verified"
+                else:
+                    try:
+                        if not self._mcp:
+                            raise RuntimeError("Platform service unavailable")
+                        raw = await self._mcp.call_tool("provision_platform", {})
+                        verified = json.loads(raw)
+                        if (
+                            not isinstance(verified, dict)
+                            or verified.get("success") is not True
+                        ):
+                            raise RuntimeError("Fresh platform verification failed")
+                        hosts = selected_hosts(
+                            ticket["custom_fields"], directives["platform_reinstall"]
+                        )
+                    except Exception:
+                        platform_ready = False
+                        hosts = []
+                        result["diagnostics"] = "Fresh Foreman host verification failed"
 
         fields: dict[str, Any] = {
             "platform_ready": platform_ready,

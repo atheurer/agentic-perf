@@ -528,6 +528,48 @@ _LOCAL_TOOLS = [
                         "mentioned."
                     ),
                     "properties": {
+                        "platform_reinstall": {
+                            "type": "object",
+                            "description": (
+                                "Only when the user explicitly requests an OS "
+                                "reinstall after allocation. This is separate from "
+                                "any OS requested for initial reservation."
+                            ),
+                            "properties": {
+                                "provider": {
+                                    "type": "string",
+                                    "enum": ["foreman"],
+                                    "description": "Requested platform installer.",
+                                },
+                                "os": {
+                                    "type": "string",
+                                    "description": "Requested OS release, verbatim.",
+                                },
+                                "site": {
+                                    "type": "string",
+                                    "description": (
+                                        "Configured Foreman site, when the user "
+                                        "explicitly selects one."
+                                    ),
+                                },
+                                "roles": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "Host roles to reinstall. Omit only when "
+                                        "the request applies to all allocated hosts."
+                                    ),
+                                },
+                                "reserve_without_os": {
+                                    "type": "boolean",
+                                    "description": (
+                                        "True only when the user explicitly requests "
+                                        "an initial reservation without an OS choice."
+                                    ),
+                                },
+                            },
+                            "required": ["provider", "os"],
+                        },
                         "on_existing_install": {
                             "type": "string",
                             "enum": [
@@ -1365,6 +1407,19 @@ class TriageAgent(AgentBase):
                     if key != "harness"
                 }
             )
+
+        from providers.directives import reserve_without_os_requested
+
+        if reserve_without_os_requested(directives):
+            # The OS names the later platform operation, not a QUADS
+            # reservation requirement. Do not retain a model-inferred OS on
+            # managed hosts when the user explicitly requested its omission.
+            required_hosts = [
+                {key: value for key, value in host.items() if key != "os"}
+                if isinstance(host, dict) and not host.get("host")
+                else host
+                for host in required_hosts
+            ]
 
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),

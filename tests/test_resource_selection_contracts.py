@@ -685,3 +685,38 @@ async def test_availability_result_exposes_selected_provider_contract(monkeypatc
         result["reservation_selection_example"]
         == RESERVATION_SELECTION_CONTRACTS["quads"].valid_example
     )
+
+
+@pytest.mark.asyncio
+async def test_quads_ticket_hostnames_override_model_but_require_discovery(monkeypatch):
+    ticket = {
+        "id": "PERF-TEST",
+        "custom_fields": {
+            "resource_provider": "quads",
+            "quads_selection": {"hostnames": ["wanted.example"]},
+            "required_hosts": [{"roles": ["client"]}],
+        },
+    }
+    srv, provider, marker = _configure_quads_server(monkeypatch, ticket)
+    provider.reserve.return_value = {
+        "status": "active",
+        "reservation_id": "73",
+        "provider_metadata": {"assignment_id": 73},
+        "hosts": ["wanted.example"],
+    }
+    selection = {"hostnames": ["other.example"]}
+    raw = await srv.reserve_resources(
+        provider="quads", selection=selection, description="test", ticket_id="PERF-TEST"
+    )
+    assert json.loads(raw)["status"] == "invalid_selection"
+    provider.reserve.assert_not_awaited()
+    marker.assert_not_awaited()
+    provider.record_availability_context(
+        [{"options": [{"hostname": "wanted.example"}, {"hostname": "other.example"}]}],
+        srv._reservation_ticket_context("PERF-TEST", ticket["custom_fields"]),
+    )
+    raw = await srv.reserve_resources(
+        provider="quads", selection=selection, description="test", ticket_id="PERF-TEST"
+    )
+    assert json.loads(raw)["status"] == "active"
+    assert provider.reserve.call_args.args[0]["hostnames"] == ["wanted.example"]

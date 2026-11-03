@@ -39,6 +39,7 @@ _CORE_DIRECTIVES: set[str] = {
     "resource_provider",
     "endpoint_type",
     "exclude_hosts",
+    "platform_reinstall",
     # Image
     "image_version",
     "image_name",
@@ -75,6 +76,10 @@ _CORE_ALIASES: dict[str, str] = {
 
 _CORE_DESCRIPTIONS: dict[str, str] = {
     "resource_provider": "Resource provider: 'jumpstarter', 'quads', 'aws', 'psap-cc', or 'user_provided'",
+    "platform_reinstall": (
+        "Explicit platform OS reinstall: object with provider, os, optional "
+        "roles, and optional reserve_without_os"
+    ),
     "endpoint_type": "Host connection type (default: 'remotehosts')",
     "image_version": "OS image version (e.g. 'AutoSD-10', 'RHIVOS-2')",
     "image_name": "Image variant name (e.g. 'qa', 'ps', 'fusa-minimal')",
@@ -176,6 +181,14 @@ def get_recognized_directives() -> set[str]:
     except ImportError:
         pass
     return _CORE_DIRECTIVES | _contributed_directives
+
+
+def reserve_without_os_requested(directives: Any) -> bool:
+    """Whether the user requested an OS-free reservation before reinstall."""
+    if not isinstance(directives, dict):
+        return False
+    reinstall = directives.get("platform_reinstall")
+    return isinstance(reinstall, dict) and reinstall.get("reserve_without_os") is True
 
 
 def _get_all_aliases() -> dict[str, str]:

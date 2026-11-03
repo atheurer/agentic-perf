@@ -38,6 +38,13 @@ existing machine (FQDN or IP). Do NOT allocate it from a provider — validate
 it with validate_host and submit the EXACT string as-is (preserve case and
 domain suffixes). Entries without `host` should be allocated normally.
 
+## Catalog discovery
+
+When a provider offers an OS catalog discovery tool, use it before allocation
+for OS requests. Failed discovery means availability is unknown. A catalog is
+not proof that an allocated host supports an OS. Keep a requested platform
+reinstall separate from any initial reservation OS.
+
 ## Host Totals
 
 The ticket's required_hosts field lists every host needed with its purpose
