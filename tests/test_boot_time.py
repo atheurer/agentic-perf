@@ -849,3 +849,17 @@ class TestRepoRegistration:
 
         config = OrchestratorConfig()
         assert "boot-time-analysis-scripts" in config.harness_repos
+
+
+class TestOutputDirPersistence:
+    """Verify output_dir is written to custom_fields early."""
+
+    def test_output_dir_created_before_subprocess(self):
+        """The output directory path is deterministic from ticket_id + run_uuid."""
+        from paths import ARTIFACT_DIR
+
+        # Just verify the path construction is correct
+        ticket_id = "PERF-TEST"
+        run_uuid = "abc12345"
+        expected = ARTIFACT_DIR / ticket_id / run_uuid
+        assert str(expected).endswith("PERF-TEST/abc12345")

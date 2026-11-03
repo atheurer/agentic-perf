@@ -5820,6 +5820,41 @@ async def execute_boot_time_test(
 
     _ticket_id = os.environ.get("TICKET_ID", "")
     output_dir = create_artifact_dir(_ticket_id, run_uuid)
+
+    # Persist output_dir early so partial results are discoverable
+    # if the subprocess is killed before completion.
+    try:
+        from agents.server_utils import ticket_state_headers
+        from providers.execution import AuditedAsyncHTTPClient
+
+        _early_ticket_id = os.environ.get("TICKET_ID", "")
+        if _early_ticket_id:
+            _early_store = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+            _early_headers = ticket_state_headers()
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0, headers=_early_headers
+            ) as _ec:
+                # Read existing output_dirs to append
+                _er = await _ec.get(f"{_early_store}/api/v1/tickets/{_early_ticket_id}")
+                _existing_dirs = (
+                    _er.json().get("custom_fields", {}).get("output_dirs", [])
+                )
+                _new_dir = str(output_dir)
+                if _new_dir not in _existing_dirs:
+                    _existing_dirs.append(_new_dir)
+                await _ec.patch(
+                    f"{_early_store}/api/v1/tickets/{_early_ticket_id}/fields",
+                    json={
+                        "fields": {
+                            "output_dir": _new_dir,
+                            "output_dirs": _existing_dirs,
+                        }
+                    },
+                )
+            logger.info("[boot-time] Persisted output_dir early: %s", output_dir)
+    except Exception:
+        logger.debug("[boot-time] Failed to persist early output_dir", exc_info=True)
+
     artifact_filesystem = (
         AuditedFilesystem(
             RootedPath(
