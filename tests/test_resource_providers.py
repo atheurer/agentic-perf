@@ -342,6 +342,49 @@ class TestQuadsResourceProvider:
 
         mock_client.create_assignment.assert_not_awaited()
 
+    def test_availability_recommendation_preserves_os_diagnostics(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        provider = QuadsResourceProvider(MagicMock())
+        result = {
+            "provider": "quads",
+            "available_count": 0,
+            "options": [],
+            "status": "failed",
+            "error": "Requested QUADS OS 'RHEL 10.1' is unavailable.",
+            "available_os": ["RHEL 10.0"],
+            "message": "Choose an available release.",
+        }
+
+        recommendation = provider.availability_recommendation(
+            {"os": "RHEL 10.1"}, result, {"ticket_id": "PERF-TEST"}
+        )
+
+        assert recommendation["status"] == "failed"
+        assert recommendation["error"] == result["error"]
+        assert recommendation["available_os"] == result["available_os"]
+        assert recommendation["message"] == result["message"]
+
+    @pytest.mark.asyncio
+    async def test_os_catalog_failure_is_definitive_before_assignment(self):
+        from providers.resource.quads import (
+            QuadsOSResolutionError,
+            QuadsResourceProvider,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get_os_list.side_effect = RuntimeError("catalog unavailable")
+
+        provider = QuadsResourceProvider(mock_client)
+        with pytest.raises(QuadsOSResolutionError, match="catalog unavailable"):
+            await provider.reserve(
+                selection={"hostnames": ["host1.example.com"], "os": "RHEL 10.0"},
+                description="test assignment",
+                ticket_id="PERF-TEST",
+            )
+
+        mock_client.create_assignment.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_reserve_max_hosts(self):
         from providers.resource.quads import QuadsResourceProvider
@@ -1998,6 +2041,41 @@ class TestProviderCorrectAutoReservation:
         assert await agent._reconcile_provider_directive("PERF-TEST", ticket)
 
         old_provider.terminate.assert_awaited_once_with("42", old_metadata)
+
+    @pytest.mark.parametrize(
+        ("requested", "saved", "changed"),
+        [
+            ("RHEL 10.0", "RHEL 10.0", False),
+            ("RHEL 10.1", "RHEL 10.0", True),
+            (False, False, False),
+            (True, False, True),
+        ],
+    )
+    def test_changed_quads_os_or_wipe_releases_existing_assignment(
+        self, requested, saved, changed
+    ):
+        from agents.resource.agent import _provider_selection_changed
+
+        key = "os" if isinstance(requested, str) else "wipe"
+        ticket = {
+            "id": "PERF-TEST",
+            "custom_fields": {
+                "resource_provider": "quads",
+                "resource_reservation_id": "42",
+                "resource_provider_metadata": {
+                    "assignment_id": 42,
+                    "reservation_selections": [
+                        {"hostnames": ["host-old.example.com"], key: saved}
+                    ],
+                },
+                "hostnames": ["host-old.example.com"],
+                key: requested,
+            },
+        }
+
+        assert (
+            _provider_selection_changed("quads", ticket["custom_fields"], {}) is changed
+        )
 
     @pytest.mark.asyncio
     async def test_quads_role_requirements_reuse_saved_assignment(self):

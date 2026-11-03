@@ -40,7 +40,7 @@ from providers.resource.base import (
     has_reservation_metadata,
     reservation_failed,
 )
-from providers.resource.quads import QuadsOSUnavailableError
+from providers.resource.quads import QuadsOSResolutionError
 from providers.resource.selection import ReservationSelectionError
 from providers.skills.private import PrivateSkillProvider
 from providers.tracing import (
@@ -940,6 +940,40 @@ def _infer_os_from_ticket() -> str:
     return ""
 
 
+def _quads_managed_os_values() -> set[str]:
+    """Return OS requirements from every host QUADS would manage."""
+    required_hosts = _ticket.get("custom_fields", {}).get("required_hosts", [])
+    values: set[str] = set()
+    for host in required_hosts:
+        if not isinstance(host, dict) or host.get("host"):
+            continue
+        os_value = host.get("os")
+        if isinstance(os_value, str) and os_value.strip():
+            values.add(os_value.strip())
+    return values
+
+
+def _quads_ticket_requirements() -> dict[str, Any]:
+    """Collect authoritative QUADS OS/wipe settings from ticket data."""
+    custom_fields = _ticket.get("custom_fields", {})
+    directives = custom_fields.get("directives", {})
+    sources: list[dict[str, Any]] = []
+    for source in (custom_fields, directives):
+        for key in ("resource_selection", "quads_selection", "quads"):
+            value = source.get(key)
+            if isinstance(value, dict):
+                nested = value.get("quads")
+                sources.append(nested if isinstance(nested, dict) else value)
+        sources.append(source)
+
+    requirements: dict[str, Any] = {}
+    for source in sources:
+        for key in ("os", "wipe"):
+            if key in source and source[key] is not None:
+                requirements[key] = source[key]
+    return requirements
+
+
 @mcp.tool()
 async def reserve_resources(
     provider: str,
@@ -1012,6 +1046,47 @@ async def reserve_resources(
                 ),
             }
         )
+    if provider == "quads":
+        managed_os_values = _quads_managed_os_values()
+        if len(managed_os_values) > 1:
+            return json.dumps(
+                {
+                    "status": "invalid_selection",
+                    "provider": provider,
+                    "invalid_selection": True,
+                    "allocation_unknown": False,
+                    "retry_blocked": False,
+                    "provider_call_started": False,
+                    "error": (
+                        "QUADS requires one OS for all managed hosts, but the "
+                        "ticket requests: "
+                        f"{', '.join(sorted(managed_os_values))}"
+                    ),
+                    "message": (
+                        "No provider allocation was attempted. Use one OS for "
+                        "all QUADS-managed hosts."
+                    ),
+                }
+            )
+
+        ticket_requirements = _quads_ticket_requirements()
+        for key in ("os", "wipe"):
+            if key not in ticket_requirements:
+                continue
+            if key in selection and selection[key] != ticket_requirements[key]:
+                logger.warning(
+                    "Overriding QUADS selection %s=%r with ticket value %r",
+                    key,
+                    selection[key],
+                    ticket_requirements[key],
+                )
+            selection = dict(selection)
+            selection[key] = ticket_requirements[key]
+
+        if not selection.get("os") and len(managed_os_values) == 1:
+            selection = dict(selection)
+            selection["os"] = next(iter(managed_os_values))
+
     # Inject OS from ticket required_hosts when the LLM doesn't
     # include it in the selection — ensures provider-specific OS
     # resolution fires regardless of LLM behavior.
@@ -1155,7 +1230,8 @@ async def reserve_resources(
                 "[resource] Failed to persist cancellation uncertainty marker"
             )
         raise
-    except QuadsOSUnavailableError as exc:
+    except QuadsOSResolutionError as exc:
+        available_os = getattr(exc, "available_os", None)
         result = {
             "status": "failed",
             "provider": provider,
@@ -1164,7 +1240,7 @@ async def reserve_resources(
             "provider_call_started": True,
             "allocation_attempted": False,
             "error": str(exc),
-            "available_os": exc.available_os,
+            **({"available_os": available_os} if available_os is not None else {}),
             "provider_metadata": {},
             "message": (
                 "No QUADS assignment was created because the requested OS is "

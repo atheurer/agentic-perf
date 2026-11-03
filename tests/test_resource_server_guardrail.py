@@ -564,6 +564,133 @@ async def test_quads_unavailable_os_is_definitive_no_allocation_failure():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("selection", "expected_os", "expected_wipe"),
+    [
+        ({"hostnames": ["host-01"]}, "RHEL 10.0", False),
+        (
+            {"hostnames": ["host-01"], "os": "Fedora 44", "wipe": True},
+            "RHEL 10.0",
+            False,
+        ),
+    ],
+)
+async def test_quads_ticket_requirements_are_authoritative(
+    selection, expected_os, expected_wipe
+):
+    """Ticket OS/wipe directives override model omissions and conflicts."""
+    import agents.resource.server as srv
+
+    provider = MagicMock()
+    provider.reserve = AsyncMock(
+        return_value={
+            "status": "success",
+            "reservation_id": "42",
+            "provider_metadata": {"assignment_id": 42},
+        }
+    )
+    registry = MagicMock()
+    registry.get_provider = AsyncMock(return_value=provider)
+
+    srv._initialized = True
+    srv._registry = registry
+    srv._ticket = {
+        "id": "PERF-TEST",
+        "custom_fields": {
+            "required_hosts": [{"roles": ["target"], "os": expected_os}],
+            "directives": {"quads": {"os": expected_os, "wipe": expected_wipe}},
+        },
+    }
+
+    raw = await srv.reserve_resources(
+        provider="quads",
+        selection=selection,
+        description="test",
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "success"
+    provider.reserve.assert_awaited_once()
+    reserved_selection = provider.reserve.await_args.args[0]
+    assert reserved_selection["os"] == expected_os
+    assert reserved_selection["wipe"] is expected_wipe
+
+
+@pytest.mark.asyncio
+async def test_quads_mixed_managed_os_requirements_are_rejected():
+    """QUADS cannot represent different OS requirements in one assignment."""
+    import agents.resource.server as srv
+
+    provider = MagicMock()
+    provider.reserve = AsyncMock()
+    registry = MagicMock()
+    registry.get_provider = AsyncMock(return_value=provider)
+
+    srv._initialized = True
+    srv._registry = registry
+    srv._ticket = {
+        "id": "PERF-TEST",
+        "custom_fields": {
+            "required_hosts": [
+                {"roles": ["controller"], "os": "Fedora 44"},
+                {"roles": ["target"], "os": "RHEL 10.0"},
+            ]
+        },
+    }
+
+    raw = await srv.reserve_resources(
+        provider="quads",
+        selection={"hostnames": ["host-01", "host-02"]},
+        description="test",
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "invalid_selection"
+    assert result["allocation_unknown"] is False
+    assert result["retry_blocked"] is False
+    assert result["provider_call_started"] is False
+    provider.reserve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quads_os_catalog_failure_is_definitive_no_allocation_failure():
+    """Catalog failures happen before assignment creation and are retryable."""
+    import agents.resource.server as srv
+    from providers.resource.quads import QuadsResourceProvider
+
+    mock_client = AsyncMock()
+    mock_client.get_os_list.side_effect = RuntimeError("catalog unavailable")
+    provider = QuadsResourceProvider(mock_client)
+    provider.record_availability_context(
+        [{"options": [{"hostname": "host-01"}]}],
+        {"ticket_id": "PERF-TEST", "required_hosts": []},
+    )
+    registry = MagicMock()
+    registry.get_provider = AsyncMock(return_value=provider)
+
+    srv._initialized = True
+    srv._registry = registry
+    srv._ticket = {"id": "PERF-TEST", "custom_fields": {}}
+
+    raw = await srv.reserve_resources(
+        provider="quads",
+        selection={"hostnames": ["host-01"], "os": "RHEL 10.0"},
+        description="test",
+        ticket_id="PERF-TEST",
+    )
+    result = json.loads(raw)
+
+    assert result["status"] == "failed"
+    assert result["allocation_unknown"] is False
+    assert result["retry_blocked"] is False
+    assert result["allocation_attempted"] is False
+    assert "catalog unavailable" in result["error"]
+    mock_client.create_assignment.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_quads_caller_ticket_key_cannot_replace_missing_active_context(
     monkeypatch,
 ):

@@ -10,7 +10,11 @@ from .base import ResourceProvider
 logger = logging.getLogger(__name__)
 
 
-class QuadsOSUnavailableError(ValueError):
+class QuadsOSResolutionError(ValueError):
+    """A QUADS OS catalog lookup failed before allocation."""
+
+
+class QuadsOSUnavailableError(QuadsOSResolutionError):
     def __init__(self, requested_os: str, available_os: list[str]) -> None:
         super().__init__(
             f"Requested QUADS OS {requested_os!r} is unavailable. "
@@ -60,7 +64,12 @@ class QuadsResourceProvider(ResourceProvider):
         )
 
     async def _resolve_os_type(self, requested_os: str) -> str:
-        available_os = await self._client.get_os_list()
+        try:
+            available_os = await self._client.get_os_list()
+        except Exception as exc:
+            raise QuadsOSResolutionError(
+                f"Could not retrieve the QUADS OS catalog: {exc}"
+            ) from exc
         for entry in available_os:
             if not isinstance(entry, dict):
                 continue
@@ -107,6 +116,9 @@ class QuadsResourceProvider(ResourceProvider):
             requirement, result, ticket_context
         )
         recommendation["options"] = result.get("options", [])
+        for key in ("status", "error", "available_os", "message"):
+            if key in result:
+                recommendation[key] = result[key]
         return recommendation
 
     def record_availability_context(
