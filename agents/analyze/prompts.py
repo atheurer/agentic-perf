@@ -59,6 +59,13 @@ skill's documented pattern, investigate the discrepancy — do not
 dismiss your data to preserve the skill's claim. Report the
 conflict explicitly in your findings.
 
+If guidance from applicable context sources materially conflicts and
+you cannot resolve the conflict from verified runtime evidence or the
+source authority rules, call `request_clarification` with the source
+refs and the decision that is blocked. This pauses the ticket for the
+user. Do not submit an inconclusive analysis that advances the ticket
+to hardware provisioning while this context conflict remains unresolved.
+
 ## Rules
 
 - **Never provision hardware or run benchmarks.** You analyze

@@ -19,11 +19,27 @@ from agents.mcp_client import AgentMCPClient
 from agents.skill_context import skill_context_prompt
 from agents.tool_ownership import selected_harness_from_ticket
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse
+from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 
 from .prompts import ANALYZE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+_LOCAL_TOOLS = [
+    ToolDefinition(
+        name="request_clarification",
+        description=(
+            "Ask the user for guidance. Pauses the ticket until the user replies."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Question to ask"},
+            },
+            "required": ["question"],
+        },
+    ),
+]
 
 
 class AnalyzeAgent(AgentBase):
@@ -36,13 +52,23 @@ class AnalyzeAgent(AgentBase):
         event_bus: EventBus | None = None,
         skill_provider: Any | None = None,
     ) -> None:
+        async def _request_clarification(question: str) -> str:
+            return await self._do_request_clarification(question)
+
         super().__init__(
             agent_name="analyze-agent",
             llm_provider=llm_provider,
             state_store_url=state_store_url,
+            tools=list(_LOCAL_TOOLS),
+            tool_handlers={"request_clarification": _request_clarification},
             event_bus=event_bus,
         )
         self._skill_provider = skill_provider
+
+    async def _do_request_clarification(self, question: str) -> str:
+        if self._current_ticket_id:
+            return await self._request_human_input(self._current_ticket_id, question)
+        return "No ticket context available."
 
     def _selected_harness(self, ticket: dict[str, Any]) -> str:
         return selected_harness_from_ticket(
