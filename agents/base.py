@@ -418,6 +418,71 @@ class AgentBase(ABC):
         if self._events:
             self._events.emit(ticket_id, self.agent_name, event_type, data)
 
+    def _build_investigation_context(self, ticket: dict[str, Any]) -> str:
+        """Build a structured investigation context section for webhook tickets.
+
+        When anomaly_context or run_metadata is present, returns a formatted
+        section that agents must reference in their outputs. Returns empty
+        string for non-webhook tickets.
+
+        This is injected by the base class — agents don't need to handle
+        webhook context individually.
+        """
+        cf = ticket.get("custom_fields", {})
+        anomaly = cf.get("anomaly_context")
+        run_meta = cf.get("run_metadata")
+
+        if not anomaly and not run_meta:
+            return ""
+
+        lines = ["\n\n## Investigation Context\n"]
+        lines.append(
+            "This ticket was triggered by an external alert. "
+            "Reference the system identifiers below in your "
+            "hypothesis, analysis, and conclusions — do not discuss "
+            "findings only in terms of run IDs.\n"
+        )
+
+        if isinstance(run_meta, dict) and run_meta:
+            target = run_meta.get("target", "")
+            os_id = run_meta.get("os_id", "")
+            build = run_meta.get("build", "")
+            mode = run_meta.get("mode", "")
+            if target:
+                lines.append(f"- **Target system:** {target}")
+            if os_id or build:
+                parts = []
+                if os_id:
+                    parts.append(os_id)
+                if mode:
+                    parts.append(mode)
+                if build:
+                    parts.append(f"build {build}")
+                lines.append(f"- **OS / Build:** {' / '.join(parts)}")
+            start = run_meta.get("start_time", "")
+            if start:
+                lines.append(f"- **Run timestamp:** {start}")
+
+        if isinstance(anomaly, dict) and anomaly:
+            source = anomaly.get("source", "")
+            if source:
+                lines.append(f"- **Alert source:** {source}")
+            metric = anomaly.get("variable_name") or anomaly.get("metric", "")
+            if metric:
+                lines.append(f"- **Metric:** {metric}")
+            change_desc = anomaly.get("change_description", "")
+            if change_desc:
+                lines.append(f"- **Change:** {change_desc}")
+            run_id = anomaly.get("run_id")
+            if run_id is not None:
+                lines.append(f"- **Run ID:** {run_id}")
+
+        if len(lines) <= 2:
+            # Only header + instruction, no actual data
+            return ""
+
+        return "\n".join(lines)
+
     async def run(self, ticket_id: str) -> None:
         self._current_ticket_id = ticket_id
         self._trace_terminal_state = LifecycleState.COMPLETED
@@ -522,6 +587,9 @@ class AgentBase(ABC):
             logger.debug(f"Failed to list workspace files for initial prompt: {e}")
         if "## Scratchpad Workspace" not in system_prompt:
             system_prompt = f"{system_prompt}{workspace_prompt}"
+        investigation_ctx = self._build_investigation_context(ticket)
+        if investigation_ctx:
+            system_prompt += investigation_ctx
         if cf.get("remember_previous") and cf.get("previous_messages"):
             messages = cf["previous_messages"]
             logger.info(
