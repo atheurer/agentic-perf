@@ -5824,33 +5824,8 @@ async def execute_boot_time_test(
     # Persist output_dir early so partial results are discoverable
     # if the subprocess is killed before completion.
     try:
-        from agents.server_utils import ticket_state_headers
-        from providers.execution import AuditedAsyncHTTPClient
-
-        _early_ticket_id = os.environ.get("TICKET_ID", "")
-        if _early_ticket_id:
-            _early_store = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
-            _early_headers = ticket_state_headers()
-            async with AuditedAsyncHTTPClient(
-                timeout=10.0, headers=_early_headers
-            ) as _ec:
-                # Read existing output_dirs to append
-                _er = await _ec.get(f"{_early_store}/api/v1/tickets/{_early_ticket_id}")
-                _existing_dirs = (
-                    _er.json().get("custom_fields", {}).get("output_dirs", [])
-                )
-                _new_dir = str(output_dir)
-                if _new_dir not in _existing_dirs:
-                    _existing_dirs.append(_new_dir)
-                await _ec.patch(
-                    f"{_early_store}/api/v1/tickets/{_early_ticket_id}/fields",
-                    json={
-                        "fields": {
-                            "output_dir": _new_dir,
-                            "output_dirs": _existing_dirs,
-                        }
-                    },
-                )
+        if _ticket_id:
+            await _append_output_dir(_ticket_id, str(output_dir))
             logger.info("[boot-time] Persisted output_dir early: %s", output_dir)
     except Exception:
         logger.debug("[boot-time] Failed to persist early output_dir", exc_info=True)
@@ -6655,6 +6630,40 @@ async def execute_boot_time_test(
 def _count_boot_time_samples(output_dir: Path) -> int:
     """Return the number of boot-time sample artifacts in an output directory."""
     return sum(1 for _ in output_dir.glob("**/*boot_time_logs.json"))
+
+
+async def _append_output_dir(ticket_id: str, output_dir_path: str) -> None:
+    """Persist *output_dir_path* into ticket custom fields.
+
+    Reads the current ``output_dirs`` list, appends the new path if it is not
+    already present, and PATCHes both ``output_dir`` (scalar) and
+    ``output_dirs`` (list) back to the state store.
+
+    Does **not** catch exceptions — callers decide whether to treat failures
+    as best-effort.
+    """
+    from agents.server_utils import ticket_state_headers
+    from providers.execution import AuditedAsyncHTTPClient
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    headers = ticket_state_headers()
+    async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+        r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+        existing_dirs: list[str] = (
+            r.json().get("custom_fields", {}).get("output_dirs") or []
+        )
+        if output_dir_path not in existing_dirs:
+            existing_dirs.append(output_dir_path)
+        patch_resp = await client.patch(
+            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+            json={
+                "fields": {
+                    "output_dir": output_dir_path,
+                    "output_dirs": existing_dirs,
+                }
+            },
+        )
+        patch_resp.raise_for_status()
 
 
 async def get_registered_tools():
