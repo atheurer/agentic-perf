@@ -18,6 +18,7 @@ from ..models import (
 )
 from ..store import (
     ClaimFenceError,
+    ExecutionPlanChangedError,
     TicketDispatchBlocked,
     TicketNotFound,
     ValidationSupersededError,
@@ -383,6 +384,7 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
             require_unsuperseded_validation_id=(
                 body.require_unsuperseded_validation_id
             ),
+            expected_execution_plan=body.expected_execution_plan,
         )
         if normalization_report:
             from state_store.models import AddCommentRequest
@@ -404,6 +406,8 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
             detail={"reason": e.reason, "message": str(e)},
         ) from e
     except ValidationSupersededError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ExecutionPlanChangedError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e

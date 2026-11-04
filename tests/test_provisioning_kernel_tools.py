@@ -211,6 +211,27 @@ class TestPrepareKernelChange:
         assert fake_store.patches[-1]["fields"]["kernel_change_intents"]["records"]
 
     @pytest.mark.asyncio
+    async def test_unresolved_prior_intent_blocks_fresh_intent(
+        self, handlers, fake_store, fleet_ssh
+    ):
+        FakeKernelStore.custom_fields()["kernel_change_intents"] = {
+            "records": {
+                "kci-old": {
+                    "intent_id": "kci-old",
+                    "step_id": 2,
+                    "progress": {"install": "indeterminate"},
+                }
+            }
+        }
+        result = await handlers["prepare_kernel_change"](
+            hosts=["10.0.0.1", "10.0.0.2"], kernel=KERNEL_B
+        )
+        assert result["status"] == "indeterminate"
+        assert result["reason_code"] == "kernel_action_requires_reconciliation"
+        assert result["unresolved_operation"]["kind"] == "install"
+        assert not fleet_ssh.calls
+
+    @pytest.mark.asyncio
     async def test_actions_shrink_when_already_installed_and_default(
         self, handlers, two_hosts
     ):
@@ -601,7 +622,7 @@ class TestInstallKernelApproval:
 
 class TestInstallOutcomes:
     @pytest.mark.asyncio
-    async def test_dnf_failure_leaves_action_started(
+    async def test_dnf_failure_marks_quiescent_action_failed(
         self, handlers, fake_store, two_hosts
     ):
         two_hosts["10.0.0.2"].available = []
@@ -615,13 +636,13 @@ class TestInstallOutcomes:
         assert result["results"]["10.0.0.1"]["state"] == "installed"
         assert result["results"]["10.0.0.2"]["state"] == "install_failed"
         assert result["results"]["10.0.0.2"]["reason_code"] == "package_install_failed"
-        assert (
-            fake_store.intent(intent["intent_id"])["progress"]["install"] == "started"
+        assert fake_store.intent(intent["intent_id"])["progress"]["install"] == (
+            "failed"
         )
 
     @pytest.mark.asyncio
-    async def test_dnf_timeout_but_installed_is_reconciled(
-        self, handlers, fake_store, two_hosts
+    async def test_dnf_timeout_stays_indeterminate_even_if_simulator_installed(
+        self, handlers, fake_store, two_hosts, fleet_ssh
     ):
         for host in two_hosts.values():
             host.dnf_behavior = "timeout_installs"
@@ -632,8 +653,53 @@ class TestInstallOutcomes:
             kernel=KERNEL_B,
             approval_request_id=approval_id,
         )
-        assert result["results"]["10.0.0.1"]["state"] == "installed"
-        assert "timed out" in result["results"]["10.0.0.1"]["note"]
+        for host in ("10.0.0.1", "10.0.0.2"):
+            record = result["results"][host]
+            assert record["state"] == "indeterminate"
+            assert record["reason_code"] == "package_install_timed_out"
+            assert record["remote_write_quiescent"] is False
+            host_calls = [
+                call["command"] for call in fleet_ssh.calls if call["host"] == host
+            ]
+            install_index = next(
+                index
+                for index, command in enumerate(host_calls)
+                if "dnf install" in command
+            )
+            assert not any(
+                "rpm -q " in command for command in host_calls[install_index + 1 :]
+            )
+        assert fake_store.intent(intent["intent_id"])["progress"]["install"] == (
+            "indeterminate"
+        )
+        before_retry = len(fleet_ssh.calls)
+        retry = await handlers["install_kernel"](
+            hosts=["10.0.0.1", "10.0.0.2"],
+            kernel=KERNEL_B,
+            approval_request_id=approval_id,
+        )
+        assert retry["reason_code"] == "action_requires_reconciliation"
+        assert len(fleet_ssh.calls) == before_retry
+
+    @pytest.mark.asyncio
+    async def test_partial_host_failure_tracks_quiescence_per_host(
+        self, handlers, fake_store, two_hosts
+    ):
+        two_hosts["10.0.0.1"].available = []
+        two_hosts["10.0.0.2"].dnf_behavior = "timeout_fails"
+        intent = await prepared_intent(handlers)
+        approval_id = fake_store.seed_approval(intent)
+        result = await handlers["install_kernel"](
+            hosts=["10.0.0.1", "10.0.0.2"],
+            kernel=KERNEL_B,
+            approval_request_id=approval_id,
+        )
+        known = result["results"]["10.0.0.1"]
+        unknown = result["results"]["10.0.0.2"]
+        assert known["state"] == "install_failed"
+        assert known["remote_write_quiescent"] is True
+        assert unknown["state"] == "indeterminate"
+        assert unknown["remote_write_quiescent"] is False
 
     @pytest.mark.asyncio
     async def test_dnf_timeout_not_installed_is_indeterminate(
@@ -733,7 +799,9 @@ class TestSelectDefaultKernel:
         assert result["results"]["10.0.0.2"]["state"] == "not_bootable"
 
     @pytest.mark.asyncio
-    async def test_grubby_timeout_but_set(self, handlers, fake_store, two_hosts):
+    async def test_grubby_timeout_is_indeterminate_even_if_simulator_set(
+        self, handlers, fake_store, two_hosts, fleet_ssh
+    ):
         intent, approval_id = await self._after_install(handlers, fake_store, two_hosts)
         for host in two_hosts.values():
             host.grubby_behavior = "timeout_sets"
@@ -742,8 +810,21 @@ class TestSelectDefaultKernel:
             kernel=KERNEL_B,
             approval_request_id=approval_id,
         )
-        assert result["results"]["10.0.0.1"]["state"] == "ok"
-        assert "timed out" in result["results"]["10.0.0.1"]["note"]
+        for host in two_hosts:
+            assert result["results"][host]["state"] == "indeterminate"
+            assert result["results"][host]["remote_write_quiescent"] is False
+        assert (
+            fake_store.intent(intent["intent_id"])["progress"]["select_default"]
+            == "indeterminate"
+        )
+        before_retry = len(fleet_ssh.calls)
+        retry = await handlers["select_default_kernel"](
+            hosts=["10.0.0.1", "10.0.0.2"],
+            kernel=KERNEL_B,
+            approval_request_id=approval_id,
+        )
+        assert retry["reason_code"] == "action_requires_reconciliation"
+        assert len(fleet_ssh.calls) == before_retry
 
     @pytest.mark.asyncio
     async def test_grubby_timeout_unset_is_indeterminate(
@@ -758,6 +839,7 @@ class TestSelectDefaultKernel:
             approval_request_id=approval_id,
         )
         assert result["results"]["10.0.0.1"]["state"] == "indeterminate"
+        assert result["results"]["10.0.0.1"]["remote_write_quiescent"] is False
 
 
 # ---------------------------------------------------------------------------

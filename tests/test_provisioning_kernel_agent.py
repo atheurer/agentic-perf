@@ -75,6 +75,7 @@ def _ticket_with_intent(transition_state: str | None = None) -> tuple[dict, dict
         verified = transition_state == "verified"
         ticket["custom_fields"]["kernel_transitions"] = {
             "2": {
+                "intent_id": intent["intent_id"],
                 "kernel": KERNEL_B,
                 "kernel_spec": {"release": KERNEL_B, "package": "kernel"},
                 "requested_hosts": HOSTS,
@@ -348,6 +349,46 @@ class TestSubmitGate:
         assert error is None
 
     @pytest.mark.asyncio
+    async def test_verified_reboot_checkpoint_resolves_started_reservation(self):
+        agent = _make_agent()
+        ticket, intent = _ticket_with_intent("verified")
+        intent["progress"]["reboot"] = "started"
+        agent._get_ticket = AsyncMock(return_value=ticket)
+
+        error = await agent._validate_submit_call("PERF-TEST", _submit_call(COMPLETE))
+
+        assert error is None
+
+    @pytest.mark.asyncio
+    async def test_prior_indeterminate_install_blocks_non_kernel_completion(self):
+        agent = _make_agent()
+        ticket = kernel_step_ticket(current_step=1)
+        old_intent = new_intent(
+            "PERF-TEST", 2, HOSTS, KernelSpec(KERNEL_B), ["install"], {}
+        )
+        old_intent["progress"]["install"] = "indeterminate"
+        ticket["custom_fields"]["kernel_change_intents"] = {
+            "records": {old_intent["intent_id"]: old_intent}
+        }
+        agent._get_ticket = AsyncMock(return_value=ticket)
+
+        error = await agent._validate_submit_call("PERF-TEST", _submit_call(COMPLETE))
+
+        assert error is not None
+        assert "host owner must reconcile it" in error
+        assert "automated resumption is currently unavailable" in error
+        fields = agent._update_fields.await_args.args[1]
+        assert fields["provisioning_complete"] is False
+
+    @pytest.mark.asyncio
+    async def test_non_kernel_step_unaffected(self):
+        agent = _make_agent()
+        ticket = kernel_step_ticket(current_step=1)
+        agent._get_ticket = AsyncMock(return_value=ticket)
+        error = await agent._validate_submit_call("PERF-TEST", _submit_call(COMPLETE))
+        assert error is None
+
+    @pytest.mark.asyncio
     async def test_incomplete_submission_never_consults_checkpoint(self):
         agent = _make_agent()
         ticket, _ = _ticket_with_intent(None)
@@ -363,16 +404,33 @@ class TestSubmitGate:
         error = await agent._validate_submit_call("PERF-TEST", _submit_call(payload))
         assert error is None
 
-    @pytest.mark.asyncio
-    async def test_non_kernel_step_unaffected(self):
-        agent = _make_agent()
-        ticket = kernel_step_ticket(current_step=1)
-        agent._get_ticket = AsyncMock(return_value=ticket)
-        error = await agent._validate_submit_call("PERF-TEST", _submit_call(COMPLETE))
-        assert error is None
-
 
 class TestCompletionDerivesVerification:
+    @pytest.mark.asyncio
+    async def test_completion_handler_blocks_unresolved_prior_writer(self):
+        agent = _make_agent()
+        ticket = kernel_step_ticket(current_step=1)
+        old_intent = new_intent(
+            "PERF-TEST", 2, HOSTS, KernelSpec(KERNEL_B), ["install"], {}
+        )
+        old_intent["progress"]["install"] = "indeterminate"
+        ticket["custom_fields"]["kernel_change_intents"] = {
+            "records": {old_intent["intent_id"]: old_intent}
+        }
+        agent._get_ticket = AsyncMock(return_value=copy.deepcopy(ticket))
+        agent._plan_controls_next_transition = AsyncMock(return_value=True)
+        agent._transition_ticket = AsyncMock()
+
+        await agent._handle_completion("PERF-TEST", _llm_response(COMPLETE))
+
+        fields = agent._update_fields.await_args_list[0].args[1]
+        assert fields["provisioning_complete"] is False
+        assert fields["provisioning_verification"]["status"] == "not_verified"
+        assert (
+            "host owner must reconcile it"
+            in fields["provisioning_verification"]["details"]
+        )
+
     @pytest.mark.asyncio
     async def test_verified_checkpoint_writes_details_from_checkpoint(self):
         agent = _make_agent()

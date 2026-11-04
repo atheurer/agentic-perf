@@ -15,7 +15,11 @@ import agents.server_utils as server_utils
 import orchestrator.main as orchestrator
 from providers.benchmark_identity import benchmark_intent_identity
 from state_store.models import CreateTicketRequest
-from state_store.store import TicketStore, ValidationSupersededError
+from state_store.store import (
+    ExecutionPlanChangedError,
+    TicketStore,
+    ValidationSupersededError,
+)
 
 
 def _digest(value: dict) -> str:
@@ -99,10 +103,17 @@ class _Response:
 
 
 class _Client:
-    def __init__(self, ticket, operation=None, supersede_on_plan_write=False):
+    def __init__(
+        self,
+        ticket,
+        operation=None,
+        supersede_on_plan_write=False,
+        change_plan_on_write=False,
+    ):
         self.ticket = ticket
         self.operation = operation
         self.supersede_on_plan_write = supersede_on_plan_write
+        self.change_plan_on_write = change_plan_on_write
         self.patches = []
         self.patch_attempts = []
         self.posts = []
@@ -138,15 +149,27 @@ class _Client:
                 },
                 status_code=409,
             )
+        if self.change_plan_on_write and kwargs.get("json", {}).get(
+            "expected_execution_plan"
+        ):
+            return _Response(
+                {"detail": "execution plan changed before the comparison step"},
+                status_code=409,
+            )
         self.patches.append((url, copy.deepcopy(kwargs)))
         return _Response({})
 
 
 async def _advance(
-    monkeypatch, cf, operation, ticket_id="PERF-TEST", supersede_on_plan_write=False
+    monkeypatch,
+    cf,
+    operation,
+    ticket_id="PERF-TEST",
+    supersede_on_plan_write=False,
+    change_plan_on_write=False,
 ):
     ticket = {"status": "awaiting_review", "custom_fields": cf}
-    client = _Client(ticket, operation, supersede_on_plan_write)
+    client = _Client(ticket, operation, supersede_on_plan_write, change_plan_on_write)
     monkeypatch.setattr(orchestrator, "AuditedAsyncHTTPClient", lambda **_: client)
     await orchestrator._advance_plan("http://store", ticket_id, "executing_benchmark")
     return client
@@ -219,6 +242,7 @@ async def test_comparison_does_not_advance_without_matching_success(monkeypatch,
 @pytest.mark.asyncio
 async def test_successful_receipt_captures_actual_runfile(monkeypatch):
     cf, record, operation = _example()
+    expected_plan = copy.deepcopy(cf["execution_plan"])
     client = await _advance(monkeypatch, cf, operation)
     plan = client.patches[0][1]["json"]["fields"]["execution_plan"]
     captured = plan["steps"][0]["results"]
@@ -229,6 +253,9 @@ async def test_successful_receipt_captures_actual_runfile(monkeypatch):
     )
     assert captured["runfile_fingerprint"] == orchestrator.comparison_fingerprint(
         record
+    )
+    assert (
+        client.patch_attempts[0][1]["json"]["expected_execution_plan"] == expected_plan
     )
 
 
@@ -267,6 +294,21 @@ async def test_supersession_after_receipt_pauses_without_committing_or_advancing
     assert len(client.posts) == 1
     assert client.posts[0][1]["json"]["status"] == "awaiting_customer_guidance"
     assert "validation was superseded" in client.posts[0][1]["json"]["comment"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_plan_edit_pauses_without_committing_comparison(monkeypatch):
+    cf, _, operation = _example()
+    expected_plan = copy.deepcopy(cf["execution_plan"])
+    client = await _advance(monkeypatch, cf, operation, change_plan_on_write=True)
+
+    assert (
+        client.patch_attempts[0][1]["json"]["expected_execution_plan"] == expected_plan
+    )
+    assert client.patches == []
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["json"]["status"] == "awaiting_customer_guidance"
+    assert "execution plan changed" in client.posts[0][1]["json"]["comment"]
 
 
 @pytest.mark.asyncio
@@ -396,6 +438,33 @@ def test_superseded_validation_cannot_prove_a_comparison_run(tmp_path):
         )
         is None
     )
+
+
+def test_stale_comparison_write_cannot_overwrite_a_concurrent_plan_edit(tmp_path):
+    cf, _, _ = _example()
+    expected_plan = copy.deepcopy(cf["execution_plan"])
+    store = TicketStore(persist_dir=tmp_path)
+    ticket = store.create_ticket(
+        CreateTicketRequest(
+            summary="comparison plan race",
+            description="comparison plan race",
+            custom_fields={"execution_plan": expected_plan},
+        )
+    )
+
+    concurrently_edited = copy.deepcopy(expected_plan)
+    concurrently_edited["steps"][0]["params"]["kernel_role"] = "candidate"
+    store.update_fields(ticket.id, {"execution_plan": concurrently_edited})
+    with pytest.raises(ExecutionPlanChangedError, match="execution plan changed"):
+        store.update_fields(
+            ticket.id,
+            {"comparison_receipt": {"run_id": "run-a"}},
+            expected_execution_plan=expected_plan,
+        )
+
+    current = store.get_ticket(ticket.id).custom_fields
+    assert current["execution_plan"] == concurrently_edited
+    assert "comparison_receipt" not in current
 
 
 def test_crucible_validation_from_another_comparison_step_is_rejected():

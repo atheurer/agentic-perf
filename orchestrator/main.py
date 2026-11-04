@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import copy
 import fcntl
 import hashlib
 import json
@@ -935,6 +936,7 @@ async def _advance_plan(
         plan = cf.get("execution_plan")
         if not plan:
             return
+        expected_execution_plan = copy.deepcopy(plan)
 
         steps = plan.get("steps", [])
         current = plan.get("current_step", 0)
@@ -1093,6 +1095,7 @@ async def _advance_plan(
                 body["require_unsuperseded_validation_id"] = comparison_receipt[
                     "validation_id"
                 ]
+                body["expected_execution_plan"] = expected_execution_plan
             response = await client.patch(
                 f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                 json=body,
@@ -1111,6 +1114,21 @@ async def _advance_plan(
                                 "The executed benchmark validation was superseded "
                                 "before the comparison step could be committed. "
                                 "Reconcile the run and validation before resuming."
+                            ),
+                        },
+                    )
+                    pause.raise_for_status()
+                    return False
+                if isinstance(detail, str) and "execution plan changed" in detail:
+                    pause = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                        json={
+                            "status": "awaiting_customer_guidance",
+                            "comment": (
+                                "The execution plan changed after the benchmark "
+                                "receipt was read, so this comparison step was not "
+                                "committed. Reconcile the run and current plan "
+                                "before resuming."
                             ),
                         },
                     )

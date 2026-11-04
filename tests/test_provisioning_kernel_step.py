@@ -147,6 +147,72 @@ class TestDeterministicKernelStep:
         agent._transition_ticket.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_mapped_hosts_use_canonical_tool_keys_and_original_labels(
+        self, monkeypatch
+    ):
+        import socket
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            },
+            targets=["sut1.lab", "sut2.lab"],
+        )
+        ticket["custom_fields"]["assigned_hardware_ips"]["controller"] = "orch.lab"
+        ticket["custom_fields"]["resource_provider_metadata"] = {
+            "ip_mapping": {
+                "orch.lab": "10.0.0.100",
+                "10.0.0.100": "10.0.0.100",
+                "sut1.lab": HOSTS[0],
+                "sut2.lab": HOSTS[1],
+            }
+        }
+
+        def resolve(host, port, *_args, **_kwargs):
+            addresses = {
+                "orch.lab": "10.0.0.100",
+                "10.0.0.100": "10.0.0.100",
+                "sut1.lab": HOSTS[0],
+                "sut2.lab": HOSTS[1],
+                HOSTS[0]: HOSTS[0],
+                HOSTS[1]: HOSTS[1],
+            }
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addresses[host], 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", resolve)
+        monkeypatch.setattr(socket, "gethostname", lambda: "orch.lab")
+        monkeypatch.setattr(socket, "getfqdn", lambda: "orch.lab")
+        agent = _agent(ticket)
+        script = full_script()
+        script["run_repo_cleanup"] = {
+            "status": "ok",
+            "results": {host: {"state": "clean"} for host in HOSTS},
+        }
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        for name, args in mcp.calls:
+            if name in {
+                "get_kernel_inventory",
+                "prepare_kernel_change",
+                "install_kernel",
+                "select_default_kernel",
+                "reboot_hosts_and_verify",
+                "run_repo_cleanup",
+            }:
+                assert args["hosts"] == HOSTS
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "sut1.lab:** kernel" in comments
+        assert "sut2.lab:** kernel" in comments
+        assert "sut1.lab:** temporary repository entry removed" in comments
+        agent._handle_completion.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_ticket_comments_report_each_host_outcome(self):
         ticket = kernel_step_ticket()
         agent = _agent(ticket)
@@ -281,6 +347,501 @@ class TestDeterministicKernelStep:
         assert "Temporary repository cleanup pending" in comments
         assert "Cleanup was not attempted at this step" in comments
         assert not any(name == "run_repo_cleanup" for name, _ in mcp.calls)
+
+    @pytest.mark.asyncio
+    async def test_failed_first_ab_step_cleans_repo_before_pausing(self):
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        ticket["custom_fields"]["execution_plan"]["steps"].append(
+            {
+                "id": 3,
+                "agent_type": "provision",
+                "params": {"label": "kernel-C", "kernel": KERNEL_B},
+            }
+        )
+        agent = _agent(ticket)
+        script = full_script(actions=("install",))
+        script["install_kernel"] = {
+            "status": "incomplete",
+            "results": {
+                host: {
+                    "host": host,
+                    "state": "install_failed",
+                    "remote_write_quiescent": True,
+                }
+                for host in HOSTS
+            },
+        }
+        script["run_repo_cleanup"] = {
+            "status": "ok",
+            "results": {host: {"state": "clean"} for host in HOSTS},
+        }
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        names = [name for name, _ in mcp.calls]
+        assert "run_repo_cleanup" in names
+        assert names.index("run_repo_cleanup") > names.index("install_kernel")
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "Temporary repository cleanup confirmed" in comments
+        assert "Kernel change paused" in comments
+        agent._handle_completion.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_partial_install_timeout_skips_cleanup_even_with_later_step(self):
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        ticket["custom_fields"]["execution_plan"]["steps"].append(
+            {
+                "id": 3,
+                "agent_type": "provision",
+                "params": {"label": "kernel-C", "kernel": KERNEL_B},
+            }
+        )
+        agent = _agent(ticket)
+        script = full_script(actions=("install",))
+        script["install_kernel"] = {
+            "status": "incomplete",
+            "results": {
+                HOSTS[0]: {
+                    "host": HOSTS[0],
+                    "state": "install_failed",
+                    "remote_write_quiescent": True,
+                },
+                HOSTS[1]: {
+                    "host": HOSTS[1],
+                    "state": "indeterminate",
+                    "remote_write_quiescent": False,
+                },
+            },
+        }
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        assert not any(name == "run_repo_cleanup" for name, _ in mcp.calls)
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "SSH write or reboot may still be in flight" in comments
+        assert (
+            "another host may still have an SSH write or reboot in flight" in comments
+        )
+        agent._handle_completion.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resume_with_old_indeterminate_intent_stops_before_new_intent(self):
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        ticket["custom_fields"]["kernel_change_intents"] = {
+            "records": {
+                "kci-old": {
+                    "intent_id": "kci-old",
+                    "step_id": 2,
+                    "progress": {"install": "indeterminate"},
+                }
+            }
+        }
+        agent = _agent(ticket)
+        mcp = ScriptedMCP({})
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        assert not mcp.calls
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "host owner must reconcile it" in comments
+        assert (
+            "cleanup not attempted because an SSH write or reboot may still be in flight"
+            in comments
+        )
+        assert "No further kernel changes were started" in comments
+        agent._transition_ticket.assert_awaited_once()
+        transition_comment = agent._transition_ticket.await_args.kwargs["comment"]
+        assert "host owner must reconcile" in transition_comment
+        assert "Automated resumption is currently unavailable" in transition_comment
+        assert "restart the kernel change request" not in transition_comment
+        agent._handle_completion.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plan_reindex_does_not_bypass_prior_unresolved_intent(self):
+        from agents.provisioning.kernel import new_intent
+        from providers.rhel_kernel import KernelSpec
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        aliases = ["sut-a", "sut-b"]
+        old_intent = new_intent(
+            ticket["id"],
+            1,
+            aliases,
+            KernelSpec(KERNEL_B),
+            ["install"],
+            {},
+            dict(zip(aliases, HOSTS, strict=True)),
+        )
+        old_intent["progress"]["install"] = "indeterminate"
+        ticket["custom_fields"]["kernel_change_intents"] = {
+            "records": {old_intent["intent_id"]: old_intent}
+        }
+        agent = _agent(ticket)
+        mcp = ScriptedMCP({})
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        assert not mcp.calls
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert (
+            "previous kernel or repository cleanup command has an unresolved"
+            in comments
+        )
+        assert "host owner must reconcile it" in comments
+
+    @pytest.mark.asyncio
+    async def test_resumed_pending_reboot_reconciles_before_completing(self):
+        from agents.provisioning.kernel import new_intent
+        from providers.rhel_kernel import KernelSpec
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        spec = KernelSpec.parse(
+            ticket["custom_fields"]["execution_plan"]["steps"][2]["params"]["kernel"]
+        )
+        intent = new_intent(
+            ticket["id"],
+            2,
+            HOSTS,
+            spec,
+            ["reboot"],
+            {},
+            {host: host for host in HOSTS},
+        )
+        intent["progress"]["reboot"] = "started"
+        intent["approval_request_id"] = "apr-existing"
+        ticket["custom_fields"]["kernel_change_intents"] = {
+            "records": {intent["intent_id"]: intent}
+        }
+        ticket["custom_fields"]["kernel_transitions"] = {
+            "2": {
+                "intent_id": intent["intent_id"],
+                "approval_request_id": "apr-existing",
+                "kernel": KERNEL_B,
+                "kernel_spec": spec.to_dict(),
+                "requested_hosts": HOSTS,
+                "addresses": {host: host for host in HOSTS},
+                "reboot_policy": "always",
+                "state": "indeterminate",
+                "hosts": {
+                    host: {
+                        "state": "indeterminate",
+                        "reboot_issued": True,
+                        "reboot_pending": True,
+                        "pre_boot_id": f"before-{host}",
+                        "post_boot_id": None,
+                    }
+                    for host in HOSTS
+                },
+            }
+        }
+        agent = _agent(ticket)
+        mcp = ScriptedMCP(
+            {
+                "verify_kernel_state": {
+                    "status": "ok",
+                    "transition_state": "verified",
+                    "results": {
+                        host: {"host": host, "state": "verified"} for host in HOSTS
+                    },
+                },
+                "run_repo_cleanup": {
+                    "status": "ok",
+                    "results": {
+                        host: {"host": host, "state": "clean"} for host in HOSTS
+                    },
+                },
+            }
+        )
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        assert [name for name, _ in mcp.calls] == [
+            "verify_kernel_state",
+            "run_repo_cleanup",
+        ]
+        agent._handle_completion.assert_awaited_once()
+        submitted = agent._handle_completion.await_args.args[1].tool_calls[0].input
+        assert submitted["provisioning_complete"] is True
+        assert (
+            submitted["configuration_applied"]["kernel_transition"]["intent_id"]
+            == (intent["intent_id"])
+        )
+
+    @pytest.mark.asyncio
+    async def test_reboot_reservation_without_checkpoint_pauses_for_human(self):
+        from agents.provisioning.kernel import new_intent
+        from providers.rhel_kernel import KernelSpec
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        spec = KernelSpec.parse(
+            ticket["custom_fields"]["execution_plan"]["steps"][2]["params"]["kernel"]
+        )
+        intent = new_intent(
+            ticket["id"],
+            2,
+            HOSTS,
+            spec,
+            ["reboot"],
+            {},
+            {host: host for host in HOSTS},
+        )
+        intent["progress"]["reboot"] = "started"
+        ticket["custom_fields"]["kernel_change_intents"] = {
+            "records": {intent["intent_id"]: intent}
+        }
+        agent = _agent(ticket)
+        mcp = ScriptedMCP(
+            {
+                "verify_kernel_state": {
+                    "status": "indeterminate",
+                    "reason_code": "reboot_checkpoint_unavailable",
+                    "error": "human host-owner intervention is required",
+                }
+            }
+        )
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        assert [name for name, _ in mcp.calls] == ["verify_kernel_state"]
+        agent._handle_completion.assert_not_awaited()
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "prior reboot remains unresolved" in comments
+        assert "host owner must reconcile it" in comments
+        assert "No further kernel changes were started" in comments
+        transition_comment = agent._transition_ticket.await_args.kwargs["comment"]
+        assert "host owner must reconcile" in transition_comment
+        assert "Automated resumption is currently unavailable" in transition_comment
+        assert "restart the kernel change request" not in transition_comment
+
+    @pytest.mark.asyncio
+    async def test_pending_reboot_checkpoint_comment_offers_supported_verification(
+        self,
+    ):
+        from agents.provisioning.kernel import new_intent
+        from providers.rhel_kernel import KernelSpec
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        spec = KernelSpec.parse(
+            ticket["custom_fields"]["execution_plan"]["steps"][2]["params"]["kernel"]
+        )
+        intent_id = "kci-recoverable-reboot"
+        intent = new_intent(
+            ticket["id"],
+            2,
+            HOSTS,
+            spec,
+            ["reboot"],
+            {},
+            {host: host for host in HOSTS},
+        )
+        intent["intent_id"] = intent_id
+        intent["progress"]["reboot"] = "started"
+        intent["approval_request_id"] = "apr-existing"
+        latest_ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        latest_ticket["custom_fields"]["kernel_change_intents"] = {
+            "records": {intent_id: intent}
+        }
+        latest_ticket["custom_fields"]["kernel_transitions"] = {
+            "2": {
+                "intent_id": intent_id,
+                "kernel": KERNEL_B,
+                "kernel_spec": spec.to_dict(),
+                "requested_hosts": HOSTS,
+                "addresses": {host: host for host in HOSTS},
+                "reboot_policy": "always",
+                "state": "indeterminate",
+                "hosts": {
+                    HOSTS[0]: {
+                        "state": "verified",
+                        "reboot_issued": True,
+                        "reboot_pending": False,
+                        "pre_boot_id": "before-1",
+                        "post_boot_id": "after-1",
+                        "observed_kernel": KERNEL_B,
+                    },
+                    HOSTS[1]: {
+                        "state": "reconnect_timeout",
+                        "reboot_issued": True,
+                        "reboot_pending": True,
+                        "pre_boot_id": "before-2",
+                        "post_boot_id": None,
+                    },
+                },
+            }
+        }
+        agent = _agent(ticket)
+        agent._get_ticket = AsyncMock(return_value=latest_ticket)
+        mcp = ScriptedMCP(
+            {
+                "get_kernel_inventory": ok_inventory(HOSTS),
+                "prepare_kernel_change": {
+                    "status": "ok",
+                    "intent_id": intent_id,
+                    "actions_required": ["reboot"],
+                },
+                "reboot_hosts_and_verify": {
+                    "status": "paused",
+                    "hosts": {
+                        HOSTS[0]: {"host": HOSTS[0], "state": "verified"},
+                        HOSTS[1]: {
+                            "host": HOSTS[1],
+                            "state": "reconnect_timeout",
+                            "reboot_pending": True,
+                        },
+                    },
+                },
+            }
+        )
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        assert not any(name == "run_repo_cleanup" for name, _ in mcp.calls)
+        transition_comment = agent._transition_ticket.await_args.kwargs["comment"]
+        assert "verify_kernel_state" in transition_comment
+        assert "will not issue another reboot" in transition_comment
+        assert "Automated resumption is currently unavailable" not in transition_comment
+
+    @pytest.mark.asyncio
+    async def test_failure_path_cleanup_timeout_reports_unknown_and_pauses(self):
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        agent = _agent(ticket)
+        script = full_script(actions=("install",))
+        script["install_kernel"] = {
+            "results": {
+                host: {
+                    "host": host,
+                    "state": "install_failed",
+                    "remote_write_quiescent": True,
+                }
+                for host in HOSTS
+            }
+        }
+        script["run_repo_cleanup"] = {
+            "status": "indeterminate",
+            "results": {
+                host: {
+                    "state": "indeterminate",
+                    "remote_write_quiescent": False,
+                }
+                for host in HOSTS
+            },
+        }
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        names = [name for name, _ in mcp.calls]
+        assert names[-1] == "run_repo_cleanup"
+        assert "select_default_kernel" not in names
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "cleanup outcome unknown" in comments
+        assert "Kernel change paused" in comments
+        transition_comment = agent._transition_ticket.await_args.kwargs["comment"]
+        assert "host owner must reconcile" in transition_comment
+        assert "Automated resumption is currently unavailable" in transition_comment
+        assert "restart the kernel change request" not in transition_comment
+        agent._handle_completion.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_final_success_cleanup_timeout_pauses_without_completion(self):
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        agent = _agent(ticket)
+        script = full_script()
+        script["run_repo_cleanup"] = {
+            "status": "indeterminate",
+            "results": {
+                host: {
+                    "state": "indeterminate",
+                    "remote_write_quiescent": False,
+                }
+                for host in HOSTS
+            },
+        }
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        assert [name for name, _ in mcp.calls][-1] == "run_repo_cleanup"
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "cleanup outcome unknown" in comments
+        assert "Kernel change paused" in comments
+        agent._handle_completion.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

@@ -336,6 +336,7 @@ class UpdateFieldsRequest(BaseModel):
     require_unsuperseded_validation_id: StrictStr | None = Field(
         default=None, min_length=1, max_length=255
     )
+    expected_execution_plan: dict[str, Any] | None = None
 
 
 class ExtendIterationsRequest(BaseModel):

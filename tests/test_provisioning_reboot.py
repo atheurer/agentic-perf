@@ -477,22 +477,28 @@ class TestApproval:
 def seed_transition(fake_store, host_records, *, kernel=KERNEL_B):
     from providers.rhel_kernel import transition_state
 
-    fake_store.custom_fields()["kernel_transitions"] = {
-        "2": {
-            "kernel": kernel,
-            "kernel_spec": {"release": kernel, "package": "kernel"},
-            "reboot_policy": fake_store.custom_fields()
-            .get("directives", {})
-            .get("kernel_reboot_policy", "always"),
-            "addresses": {host: host for host in HOSTS},
-            "package": "kernel",
-            "requested_hosts": HOSTS,
-            "strategy": "serial",
-            "state": transition_state(host_records, HOSTS),
-            "hosts": host_records,
-            "record_version": 3,
-        }
+    transition = {
+        "kernel": kernel,
+        "kernel_spec": {"release": kernel, "package": "kernel"},
+        "reboot_policy": fake_store.custom_fields()
+        .get("directives", {})
+        .get("kernel_reboot_policy", "always"),
+        "addresses": {host: host for host in HOSTS},
+        "package": "kernel",
+        "requested_hosts": HOSTS,
+        "strategy": "serial",
+        "state": transition_state(host_records, HOSTS),
+        "hosts": host_records,
+        "record_version": 3,
     }
+    intents = (
+        fake_store.custom_fields().get("kernel_change_intents", {}).get("records", {})
+    )
+    matching = [intent for intent in intents.values() if intent.get("step_id") == 2]
+    if matching:
+        transition["intent_id"] = matching[-1]["intent_id"]
+        transition["approval_request_id"] = matching[-1].get("approval_request_id")
+    fake_store.custom_fields()["kernel_transitions"] = {"2": transition}
 
 
 def host_record(host, state, **extra):
@@ -533,6 +539,56 @@ def host_record(host, state, **extra):
 
 
 class TestRecovery:
+    @pytest.mark.asyncio
+    async def test_started_reboot_without_checkpoint_is_not_replayed(
+        self, handlers, fleet_ssh, fake_store, approval
+    ):
+        intent = next(
+            iter(
+                fake_store.custom_fields()["kernel_change_intents"]["records"].values()
+            )
+        )
+        intent["progress"]["reboot"] = "started"
+
+        result = await run_reboot(handlers, approval)
+
+        assert result["status"] == "rejected"
+        assert result["reason_code"] == "reboot_checkpoint_unavailable"
+        assert "human host-owner intervention is required" in result["error"]
+        assert reboot_calls(fleet_ssh) == []
+        assert not any("@@boot_id" in call["command"] for call in fleet_ssh.calls)
+
+    @pytest.mark.asyncio
+    async def test_started_reboot_rejects_checkpoint_for_different_intent(
+        self, handlers, fleet_ssh, fake_store, approval
+    ):
+        intent = next(
+            iter(
+                fake_store.custom_fields()["kernel_change_intents"]["records"].values()
+            )
+        )
+        intent["progress"]["reboot"] = "started"
+        seed_transition(
+            fake_store,
+            {
+                host: host_record(
+                    host, "reconnect_timeout", pre_boot_id="previous-boot"
+                )
+                for host in HOSTS
+            },
+        )
+        fake_store.custom_fields()["kernel_transitions"]["2"]["intent_id"] = (
+            "kci-different-intent"
+        )
+
+        result = await run_reboot(handlers, approval)
+
+        assert result["status"] == "rejected"
+        assert result["reason_code"] == "reboot_intent_binding_mismatch"
+        assert "different intent" in result["error"]
+        assert reboot_calls(fleet_ssh) == []
+        assert not any("@@boot_id" in call["command"] for call in fleet_ssh.calls)
+
     @pytest.mark.asyncio
     async def test_crash_after_reboot_reconciles_without_second_reboot(
         self, handlers, two_hosts_ready, fleet_ssh, fake_store
@@ -798,6 +854,186 @@ class TestVerifyKernelState:
             final["hosts"]["10.0.0.1"]["post_boot_id"]
             == two_hosts_ready["10.0.0.1"].boot_id
         )
+
+    @pytest.mark.asyncio
+    async def test_reboot_reconciliation_resolves_started_reservation(
+        self, handlers, two_hosts_ready, fake_store
+    ):
+        from agents.provisioning.kernel import (
+            new_intent,
+            unresolved_kernel_step_operation,
+        )
+        from providers.rhel_kernel import KernelSpec
+
+        for host in two_hosts_ready.values():
+            host.running = KERNEL_B
+        intent = new_intent(
+            "PERF-TEST",
+            2,
+            HOSTS,
+            KernelSpec(KERNEL_B),
+            ["reboot"],
+            {},
+            {host: host for host in HOSTS},
+            reboot_policy="if_needed",
+        )
+        intent["progress"]["reboot"] = "started"
+        fake_store.seed_intent(intent)
+        seed_transition(
+            fake_store,
+            {
+                host: host_record(
+                    host,
+                    "reconnect_timeout",
+                    pre_boot_id="previous-boot",
+                )
+                for host in HOSTS
+            },
+        )
+        transition = fake_store.custom_fields()["kernel_transitions"]["2"]
+        transition["intent_id"] = intent["intent_id"]
+
+        result = await handlers["verify_kernel_state"](
+            hosts=HOSTS, expected_kernel=KERNEL_B
+        )
+
+        assert result["transition_state"] == "verified"
+        assert (
+            unresolved_kernel_step_operation(fake_store.ticket, 2, hosts=HOSTS) is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_install_indeterminate_refuses_verification_probe(
+        self, handlers, fleet_ssh, fake_store
+    ):
+        from agents.provisioning.kernel import new_intent
+        from providers.rhel_kernel import KernelSpec
+
+        intent = new_intent(
+            "PERF-TEST",
+            2,
+            HOSTS,
+            KernelSpec(KERNEL_B),
+            ["install"],
+            {},
+        )
+        intent["progress"]["install"] = "indeterminate"
+        fake_store.seed_intent(intent)
+
+        result = await handlers["verify_kernel_state"](
+            hosts=HOSTS, expected_kernel=KERNEL_B
+        )
+
+        assert result["status"] == "indeterminate"
+        assert result["reason_code"] == "kernel_action_requires_reconciliation"
+        assert "automated resumption is currently unavailable" in result["error"]
+        assert not fleet_ssh.calls
+        assert checkpoints(fake_store) == []
+
+    @pytest.mark.asyncio
+    async def test_started_reboot_without_checkpoint_requires_human_reconciliation(
+        self, handlers, fleet_ssh, fake_store
+    ):
+        from agents.provisioning.kernel import new_intent
+        from providers.rhel_kernel import KernelSpec
+
+        intent = new_intent(
+            "PERF-TEST",
+            2,
+            HOSTS,
+            KernelSpec(KERNEL_B),
+            ["reboot"],
+            {},
+            {host: host for host in HOSTS},
+        )
+        intent["progress"]["reboot"] = "started"
+        fake_store.seed_intent(intent)
+
+        result = await handlers["verify_kernel_state"](
+            hosts=HOSTS, expected_kernel=KERNEL_B
+        )
+
+        assert result["status"] == "indeterminate"
+        assert result["reason_code"] == "reboot_checkpoint_unavailable"
+        assert "human host-owner intervention is required" in result["error"]
+        assert not fleet_ssh.calls
+        assert checkpoints(fake_store) == []
+
+    @pytest.mark.asyncio
+    async def test_started_reboot_rejects_checkpoint_for_another_intent(
+        self, handlers, fleet_ssh, fake_store
+    ):
+        from agents.provisioning.kernel import new_intent
+        from providers.rhel_kernel import KernelSpec
+
+        intent = new_intent(
+            "PERF-TEST",
+            2,
+            HOSTS,
+            KernelSpec(KERNEL_B),
+            ["reboot"],
+            {},
+            {host: host for host in HOSTS},
+        )
+        intent["progress"]["reboot"] = "started"
+        fake_store.seed_intent(intent)
+        seed_transition(
+            fake_store,
+            {
+                host: host_record(
+                    host, "reconnect_timeout", pre_boot_id="previous-boot"
+                )
+                for host in HOSTS
+            },
+        )
+        fake_store.custom_fields()["kernel_transitions"]["2"]["intent_id"] = (
+            "kci-different-intent"
+        )
+
+        result = await handlers["verify_kernel_state"](
+            hosts=HOSTS, expected_kernel=KERNEL_B
+        )
+
+        assert result["status"] == "rejected"
+        assert result["reason_code"] == "reboot_intent_binding_mismatch"
+        assert "different intent" in result["error"]
+        assert not fleet_ssh.calls
+        assert checkpoints(fake_store) == []
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_refuses_address_drift_before_probe(
+        self, handlers, fleet_ssh, fake_store, monkeypatch
+    ):
+        import agents.provisioning.kernel as kernel
+
+        seed_transition(
+            fake_store,
+            {
+                host: host_record(
+                    host, "reconnect_timeout", pre_boot_id="previous-boot"
+                )
+                for host in HOSTS
+            },
+        )
+        monkeypatch.setattr(
+            kernel,
+            "canonicalize_targets",
+            lambda requested, _ticket, **_kwargs: (
+                sorted(requested),
+                {},
+                {host: host for host in requested},
+                {"10.0.0.1": "10.0.0.99", "10.0.0.2": "10.0.0.2"},
+            ),
+        )
+
+        result = await handlers["verify_kernel_state"](
+            hosts=HOSTS, expected_kernel=KERNEL_B
+        )
+
+        assert result["status"] == "rejected"
+        assert result["reason_code"] == "transition_target_binding_changed"
+        assert not fleet_ssh.calls
+        assert checkpoints(fake_store) == []
 
     @pytest.mark.asyncio
     async def test_mismatch_when_running_other(self, handlers, fake_store):

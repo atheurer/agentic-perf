@@ -272,6 +272,9 @@ class TestKernelSpecRepoUrl:
         assert "gpgcheck=0" not in cmd
         assert "sslverify=0" not in cmd
         assert f"dnf -q list --available {spec.nevra}" in cmd
+        assert " && dnf clean metadata" in cmd
+        assert " && dnf -q list" in cmd
+        assert "; dnf -q list" not in cmd
 
     def test_build_repo_setup_command_requires_url(self):
         with pytest.raises(ValueError):
@@ -443,7 +446,240 @@ class TestInstallKernelRepoBootstrap:
             record = result["results"][host]
             assert record["state"] == "install_failed"
             assert record["reason_code"] == "repository_setup_failed"
+            assert record["remote_write_quiescent"] is True
             assert "repository bootstrap failed" in record["error"]
+
+    @pytest.mark.asyncio
+    async def test_repo_setup_ssh_loss_is_indeterminate_and_stops_before_dnf(
+        self, handlers, fake_store, fleet_ssh
+    ):
+        from providers.ssh import SSHResult
+
+        intent_id = await self.prepared_intent(handlers)
+        approval_id = fake_store.seed_approval(fake_store.intent(intent_id))
+        for host in fleet_ssh._hosts.values():
+            original = host.handle
+
+            def setup_lost(command, original=original):
+                if "agentic-perf kernel repository" in command:
+                    return SSHResult(stdout="", exit_code=255, stderr="connection lost")
+                return original(command)
+
+            host.handle = setup_lost
+        result = await handlers["install_kernel"](
+            hosts=["10.0.0.1", "10.0.0.2"],
+            kernel=KERNEL_B,
+            approval_request_id=approval_id,
+        )
+        for host in ("10.0.0.1", "10.0.0.2"):
+            record = result["results"][host]
+            assert record["state"] == "indeterminate", record
+            assert record["reason_code"] == "repository_setup_indeterminate"
+            assert record["remote_write_quiescent"] is False
+        assert not any("dnf install" in call["command"] for call in fleet_ssh.calls)
+
+
+class TestRunRepoCleanup:
+    def _activate(self, monkeypatch, ticket, ssh):
+        from unittest.mock import AsyncMock
+
+        import agents.provisioning.server as srv
+        from tests.fake_rhel import FakeKernelStore
+
+        FakeKernelStore.reset(ticket)
+        monkeypatch.setattr(srv, "_initialized", True)
+        monkeypatch.setattr(srv, "_ssh", ssh)
+
+        async def active(**_kwargs):
+            return {"status": "ok", "ticket": FakeKernelStore.ticket}
+
+        monkeypatch.setattr(
+            "agents.server_utils.assert_ticket_active", AsyncMock(side_effect=active)
+        )
+        monkeypatch.setattr(
+            "agents.provisioning.kernel.AuditedAsyncHTTPClient", FakeKernelStore
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_and_refused_targets_are_incomplete(self, monkeypatch):
+        import json
+
+        import agents.provisioning.server as srv
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": REPO_URL,
+            }
+        )
+        ssh = FakeFleetSSH(fresh_repo_hosts())
+        self._activate(monkeypatch, ticket, ssh)
+        empty = json.loads(await srv.run_repo_cleanup(hosts=[]))
+        refused = json.loads(await srv.run_repo_cleanup(hosts=["10.99.99.99"]))
+        assert empty["status"] == "incomplete"
+        assert refused["status"] == "incomplete"
+        assert refused["results"]["10.99.99.99"]["state"] == "refused"
+        assert not ssh.calls
+
+    @pytest.mark.asyncio
+    async def test_cleanup_refuses_dns_pin_drift_before_ssh(self, monkeypatch):
+        import json
+
+        import agents.provisioning.kernel as kernel
+        import agents.provisioning.server as srv
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": REPO_URL,
+            }
+        )
+        old_addresses = {host: host for host in ("10.0.0.1", "10.0.0.2")}
+        ticket["custom_fields"]["kernel_transitions"] = {
+            "2": {
+                "requested_hosts": sorted(old_addresses),
+                "addresses": old_addresses,
+                "hosts": {},
+            }
+        }
+        ssh = FakeFleetSSH(fresh_repo_hosts())
+        self._activate(monkeypatch, ticket, ssh)
+        monkeypatch.setattr(
+            kernel,
+            "canonicalize_targets",
+            lambda requested, _ticket: (
+                sorted(requested),
+                {},
+                {host: host for host in requested},
+                {"10.0.0.1": "10.0.0.99", "10.0.0.2": "10.0.0.2"},
+            ),
+        )
+
+        result = json.loads(await srv.run_repo_cleanup(hosts=list(old_addresses)))
+
+        assert result["status"] == "rejected"
+        assert result["reason_code"] == "cleanup_target_binding_changed"
+        assert not ssh.calls
+        assert (
+            ticket["custom_fields"]["kernel_transitions"]["2"]["addresses"]
+            == old_addresses
+        )
+
+    @pytest.mark.asyncio
+    async def test_cleanup_refuses_drift_from_prepared_intent_without_transition(
+        self, monkeypatch
+    ):
+        import json
+
+        import agents.provisioning.server as srv
+        from agents.provisioning.kernel import new_intent
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": REPO_URL,
+            }
+        )
+        intent = new_intent(
+            ticket["id"],
+            2,
+            ["10.0.0.1", "10.0.0.2"],
+            KernelSpec(KERNEL_B, repo_url=REPO_URL),
+            ["install"],
+            {},
+            {"10.0.0.1": "10.0.0.99", "10.0.0.2": "10.0.0.2"},
+        )
+        intent["progress"]["install"] = "done"
+        ticket["custom_fields"]["kernel_change_intents"] = {
+            "records": {intent["intent_id"]: intent}
+        }
+        ssh = FakeFleetSSH(fresh_repo_hosts())
+        self._activate(monkeypatch, ticket, ssh)
+
+        result = json.loads(await srv.run_repo_cleanup(hosts=["10.0.0.1", "10.0.0.2"]))
+
+        assert result["status"] == "rejected"
+        assert result["reason_code"] == "cleanup_target_binding_changed"
+        assert "prepared kernel intent pins" in result["error"]
+        assert not ssh.calls
+
+    @pytest.mark.asyncio
+    async def test_cleanup_timeout_is_persisted_and_blocks_retry(self, monkeypatch):
+        import json
+
+        import agents.provisioning.server as srv
+        from providers.ssh import SSHResult
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": REPO_URL,
+            }
+        )
+        ssh = FakeFleetSSH(fresh_repo_hosts())
+        original_run = ssh.run
+
+        async def cleanup_timeout(host, command, timeout=300, mutating=False):
+            if "rm -f /etc/yum.repos.d/agentic-perf-kernel.repo" in command:
+                ssh.calls.append(
+                    {
+                        "method": "run",
+                        "host": host,
+                        "command": command,
+                        "mutating": mutating,
+                    }
+                )
+                return SSHResult(stdout="", stderr="connection lost", exit_code=255)
+            return await original_run(host, command, timeout, mutating)
+
+        ssh.run = cleanup_timeout
+        self._activate(monkeypatch, ticket, ssh)
+
+        first = json.loads(await srv.run_repo_cleanup(hosts=["10.0.0.1", "10.0.0.2"]))
+        checkpoint = ticket["custom_fields"]["kernel_transitions"]["2"]
+        assert first["status"] == "indeterminate"
+        assert checkpoint["repo_cleanup"]["state"] == "indeterminate"
+        calls_before_retry = len(ssh.calls)
+
+        retry = json.loads(await srv.run_repo_cleanup(hosts=["10.0.0.1", "10.0.0.2"]))
+        assert retry["status"] == "indeterminate"
+        assert retry["reason_code"] == "kernel_action_requires_reconciliation"
+        assert len(ssh.calls) == calls_before_retry
+
+    @pytest.mark.asyncio
+    async def test_unresolved_install_blocks_direct_cleanup(self, monkeypatch):
+        import json
+
+        import agents.provisioning.server as srv
+
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": REPO_URL,
+            }
+        )
+        ticket["custom_fields"]["kernel_change_intents"] = {
+            "records": {
+                "kci-old": {
+                    "intent_id": "kci-old",
+                    "step_id": 2,
+                    "progress": {"install": "indeterminate"},
+                }
+            }
+        }
+        ssh = FakeFleetSSH(fresh_repo_hosts())
+        self._activate(monkeypatch, ticket, ssh)
+
+        result = json.loads(await srv.run_repo_cleanup(hosts=["10.0.0.1", "10.0.0.2"]))
+
+        assert result["status"] == "indeterminate"
+        assert result["reason_code"] == "kernel_action_requires_reconciliation"
+        assert not ssh.calls
 
 
 # ---------------------------------------------------------------------------
@@ -1082,17 +1318,16 @@ class TestSecretTransferSafety:
         trust = await srv._resolve_repository_trust(REPO_URL)
         assert trust["approved"] is True
 
-        gpg, ca = await srv._deploy_repository_trust("10.0.0.1", trust)
+        gpg, ca, ambiguous = await srv._deploy_repository_trust("10.0.0.1", trust)
         assert gpg and ca  # deployment succeeds
+        assert ambiguous is False
         trust_calls = [
             call for call in ssh.calls if "/etc/pki/agentic-perf/" in call["command"]
         ]
         assert len(trust_calls) == 2
         assert all(call["stdin_data"] is not None for call in trust_calls)
-        secret_calls = trust_calls
-        assert len(secret_calls) == 2
         encoded = base64.b64encode(hostile.encode("utf-8")).decode("ascii")
-        for call in secret_calls:
+        for call in trust_calls:
             cmd = call["command"]
             assert call["stdin_data"] == hostile.encode("utf-8")
             assert hostile not in cmd
@@ -1104,6 +1339,42 @@ class TestSecretTransferSafety:
             assert "chmod 0600 /etc/pki/agentic-perf/" in cmd
             assert "rm -rf" not in cmd
             assert "`reboot`" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_trust_write_timeout_is_indeterminate_without_next_write(
+        self, monkeypatch
+    ):
+        import agents.provisioning.server as srv
+        from providers.ssh import SSHResult
+        from tests.conftest import MockSkillProvider
+
+        class TimeoutSSH:
+            def __init__(self):
+                self.calls = []
+
+            async def run(self, host, command, **kwargs):
+                self.calls.append((host, command, kwargs))
+                return SSHResult(stdout="", stderr="connection lost", exit_code=255)
+
+        ssh = TimeoutSSH()
+        monkeypatch.setattr(srv, "_initialized", True)
+        monkeypatch.setattr(srv, "_ssh", ssh)
+        monkeypatch.setattr(
+            srv,
+            "_skill_provider",
+            MockSkillProvider(private_config=REPO_TRUST_CONFIG),
+        )
+        monkeypatch.setattr(srv, "_secrets_provider", _TrustSecrets())
+        trust = await srv._resolve_repository_trust(REPO_URL)
+        assert trust["approved"] is True
+
+        gpg_path, ca_path, ambiguous = await srv._deploy_repository_trust(
+            "10.0.0.1", trust
+        )
+
+        assert gpg_path == ca_path == ""
+        assert ambiguous is True
+        assert len(ssh.calls) == 1
 
 
 # ---------------------------------------------------------------------------

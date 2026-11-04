@@ -167,6 +167,151 @@ def test_kernel_change_binds_to_persisted_intent(tmp_path):
         )
 
 
+def test_consumption_atomically_marks_install_started_and_blocks_replay(tmp_path):
+    store, ticket, session_id, claim_id = _claimed_store(tmp_path)
+    digest = _seed_intent(store, ticket, actions=["install"])
+    binding = dict(presented_run_file_digest=digest, execution_intent_digest=digest)
+    approval = store.create_approval_request(
+        ticket.id, _request(session_id, claim_id, **binding), created_by="provisioning"
+    )
+    store.resolve_approval_request(
+        ticket.id,
+        approval.approval_request_id,
+        ResolveApprovalRequest(decision="approved", comment_id="c-1"),
+        resolved_by="alice",
+    )
+
+    store.consume_approval_request(
+        ticket.id,
+        approval.approval_request_id,
+        _consume(session_id, claim_id, kernel_action="install", **binding),
+        consumed_by="provisioning",
+    )
+
+    progress = store.get_ticket(ticket.id).custom_fields["kernel_change_intents"][
+        "records"
+    ][INTENT_ID]["progress"]
+    assert progress["install"] == "started"
+    with pytest.raises(ValueError, match="requires reconciliation"):
+        store.consume_approval_request(
+            ticket.id,
+            approval.approval_request_id,
+            _consume(session_id, claim_id, kernel_action="install", **binding),
+            consumed_by="provisioning",
+        )
+
+
+def test_repository_cleanup_checkpoint_blocks_new_intent_under_store_lock(tmp_path):
+    import copy
+
+    store, ticket, session_id, claim_id = _claimed_store(tmp_path)
+    fence = dict(session_id=UUID(session_id), epoch=1, claim_id=claim_id)
+    transition = _verified_checkpoint()
+    transition["repo_cleanup"] = {
+        "state": "started",
+        "hosts": ["10.0.0.1", "10.0.0.2"],
+    }
+    stored = store.kernel_control(ticket.id, "transition", "2", 0, transition, **fence)
+
+    candidate = new_intent(
+        ticket.id,
+        2,
+        ["10.0.0.1", "10.0.0.2"],
+        KernelSpec("5.14.0-503.16.1.el9_5.x86_64"),
+        ["install"],
+        {},
+    )
+    with pytest.raises(ValueError, match="requires reconciliation"):
+        store.kernel_control(
+            ticket.id,
+            "intent",
+            candidate["intent_id"],
+            0,
+            candidate,
+            **fence,
+        )
+    ambiguous = copy.deepcopy(stored)
+    ambiguous["repo_cleanup"]["state"] = "indeterminate"
+    stored_ambiguous = store.kernel_control(
+        ticket.id,
+        "transition",
+        "2",
+        stored["record_version"],
+        ambiguous,
+        **fence,
+    )
+    assert stored_ambiguous["repo_cleanup"]["state"] == "indeterminate"
+    with pytest.raises(ValueError, match="requires reconciliation"):
+        store.kernel_control(
+            ticket.id,
+            "intent",
+            candidate["intent_id"],
+            0,
+            candidate,
+            **fence,
+        )
+
+
+@pytest.mark.parametrize("operation", ["install", "cleanup", "reboot"])
+def test_unresolved_prior_step_blocks_new_intent_after_plan_reindex(
+    tmp_path, operation
+):
+    store, ticket, session_id, claim_id = _claimed_store(tmp_path)
+    fence = dict(session_id=UUID(session_id), epoch=1, claim_id=claim_id)
+    current = store.get_ticket(ticket.id)
+    fields = current.custom_fields
+    plan = fields["execution_plan"]
+    plan["current_step"] = 1
+    plan["steps"][1]["params"]["kernel"] = plan["steps"][2]["params"]["kernel"].copy()
+    hosts = ["10.0.0.1", "10.0.0.2"]
+    old_hosts = ["sut-a", "sut-b"]
+    old_addresses = dict(zip(old_hosts, hosts, strict=True))
+    fields["assigned_hardware_ips"]["targets"] = hosts
+    spec = KernelSpec.parse(plan["steps"][1]["params"]["kernel"])
+    if operation == "install":
+        old_intent = new_intent(
+            ticket.id, 2, old_hosts, spec, ["install"], {}, old_addresses
+        )
+        old_intent["progress"]["install"] = "indeterminate"
+        fields["kernel_change_intents"] = {
+            "records": {old_intent["intent_id"]: old_intent}
+        }
+    else:
+        old_transition = _verified_checkpoint()
+        old_transition["requested_hosts"] = old_hosts
+        old_transition["addresses"] = old_addresses
+        old_transition["hosts"] = {
+            old_host: old_transition["hosts"][host]
+            for old_host, host in zip(old_hosts, hosts, strict=True)
+        }
+        if operation == "cleanup":
+            old_transition["repo_cleanup"] = {
+                "state": "indeterminate",
+                "hosts": old_hosts,
+            }
+        else:
+            old_transition["state"] = "indeterminate"
+            for record in old_transition["hosts"].values():
+                record.update(
+                    state="indeterminate",
+                    reboot_pending=True,
+                    post_boot_id=None,
+                )
+        fields["kernel_transitions"] = {"2": old_transition}
+    store._persist_ticket(current)
+
+    candidate = new_intent(ticket.id, 1, hosts, spec, ["install"], {})
+    with pytest.raises(ValueError, match="requires reconciliation"):
+        store.kernel_control(
+            ticket.id,
+            "intent",
+            candidate["intent_id"],
+            0,
+            candidate,
+            **fence,
+        )
+
+
 def test_kernel_change_without_intent_is_rejected(tmp_path):
     store, ticket, session_id, claim_id = _claimed_store(tmp_path)
     digest = DIGEST
