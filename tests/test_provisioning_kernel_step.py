@@ -314,7 +314,9 @@ class TestDeterministicKernelStep:
         assert "secret" not in comments
         assert "may remain" in comments
         pause_comment = next(
-            comment for comment in comment_list if "Kernel change paused" in comment
+            comment
+            for comment in comment_list
+            if "Kernel change step stopped" in comment
         )
         assert HOSTS[0] not in pause_comment
         assert HOSTS[1] in pause_comment
@@ -392,7 +394,7 @@ class TestDeterministicKernelStep:
             call.args[1] for call in agent._add_comment.await_args_list
         )
         assert "Temporary repository cleanup confirmed" in comments
-        assert "Kernel change paused" in comments
+        assert "Kernel change step stopped" in comments
         agent._handle_completion.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -803,7 +805,7 @@ class TestDeterministicKernelStep:
             call.args[1] for call in agent._add_comment.await_args_list
         )
         assert "cleanup outcome unknown" in comments
-        assert "Kernel change paused" in comments
+        assert "Kernel change step stopped" in comments
         transition_comment = agent._transition_ticket.await_args.kwargs["comment"]
         assert "host owner must reconcile" in transition_comment
         assert "Automated resumption is currently unavailable" in transition_comment
@@ -840,7 +842,7 @@ class TestDeterministicKernelStep:
             call.args[1] for call in agent._add_comment.await_args_list
         )
         assert "cleanup outcome unknown" in comments
-        assert "Kernel change paused" in comments
+        assert "Kernel change step stopped" in comments
         agent._handle_completion.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -932,7 +934,7 @@ class TestDeterministicKernelStep:
         comments = [call.args[1] for call in agent._add_comment.await_args_list]
         action_comment = next(comment for comment in comments if "result**" in comment)
         pause_comment = next(
-            comment for comment in comments if "Kernel change paused" in comment
+            comment for comment in comments if "Kernel change step stopped" in comment
         )
         assert f"{HOSTS[0]}:** running kernel {KERNEL_B} was verified" in action_comment
         assert "not confirmed (reconnect timeout)" in action_comment
@@ -1216,7 +1218,10 @@ class TestDeterministicKernelStep:
         comments = [call.args[1] for call in agent._add_comment.await_args_list]
         assert len(comments) == 2
         assert (
-            sum(comment.count("**Kernel change paused:**") for comment in comments) == 1
+            sum(
+                comment.count("**Kernel change step stopped:**") for comment in comments
+            )
+            == 1
         )
         comment = "\n".join(comments)
         assert expected_guidance in comment
@@ -1226,9 +1231,15 @@ class TestDeterministicKernelStep:
     async def test_status_read_failure_does_not_suppress_manual_guidance(self):
         ticket = kernel_step_ticket()
         agent = _agent(ticket)
+        state = {"status": "awaiting_provision"}
         agent._get_ticket = AsyncMock(
             side_effect=RuntimeError("temporary read failure")
         )
+
+        async def transition(ticket_id, status, comment=None):
+            state["status"] = status
+
+        agent._transition_ticket = AsyncMock(side_effect=transition)
 
         await agent._kernel_step_stop(
             ticket["id"],
@@ -1240,11 +1251,76 @@ class TestDeterministicKernelStep:
             requires_manual_reconciliation=True,
         )
 
-        agent._transition_ticket.assert_not_called()
+        agent._transition_ticket.assert_awaited_once()
+        transition_call = agent._transition_ticket.await_args
+        assert transition_call.args[:2] == (
+            ticket["id"],
+            "awaiting_customer_guidance",
+        )
+        assert "preceding reconciliation guidance" in transition_call.kwargs["comment"]
+        assert state["status"] == "awaiting_customer_guidance"
         comments = "\n".join(
             call.args[1] for call in agent._add_comment.await_args_list
         )
-        assert "**Kernel change paused:**" in comments
+        assert "**Kernel change step stopped:**" in comments
+        assert "Automated resumption is currently unavailable" in comments
+
+    @pytest.mark.asyncio
+    async def test_transition_failure_with_unknown_status_propagates_unconfirmed_pause(
+        self,
+    ):
+        ticket = kernel_step_ticket()
+        agent = _agent(ticket)
+        agent._get_ticket = AsyncMock(
+            side_effect=[
+                RuntimeError("temporary read failure"),
+                {**ticket, "status": "awaiting_provision"},
+            ]
+        )
+        agent._transition_ticket = AsyncMock(
+            side_effect=RuntimeError("pause transition failed")
+        )
+
+        with pytest.raises(RuntimeError, match="pause transition failed"):
+            await agent._kernel_step_stop(
+                ticket["id"],
+                "repository cleanup outcome is unknown",
+                {"status": "indeterminate"},
+                requires_manual_reconciliation=True,
+            )
+
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "Automated resumption is currently unavailable" in comments
+        assert "**Kernel change paused:**" not in comments
+
+    @pytest.mark.asyncio
+    async def test_unknown_status_transition_conflict_is_confirmed_if_already_paused(
+        self,
+    ):
+        ticket = kernel_step_ticket()
+        paused = {**ticket, "status": "awaiting_customer_guidance"}
+        agent = _agent(ticket)
+        agent._get_ticket = AsyncMock(
+            side_effect=[RuntimeError("temporary read failure"), paused]
+        )
+        agent._transition_ticket = AsyncMock(
+            side_effect=RuntimeError("transition rejected because already paused")
+        )
+
+        await agent._kernel_step_stop(
+            ticket["id"],
+            "repository cleanup outcome is unknown",
+            {"status": "indeterminate"},
+            requires_manual_reconciliation=True,
+        )
+
+        agent._transition_ticket.assert_awaited_once()
+        assert agent._get_ticket.await_count == 2
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
         assert "Automated resumption is currently unavailable" in comments
 
     @pytest.mark.asyncio

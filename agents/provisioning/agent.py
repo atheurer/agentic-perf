@@ -817,7 +817,7 @@ class ProvisioningAgent(AgentBase):
         reboot_reconciliation_available: bool = False,
     ) -> None:
         """Pause for the user unless a tool already paused the ticket."""
-        body = f"**Kernel change paused:** {headline}"
+        body = f"**Kernel change step stopped:** {headline}"
         if isinstance(detail, dict) and detail:
             host_lines = []
             records = detail.get("results", detail.get("hosts", detail))
@@ -865,25 +865,54 @@ class ProvisioningAgent(AgentBase):
             ticket = await self._get_ticket(ticket_id)
         except Exception:
             ticket = None
-        if not isinstance(ticket, dict):
-            if reboot_reconciliation_available or requires_manual_reconciliation:
-                await self._add_comment(
-                    ticket_id,
-                    f"**Required reconciliation:** {transition_comment}",
-                )
-            return
-        if ticket.get("status") == "awaiting_customer_guidance":
-            if reboot_reconciliation_available or requires_manual_reconciliation:
-                await self._add_comment(
-                    ticket_id,
-                    f"**Required reconciliation:** {transition_comment}",
-                )
-            return
-        await self._transition_ticket(
-            ticket_id,
-            "awaiting_customer_guidance",
-            comment=f"The kernel change needs attention. {transition_comment}",
+        ticket_status = ticket.get("status") if isinstance(ticket, dict) else None
+        guidance_needed = (
+            reboot_reconciliation_available or requires_manual_reconciliation
         )
+        guidance_written = False
+        if ticket_status == "awaiting_customer_guidance":
+            if reboot_reconciliation_available or requires_manual_reconciliation:
+                await self._add_comment(
+                    ticket_id,
+                    f"**Required reconciliation:** {transition_comment}",
+                )
+                guidance_written = True
+            return
+        if ticket_status is None and guidance_needed:
+            await self._add_comment(
+                ticket_id,
+                f"**Required reconciliation:** {transition_comment}",
+            )
+            guidance_written = True
+        pause_comment = (
+            "The kernel change needs attention. See the preceding reconciliation "
+            "guidance."
+            if guidance_written
+            else f"The kernel change needs attention. {transition_comment}"
+        )
+        try:
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_customer_guidance",
+                comment=pause_comment,
+            )
+        except Exception as transition_error:
+            if guidance_needed and not guidance_written:
+                await self._add_comment(
+                    ticket_id,
+                    f"**Required reconciliation:** {transition_comment}",
+                )
+                guidance_written = True
+            try:
+                updated = await self._get_ticket(ticket_id)
+            except Exception:
+                raise transition_error
+            if (
+                isinstance(updated, dict)
+                and updated.get("status") == "awaiting_customer_guidance"
+            ):
+                return
+            raise transition_error
 
     @staticmethod
     def _kernel_requires_manual_reconciliation(detail: Any) -> bool:
