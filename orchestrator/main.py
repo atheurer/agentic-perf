@@ -1096,6 +1096,14 @@ async def _advance_plan(
                     "validation_id"
                 ]
                 body["expected_execution_plan"] = expected_execution_plan
+                body["expected_comparison_evidence"] = {
+                    name: cf.get(name)
+                    for name in (
+                        "benchmark_execution_validation_id",
+                        "run_id",
+                        "benchmark_status",
+                    )
+                }
             response = await client.patch(
                 f"{store_url}/api/v1/tickets/{ticket_id}/fields",
                 json=body,
@@ -1129,6 +1137,24 @@ async def _advance_plan(
                                 "receipt was read, so this comparison step was not "
                                 "committed. Reconcile the run and current plan "
                                 "before resuming."
+                            ),
+                        },
+                    )
+                    pause.raise_for_status()
+                    return False
+                if (
+                    isinstance(detail, str)
+                    and "comparison execution evidence changed" in detail
+                ):
+                    pause = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                        json={
+                            "status": "awaiting_customer_guidance",
+                            "comment": (
+                                "Benchmark run or validation evidence changed after "
+                                "the durable receipt was read, so this comparison "
+                                "step was not committed. Reconcile the run and "
+                                "ticket evidence before resuming."
                             ),
                         },
                     )

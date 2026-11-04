@@ -842,28 +842,43 @@ class ProvisioningAgent(AgentBase):
             if host_lines:
                 body += "\n\n" + "\n".join(host_lines)
         body += "\n\nNo further kernel changes were started."
-        await self._add_comment(ticket_id, body)
-        ticket = await self._get_ticket(ticket_id)
-        if ticket.get("status") == "awaiting_customer_guidance":
-            return
-        if reboot_reconciliation_available:
+        if requires_manual_reconciliation:
+            transition_comment = (
+                "A host owner must reconcile the unresolved remote operation. "
+                "Automated resumption is currently unavailable; do not start another "
+                "kernel action from this ticket."
+            )
+        elif reboot_reconciliation_available:
             transition_comment = (
                 "The reboot checkpoint is durable. Use verify_kernel_state with "
                 "the full assigned host list to reconcile it; this check is "
                 "read-only and will not issue another reboot. If the checkpoint "
                 "cannot be verified, a host owner must reconcile the host state."
             )
-        elif requires_manual_reconciliation:
-            transition_comment = (
-                "A host owner must reconcile the unresolved remote operation. "
-                "Automated resumption is currently unavailable; do not start another "
-                "kernel action from this ticket."
-            )
         else:
             transition_comment = (
                 "Fix the host or plan, then restart the kernel change request and "
                 "get approval before another reboot."
             )
+        await self._add_comment(ticket_id, body)
+        try:
+            ticket = await self._get_ticket(ticket_id)
+        except Exception:
+            ticket = None
+        if not isinstance(ticket, dict):
+            if reboot_reconciliation_available or requires_manual_reconciliation:
+                await self._add_comment(
+                    ticket_id,
+                    f"**Required reconciliation:** {transition_comment}",
+                )
+            return
+        if ticket.get("status") == "awaiting_customer_guidance":
+            if reboot_reconciliation_available or requires_manual_reconciliation:
+                await self._add_comment(
+                    ticket_id,
+                    f"**Required reconciliation:** {transition_comment}",
+                )
+            return
         await self._transition_ticket(
             ticket_id,
             "awaiting_customer_guidance",

@@ -331,12 +331,23 @@ class KernelControlRequest(BaseModel):
     record: dict[str, Any]
 
 
+class ComparisonEvidenceSnapshot(BaseModel):
+    """Ticket evidence that must remain unchanged while a comparison commits."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    benchmark_execution_validation_id: StrictStr | None
+    run_id: StrictStr | None
+    benchmark_status: StrictStr | None
+
+
 class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
     require_unsuperseded_validation_id: StrictStr | None = Field(
         default=None, min_length=1, max_length=255
     )
     expected_execution_plan: dict[str, Any] | None = None
+    expected_comparison_evidence: ComparisonEvidenceSnapshot | None = None
 
 
 class ExtendIterationsRequest(BaseModel):

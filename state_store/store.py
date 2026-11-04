@@ -75,6 +75,10 @@ class ExecutionPlanChangedError(ValueError):
     """A conditional field update used an out-of-date execution plan."""
 
 
+class ComparisonEvidenceChangedError(ValueError):
+    """A comparison receipt's ticket evidence changed before its plan write."""
+
+
 class ClaimFenceError(Exception):
     """A claim mutation was rejected by the state-store fencing contract."""
 
@@ -1270,6 +1274,7 @@ class TicketStore:
         iteration_limits: tuple[dict[str, int], int] | None = None,
         require_unsuperseded_validation_id: str | None = None,
         expected_execution_plan: dict | None = None,
+        expected_comparison_evidence: dict | None = None,
     ) -> Ticket:
         with self._lock:
             ticket = self._resolve(ticket_id)
@@ -1303,6 +1308,20 @@ class TicketStore:
                     raise ValidationSupersededError(
                         "the executed benchmark validation was superseded before "
                         "the comparison step could be committed"
+                    )
+            if expected_comparison_evidence is not None:
+                current_evidence = {
+                    name: ticket.custom_fields.get(name)
+                    for name in (
+                        "benchmark_execution_validation_id",
+                        "run_id",
+                        "benchmark_status",
+                    )
+                }
+                if current_evidence != expected_comparison_evidence:
+                    raise ComparisonEvidenceChangedError(
+                        "comparison execution evidence changed after its durable "
+                        "receipt was read"
                     )
             if self._contains_kernel_reserved(fields):
                 raise ValueError("kernel control and approval fields are server-owned")

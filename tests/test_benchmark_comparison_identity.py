@@ -6,16 +6,22 @@ import copy
 import hashlib
 import json
 from types import SimpleNamespace
+from uuid import uuid4
 
+import httpx
 import pytest
+from fastapi import Depends, FastAPI
 
 import agents.benchmark.arcaflow_plugin_server as plugin_server
 import agents.benchmark.server as benchmark_server
 import agents.server_utils as server_utils
 import orchestrator.main as orchestrator
 from providers.benchmark_identity import benchmark_intent_identity
-from state_store.models import CreateTicketRequest
+from state_store.api.router import api_router
+from state_store.auth import make_auth_dependency
+from state_store.models import AcquireOrchestratorLeaseRequest, CreateTicketRequest
 from state_store.store import (
+    ComparisonEvidenceChangedError,
     ExecutionPlanChangedError,
     TicketStore,
     ValidationSupersededError,
@@ -109,11 +115,13 @@ class _Client:
         operation=None,
         supersede_on_plan_write=False,
         change_plan_on_write=False,
+        change_evidence_on_write=None,
     ):
         self.ticket = ticket
         self.operation = operation
         self.supersede_on_plan_write = supersede_on_plan_write
         self.change_plan_on_write = change_plan_on_write
+        self.change_evidence_on_write = change_evidence_on_write
         self.patches = []
         self.patch_attempts = []
         self.posts = []
@@ -156,6 +164,29 @@ class _Client:
                 {"detail": "execution plan changed before the comparison step"},
                 status_code=409,
             )
+        expected_evidence = kwargs.get("json", {}).get("expected_comparison_evidence")
+        if self.change_evidence_on_write and expected_evidence:
+            self.ticket["custom_fields"][self.change_evidence_on_write] = (
+                "concurrent-value"
+            )
+            current_evidence = {
+                name: self.ticket["custom_fields"].get(name)
+                for name in (
+                    "benchmark_execution_validation_id",
+                    "run_id",
+                    "benchmark_status",
+                )
+            }
+            if current_evidence != expected_evidence:
+                return _Response(
+                    {
+                        "detail": (
+                            "comparison execution evidence changed after its "
+                            "durable receipt was read"
+                        )
+                    },
+                    status_code=409,
+                )
         self.patches.append((url, copy.deepcopy(kwargs)))
         return _Response({})
 
@@ -167,9 +198,16 @@ async def _advance(
     ticket_id="PERF-TEST",
     supersede_on_plan_write=False,
     change_plan_on_write=False,
+    change_evidence_on_write=None,
 ):
     ticket = {"status": "awaiting_review", "custom_fields": cf}
-    client = _Client(ticket, operation, supersede_on_plan_write, change_plan_on_write)
+    client = _Client(
+        ticket,
+        operation,
+        supersede_on_plan_write,
+        change_plan_on_write,
+        change_evidence_on_write,
+    )
     monkeypatch.setattr(orchestrator, "AuditedAsyncHTTPClient", lambda **_: client)
     await orchestrator._advance_plan("http://store", ticket_id, "executing_benchmark")
     return client
@@ -257,6 +295,11 @@ async def test_successful_receipt_captures_actual_runfile(monkeypatch):
     assert (
         client.patch_attempts[0][1]["json"]["expected_execution_plan"] == expected_plan
     )
+    assert client.patch_attempts[0][1]["json"]["expected_comparison_evidence"] == {
+        "benchmark_execution_validation_id": "val-a",
+        "run_id": "run-a",
+        "benchmark_status": "completed",
+    }
 
 
 @pytest.mark.asyncio
@@ -309,6 +352,38 @@ async def test_concurrent_plan_edit_pauses_without_committing_comparison(monkeyp
     assert len(client.posts) == 1
     assert client.posts[0][1]["json"]["status"] == "awaiting_customer_guidance"
     assert "execution plan changed" in client.posts[0][1]["json"]["comment"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed_field",
+    [
+        "benchmark_execution_validation_id",
+        "run_id",
+        "benchmark_status",
+    ],
+)
+async def test_concurrent_comparison_evidence_edit_pauses_before_commit(
+    monkeypatch, changed_field
+):
+    cf, _, operation = _example()
+    client = await _advance(
+        monkeypatch, cf, operation, change_evidence_on_write=changed_field
+    )
+
+    expected = client.patch_attempts[0][1]["json"]["expected_comparison_evidence"]
+    assert expected == {
+        "benchmark_execution_validation_id": "val-a",
+        "run_id": "run-a",
+        "benchmark_status": "completed",
+    }
+    assert client.patches == []
+    assert len(client.posts) == 1
+    assert client.posts[0][1]["json"]["status"] == "awaiting_customer_guidance"
+    assert (
+        "evidence changed after the durable receipt was read"
+        in client.posts[0][1]["json"]["comment"]
+    )
 
 
 @pytest.mark.asyncio
@@ -465,6 +540,263 @@ def test_stale_comparison_write_cannot_overwrite_a_concurrent_plan_edit(tmp_path
     current = store.get_ticket(ticket.id).custom_fields
     assert current["execution_plan"] == concurrently_edited
     assert "comparison_receipt" not in current
+
+
+def test_ticket_store_atomically_rejects_stale_comparison_evidence(tmp_path):
+    cf, _, _ = _example()
+    plan = copy.deepcopy(cf["execution_plan"])
+    store = TicketStore(persist_dir=tmp_path)
+    ticket = store.create_ticket(
+        CreateTicketRequest(
+            summary="comparison evidence race",
+            description="comparison evidence race",
+            custom_fields={"execution_plan": plan},
+        )
+    )
+    expected_evidence = {
+        "benchmark_execution_validation_id": "val-a",
+        "run_id": "run-a",
+        "benchmark_status": "completed",
+    }
+    store.update_fields(ticket.id, expected_evidence)
+    store.update_fields(ticket.id, {"run_id": "run-b"})
+
+    with pytest.raises(
+        ComparisonEvidenceChangedError,
+        match="comparison execution evidence changed",
+    ):
+        store.update_fields(
+            ticket.id,
+            {"comparison_receipt": {"run_id": "run-a"}},
+            expected_execution_plan=plan,
+            expected_comparison_evidence=expected_evidence,
+        )
+
+    current = store.get_ticket(ticket.id).custom_fields
+    assert current["run_id"] == "run-b"
+    assert "comparison_receipt" not in current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed_field",
+    [
+        "benchmark_execution_validation_id",
+        "run_id",
+        "benchmark_status",
+    ],
+)
+async def test_ticket_fields_api_maps_evidence_cas_conflict_to_409(
+    tmp_path, monkeypatch, changed_field
+):
+    from orchestrator.main import _mutation_headers
+
+    cf, record, _ = _example()
+    plan = copy.deepcopy(cf["execution_plan"])
+    store = TicketStore(persist_dir=tmp_path)
+    ticket = store.create_ticket(
+        CreateTicketRequest(
+            summary="comparison API evidence race",
+            description="comparison API evidence race",
+            custom_fields={"execution_plan": plan},
+        )
+    )
+    runfile_digest = _digest(record["run_file"])
+    params_digest = _digest(plan["steps"][0]["params"])
+    validation = {
+        **record,
+        "validation_id": "val-a",
+        "runfile_fingerprint": runfile_digest,
+        "execution_plan_fingerprint": params_digest,
+        "execution_intent_digest": benchmark_server._execution_intent_digest(
+            runfile_digest, params_digest, "crucible", "controller", "crucible run"
+        ),
+        "validator_command": "crucible validate",
+        "validator_version": "test",
+        "validation_output": {
+            "size_bytes": 2,
+            "original_size_bytes": 2,
+            "redacted_size_bytes": 2,
+            "media_type": "text/plain",
+            "digest": "a" * 64,
+            "digest_kind": "sha256",
+            "preview": "ok",
+            "truncated": False,
+            "redaction_applied": False,
+        },
+    }
+    _, conflict = store.create_validation(ticket.id, validation, 0)
+    assert conflict is None
+
+    expected_evidence = {
+        "benchmark_execution_validation_id": "val-a",
+        "run_id": "run-a",
+        "benchmark_status": "completed",
+    }
+    store.update_fields(ticket.id, expected_evidence)
+    changed_values = {
+        "benchmark_execution_validation_id": "val-b",
+        "run_id": "run-b",
+        "benchmark_status": "failed",
+    }
+    store.update_fields(ticket.id, {changed_field: changed_values[changed_field]})
+
+    session_id = uuid4()
+    lease = store.acquire_orchestrator_lease(
+        AcquireOrchestratorLeaseRequest(
+            session_id=session_id,
+            instance_name="comparison-cas-test",
+            host="host-a",
+            pid=123,
+            process_start_id="boot:123",
+            ttl_seconds=30,
+        )
+    )
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "service")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", str(session_id))
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", str(lease.epoch))
+    app = FastAPI()
+    app.state.store = store
+    app.include_router(
+        api_router, dependencies=[Depends(make_auth_dependency("service"))]
+    )
+    path = f"/api/v1/tickets/{ticket.id}/fields"
+    body = {
+        "fields": {"comparison_receipt": {"run_id": "run-a"}},
+        "require_unsuperseded_validation_id": "val-a",
+        "expected_execution_plan": plan,
+        "expected_comparison_evidence": expected_evidence,
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://store"
+    ) as client:
+        response = await client.patch(path, headers=_mutation_headers(None), json=body)
+        assert response.status_code == 409
+        assert "comparison execution evidence changed" in response.json()["detail"]
+
+        # An ordinary ticket edit without this optional precondition remains valid.
+        ordinary = await client.patch(
+            path,
+            headers=_mutation_headers(None),
+            json={"fields": {"ordinary_note": "still allowed"}},
+        )
+        assert ordinary.status_code == 200, ordinary.text
+
+    current = store.get_ticket(ticket.id).custom_fields
+    assert current[changed_field] == changed_values[changed_field]
+    assert "comparison_receipt" not in current
+    assert current["ordinary_note"] == "still allowed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed_field",
+    [
+        "benchmark_execution_validation_id",
+        "run_id",
+        "benchmark_status",
+    ],
+)
+async def test_ticket_fields_api_atomically_rejects_changed_comparison_evidence(
+    tmp_path, monkeypatch, changed_field
+):
+    from orchestrator.main import _mutation_headers
+
+    cf, record, _ = _example()
+    plan = copy.deepcopy(cf["execution_plan"])
+    store = TicketStore(persist_dir=tmp_path)
+    ticket = store.create_ticket(
+        CreateTicketRequest(
+            summary="comparison evidence race",
+            description="comparison evidence race",
+            custom_fields={"execution_plan": plan},
+        )
+    )
+    runfile_digest = _digest(record["run_file"])
+    params_digest = _digest(plan["steps"][0]["params"])
+    validation = {
+        **record,
+        "validation_id": "val-a",
+        "runfile_fingerprint": runfile_digest,
+        "execution_plan_fingerprint": params_digest,
+        "execution_intent_digest": benchmark_server._execution_intent_digest(
+            runfile_digest, params_digest, "crucible", "controller", "crucible run"
+        ),
+        "validator_command": "crucible validate",
+        "validator_version": "test",
+        "validation_output": {
+            "size_bytes": 2,
+            "original_size_bytes": 2,
+            "redacted_size_bytes": 2,
+            "media_type": "text/plain",
+            "digest": "a" * 64,
+            "digest_kind": "sha256",
+            "preview": "ok",
+            "truncated": False,
+            "redaction_applied": False,
+        },
+    }
+    _, conflict = store.create_validation(ticket.id, validation, 0)
+    assert conflict is None
+
+    original_evidence = {
+        "benchmark_execution_validation_id": "val-a",
+        "run_id": "run-a",
+        "benchmark_status": "completed",
+    }
+    store.update_fields(ticket.id, original_evidence)
+    concurrent_value = {
+        "benchmark_execution_validation_id": "val-b",
+        "run_id": "run-b",
+        "benchmark_status": "failed",
+    }[changed_field]
+    store.update_fields(ticket.id, {changed_field: concurrent_value})
+
+    session_id = uuid4()
+    lease = store.acquire_orchestrator_lease(
+        AcquireOrchestratorLeaseRequest(
+            session_id=session_id,
+            instance_name="comparison-cas-test",
+            host="host-a",
+            pid=123,
+            process_start_id="boot:123",
+            ttl_seconds=30,
+        )
+    )
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "service")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", str(session_id))
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", str(lease.epoch))
+    app = FastAPI()
+    app.state.store = store
+    app.include_router(
+        api_router, dependencies=[Depends(make_auth_dependency("service"))]
+    )
+    path = f"/api/v1/tickets/{ticket.id}/fields"
+    body = {
+        "fields": {"comparison_receipt": {"run_id": "run-a"}},
+        "require_unsuperseded_validation_id": "val-a",
+        "expected_execution_plan": plan,
+        "expected_comparison_evidence": original_evidence,
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://store"
+    ) as client:
+        response = await client.patch(path, headers=_mutation_headers(None), json=body)
+        assert response.status_code == 409
+        assert "comparison execution evidence changed" in response.json()["detail"]
+
+        # Generic ticket edits remain unaffected by the optional comparison CAS.
+        ordinary = await client.patch(
+            path,
+            headers=_mutation_headers(None),
+            json={"fields": {"ordinary_note": "still allowed"}},
+        )
+        assert ordinary.status_code == 200, ordinary.text
+
+    current = store.get_ticket(ticket.id).custom_fields
+    assert current[changed_field] == concurrent_value
+    assert "comparison_receipt" not in current
+    assert current["ordinary_note"] == "still allowed"
 
 
 def test_crucible_validation_from_another_comparison_step_is_rejected():

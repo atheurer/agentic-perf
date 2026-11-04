@@ -1171,6 +1171,83 @@ class TestDeterministicKernelStep:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("requires_manual", "reboot_available", "expected_guidance"),
+        [
+            (
+                True,
+                True,
+                "Automated resumption is currently unavailable",
+            ),
+            (
+                False,
+                True,
+                "read-only and will not issue another reboot",
+            ),
+        ],
+    )
+    async def test_already_paused_ticket_keeps_reconciliation_guidance(
+        self, requires_manual, reboot_available, expected_guidance
+    ):
+        ticket = kernel_step_ticket()
+        paused = dict(ticket, status="awaiting_customer_guidance")
+        agent = _agent(ticket)
+        agent._get_ticket = AsyncMock(return_value=paused)
+
+        await agent._kernel_step_stop(
+            ticket["id"],
+            "repository cleanup outcome is unknown after reboot pause",
+            {
+                "status": "indeterminate",
+                "reason_code": "repository_cleanup_indeterminate",
+                "results": {
+                    host: {
+                        "state": "indeterminate",
+                        "remote_write_quiescent": False,
+                    }
+                    for host in HOSTS
+                },
+            },
+            requires_manual_reconciliation=requires_manual,
+            reboot_reconciliation_available=reboot_available,
+        )
+
+        agent._transition_ticket.assert_not_called()
+        comments = [call.args[1] for call in agent._add_comment.await_args_list]
+        assert len(comments) == 2
+        assert (
+            sum(comment.count("**Kernel change paused:**") for comment in comments) == 1
+        )
+        comment = "\n".join(comments)
+        assert expected_guidance in comment
+        assert "The kernel change needs attention." not in comment
+
+    @pytest.mark.asyncio
+    async def test_status_read_failure_does_not_suppress_manual_guidance(self):
+        ticket = kernel_step_ticket()
+        agent = _agent(ticket)
+        agent._get_ticket = AsyncMock(
+            side_effect=RuntimeError("temporary read failure")
+        )
+
+        await agent._kernel_step_stop(
+            ticket["id"],
+            "repository cleanup outcome is unknown",
+            {
+                "status": "indeterminate",
+                "reason_code": "repository_cleanup_indeterminate",
+            },
+            requires_manual_reconciliation=True,
+        )
+
+        agent._transition_ticket.assert_not_called()
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "**Kernel change paused:**" in comments
+        assert "Automated resumption is currently unavailable" in comments
+
+    @pytest.mark.asyncio
     async def test_reboot_policy_directive_is_forwarded(self):
         ticket = kernel_step_ticket()
         ticket["custom_fields"]["directives"] = {"kernel_reboot_policy": "if_needed"}
