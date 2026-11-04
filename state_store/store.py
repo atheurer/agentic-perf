@@ -67,6 +67,18 @@ class TicketNotFound(Exception):
     pass
 
 
+class ValidationSupersededError(ValueError):
+    """A conditional field update referenced a retired validation."""
+
+
+class ExecutionPlanChangedError(ValueError):
+    """A conditional field update used an out-of-date execution plan."""
+
+
+class ComparisonEvidenceChangedError(ValueError):
+    """A comparison receipt's ticket evidence changed before its plan write."""
+
+
 class ClaimFenceError(Exception):
     """A claim mutation was rejected by the state-store fencing contract."""
 
@@ -432,22 +444,29 @@ class TicketStore:
             current_kernel_step,
             require_full_coverage,
             step_kernel_hosts,
+            unresolved_kernel_step_operation,
         )
-        from providers.rhel_kernel import compute_intent_digest, host_reboot_pending
+        from providers.rhel_kernel import compute_intent_digest
 
         view = ticket.model_dump(mode="json")
         step = current_kernel_step(view)
         if ticket.status.value != "awaiting_provision" or step is None:
             raise ValueError("kernel action requires the current provisioning step")
         step_id, spec = step
-        old_transition = ticket.custom_fields.get("kernel_transitions", {}).get(
-            str(step_id), {}
+        unresolved = unresolved_kernel_step_operation(
+            view,
+            step_id,
+            exclude_intent_id=intent.get("intent_id"),
+            hosts=intent.get("hosts", []),
+            addresses=list(intent.get("addresses", {}).values()),
         )
-        if any(
-            host_reboot_pending(record)
-            for record in old_transition.get("hosts", {}).values()
-        ):
-            raise ValueError("previous kernel reboot requires reconciliation")
+        if unresolved:
+            if unresolved.get("kind") == "reboot":
+                raise ValueError("previous kernel reboot requires reconciliation")
+            raise ValueError(
+                "previous kernel operation requires reconciliation: "
+                f"{unresolved.get('kind')} is {unresolved.get('state')}"
+            )
         policy = ticket.custom_fields.get("directives", {}).get(
             "kernel_reboot_policy", "always"
         )
@@ -508,10 +527,18 @@ class TicketStore:
             self._validate_mutation_fence(
                 ticket_id, session_id, epoch, claim_id, leader_only=False
             )
-            if ticket.status.value != "awaiting_provision":
-                raise ValueError("kernel control requires awaiting_provision")
             if kind not in ("intent", "transition"):
                 raise ValueError("unknown kernel control record kind")
+            cleanup_update_in_guidance = (
+                ticket.status.value == "awaiting_customer_guidance"
+                and kind == "transition"
+                and isinstance(record.get("repo_cleanup"), dict)
+            )
+            if (
+                ticket.status.value != "awaiting_provision"
+                and not cleanup_update_in_guidance
+            ):
+                raise ValueError("kernel control requires awaiting_provision")
             field = (
                 "kernel_change_intents" if kind == "intent" else "kernel_transitions"
             )
@@ -540,6 +567,7 @@ class TicketStore:
                     canonicalize_targets,
                     current_kernel_step,
                     require_full_coverage,
+                    unresolved_kernel_step_operation,
                 )
                 from providers.rhel_kernel import (
                     host_reboot_pending,
@@ -571,6 +599,40 @@ class TicketStore:
                     "if_needed",
                 ):
                     raise ValueError("kernel transition policy mismatch")
+                prior_cleanup = previous.get("repo_cleanup", {})
+                next_cleanup = candidate.get("repo_cleanup", {})
+                if next_cleanup != prior_cleanup:
+                    if not isinstance(next_cleanup, dict) or next_cleanup.get(
+                        "state"
+                    ) not in {"started", "clean", "failed", "indeterminate"}:
+                        raise ValueError("invalid repository cleanup state")
+                    next_state = next_cleanup["state"]
+                    prior_state = (
+                        prior_cleanup.get("state")
+                        if isinstance(prior_cleanup, dict)
+                        else None
+                    )
+                    if next_state == "started":
+                        if prior_state in {"started", "indeterminate"}:
+                            raise ValueError(
+                                "repository cleanup requires reconciliation"
+                            )
+                        unresolved = unresolved_kernel_step_operation(
+                            view,
+                            step[0],
+                            hosts=candidate.get("requested_hosts", []),
+                            addresses=list(candidate.get("addresses", {}).values()),
+                        )
+                        if unresolved:
+                            raise ValueError(
+                                "previous kernel operation requires reconciliation: "
+                                f"{unresolved.get('kind')} is "
+                                f"{unresolved.get('state')}"
+                            )
+                    elif prior_state != "started":
+                        raise ValueError(
+                            "repository cleanup result requires a started cleanup"
+                        )
                 changed_binding = previous and (
                     previous.get("kernel_spec") != candidate.get("kernel_spec")
                     or previous.get("reboot_policy") != policy
@@ -1210,12 +1272,57 @@ class TicketStore:
         claim_id: str | None = None,
         leader_only: bool = False,
         iteration_limits: tuple[dict[str, int], int] | None = None,
+        require_unsuperseded_validation_id: str | None = None,
+        expected_execution_plan: dict | None = None,
+        expected_comparison_evidence: dict | None = None,
     ) -> Ticket:
         with self._lock:
             ticket = self._resolve(ticket_id)
             self._validate_mutation_fence(
                 ticket_id, session_id, epoch, claim_id, leader_only=leader_only
             )
+            if (
+                expected_execution_plan is not None
+                and ticket.custom_fields.get("execution_plan")
+                != expected_execution_plan
+            ):
+                raise ExecutionPlanChangedError(
+                    "execution plan changed before the comparison step could be "
+                    "committed"
+                )
+            if require_unsuperseded_validation_id is not None:
+                manifest = self._validation_manifest(ticket)
+                validation = manifest["records"].get(require_unsuperseded_validation_id)
+                superseded = any(
+                    isinstance(record, dict)
+                    and record.get("record_type") == "supersession"
+                    and record.get("supersedes_validation_id")
+                    == require_unsuperseded_validation_id
+                    for record in manifest["records"].values()
+                )
+                if (
+                    not isinstance(validation, dict)
+                    or validation.get("record_type", "validation") != "validation"
+                    or superseded
+                ):
+                    raise ValidationSupersededError(
+                        "the executed benchmark validation was superseded before "
+                        "the comparison step could be committed"
+                    )
+            if expected_comparison_evidence is not None:
+                current_evidence = {
+                    name: ticket.custom_fields.get(name)
+                    for name in (
+                        "benchmark_execution_validation_id",
+                        "run_id",
+                        "benchmark_status",
+                    )
+                }
+                if current_evidence != expected_comparison_evidence:
+                    raise ComparisonEvidenceChangedError(
+                        "comparison execution evidence changed after its durable "
+                        "receipt was read"
+                    )
             if self._contains_kernel_reserved(fields):
                 raise ValueError("kernel control and approval fields are server-owned")
             durable_grant = fields.get("max_iterations_override") is not None
@@ -1991,7 +2098,8 @@ class TicketStore:
                 if (
                     intent.get("intent_digest") != current.execution_intent_digest
                     or kernel_action not in actions
-                    or progress.get(kernel_action) == "done"
+                    or progress.get(kernel_action)
+                    in {"done", "started", "indeterminate"}
                     or (reserve_reboot and progress.get(kernel_action) != "pending")
                     or any(
                         progress.get(a) != "done"
@@ -2000,6 +2108,19 @@ class TicketStore:
                 ):
                     raise ValueError("kernel intent changed or requires reconciliation")
                 # The approval-owned flag cannot be revived by mutable progress.
+                # Reserve the selected action in the same ticket write as the
+                # approval consumption. This closes the gap between consuming
+                # the approval and the caller's later intent-progress update.
+                records = ticket.custom_fields.get("kernel_change_intents", {}).get(
+                    "records", {}
+                )
+                intent = deepcopy(intent)
+                action_progress = dict(intent.get("progress", {}))
+                action_progress[kernel_action] = "started"
+                intent["progress"] = action_progress
+                intent["record_version"] = int(intent.get("record_version", 0)) + 1
+                intent["updated_at"] = datetime.now(timezone.utc).isoformat()
+                records[current.validation_id] = intent
             consumed = current.model_copy(
                 update={
                     "consumed_at": current.consumed_at or datetime.now(timezone.utc),

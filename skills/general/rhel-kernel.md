@@ -42,7 +42,7 @@ sequence describes the optional model workflow.
      reconnect polling and `uname -r` / `boot_id` verification.
      Long-lived; progress is posted to the ticket.
    Every action is authorized against the current plan and allocation under
-   the state-store lock, including retries after initial consumption.
+   the state-store lock.
    A tool called out of order, or for an action the intent does not
    require, is refused.
 5. In the model workflow, use `verify_harness_install` to check the
@@ -81,14 +81,24 @@ SSH only to the canonical address that passed validation.
 
 ## After a pause
 
-Use `verify_kernel_state` (with the full host list — it refuses a
-subset so a stale record can never hide) to reconcile the checkpoint
-with what is actually running — it never reboots and needs no approval. The approved reboot policy also has to be satisfied. Under `always`, an
+For an uncertain reboot with a matching durable checkpoint, use
+`verify_kernel_state` (with the full host list — it refuses a subset so a stale
+record can never hide) to reconcile the checkpoint with what is actually
+running — it never reboots and needs no approval. It can reconcile reboot
+evidence, but it does not clear an indeterminate install, default-selection, or
+repository-cleanup marker. A reboot reservation without a matching checkpoint,
+or with a checkpoint bound to a different intent, requires human host-owner
+intervention; automated resumption is unavailable. The approved reboot policy
+also has to be satisfied. Under `always`, an
 issued reboot must have a nonempty changed boot ID; merely observing the
 expected kernel does not complete the step. Under explicit `if_needed`, a
 host already running the kernel can verify only if no issued reboot is pending. If a host needs
-another reboot, run `prepare_kernel_change` again and get a new approval;
-the previous approval was consumed.
+another reboot after a resolved checkpoint, run `prepare_kernel_change` again
+and get a new approval; the previous approval was consumed. After an
+indeterminate install, default-selection, or repository-cleanup command, stop
+automated kernel actions and contact the host owner to reconcile its state. The
+current APIs do not clear those durable ambiguity markers, so confirming the
+host state alone does not make the ticket resumable.
 
 ## Safety rules
 
@@ -112,7 +122,7 @@ Inventory / install / select, per host:
 | `not_checked` / `unreachable` | The host could not be queried | Fix access; prepare refuses until resolved |
 | `install_failed` / `selection_failed` | The command failed | Report; do not retry blindly |
 | `not_bootable` | `vmlinuz` or `initramfs` missing | Report; do not select |
-| `indeterminate` | A command timed out and the outcome could not be confirmed | Re-run the same tool; it re-reads the host first |
+| `indeterminate` | An install, default-selection, or repository-cleanup command timed out and may still be running | Do not retry the command. A host owner must reconcile the host-side operation; automated resumption of that ticket is currently unavailable |
 | `already_default` / `ok` | Boot entry is set | Proceed to reboot |
 
 Reboot, per host:

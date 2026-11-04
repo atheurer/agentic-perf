@@ -30,6 +30,7 @@ from providers.execution import AuditedAsyncHTTPClient
 from providers.rhel_kernel import (
     KernelSpec,
     compute_intent_digest,
+    host_reboot_pending,
     host_verification_proved,
     transition_state,
     validate_host_transition,
@@ -572,6 +573,21 @@ async def authorize_action(
                     },
                 )
 
+        unresolved = unresolved_kernel_step_operation(
+            ticket,
+            step_id if step_id is not None else intent.get("step_id", -1),
+            exclude_intent_id=intent_id,
+            hosts=intent.get("hosts", []),
+            addresses=list(intent.get("addresses", {}).values()),
+        )
+        if unresolved and not (
+            action == "reboot"
+            and unresolved.get("kind") == "reboot"
+            and str(unresolved.get("record_id"))
+            == str(step_id if step_id is not None else intent.get("step_id", -1))
+        ):
+            return False, "action_requires_reconciliation", unresolved
+
         policy = cf.get("directives", {}).get("kernel_reboot_policy", "always")
         if intent.get("reboot_policy") != policy or policy not in (
             "always",
@@ -583,6 +599,54 @@ async def authorize_action(
             return False, "intent_addresses_missing", {}
         if addresses is not None and pins != addresses:
             return False, "approved_targets_changed", {}
+        progress = intent.get("progress", {})
+        if action == "reboot":
+            transition = read_transition(cf, intent.get("step_id", -1))
+            reboot_progress = progress.get("reboot")
+            transition_pending = any(
+                host_reboot_pending(record)
+                for record in transition.get("hosts", {}).values()
+                if isinstance(record, dict)
+            )
+            if reboot_progress in {"started", "indeterminate"} and not transition:
+                return (
+                    False,
+                    "reboot_checkpoint_unavailable",
+                    {
+                        "error": (
+                            "the reboot reservation has no matching durable "
+                            "checkpoint; human host-owner intervention is required "
+                            "and automated resumption is unavailable"
+                        )
+                    },
+                )
+            if (
+                transition
+                and (
+                    transition.get("intent_id") != intent_id
+                    or transition.get("addresses") != pins
+                    or set(transition.get("requested_hosts", []))
+                    != set(intent.get("hosts", []))
+                    or transition.get("kernel_spec") != intent.get("kernel")
+                    or transition.get("reboot_policy") != intent.get("reboot_policy")
+                )
+                and (
+                    reboot_progress in {"started", "indeterminate"}
+                    or transition_pending
+                )
+            ):
+                return (
+                    False,
+                    "reboot_intent_binding_mismatch",
+                    {
+                        "error": (
+                            "the reboot checkpoint belongs to a different intent "
+                            "or binding; "
+                            "human host-owner intervention is required and "
+                            "automated resumption is unavailable"
+                        )
+                    },
+                )
         expected_digest = compute_intent_digest(
             ticket_id,
             intent["step_id"],
@@ -635,8 +699,12 @@ async def authorize_action(
         if action not in actions:
             return False, "action_not_required", {"actions_required": actions}
         progress = intent.get("progress", {})
-        if action == "reboot" and progress.get(action) == "started":
-            return False, "reboot_requires_reconciliation", {}
+        if progress.get(action) in {"started", "indeterminate"} and action != "reboot":
+            return (
+                False,
+                "action_requires_reconciliation",
+                {"action": action, "progress": progress.get(action)},
+            )
         if progress.get(action) == "done":
             return False, "action_already_done", {"action": action}
         predecessors = actions[: actions.index(action)]
@@ -687,6 +755,149 @@ def read_transition(cf: dict[str, Any], step_id: int | str) -> dict[str, Any]:
         return {}
     record = transitions.get(str(step_id), {})
     return record if isinstance(record, dict) else {}
+
+
+def unresolved_kernel_step_operation(
+    ticket: dict[str, Any],
+    step_id: int | str | None,
+    *,
+    exclude_intent_id: str | None = None,
+    hosts: list[str] | set[str] | None = None,
+    addresses: list[str] | set[str] | None = None,
+) -> dict[str, str] | None:
+    """Return relevant persisted work whose remote writer may still be active.
+
+    A new intent, action, or repository cleanup cannot establish that an old
+    timed-out SSH command stopped. Same-step work and work on overlapping
+    targets therefore block automation until a host owner reconciles the step.
+    With ``step_id=None`` and no target filter, all unresolved work for the
+    ticket is returned; completion gates use this conservative form.
+    """
+    cf = ticket.get("custom_fields", {})
+    target_hosts = {str(host) for host in hosts} if hosts is not None else None
+    target_addresses = (
+        {str(address) for address in addresses} if addresses is not None else None
+    )
+
+    def relevant(
+        record_step: Any, record_hosts: Any, record_addresses: Any = None
+    ) -> bool:
+        same_step = step_id is not None and str(record_step) == str(step_id)
+        if same_step:
+            return True
+        if target_hosts is None and target_addresses is None:
+            return step_id is None
+        if (
+            target_hosts is not None
+            and isinstance(record_hosts, (list, tuple, set))
+            and target_hosts.intersection(str(host) for host in record_hosts)
+        ):
+            return True
+        return bool(
+            target_addresses is not None
+            and isinstance(record_addresses, dict)
+            and target_addresses.intersection(
+                str(address) for address in record_addresses.values()
+            )
+        )
+
+    transitions = cf.get("kernel_transitions", {})
+    if isinstance(transitions, dict):
+        for transition_step, transition in transitions.items():
+            if not isinstance(transition, dict):
+                continue
+            cleanup = transition.get("repo_cleanup", {})
+            cleanup_hosts = (
+                cleanup.get("hosts", transition.get("requested_hosts", []))
+                if isinstance(cleanup, dict)
+                else []
+            )
+            if (
+                isinstance(cleanup, dict)
+                and cleanup.get("state") in {"started", "indeterminate"}
+                and relevant(
+                    transition_step, cleanup_hosts, transition.get("addresses")
+                )
+            ):
+                return {
+                    "kind": "repository_cleanup",
+                    "state": str(cleanup["state"]),
+                    "record_id": str(transition_step),
+                }
+
+    for intent_id, intent in read_intents(cf).items():
+        if intent_id == exclude_intent_id:
+            continue
+        intent_hosts = intent.get("hosts", [])
+        if not relevant(intent.get("step_id"), intent_hosts, intent.get("addresses")):
+            continue
+        progress = intent.get("progress", {})
+        if not isinstance(progress, dict):
+            continue
+        for action in KERNEL_ACTIONS:
+            if progress.get(action) in {"started", "indeterminate"}:
+                if action == "reboot" and _reboot_intent_checkpoint_verified(
+                    cf, intent_id, intent
+                ):
+                    continue
+                return {
+                    "kind": action,
+                    "state": str(progress[action]),
+                    "record_id": intent_id,
+                }
+
+    if isinstance(transitions, dict):
+        for transition_step, transition in transitions.items():
+            if not isinstance(transition, dict):
+                continue
+            host_records = transition.get("hosts", {})
+            if not isinstance(host_records, dict):
+                continue
+            pending_hosts = [
+                host
+                for host, record in host_records.items()
+                if isinstance(record, dict) and host_reboot_pending(record)
+            ]
+            if pending_hosts and relevant(
+                transition_step, pending_hosts, transition.get("addresses")
+            ):
+                return {
+                    "kind": "reboot",
+                    "state": "indeterminate",
+                    "record_id": str(transition_step),
+                }
+    return None
+
+
+def _reboot_intent_checkpoint_verified(
+    cf: dict[str, Any], intent_id: str, intent: dict[str, Any]
+) -> bool:
+    """Recognize a reboot reservation reconciled by its durable checkpoint."""
+    step_id = intent.get("step_id")
+    transition = read_transition(cf, step_id)
+    if (
+        transition.get("intent_id") != intent_id
+        or transition.get("state") != "verified"
+        or transition.get("kernel_spec") != intent.get("kernel")
+        or transition.get("addresses") != intent.get("addresses")
+        or transition.get("reboot_policy") != intent.get("reboot_policy")
+        or set(transition.get("requested_hosts", [])) != set(intent.get("hosts", []))
+    ):
+        return False
+    from providers.rhel_kernel import host_verification_proved
+
+    hosts = transition.get("hosts", {})
+    policy = intent.get("reboot_policy", "")
+    kernel = intent.get("kernel", {}).get("release")
+    return bool(intent.get("hosts")) and all(
+        isinstance(hosts.get(host), dict)
+        and hosts[host].get("state") in {"verified", "already_verified"}
+        and hosts[host].get("observed_kernel") == kernel
+        and hosts[host].get("post_boot_id")
+        and not host_reboot_pending(hosts[host])
+        and host_verification_proved(hosts[host], policy)
+        for host in intent.get("hosts", [])
+    )
 
 
 def new_transition(

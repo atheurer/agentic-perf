@@ -110,3 +110,8 @@ the manifest wrapper. Trace reads require authentication plus service/admin or
 ticket ownership authorization. Owner responses are redacted and omit blob
 references/digests; only authorized detailed principals may retrieve an
 existing, verified `sha256:<64 lowercase hex>` payload blob.
+
+Durable fenced operations are service-only. `GET /traces/operations`
+requires the `operation_key` query parameter and returns that operation's
+state, request hash, result descriptor, and external IDs for internal
+reconciliation. It returns `404` when the operation is unknown.

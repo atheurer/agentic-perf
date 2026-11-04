@@ -767,7 +767,23 @@ class BenchmarkAgent(AgentBase):
         import asyncio
         import uuid
 
+        from providers.benchmark_identity import comparison_step_requested
+
         run_uuid = uuid.uuid4().hex[:8]
+        ticket_id = getattr(self, "_ticket_id", None)
+        if ticket_id:
+            ticket = await self._get_ticket(ticket_id)
+            if comparison_step_requested(ticket):
+                return json.dumps(
+                    {
+                        "status": "rejected",
+                        "reason_code": "workload_group_harness_unsupported",
+                        "error": (
+                            "Arcaflow workflows cannot provide the durable "
+                            "execution receipt required for a kernel comparison."
+                        ),
+                    }
+                )
         if getattr(self, "_selected_harness", None) != "arcaflow-workflows":
             return json.dumps(
                 {
@@ -1317,6 +1333,7 @@ class BenchmarkAgent(AgentBase):
             "benchmark_notes": _bounded_benchmark_notes(result.get("notes")),
         }
         validation_id = result.get("validation_id") or self._active_validation_id
+        fields["benchmark_execution_validation_id"] = validation_id or ""
         run_file_used = result.get("run_file_used", {})
         if validation_id:
             ticket = await self._get_ticket(ticket_id)

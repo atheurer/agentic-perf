@@ -23,6 +23,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/benchmark/server.py", "_find_controller_path", "ssh"),
     ("agents/benchmark/server.py", "_find_controller_repository", "filesystem"),
     ("agents/benchmark/server.py", "_find_controller_repository", "ssh"),
+    ("agents/benchmark/server.py", "_prepare_operation_result", "filesystem"),
     ("agents/benchmark/server.py", "_persist_validated_runfile", "mutating_http_state"),
     (
         "agents/benchmark/server.py",
@@ -118,6 +119,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/provisioning/server.py", "_install_harness_one", "ssh"),
     ("agents/provisioning/server.py", "_install_k3s_one", "ssh"),
     ("agents/provisioning/server.py", "_install_kernel_one", "ssh"),
+    ("agents/provisioning/server.py", "_run_repo_cleanup_one", "ssh"),
+    ("agents/provisioning/server.py", "_deploy_repository_trust", "ssh"),
     ("agents/provisioning/server.py", "_install_packages_one", "ssh"),
     ("agents/provisioning/server.py", "_capture_environment_one", "ssh"),
     ("agents/provisioning/agent.py", "_kernel_tool", "mcp"),
@@ -332,6 +335,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("orchestrator/main.py", "_add_comment", "mutating_http_state"),
     ("orchestrator/main.py", "_advance_plan", "mutating_http_state"),
     ("orchestrator/main.py", "_apply_step_overrides", "mutating_http_state"),
+    ("orchestrator/main.py", "persist_plan_fields", "mutating_http_state"),
     ("orchestrator/main.py", "_block_absent_suite", "mutating_http_state"),
     ("orchestrator/main.py", "_block_handoff_failed", "mutating_http_state"),
     ("orchestrator/main.py", "_normalize_ticket_directives", "mutating_http_state"),
@@ -952,6 +956,12 @@ INVENTORY_DISPOSITIONS = {
         "agents/benchmark/server.py:_find_controller_repository",
         "2027-12-31",
     ),
+    ("agents/benchmark/server.py", "_prepare_operation_result", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/server.py:_prepare_operation_result",
+        "2027-12-31",
+    ),
     (
         "agents/benchmark/server.py",
         "_persist_validated_runfile",
@@ -1506,6 +1516,18 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/provisioning/server.py:_install_k3s_one",
+        "2027-12-31",
+    ),
+    ("agents/provisioning/server.py", "_deploy_repository_trust", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/provisioning/server.py:_deploy_repository_trust",
+        "2027-12-31",
+    ),
+    ("agents/provisioning/server.py", "_run_repo_cleanup_one", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/provisioning/server.py:_run_repo_cleanup_one",
         "2027-12-31",
     ),
     ("agents/provisioning/server.py", "_install_kernel_one", "ssh"): (
@@ -2506,6 +2528,12 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "orchestration-maintainers",
         "orchestrator/main.py:_apply_step_overrides",
+        "2027-12-31",
+    ),
+    ("orchestrator/main.py", "persist_plan_fields", "mutating_http_state"): (
+        "system_only",
+        "orchestration-maintainers",
+        "orchestrator/main.py:persist_plan_fields",
         "2027-12-31",
     ),
     ("orchestrator/main.py", "_block_absent_suite", "mutating_http_state"): (

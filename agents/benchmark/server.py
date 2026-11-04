@@ -57,6 +57,13 @@ from agents.tool_ownership import (
     require_ticket_harness,
     selected_harness_from_ticket,
 )
+from providers.benchmark_identity import (
+    benchmark_intent_identity as _benchmark_intent_identity,
+)
+from providers.benchmark_identity import (
+    comparison_fingerprint,
+    comparison_step_requested,
+)
 from providers.execution import (
     AuditedFilesystem,
     AuditedSubprocessRunner,
@@ -75,6 +82,72 @@ CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 
 _CRUCIBLE_ROOT = "/opt/crucible"
 _BOOT_TIME_DRAIN_TIMEOUT = 10.0
+_OPERATION_INLINE_RESULT_BYTES = 3000
+_OPERATION_RESULT_BLOB_MAX_BYTES = 1_048_576
+
+
+def _execution_result_blob_store(ticket_id: str):
+    from providers.tracing import PayloadBlobStore
+
+    return PayloadBlobStore(ticket_id=ticket_id)
+
+
+def _prepare_operation_result(
+    ticket_id: str, result: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Keep durable receipts small while retaining a private full result."""
+    from providers.redaction import get_shared_redactor
+
+    safe = get_shared_redactor().redact(ticket_id, result)
+    if not isinstance(safe, dict) or "redaction_error" in safe:
+        raise ValueError("benchmark result redaction failed")
+    identity_keys = (
+        "status",
+        "exit_code",
+        "harness",
+        "run_id",
+        "run_dir",
+        "validation_id",
+    )
+    if any(safe.get(key) != result.get(key) for key in identity_keys):
+        raise ValueError("benchmark result identity could not be retained safely")
+    safe_bytes = json.dumps(safe, sort_keys=True, separators=(",", ":")).encode()
+    if len(safe_bytes) <= _OPERATION_INLINE_RESULT_BYTES:
+        return safe, safe
+    result_blob_store = _execution_result_blob_store(ticket_id)
+    reference = result_blob_store.put(
+        safe_bytes, max_bytes=_OPERATION_RESULT_BLOB_MAX_BYTES
+    )
+    compact = {key: safe[key] for key in identity_keys if key in safe}
+    compact["result_blob_ref"] = reference
+    if len(json.dumps(compact).encode()) > _OPERATION_INLINE_RESULT_BYTES:
+        raise ValueError("benchmark result identity exceeds receipt limit")
+    return compact, safe
+
+
+def _replay_operation_result(ticket_id: str, cached: dict[str, Any]) -> dict[str, Any]:
+    """Recover the full cached result without relaunching a benchmark."""
+    reference = cached.get("result_blob_ref")
+    if not reference:
+        return cached
+    try:
+        payload = _execution_result_blob_store(ticket_id).get(
+            reference, max_bytes=_OPERATION_RESULT_BLOB_MAX_BYTES
+        )
+        result = json.loads(payload)
+        keys = ("status", "exit_code", "harness", "run_id", "run_dir", "validation_id")
+        if not isinstance(result, dict) or any(
+            result.get(key) != cached.get(key) for key in keys
+        ):
+            raise ValueError("benchmark result identity mismatch")
+        return result
+    except Exception:
+        logger.exception("Unable to recover cached benchmark result")
+        return {
+            "status": "indeterminate",
+            "reason_code": "cached_result_unavailable",
+            "message": "The recorded benchmark result payload could not be recovered.",
+        }
 
 
 def _write_ticket_staging_file(
@@ -304,6 +377,13 @@ async def _persist_validated_runfile(
                 f"{state_store_url}/api/v1/tickets/{ticket_id}",
             )
             ticket_response.raise_for_status()
+            ticket_cf = ticket_response.json().get("custom_fields") or {}
+            plan = ticket_cf.get("execution_plan") or {}
+            if isinstance(plan.get("current_step"), int):
+                record["execution_plan_step_id"] = str(plan["current_step"])
+                _validation_records[validation_id]["execution_plan_step_id"] = str(
+                    plan["current_step"]
+                )
             capability_response = await client.post(
                 f"{state_store_url}/api/v1/tickets/{ticket_id}/validations/capability",
                 headers={
@@ -428,40 +508,6 @@ _BENCHMARK_OPERATION_LEASE_TTL_SECONDS = 900.0
 _BENCHMARK_OPERATION_LEASE_RENEW_INTERVAL_SECONDS = 300.0
 _BENCHMARK_OPERATION_RENEW_RETRY_INITIAL_SECONDS = 1.0
 _BENCHMARK_OPERATION_RENEW_RETRY_MAX_SECONDS = 30.0
-
-
-def _benchmark_intent_identity(
-    ticket_id: str,
-    validation_id: str,
-    record: dict[str, Any],
-    controller: str,
-    harness: str,
-    run_command: str,
-) -> tuple[str, str, dict[str, Any]]:
-    """Return the immutable attempt, operation key, and request hash.
-
-    A validation record is the lifecycle authority for an execution intent.
-    Consequently a replay keeps the same attempt and operation identity while
-    a new validation (the explicit rerun boundary) gets a new one.
-    """
-    attempt_id = str(record.get("attempt_id") or validation_id)
-    intent_id = str(record.get("execution_intent_id") or validation_id)
-    operation_key = f"benchmark-execution:{ticket_id or 'external'}:{intent_id}"
-    immutable = {
-        "ticket_id": ticket_id,
-        "execution_plan_step_id": record.get("execution_plan_step_id", "current"),
-        "attempt_id": attempt_id,
-        "execution_intent_id": intent_id,
-        "validation_id": validation_id,
-        "validation_fingerprint": record.get("runfile_fingerprint"),
-        "harness": harness,
-        "controller": controller,
-        "run_command": run_command,
-    }
-    request_hash = hashlib.sha256(
-        json.dumps(immutable, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    return operation_key, request_hash, immutable
 
 
 class _BenchmarkOperation:
@@ -913,6 +959,10 @@ def _get_validated_runfile(
             ticket.get("custom_fields", {})
         ):
             return None, "validation token is execution-intent-mismatched"
+        if (plan_step_params(ticket) or {}).get("workload_group") and record.get(
+            "execution_plan_step_id"
+        ) != str(_resolve_current_step_id(ticket)):
+            return None, "validation token belongs to a different execution plan step"
     else:
         record = _validation_records.get(validation_id)
 
@@ -2832,6 +2882,174 @@ async def _autoconsume_runfile_approval(
     return {"status": "ok", "approval_request_id": approval_id}
 
 
+def plan_step_params(ticket: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the current plan step's params from the ticket's plan state."""
+    cf = ticket.get("custom_fields") or {}
+    plan = cf.get("execution_plan") or {}
+    current_id = _resolve_current_step_id(ticket)
+    if current_id is None:
+        return None
+    steps = plan.get("steps") or []
+    step = next(
+        (s for s in steps if isinstance(s, dict) and s.get("id") == current_id), None
+    )
+    return (step or {}).get("params") or None
+
+
+def _check_plan_mv_params(
+    ticket: dict[str, Any],
+    run_file: dict[str, Any] | None,
+    plan_mv_params: dict[str, Any] | None,
+    *,
+    enforce_no_extras: bool = False,
+) -> str:
+    """Return a reason when the validated runfile does not match the plan's mv_params.
+
+    The plan step's ``mv_params`` is the deterministic statement of what the
+    benchmark must vary; the LLM-built run file must carry them verbatim in
+    its ``mv-params.sets[0].params``. This is the enforcement behind "the
+    plan is the intent" — it is what catches a dropped ``seconds`` value
+    that would otherwise silently run the harness default (600s instead of
+    the planned 30s in PERF-E47D0F45).
+    """
+    # Harness-neutral: the run file under execution is passed in
+    # directly (from the validation record for crucible, or the
+    # caller-supplied file for generic adapters).
+    plan_mv_params = plan_mv_params or {}
+    if not plan_mv_params and not enforce_no_extras:
+        return ""
+    run_file = run_file or {}
+    benchmarks = run_file.get("benchmarks") or []
+    for benchmark in benchmarks:
+        if not isinstance(benchmark, dict):
+            return "run file contains a malformed benchmark entry"
+        mv_params = benchmark.get("mv-params") or {}
+        if not isinstance(mv_params, dict):
+            return "run file contains malformed mv-params"
+        sets = mv_params.get("sets") or [{}]
+        if not isinstance(sets, list):
+            return "run file contains malformed mv-params sets"
+        for param_set in sets:
+            if not isinstance(param_set, dict):
+                return "run file contains a malformed mv-params set"
+            params = param_set.get("params") or []
+            if not isinstance(params, list) or any(
+                not isinstance(param, dict) or not param.get("arg") for param in params
+            ):
+                return "run file contains malformed mv-params"
+            names = [str(param["arg"]) for param in params]
+            if len(names) != len(set(names)):
+                return "run file contains duplicate mv-params"
+            runfile_params = {str(param["arg"]): param.get("vals") for param in params}
+            for key, expected in plan_mv_params.items():
+                expected_vals = expected if isinstance(expected, list) else [expected]
+                actual = runfile_params.get(str(key))
+                if actual != [str(value) for value in expected_vals]:
+                    return (
+                        f"run file mv-params does not match the plan: plan requires "
+                        f"{key}={expected_vals!r}, run file has {actual!r} (or omits it)"
+                    )
+            extras = sorted(set(runfile_params) - {str(key) for key in plan_mv_params})
+            if extras and (plan_mv_params or enforce_no_extras):
+                return (
+                    "run file varies parameters the plan does not name: "
+                    f"{', '.join(extras)}"
+                )
+    return ""
+
+
+def _resolve_current_step_id(ticket: dict[str, Any]) -> int | None:
+    """Derive the executing step from the ticket's own plan state.
+
+    The authoritative source is ``execution_plan.current_step`` — in-band,
+    written by the orchestrator when the plan advances. Returns None only
+    when the ticket carries no plan at all (external/legacy runs).
+    """
+    cf = ticket.get("custom_fields") or {}
+    plan = cf.get("execution_plan") or {}
+    current = plan.get("current_step")
+    if isinstance(current, int) and not isinstance(current, bool):
+        return current
+    return None
+
+
+def _check_workload_group_drift(
+    ticket: dict[str, Any], runfile_fingerprint: str | None
+) -> str:
+    """Return a drift reason when this execution would break group identity.
+
+    Benchmark steps carrying the same ``params.workload_group`` must run
+    an identical runfile: earlier completed steps in the group record the
+    runfile fingerprint their execution used (written by the orchestrator's
+    step-results capture), and this execution's validated runfile must
+    match. Returns "" when the check passes or does not apply.
+
+    Fail-closed (review round 2): the current step comes from the ticket's
+    own ``execution_plan.current_step``, never an environment variable.
+    A kernel-comparison ticket whose executing step cannot be determined
+    is a rejection, not a bypass.
+    """
+    cf = ticket.get("custom_fields") or {}
+    plan = cf.get("execution_plan") or {}
+    if not plan.get("steps"):
+        return ""  # no plan: external run, group enforcement does not apply
+    current_id = _resolve_current_step_id(ticket)
+    if current_id is None:
+        return (
+            "the executing plan step could not be determined from the "
+            "ticket's execution_plan.current_step; refusing to run a "
+            "workload-group benchmark without a verified step identity"
+        )
+    steps = plan.get("steps") or []
+    current = next((s for s in steps if s.get("id") == current_id), None)
+    if not isinstance(current, dict):
+        return (
+            f"execution_plan.current_step {current_id} does not match any "
+            "plan step; refusing to run a workload-group benchmark "
+            "without a verified step identity"
+        )
+    group = (current.get("params") or {}).get("workload_group")
+    if not group:
+        return ""
+
+    # Harness-neutral: the caller supplies the fingerprint of the run
+    # file actually being executed — from the validation record (crucible)
+    # or from the caller-supplied run file (generic adapters). This keeps
+    # the identity checks from being Crucible-only (review round 2).
+    this_fingerprint = runfile_fingerprint or ""
+    if not this_fingerprint:
+        return "workload-group benchmark has no verified execution identity"
+
+    for step in steps:
+        if not isinstance(step, dict) or step.get("id", -1) >= current_id:
+            continue
+        if (step.get("params") or {}).get("workload_group") != group:
+            continue
+        results = step.get("results") or {}
+        prior = results.get("runfile_fingerprint")
+        if not prior:
+            # A feature-created plan must establish identity on every
+            # group step: a missing fingerprint means the earlier run's
+            # identity was never proven, so comparison enforcement cannot
+            # be satisfied (review round 2 — no silent bypass).
+            return (
+                f"step {step.get('id')} in workload group {group!r} has no "
+                "recorded runfile fingerprint; the earlier run's identity "
+                "is unproven. Re-run the earlier benchmark step so its "
+                "configuration is recorded before executing this step."
+            )
+        if prior != this_fingerprint:
+            return (
+                f"step {current_id} runfile fingerprint {this_fingerprint[:12]}... "
+                f"differs from step {step.get('id')} in workload group "
+                f"{group!r} ({prior[:12]}...); benchmark steps in the same "
+                "group must execute an identical run file. Re-validate with "
+                "the exact runfile the group's earlier steps used (same "
+                "benchmark parameters, e.g. mv-params)."
+            )
+    return ""
+
+
 async def _add_execution_note(ticket_id: str, body: str) -> None:
     """Best-effort audit comment for automatic approvals."""
     from agents.server_utils import ticket_state_headers
@@ -2902,6 +3120,19 @@ async def execute_benchmark(
             }
         )
 
+    if comparison_step_requested(_ticket) and harness_name != "crucible":
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "workload_group_harness_unsupported",
+                "harness": harness_name,
+                "message": (
+                    "This harness cannot provide the durable execution receipt "
+                    "required for a truthful kernel comparison."
+                ),
+            }
+        )
+
     if not _supports_generic_execution(harness_name):
         return json.dumps(
             {
@@ -2950,6 +3181,7 @@ async def execute_benchmark(
                         "result"
                     )
                     if isinstance(cached, dict):
+                        cached = _replay_operation_result(ticket_id, cached)
                         return json.dumps(
                             {
                                 **cached,
@@ -2961,6 +3193,29 @@ async def execute_benchmark(
                 await replay_guard.close()
         return json.dumps(active_check)
     run_uuid = uuid.uuid4().hex[:8]
+    step_params = plan_step_params(active_check) or {}
+    in_workload_group = bool(step_params.get("workload_group"))
+    comparison_step = comparison_step_requested(active_check)
+    if comparison_step and not in_workload_group:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "workload_group_step_missing",
+                "message": "The comparison's current benchmark step is not identifiable.",
+            }
+        )
+    if in_workload_group and harness_name != "crucible":
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "workload_group_harness_unsupported",
+                "harness": harness_name,
+                "message": (
+                    "This harness cannot provide the durable execution receipt "
+                    "required for a truthful kernel comparison."
+                ),
+            }
+        )
 
     async def pause_for_reconciliation(reason: str) -> None:
         """Put ambiguous executions in the canonical human-guidance state."""
@@ -3194,6 +3449,7 @@ async def execute_benchmark(
             )
             await operation_guard.close()
             if isinstance(cached, dict):
+                cached = _replay_operation_result(ticket_id, cached)
                 _emit_context_audit_event(
                     ticket_id,
                     agent_name="benchmark-agent",
@@ -3260,6 +3516,80 @@ async def execute_benchmark(
             await operation_guard.close()
             await pause_for_reconciliation("execution intent preparation failed")
             return json.dumps({"status": "indeterminate", "operation_id": intent_key})
+
+    # Workload-group immutability (#998): benchmark steps in the same
+    # workload_group must execute an identical runfile, and a plan step
+    # that names mv_params must see them verbatim in the validated run
+    # file. Checked here — immediately before the approval gate and any
+    # side effect — because a mismatch means the LLM rebuilt the run file
+    # differently than planned (observed in PERF-E47D0F45: one run
+    # silently executed the sleep benchmark's 600s default instead of the
+    # planned 30s, making the A/B comparison invalid).
+    # Harness-neutral run-file identity: crucible resolves the run file
+    # from the validation record; generic adapters execute the
+    # caller-supplied run_file directly. Both must satisfy the same
+    # group-identity and plan-parameter checks (review round 2).
+    if run_file is not None:
+        effective_run_file = run_file
+        current_fingerprint = _runfile_fingerprint(run_file)
+    else:
+        cf_exec = active_check.get("custom_fields") or {}
+        manifest_exec = cf_exec.get("benchmark_validations") or {}
+        records_exec = (
+            manifest_exec.get("records", {}) if isinstance(manifest_exec, dict) else {}
+        )
+        record_exec = records_exec.get(validation_id) if validation_id else None
+        effective_run_file = (
+            record_exec.get("run_file") if isinstance(record_exec, dict) else None
+        )
+        current_fingerprint = (
+            record_exec.get("runfile_fingerprint")
+            if isinstance(record_exec, dict)
+            else None
+        )
+    effective_fingerprint = (
+        comparison_fingerprint(record) if in_workload_group else current_fingerprint
+    )
+    drift = _check_workload_group_drift(active_check, effective_fingerprint)
+    if drift:
+        rejection = {
+            "status": "rejected",
+            "reason_code": "workload_drift",
+            "message": drift,
+        }
+        if operation_guard and operation_owned:
+            await operation_guard.terminalize(
+                operation_record,
+                "fail",
+                {"outcome": "workload_drift", "benchmark_result": rejection},
+            )
+            await operation_guard.close()
+        return json.dumps(rejection)
+    plan_mv = step_params.get("mv_params")
+    if plan_mv or in_workload_group:
+        mv_error = _check_plan_mv_params(
+            active_check,
+            effective_run_file,
+            plan_mv,
+            enforce_no_extras=in_workload_group,
+        )
+        if mv_error:
+            rejection = {
+                "status": "rejected",
+                "reason_code": "runfile_params_mismatch",
+                "message": mv_error,
+            }
+            if operation_guard and operation_owned:
+                await operation_guard.terminalize(
+                    operation_record,
+                    "fail",
+                    {
+                        "outcome": "runfile_params_mismatch",
+                        "benchmark_result": rejection,
+                    },
+                )
+                await operation_guard.close()
+            return json.dumps(rejection)
 
     # Claim the execution intent before creating an automatic approval. The
     # acquired lease remains held through approval consumption and execution.
@@ -4553,6 +4883,7 @@ async def execute_benchmark(
                 }
             )
             if isinstance(duplicate_result, dict):
+                duplicate_result = _replay_operation_result(ticket_id, duplicate_result)
                 duplicate_result = {
                     **duplicate_result,
                     "operation_id": intent_key,
@@ -4884,10 +5215,28 @@ async def execute_benchmark(
         response["output"] = result.stdout[-3000:] if result.stdout else ""
         response["error"] = result.stderr[-1000:] if result.stderr else ""
     if operation_guard and operation_owned:
+        try:
+            persisted_result, response = _prepare_operation_result(ticket_id, response)
+        except Exception:
+            logger.exception("Could not persist benchmark result payload")
+            await operation_guard.terminalize(
+                operation_record,
+                "indeterminate",
+                {"outcome": "result_payload_unavailable"},
+            )
+            await operation_guard.close()
+            await pause_for_reconciliation("benchmark result could not be stored")
+            return json.dumps(
+                {
+                    "status": "indeterminate",
+                    "operation_id": intent_key,
+                    "reason_code": "result_payload_unavailable",
+                }
+            )
         terminal_ok = await operation_guard.terminalize(
             operation_record,
             "complete" if response["status"] == "completed" else "fail",
-            {"benchmark_result": response},
+            {"benchmark_result": persisted_result},
         )
         await operation_guard.close()
         response["operation_id"] = intent_key
@@ -5247,6 +5596,17 @@ async def execute_boot_time_test(
         description: Human-readable test description.
     """
     await _require_tool_owner(_BOOT_TIME_TOOL_OWNER)
+    if comparison_step_requested(_ticket or {}):
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "workload_group_harness_unsupported",
+                "message": (
+                    "Boot-time analysis cannot provide the durable execution "
+                    "receipt required for a kernel comparison."
+                ),
+            }
+        )
 
     # ── Guardrail: one execution per agent session ───────
     global _boot_time_executed

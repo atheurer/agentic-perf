@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import os
@@ -3491,6 +3492,198 @@ def _actions_for_host(spec: KernelSpec, inventory: dict[str, Any]) -> dict[str, 
     }
 
 
+def _url_within_prefix(url: str, prefix: str) -> bool:
+    """Path-boundary approval check (review round 2, blocker).
+
+    Both URLs are parsed and canonicalized: scheme, host, and effective port
+    must match exactly (no userinfo tricks). The approved prefix's path must
+    sit at the URL's path root as complete components (so ``/approved`` never
+    approves ``/approvedevil/``), and percent-encoding is decoded before
+    dot-segments are resolved (so ``/approved/%2e%2e/unapproved`` cannot
+    escape). Ambiguous path parameters and non-dot segments with trailing
+    spaces or dots are rejected because some servers normalize them. A prefix
+    without a trailing slash is treated as a component boundary anyway.
+    Query strings and fragments are ignored — approval is about where
+    the packages live, not the fetch parameters.
+    """
+    import posixpath
+    from urllib.parse import unquote, urlsplit
+
+    def _canonical(raw: str) -> tuple[str, str, int, list[str]] | None:
+        if not isinstance(raw, str) or any(
+            ord(char) < 32 or ord(char) == 127 for char in raw
+        ):
+            return None
+        try:
+            parts = urlsplit(raw)
+            scheme = parts.scheme.lower()
+            if scheme not in {"http", "https"} or not parts.hostname:
+                return None
+            # Userinfo in either URL is rejected outright: it has no
+            # legitimate role in a package repository URL and enables
+            # host-confusion bypasses (user@approved/ vs approved/).
+            if parts.username or parts.password:
+                return None
+            # Ports are part of the URL origin. Treat an omitted port and
+            # its scheme default as the same origin, but keep custom ports
+            # distinct.
+            port = parts.port
+            effective_port = (
+                port if port is not None else (443 if scheme == "https" else 80)
+            )
+
+            # Servers may decode escaped separators or dot-segments before
+            # routing. Repeatedly decode so nested escapes cannot hide them
+            # from the component-boundary check.
+            path = parts.path or "/"
+            while True:
+                decoded = unquote(path)
+                if decoded == path:
+                    break
+                path = decoded
+            if "\\" in path or any(ord(char) < 32 or ord(char) == 127 for char in path):
+                return None
+            path_segments = [segment for segment in path.split("/") if segment]
+            for segment in path_segments:
+                if ";" in segment:
+                    return None
+                if segment not in {".", ".."} and segment.endswith((".", " ")):
+                    return None
+            path = posixpath.normpath(path)
+            if not path.startswith("/"):
+                path = "/" + path
+            segments = [s for s in path.split("/") if s]
+            return scheme, (parts.hostname or "").lower(), effective_port, segments
+        except ValueError:
+            return None
+
+    url_c = _canonical(url)
+    prefix_c = _canonical(prefix)
+    if url_c is None or prefix_c is None:
+        return False
+    url_scheme, url_host, url_port, url_segments = url_c
+    p_scheme, p_host, p_port, prefix_segments = prefix_c
+    if (url_scheme, url_host, url_port) != (p_scheme, p_host, p_port):
+        return False
+    if len(url_segments) < len(prefix_segments):
+        return False
+    return url_segments[: len(prefix_segments)] == prefix_segments
+
+
+async def _resolve_repository_trust(repo_url: str) -> dict[str, Any]:
+    """Match a repo URL against the organization's approved repositories.
+
+    Expected shape in the harness private config (e.g.
+    private-skills/crucible.json)::
+
+        "approved_repositories": [
+            {
+                "url_prefix": "https://download.eng.rdu.redhat.com/rhel-9/composes/",
+                "gpg_key_secret": "rhel-compose-gpg-key",
+                "ca_secret": "rhel-lab-ca-bundle",
+                "description": "RDU3 RHEL composes"
+            }
+        ]
+
+    The secrets resolve through the normal secrets provider (local
+    files under ~/.agentic-perf/secrets/ or the configured vault) and
+    are never exposed to the LLM. Returns {"approved": bool,
+    "entry": <matched entry>}.
+    """
+    provider = _skill_provider
+    get_all = getattr(provider, "get_all_private_config", None)
+    config = {}
+    if get_all is not None:
+        try:
+            config = await get_all("crucible") or {}
+        except Exception:
+            config = {}
+    approved: list[Any] = []
+    if isinstance(config, dict):
+        # The private config may nest the list under "provisioning" or
+        # expose it at the suite top level, depending on the file layout.
+        nested = config.get("provisioning")
+        if isinstance(nested, dict):
+            approved = nested.get("approved_repositories") or []
+        if not approved:
+            approved = config.get("approved_repositories") or []
+    for entry in approved:
+        prefix = entry.get("url_prefix", "")
+        if not prefix:
+            continue
+        if _url_within_prefix(repo_url, prefix):
+            return {"approved": True, "entry": entry}
+    return {"approved": False}
+
+
+async def _deploy_repository_trust(
+    target: str, trust: dict[str, Any]
+) -> tuple[str, str, bool]:
+    """Deploy the approved entry's GPG key and CA bundle to a host.
+
+    Materializes the secrets as root-only files under /etc/pki so the
+    repo file can reference them. Returns the GPG path, CA path, and
+    whether a failed SSH write may still be active.
+    """
+    entry = trust.get("entry") or {}
+    gpg_secret = entry.get("gpg_key_secret")
+    ca_secret = entry.get("ca_secret")
+    if not gpg_secret or not ca_secret:
+        return "", "", False
+    deployed: list[str] = []
+    paths: dict[str, str] = {}
+    for kind, secret_name, remote in (
+        ("gpg", gpg_secret, "/etc/pki/agentic-perf/kernel-repo-gpg.key"),
+        ("ca", ca_secret, "/etc/pki/agentic-perf/kernel-repo-ca.pem"),
+    ):
+        try:
+            content = await _read_secret(secret_name)
+        except Exception:
+            return "", "", False
+        if not content:
+            return "", "", False
+        # Send secret bytes through SSH stdin so they never enter command
+        # arguments, logs, or shell parsing. Keep the directory private while
+        # writing, then set root ownership and restrictive file permissions.
+        result = await _ssh.run(
+            target,
+            "install -o root -g root -m 0700 -d /etc/pki/agentic-perf"
+            " && chmod 0700 /etc/pki/agentic-perf"
+            f" && umask 077 && cat > {remote}"
+            f" && chown root:root {remote} && chmod 0600 {remote}",
+            timeout=30,
+            stdin_data=content.encode("utf-8"),
+            mutating=True,
+        )
+        if result.exit_code != 0:
+            return "", "", result.exit_code in (-1, 255)
+        paths[kind] = remote
+        deployed.append(remote)
+    if len(deployed) != 2:
+        return "", "", False
+    return paths["gpg"], paths["ca"], False
+
+
+async def _read_secret(secret_name: str) -> str:
+    """Read a secret's text content through the server's secrets provider."""
+    global _secrets_provider
+    await _ensure_init()
+    provider = _secrets_provider
+    if provider is None:
+        return ""
+    get = getattr(provider, "get_secret", None)
+    if get is None:
+        return ""
+    value = get(secret_name)
+    if asyncio.iscoroutine(value):
+        value = await value
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 async def _install_kernel_one(
     host: str, spec: KernelSpec, address: str | None = None
 ) -> dict[str, Any]:
@@ -3511,6 +3704,8 @@ async def _install_kernel_one(
         return {
             "host": host,
             "state": "unreachable",
+            "remote_write_quiescent": True,
+            "reason_code": "inventory_before_install_unavailable",
             "error": "could not read inventory before install",
         }
 
@@ -3518,17 +3713,99 @@ async def _install_kernel_one(
         return {
             "host": host,
             "state": "already_installed",
+            "remote_write_quiescent": True,
             "before": before.to_dict(),
         }
+
+    # A step-supplied repo_url bootstraps the repository the kernel comes
+    # from (fresh lab hosts have no compose repos). Trust model (review
+    # blocker on #1230): the URL must match an organization-approved
+    # repository entry, and the entry's GPG key + CA bundle must be
+    # deployed to the host before any repo file is written. Unverified
+    # repositories are refused — package scriptlets run as root.
+    if spec.repo_url:
+        from providers.rhel_kernel import build_repo_setup_command
+
+        trust = await _resolve_repository_trust(spec.repo_url)
+        if not trust.get("approved"):
+            return {
+                "host": host,
+                "state": "install_failed",
+                "remote_write_quiescent": True,
+                "reason_code": "repository_not_approved",
+                "error": (
+                    f"repository {spec.repo_url!r} is not in the "
+                    "organization's approved_repositories configuration; "
+                    "add an entry with gpg_key_secret and ca_secret before "
+                    "using it"
+                ),
+                "before": before.to_dict(),
+            }
+        gpg_path, ca_path, trust_write_ambiguous = await _deploy_repository_trust(
+            target, trust
+        )
+        if not gpg_path or not ca_path:
+            return {
+                "host": host,
+                "state": (
+                    "indeterminate" if trust_write_ambiguous else "install_failed"
+                ),
+                "remote_write_quiescent": not trust_write_ambiguous,
+                "reason_code": (
+                    "repository_trust_material_indeterminate"
+                    if trust_write_ambiguous
+                    else "repository_trust_material_unavailable"
+                ),
+                "error": (
+                    "repository trust material could not be deployed to "
+                    f"{host}; refusing unverified dnf access"
+                ),
+                "before": before.to_dict(),
+            }
+        repo_result = await _ssh.run(
+            target,
+            build_repo_setup_command(spec, gpg_key_path=gpg_path, ca_cert_path=ca_path),
+            timeout=300,
+            mutating=True,
+        )
+        if repo_result.exit_code != 0:
+            ambiguous = repo_result.exit_code in (-1, 255)
+            return {
+                "host": host,
+                "state": "indeterminate" if ambiguous else "install_failed",
+                "remote_write_quiescent": not ambiguous,
+                "reason_code": (
+                    "repository_setup_indeterminate"
+                    if ambiguous
+                    else "repository_setup_failed"
+                ),
+                "error": (
+                    "kernel repository bootstrap failed: "
+                    f"{repo_result.stderr or repo_result.stdout}"
+                ),
+                "before": before.to_dict(),
+            }
 
     result = await _ssh.run(
         target, build_install_command(spec), timeout=900, mutating=True
     )
-    timed_out = result.exit_code == -1
-    if result.exit_code != 0 and not timed_out:
+    if result.exit_code in (-1, 255):
+        return {
+            "host": host,
+            "state": "indeterminate",
+            "remote_write_quiescent": False,
+            "reason_code": "package_install_timed_out",
+            "error": (
+                "dnf timed out or lost SSH; package installation may still be running"
+            ),
+            "before": before.to_dict(),
+        }
+    if result.exit_code != 0:
         return {
             "host": host,
             "state": "install_failed",
+            "remote_write_quiescent": True,
+            "reason_code": "package_install_failed",
             "error": result.stderr or result.stdout,
             "before": before.to_dict(),
         }
@@ -3544,6 +3821,8 @@ async def _install_kernel_one(
         return {
             "host": host,
             "state": "indeterminate",
+            "remote_write_quiescent": True,
+            "reason_code": "post_install_inventory_unavailable",
             "error": "could not read inventory after install",
             "before": before.to_dict(),
         }
@@ -3551,20 +3830,17 @@ async def _install_kernel_one(
         record = {
             "host": host,
             "state": "installed",
+            "remote_write_quiescent": True,
             "before": before.to_dict(),
             "after": after.to_dict(),
         }
-        if timed_out:
-            record["note"] = "dnf timed out but the release is installed"
         return record
     return {
         "host": host,
-        "state": "indeterminate" if timed_out else "install_failed",
-        "error": (
-            "dnf timed out and the release is not installed"
-            if timed_out
-            else "package installed but release not in rpm list"
-        ),
+        "state": "install_failed",
+        "remote_write_quiescent": True,
+        "reason_code": "package_install_unconfirmed",
+        "error": "package installed but release not in rpm list",
         "before": before.to_dict(),
         "after": after.to_dict(),
     }
@@ -3582,6 +3858,7 @@ async def _select_default_kernel_one(
         return {
             "host": host,
             "state": "unreachable",
+            "remote_write_quiescent": True,
             "error": before_result.stderr or before_result.stdout,
         }
     before_default = before_result.stdout.strip()
@@ -3589,6 +3866,7 @@ async def _select_default_kernel_one(
         return {
             "host": host,
             "state": "already_default",
+            "remote_write_quiescent": True,
             "before": before_default,
             "after": before_default,
         }
@@ -3600,6 +3878,7 @@ async def _select_default_kernel_one(
         return {
             "host": host,
             "state": "not_bootable",
+            "remote_write_quiescent": True,
             "error": f"missing {spec.vmlinuz} or {spec.initramfs}",
             "before": before_default,
         }
@@ -3607,30 +3886,20 @@ async def _select_default_kernel_one(
     result = await _ssh.run(
         target, build_select_command(spec), timeout=30, mutating=True
     )
-    if result.exit_code == -1:
-        # Timeout: ask the bootloader what it believes before judging.
-        recheck = await _ssh.run(target, "grubby --default-kernel 2>&1", timeout=15)
-        after_default = recheck.stdout.strip()
-        if recheck.exit_code == 0 and after_default == spec.vmlinuz:
-            return {
-                "host": host,
-                "state": "ok",
-                "before": before_default,
-                "after": after_default,
-                "note": "grubby timed out but the default entry is set",
-            }
+    if result.exit_code in (-1, 255):
         return {
             "host": host,
             "state": "indeterminate",
+            "remote_write_quiescent": False,
             "error": "grubby timed out; default entry could not be confirmed",
             "before": before_default,
-            "after": after_default,
         }
     after_default = result.stdout.strip().split("\n")[-1].strip()
     if after_default != spec.vmlinuz:
         return {
             "host": host,
             "state": "selection_failed",
+            "remote_write_quiescent": True,
             "error": f"grubby reports {after_default}, expected {spec.vmlinuz}",
             "before": before_default,
             "after": after_default,
@@ -3638,6 +3907,7 @@ async def _select_default_kernel_one(
     return {
         "host": host,
         "state": "ok",
+        "remote_write_quiescent": True,
         "before": before_default,
         "after": after_default,
     }
@@ -3697,6 +3967,7 @@ async def prepare_kernel_change(
     await _ensure_init()
     from agents.provisioning.kernel import (
         new_intent,
+        unresolved_kernel_step_operation,
         write_intent,
     )
 
@@ -3705,6 +3976,25 @@ async def prepare_kernel_change(
         return json.dumps(rejection)
     assert ctx is not None
     spec, allowed = ctx["spec"], ctx["allowed"]
+    unresolved = unresolved_kernel_step_operation(
+        ctx["ticket"],
+        ctx["step_id"],
+        hosts=ctx["allowed"],
+        addresses=list(ctx["addresses"].values()),
+    )
+    if unresolved:
+        return json.dumps(
+            {
+                "status": "indeterminate",
+                "reason_code": "kernel_action_requires_reconciliation",
+                "unresolved_operation": unresolved,
+                "error": (
+                    "a previous kernel or repository cleanup command may still "
+                    "be running; a host owner must reconcile it before preparing "
+                    "another intent"
+                ),
+            }
+        )
 
     inventories: dict[str, Any] = {}
     per_host: dict[str, Any] = {}
@@ -3774,10 +4064,25 @@ async def install_kernel(
 ) -> str:
     """Install a specific kernel version on this ticket's benchmark hosts. Requires an approved kernel_change approval bound to the prepared intent (consumed here if this is the intent's first action). Idempotent — already-installed kernels are reported without running dnf."""
     await _ensure_init()
-    from agents.provisioning.kernel import complete_action
+    from agents.provisioning.kernel import complete_action, update_intent
 
     ctx, rejection = await _kernel_tool_context(kernel, hosts, require_coverage=True)
     if rejection:
+        if rejection.get("reason_code") == "action_requires_reconciliation":
+            rejection["status"] = "indeterminate"
+            rejection["results"] = {
+                host: {
+                    "host": host,
+                    "state": "indeterminate",
+                    "reason_code": "action_requires_reconciliation",
+                    "remote_write_quiescent": False,
+                    "error": (
+                        "a prior remote action may still be in flight; reconcile "
+                        "its outcome before retrying"
+                    ),
+                }
+                for host in hosts
+            }
         return json.dumps(rejection)
     assert ctx is not None
     spec, allowed = ctx["spec"], ctx["allowed"]
@@ -3791,6 +4096,21 @@ async def install_kernel(
         addresses=ctx["addresses"],
     )
     if rejection:
+        if rejection.get("reason_code") == "action_requires_reconciliation":
+            rejection["status"] = "indeterminate"
+            rejection["results"] = {
+                host: {
+                    "host": host,
+                    "state": "indeterminate",
+                    "reason_code": "action_requires_reconciliation",
+                    "remote_write_quiescent": False,
+                    "error": (
+                        "a prior remote action may still be in flight; reconcile "
+                        "its outcome before retrying"
+                    ),
+                }
+                for host in hosts
+            }
         return json.dumps(rejection)
     assert intent is not None
 
@@ -3801,13 +4121,29 @@ async def install_kernel(
     )
     for host, result in zip(allowed, raw):
         if isinstance(result, Exception):
-            results[host] = {"host": host, "state": "error", "error": str(result)}
+            results[host] = {
+                "host": host,
+                "state": "error",
+                "remote_write_quiescent": False,
+                "error": str(result),
+            }
         else:
             results[host] = result
     if all(
         results[h].get("state") in ("installed", "already_installed") for h in allowed
     ):
         await complete_action(ctx["ticket_id"], intent["intent_id"], "install")
+    else:
+        progress = (
+            "indeterminate"
+            if any(
+                results[h].get("remote_write_quiescent") is not True for h in allowed
+            )
+            else "failed"
+        )
+        await update_intent(
+            ctx["ticket_id"], intent["intent_id"], progress={"install": progress}
+        )
     summary = _summarize(results)
     summary["intent_id"] = intent["intent_id"]
     return json.dumps(summary)
@@ -3821,7 +4157,7 @@ async def select_default_kernel(
 ) -> str:
     """Select a kernel as the persistent default boot entry on this ticket's benchmark hosts using grubby. Requires the approved kernel_change approval. Verifies vmlinuz and initramfs exist before selection. Idempotent — already-default kernels are reported without changes."""
     await _ensure_init()
-    from agents.provisioning.kernel import complete_action
+    from agents.provisioning.kernel import complete_action, update_intent
 
     ctx, rejection = await _kernel_tool_context(kernel, hosts, require_coverage=True)
     if rejection:
@@ -3838,6 +4174,21 @@ async def select_default_kernel(
         addresses=ctx["addresses"],
     )
     if rejection:
+        if rejection.get("reason_code") == "action_requires_reconciliation":
+            rejection["status"] = "indeterminate"
+            rejection["results"] = {
+                host: {
+                    "host": host,
+                    "state": "indeterminate",
+                    "reason_code": "action_requires_reconciliation",
+                    "remote_write_quiescent": False,
+                    "error": (
+                        "a prior remote action may still be in flight; reconcile "
+                        "its outcome before retrying"
+                    ),
+                }
+                for host in hosts
+            }
         return json.dumps(rejection)
     assert intent is not None
 
@@ -3851,11 +4202,29 @@ async def select_default_kernel(
     )
     for host, result in zip(allowed, raw):
         if isinstance(result, Exception):
-            results[host] = {"host": host, "state": "error", "error": str(result)}
+            results[host] = {
+                "host": host,
+                "state": "error",
+                "remote_write_quiescent": False,
+                "error": str(result),
+            }
         else:
             results[host] = result
     if all(results[h].get("state") in ("ok", "already_default") for h in allowed):
         await complete_action(ctx["ticket_id"], intent["intent_id"], "select_default")
+    else:
+        progress = (
+            "indeterminate"
+            if any(
+                results[h].get("remote_write_quiescent") is not True for h in allowed
+            )
+            else "failed"
+        )
+        await update_intent(
+            ctx["ticket_id"],
+            intent["intent_id"],
+            progress={"select_default": progress},
+        )
     summary = _summarize(results)
     summary["intent_id"] = intent["intent_id"]
     return json.dumps(summary)
@@ -4371,8 +4740,10 @@ async def verify_kernel_state(
     await _ensure_init()
     from agents.provisioning.kernel import (
         new_transition,
+        read_intents,
         read_transition,
         set_host_record,
+        unresolved_kernel_step_operation,
         write_transition,
     )
 
@@ -4387,8 +4758,103 @@ async def verify_kernel_state(
     ticket, ticket_id, step_id = ctx["ticket"], ctx["ticket_id"], ctx["step_id"]
     spec, allowed = ctx["spec"], ctx["allowed"]
 
+    unresolved = unresolved_kernel_step_operation(
+        ticket,
+        step_id,
+        hosts=allowed,
+        addresses=list(ctx["addresses"].values()),
+    )
+    if unresolved and unresolved.get("kind") != "reboot":
+        return json.dumps(
+            {
+                "status": "indeterminate",
+                "reason_code": "kernel_action_requires_reconciliation",
+                "unresolved_operation": unresolved,
+                "error": (
+                    "this read-only probe cannot clear an unresolved install, "
+                    "default selection, or repository cleanup command; a host "
+                    "owner must reconcile it, and automated resumption is "
+                    "currently unavailable"
+                ),
+            }
+        )
+
     cf = ticket.get("custom_fields", {})
     transition = read_transition(cf, step_id)
+    if unresolved and unresolved.get("kind") == "reboot":
+        intent = read_intents(cf).get(unresolved.get("record_id"))
+        unresolved_step = (
+            intent.get("step_id")
+            if isinstance(intent, dict)
+            else unresolved.get("record_id")
+        )
+        if str(unresolved_step) != str(step_id):
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "reason_code": "reboot_reconciliation_wrong_step",
+                    "error": (
+                        "the unresolved reboot belongs to another plan step; restore "
+                        "that step before reconciling its recorded reboot"
+                    ),
+                }
+            )
+        if isinstance(intent, dict) and not transition:
+            return json.dumps(
+                {
+                    "status": "indeterminate",
+                    "reason_code": "reboot_checkpoint_unavailable",
+                    "error": (
+                        "the reboot reservation has no matching durable checkpoint; "
+                        "human host-owner intervention is required and automated "
+                        "resumption is unavailable"
+                    ),
+                }
+            )
+        if (
+            isinstance(intent, dict)
+            and transition
+            and transition.get("intent_id") != intent.get("intent_id")
+        ):
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "reason_code": "reboot_intent_binding_mismatch",
+                    "error": (
+                        "the reboot checkpoint belongs to a different intent; human "
+                        "host-owner intervention is required and automated "
+                        "resumption is unavailable"
+                    ),
+                }
+            )
+        if isinstance(intent, dict) and (
+            set(intent.get("hosts", [])) != set(allowed)
+            or intent.get("addresses") != ctx["addresses"]
+        ):
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "reason_code": "reboot_target_binding_changed",
+                    "error": (
+                        "the current host addresses do not match the approved reboot "
+                        "pins; reconciliation was not started"
+                    ),
+                }
+            )
+    if transition and (
+        set(transition.get("requested_hosts", [])) != set(allowed)
+        or transition.get("addresses") != ctx["addresses"]
+    ):
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "transition_target_binding_changed",
+                "error": (
+                    "the current host addresses do not match the recorded kernel "
+                    "transition pins; verification was not started"
+                ),
+            }
+        )
     from providers.rhel_kernel import host_reboot_pending
 
     policy = cf.get("directives", {}).get("kernel_reboot_policy", "always")
@@ -4410,12 +4876,19 @@ async def verify_kernel_state(
     if not transition:
         from agents.provisioning.kernel import authorized_kernel_hosts
 
+        reboot_intent_id = (
+            unresolved.get("record_id")
+            if unresolved and unresolved.get("kind") == "reboot"
+            else None
+        )
+        reboot_intent = read_intents(cf).get(reboot_intent_id, {})
+
         transition = new_transition(
             step_id,
             spec,
             sorted(authorized_kernel_hosts(ticket)),
-            intent_id=None,
-            approval_request_id=None,
+            intent_id=reboot_intent_id,
+            approval_request_id=reboot_intent.get("approval_request_id"),
             reboot_policy=policy,
         )
         transition["record_version"] = old_version
@@ -4574,6 +5047,261 @@ async def _capture_environment_one(
         "snapshot": snapshot,
         "fingerprint": environment_fingerprint(snapshot),
     }
+
+
+async def _run_repo_cleanup_one(
+    host: str, address: str | None = None
+) -> dict[str, Any]:
+    """Remove the ticket repository file from one host (idempotent)."""
+    from providers.rhel_kernel import build_repo_cleanup_command
+
+    target = address or host
+    result = await _ssh.run(
+        target, build_repo_cleanup_command(), timeout=60, mutating=True
+    )
+    if result.exit_code != 0:
+        ambiguous = result.exit_code in (-1, 255)
+        return {
+            "host": host,
+            "state": "indeterminate" if ambiguous else "cleanup_failed",
+            "remote_write_quiescent": not ambiguous,
+            "reason_code": "cleanup_indeterminate" if ambiguous else "cleanup_failed",
+            "error": result.stderr or result.stdout,
+        }
+    return {"host": host, "state": "clean", "remote_write_quiescent": True}
+
+
+async def _write_repo_cleanup_checkpoint(
+    ticket: dict[str, Any],
+    step_id: int,
+    spec: KernelSpec,
+    hosts: list[str],
+    addresses: dict[str, str],
+    state: str,
+) -> dict[str, Any]:
+    """CAS the repository cleanup state into the current kernel transition."""
+    from agents.provisioning.kernel import (
+        new_transition,
+        read_transition,
+        write_transition,
+    )
+
+    cf = ticket.get("custom_fields", {})
+    transition = copy.deepcopy(read_transition(cf, step_id))
+    if not transition:
+        transition = new_transition(
+            step_id,
+            spec,
+            hosts,
+            intent_id=None,
+            approval_request_id=None,
+            reboot_policy=(cf.get("directives") or {}).get(
+                "kernel_reboot_policy", "always"
+            ),
+        )
+        transition["addresses"] = dict(addresses)
+        transition["requested_hosts"] = sorted(hosts)
+    transition["repo_cleanup"] = {"state": state, "hosts": sorted(hosts)}
+    stored = await write_transition(ticket.get("id", ""), step_id, transition)
+    ticket.setdefault("custom_fields", {}).setdefault("kernel_transitions", {})[
+        str(step_id)
+    ] = copy.deepcopy(stored)
+    return stored
+
+
+@mcp.tool()
+async def run_repo_cleanup(hosts: list[str]) -> str:
+    """Remove this ticket's kernel repository file from the assigned hosts. Idempotent; runs at the end of the final kernel transition so the unauthenticated package source does not outlive the ticket."""
+    await _ensure_init()
+    from agents.provisioning.kernel import (
+        canonicalize_targets,
+        current_kernel_step,
+        read_intents,
+        read_transition,
+        require_full_coverage,
+        step_kernel_hosts,
+        unresolved_kernel_step_operation,
+    )
+    from agents.server_utils import assert_ticket_active
+
+    active = await assert_ticket_active()
+    if active.get("status") == "rejected":
+        return json.dumps(active)
+    ticket = active.get("ticket", active)
+    status = ticket.get("status")
+    if status not in {"awaiting_provision", "awaiting_customer_guidance"}:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "ticket_status_not_cleanup_safe",
+                "error": (
+                    "repository cleanup is allowed only while this kernel step "
+                    "is provisioning or paused for customer guidance"
+                ),
+            }
+        )
+    # Recheck with the concrete status so claim fencing still applies after the
+    # first read, including when an action paused the ticket before cleanup.
+    fenced = await assert_ticket_active(expected_status=status)
+    if fenced.get("status") == "rejected":
+        return json.dumps(fenced)
+    ticket = fenced.get("ticket", fenced)
+    step = current_kernel_step(ticket)
+    if step is None or not step[1].repo_url:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "kernel_repository_not_in_current_step",
+                "error": "the current kernel step does not declare a repository URL",
+            }
+        )
+    step_id, spec = step
+    allowed, refused, requested_as, addresses = canonicalize_targets(hosts, ticket)
+    covered, detail = require_full_coverage(allowed, refused, ticket)
+    if not covered:
+        if not hosts or not allowed:
+            return json.dumps(
+                {
+                    "status": "incomplete",
+                    "reason_code": "cleanup_targets_empty_or_refused",
+                    "results": refused,
+                    "error": "no authorized hosts were observed for cleanup",
+                }
+            )
+        return json.dumps(
+            {"status": "rejected", "reason_code": "host_set_mismatch", **detail}
+        )
+    unresolved = unresolved_kernel_step_operation(
+        ticket, step_id, hosts=allowed, addresses=list(addresses.values())
+    )
+    if unresolved:
+        return json.dumps(
+            {
+                "status": "indeterminate",
+                "reason_code": "kernel_action_requires_reconciliation",
+                "unresolved_operation": unresolved,
+                "error": (
+                    "a prior kernel or repository cleanup command may still be "
+                    "running; reconcile it with the host owner before retrying"
+                ),
+            }
+        )
+    existing_transition = read_transition(ticket.get("custom_fields", {}), step_id)
+    if existing_transition and (
+        set(existing_transition.get("requested_hosts", [])) != set(allowed)
+        or existing_transition.get("addresses") != addresses
+    ):
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "cleanup_target_binding_changed",
+                "error": (
+                    "the current host addresses do not match the kernel transition "
+                    "pins; cleanup was not started because repository cleanup must "
+                    "target the same machines as the recorded kernel actions"
+                ),
+                "recorded_hosts": existing_transition.get("requested_hosts", []),
+            }
+        )
+    if not existing_transition:
+        prior_intents = [
+            intent
+            for intent in read_intents(ticket.get("custom_fields", {})).values()
+            if str(intent.get("step_id")) == str(step_id)
+            and isinstance(intent.get("addresses"), dict)
+        ]
+        if any(
+            set(intent["addresses"].values()) != set(addresses.values())
+            for intent in prior_intents
+        ):
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "reason_code": "cleanup_target_binding_changed",
+                    "error": (
+                        "the current host addresses do not match the prepared kernel "
+                        "intent pins; cleanup was not started because repository "
+                        "cleanup must target the same machines as the kernel actions"
+                    ),
+                }
+            )
+    plan_hosts = step_kernel_hosts(ticket)
+    if plan_hosts is not None:
+        plan_allowed, plan_refused, _, _ = canonicalize_targets(plan_hosts, ticket)
+        plan_covered, plan_detail = require_full_coverage(
+            plan_allowed, plan_refused, ticket
+        )
+        if not plan_covered:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "reason_code": "plan_host_set_mismatch",
+                    **plan_detail,
+                }
+            )
+
+    try:
+        await _write_repo_cleanup_checkpoint(
+            ticket, step_id, spec, allowed, addresses, "started"
+        )
+    except Exception:
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "cleanup_reservation_failed",
+                "error": (
+                    "repository cleanup state changed or could not be reserved; "
+                    "no host cleanup command was started"
+                ),
+            }
+        )
+    results: dict[str, Any] = dict(refused)
+    raw = await asyncio.gather(
+        *[_run_repo_cleanup_one(h, addresses.get(h)) for h in allowed],
+        return_exceptions=True,
+    )
+    for host, result in zip(allowed, raw):
+        if isinstance(result, Exception):
+            results[host] = {
+                "host": host,
+                "state": "indeterminate",
+                "remote_write_quiescent": False,
+                "error": str(result),
+            }
+        else:
+            results[host] = result
+        results[host]["requested_as"] = requested_as.get(host, host)
+    states = {r.get("state") for r in results.values() if isinstance(r, dict)}
+    quiescent = all(
+        isinstance(results.get(host), dict)
+        and results[host].get("remote_write_quiescent") is True
+        for host in allowed
+    )
+    cleanup_state = (
+        "indeterminate"
+        if not quiescent
+        else "clean"
+        if allowed and not refused and states == {"clean"}
+        else "failed"
+    )
+    try:
+        await _write_repo_cleanup_checkpoint(
+            ticket, step_id, spec, allowed, addresses, cleanup_state
+        )
+    except Exception:
+        cleanup_state = "indeterminate"
+        for host in allowed:
+            if isinstance(results.get(host), dict):
+                results[host]["cleanup_state_persisted"] = False
+    summary = _summarize(results)
+    if cleanup_state == "clean":
+        summary["status"] = "ok"
+    elif cleanup_state == "indeterminate":
+        summary["status"] = "indeterminate"
+        summary["reason_code"] = "cleanup_outcome_indeterminate"
+    else:
+        summary["status"] = "incomplete"
+    return json.dumps(summary)
 
 
 @mcp.tool()

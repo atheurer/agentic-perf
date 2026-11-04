@@ -562,6 +562,112 @@ class TestSuiteAutoCorrection:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("selection", ["generic", "arcaflow"])
+    async def test_kernel_comparison_rejects_unsupported_harness_before_plan_write(
+        self, selection
+    ):
+        directives = {
+            "kernel_comparison": {
+                "baseline": "6.1.0-1.el9.x86_64",
+                "candidate": "6.1.0-2.el9.x86_64",
+            }
+        }
+        if selection == "generic":
+            suite = "generic-work"
+            provider = _make_provider(
+                suites={suite: {"name": suite, "harness": "kube-burner"}}
+            )
+            directives["harness"] = "kube-burner"
+        else:
+            suite = ""
+            provider = _make_provider()
+            directives["workflow_source"] = "https://example.test/workflow.yaml"
+
+        agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": suite,
+                "absent_suite": False,
+                "directives": directives,
+            },
+            provider,
+        )
+
+        assert ticket["status"] == "awaiting_customer_guidance"
+        assert updated_fields == {}
+        comment = agent._add_comment.await_args.args[1]
+        assert "Kernel comparisons currently require Crucible" in comment
+        assert "durable execution receipt" in comment
+        assert "Select Crucible" in comment
+
+    @pytest.mark.asyncio
+    async def test_kernel_comparison_with_unresolved_harness_pauses_before_plan_write(
+        self,
+    ):
+        provider = _FakeSkillProvider(
+            ["crucible", "kube-burner"],
+            {"unknown-work": {"name": "unknown-work", "harness": ""}},
+        )
+        agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": "",
+                "absent_suite": False,
+                "directives": {
+                    "kernel_comparison": {
+                        "baseline": "6.1.0-1.el9.x86_64",
+                        "candidate": "6.1.0-2.el9.x86_64",
+                    }
+                },
+            },
+            provider,
+        )
+
+        assert ticket["status"] == "awaiting_customer_guidance"
+        assert updated_fields == {}
+        assert "could not determine one" in agent._add_comment.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_catalog_resolved_crucible_comparison_remains_supported(self):
+        _agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": "uperf",
+                "absent_suite": False,
+                "directives": {
+                    "kernel_comparison": {
+                        "baseline": "6.1.0-1.el9.x86_64",
+                        "candidate": "6.1.0-2.el9.x86_64",
+                    }
+                },
+            },
+            _make_provider(),
+        )
+
+        assert ticket["status"] == "awaiting_hardware"
+        assert updated_fields["directives"]["harness"] == "crucible"
+        assert any(
+            step.get("params", {}).get("workload_group") == "kernel-ab"
+            for step in updated_fields["execution_plan"]["steps"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_ordinary_generic_plan_is_unchanged(self):
+        suite = "generic-work"
+        _agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": suite,
+                "absent_suite": False,
+                "directives": {"harness": "kube-burner"},
+            },
+            _make_provider(suites={suite: {"name": suite, "harness": "kube-burner"}}),
+        )
+
+        assert ticket["status"] == "awaiting_hardware"
+        assert updated_fields["directives"]["harness"] == "kube-burner"
+        assert not any(
+            step.get("params", {}).get("workload_group")
+            for step in updated_fields["execution_plan"]["steps"]
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("selected_harness", ["zathras", "crucible"])
     async def test_avoided_either_or_pauses_for_each_prohibited_harness(
         self, selected_harness

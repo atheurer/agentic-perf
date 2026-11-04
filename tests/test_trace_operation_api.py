@@ -45,6 +45,20 @@ async def test_service_acquire_existing_terminal_and_actions(tmp_path) -> None:
     )
     assert cached.json()["status"] == "terminal"
     assert cached.json()["operation"]["result_descriptor"] == {"id": "safe"}
+    receipt = await client.get(
+        "/api/v1/traces/operations",
+        params={"operation_key": "key"},
+        headers=headers,
+    )
+    assert receipt.status_code == 200
+    assert receipt.json()["operation"]["operation_key"] == "key"
+    assert receipt.json()["operation"]["terminal_outcome"] == "success"
+    missing = await client.get(
+        "/api/v1/traces/operations",
+        params={"operation_key": "missing"},
+        headers=headers,
+    )
+    assert missing.status_code == 404
     conflict = await client.post(
         "/api/v1/traces/operations/register",
         json={"operation_key": "key", "request_hash": "other"},
@@ -82,6 +96,10 @@ async def test_operation_api_requires_service_principal(tmp_path) -> None:
     response = await client.post(
         "/api/v1/traces/operations/register",
         json={"operation_key": "key", "request_hash": "hash"},
+    )
+    assert response.status_code == 401
+    response = await client.get(
+        "/api/v1/traces/operations", params={"operation_key": "key"}
     )
     assert response.status_code == 401
     await client.aclose()

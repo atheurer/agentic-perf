@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import copy
 import fcntl
 import hashlib
 import json
@@ -19,6 +20,11 @@ import httpx
 from agents.base import AgentAbortedError, HITLDriftError
 from agents.server_utils import build_skill_provider_async
 from paths import AGENTIC_PERF_HOME, LOCK_FILE, TRACE_SPOOL_DIR, resolve_state_store
+from providers.benchmark_identity import (
+    benchmark_intent_identity,
+    comparison_fingerprint,
+    comparison_step_requested,
+)
 from providers.events import EventBus
 from providers.execution import (
     AmbiguousHTTPReplayError,
@@ -616,18 +622,126 @@ PLAN_AGENT_STATUS = {
 DISPATCH_RETRY_STATUSES = frozenset({*PLAN_AGENT_STATUS.values(), "triage_pending"})
 
 
-def _capture_step_results(agent_type: str, cf: dict) -> dict:
+def _comparison_operation_identity(
+    ticket_id: str, step: dict, cf: dict
+) -> tuple[str, str, dict] | None:
+    """Build the operation identity for this exact validated plan step."""
+    validation_id = cf.get("benchmark_execution_validation_id")
+    validations = cf.get("benchmark_validations") or {}
+    records = validations.get("records") if isinstance(validations, dict) else {}
+    record = records.get(validation_id) if isinstance(records, dict) else None
+    superseded = isinstance(records, dict) and any(
+        isinstance(candidate, dict)
+        and candidate.get("record_type") == "supersession"
+        and candidate.get("supersedes_validation_id") == validation_id
+        for candidate in records.values()
+    )
+    if (
+        not isinstance(record, dict)
+        or not validation_id
+        or superseded
+        or record.get("validation_id") != validation_id
+        or record.get("execution_plan_step_id") != str(step.get("id"))
+        or record.get("harness") != "crucible"
+        or not isinstance(record.get("controller"), str)
+        or not record.get("controller")
+        or not isinstance(record.get("run_file"), dict)
+    ):
+        return None
+    digest = hashlib.sha256(
+        json.dumps(record["run_file"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    params_digest = hashlib.sha256(
+        json.dumps(
+            step.get("params") or {}, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    if digest != record.get("runfile_fingerprint") or params_digest != record.get(
+        "execution_plan_fingerprint"
+    ):
+        return None
+    return benchmark_intent_identity(
+        ticket_id,
+        validation_id,
+        record,
+        record["controller"],
+        record["harness"],
+        record.get("run_command") or "crucible run",
+    )[:2] + (record,)
+
+
+def _comparison_receipt(
+    validation: dict, cf: dict, expected_key: str, expected_hash: str, operation: dict
+) -> dict | None:
+    """Accept only a matching successful durable operation and external run ID."""
+    descriptor = operation.get("result_descriptor") or {}
+    result = (
+        descriptor.get("benchmark_result") if isinstance(descriptor, dict) else None
+    )
+    external_ids = operation.get("external_ids") or {}
+    run_id = cf.get("run_id")
+    if (
+        operation.get("operation_key") != expected_key
+        or operation.get("state") != "terminal"
+        or operation.get("terminal_outcome") != "success"
+        or operation.get("request_hash") != expected_hash
+        or not isinstance(result, dict)
+        or result.get("status") != "completed"
+        or cf.get("benchmark_status") != "completed"
+        or result.get("validation_id") != validation.get("validation_id")
+        or not run_id
+        or result.get("run_id") != run_id
+        or not isinstance(external_ids, dict)
+        or external_ids.get("run_id") != run_id
+    ):
+        return None
+    return {
+        "runfile_fingerprint": comparison_fingerprint(validation),
+        "runfile": validation["run_file"],
+        "validation_id": validation["validation_id"],
+    }
+
+
+def _capture_step_results(
+    agent_type: str, cf: dict, comparison_receipt: dict | None = None
+) -> dict:
     """Snapshot agent-type-specific fields from custom_fields.
 
     Called when a plan step completes so per-iteration state
     (IPs, run_ids, provisioning info) survives teardown.
     """
     if agent_type == "benchmark":
+        # Comparison steps store the identity from their verified operation.
+        validations = cf.get("benchmark_validations") or {}
+        records = (
+            validations.get("records", {}) if isinstance(validations, dict) else {}
+        )
+        executed = cf.get("benchmark_execution_validation_id")
+        validation_id = executed or validations.get("active_validation_id")
+        record = (
+            records.get(validation_id)
+            if validation_id and isinstance(records, dict)
+            else None
+        )
         return {
             "run_id": cf.get("run_id", ""),
             "benchmark_status": cf.get("benchmark_status", ""),
             "benchmark_duration": cf.get("benchmark_duration"),
             "run_file_used": cf.get("run_file_used", {}),
+            "runfile_fingerprint": (
+                comparison_receipt.get("runfile_fingerprint", "")
+                if comparison_receipt is not None
+                else (record or {}).get("runfile_fingerprint", "")
+                if isinstance(record, dict)
+                else ""
+            ),
+            "runfile": (
+                (comparison_receipt or {}).get("runfile")
+                if comparison_receipt is not None
+                else (record or {}).get("run_file")
+                if isinstance(record, dict)
+                else None
+            ),
         }
     elif agent_type == "resource":
         return {
@@ -705,14 +819,8 @@ def _missing_host_tuning(cf: dict) -> str:
     return ""
 
 
-async def _apply_step_overrides(
-    store_url: str,
-    client: object,
-    ticket_id: str,
-    next_step: dict,
-    cf: dict,
-) -> None:
-    """Write step-level param overrides to ticket custom_fields.
+def _prepare_step_overrides(next_step: dict, cf: dict) -> dict:
+    """Apply step-level param overrides in memory and return ticket fields.
 
     Resource steps can carry per-step required_hosts, directives,
     and scoped_context. Provision steps can carry per-step directive
@@ -779,6 +887,18 @@ async def _apply_step_overrides(
             del scoped[agent_key]
             override_fields["scoped_context"] = scoped
 
+    return override_fields
+
+
+async def _apply_step_overrides(
+    store_url: str,
+    client: object,
+    ticket_id: str,
+    next_step: dict,
+    cf: dict,
+) -> None:
+    """Write step-level param overrides to ticket custom_fields."""
+    override_fields = _prepare_step_overrides(next_step, cf)
     if override_fields:
         response = await client.patch(
             f"{store_url}/api/v1/tickets/{ticket_id}/fields",
@@ -816,6 +936,7 @@ async def _advance_plan(
         plan = cf.get("execution_plan")
         if not plan:
             return
+        expected_execution_plan = copy.deepcopy(plan)
 
         steps = plan.get("steps", [])
         current = plan.get("current_step", 0)
@@ -927,10 +1048,126 @@ async def _advance_plan(
                 response.raise_for_status()
                 return
 
+        comparison_receipt = None
+        workload_group = (step.get("params") or {}).get("workload_group")
+        if step.get("agent_type") == "benchmark" and (
+            workload_group or comparison_step_requested(ticket, step)
+        ):
+            identity = (
+                _comparison_operation_identity(ticket_id, step, cf)
+                if workload_group
+                else None
+            )
+            if identity is not None:
+                key, request_hash, validation = identity
+                try:
+                    op_response = await client.get(
+                        f"{store_url}/api/v1/traces/operations",
+                        params={"operation_key": key},
+                    )
+                    if op_response.status_code == 200:
+                        operation = op_response.json().get("operation") or {}
+                        comparison_receipt = _comparison_receipt(
+                            validation, cf, key, request_hash, operation
+                        )
+                except (httpx.HTTPError, ValueError, TypeError):
+                    logger.warning(
+                        "Could not verify benchmark operation for %s", ticket_id
+                    )
+            if comparison_receipt is None:
+                response = await client.post(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                    json={
+                        "status": "awaiting_customer_guidance",
+                        "comment": (
+                            "The comparison benchmark has no matching successful "
+                            "durable execution receipt for this step and run. "
+                            "Reconcile the run before resuming the comparison."
+                        ),
+                    },
+                )
+                response.raise_for_status()
+                return
+
+        async def persist_plan_fields(fields: dict) -> bool:
+            body: dict = {"fields": fields}
+            if comparison_receipt is not None:
+                body["require_unsuperseded_validation_id"] = comparison_receipt[
+                    "validation_id"
+                ]
+                body["expected_execution_plan"] = expected_execution_plan
+                body["expected_comparison_evidence"] = {
+                    name: cf.get(name)
+                    for name in (
+                        "benchmark_execution_validation_id",
+                        "run_id",
+                        "benchmark_status",
+                    )
+                }
+            response = await client.patch(
+                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                json=body,
+            )
+            if response.status_code == 409 and comparison_receipt is not None:
+                try:
+                    detail = response.json().get("detail")
+                except (AttributeError, TypeError, ValueError):
+                    detail = None
+                if isinstance(detail, str) and "validation was superseded" in detail:
+                    pause = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                        json={
+                            "status": "awaiting_customer_guidance",
+                            "comment": (
+                                "The executed benchmark validation was superseded "
+                                "before the comparison step could be committed. "
+                                "Reconcile the run and validation before resuming."
+                            ),
+                        },
+                    )
+                    pause.raise_for_status()
+                    return False
+                if isinstance(detail, str) and "execution plan changed" in detail:
+                    pause = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                        json={
+                            "status": "awaiting_customer_guidance",
+                            "comment": (
+                                "The execution plan changed after the benchmark "
+                                "receipt was read, so this comparison step was not "
+                                "committed. Reconcile the run and current plan "
+                                "before resuming."
+                            ),
+                        },
+                    )
+                    pause.raise_for_status()
+                    return False
+                if (
+                    isinstance(detail, str)
+                    and "comparison execution evidence changed" in detail
+                ):
+                    pause = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                        json={
+                            "status": "awaiting_customer_guidance",
+                            "comment": (
+                                "Benchmark run or validation evidence changed after "
+                                "the durable receipt was read, so this comparison "
+                                "step was not committed. Reconcile the run and "
+                                "ticket evidence before resuming."
+                            ),
+                        },
+                    )
+                    pause.raise_for_status()
+                    return False
+            response.raise_for_status()
+            return True
+
         step["status"] = "completed"
         step["results"] = _capture_step_results(
             step.get("agent_type", ""),
             cf,
+            comparison_receipt,
         )
 
         run_ids = plan.get("run_ids", [])
@@ -944,11 +1181,8 @@ async def _advance_plan(
         # (the ticket may be in any status at this point).
         stop_after = cf.get("stop_after_step")
         if stop_after and step.get("agent_type") == stop_after:
-            response = await client.patch(
-                f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-                json={"fields": {"execution_plan": plan}},
-            )
-            response.raise_for_status()
+            if not await persist_plan_fields({"execution_plan": plan}):
+                return
             response = await client.post(
                 f"{store_url}/api/v1/tickets/{ticket_id}/comments",
                 json={
@@ -1033,20 +1267,19 @@ async def _advance_plan(
             if next_status:
                 next_step["status"] = "in_progress"
 
-                # Apply step overrides BEFORE saving the plan
-                # so that mutations (e.g. analysis-informed
-                # benchmark params) are persisted.
-                await _apply_step_overrides(store_url, client, ticket_id, next_step, cf)
-                response = await client.patch(
-                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-                    json={
-                        "fields": {
-                            "execution_plan": plan,
-                            "review_submitted": None,
-                        },
-                    },
-                )
-                response.raise_for_status()
+                # Comparison completion must atomically fence its plan write
+                # against validation supersession. Include step overrides in
+                # that same write so no next-step state is applied if the
+                # validation was retired after the receipt check.
+                fields = {"execution_plan": plan, "review_submitted": None}
+                if comparison_receipt is not None:
+                    fields.update(_prepare_step_overrides(next_step, cf))
+                else:
+                    await _apply_step_overrides(
+                        store_url, client, ticket_id, next_step, cf
+                    )
+                if not await persist_plan_fields(fields):
+                    return
 
                 label = next_step.get("params", {}).get(
                     "label",
@@ -1075,16 +1308,10 @@ async def _advance_plan(
                 response.raise_for_status()
                 return
 
-        response = await client.patch(
-            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
-            json={
-                "fields": {
-                    "execution_plan": plan,
-                    "review_submitted": None,
-                },
-            },
-        )
-        response.raise_for_status()
+        if not await persist_plan_fields(
+            {"execution_plan": plan, "review_submitted": None}
+        ):
+            return
 
 
 def _cancellation_reason(dispatcher: Dispatcher, ticket_id: str) -> str:

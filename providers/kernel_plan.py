@@ -1,166 +1,220 @@
-"""Kernel A/B comparison plan builder.
+"""Deterministic kernel-comparison plan builder (epic #995 wiring).
 
-Builds execution plans from a kernel_comparison directive. The plan
-shape reuses existing provision/benchmark steps — no new agent types
-or status machine edges.
+Turns the ``kernel_comparison`` directive into the canonical A/B
+execution plan by transforming the triage-generated plan in code — the
+LLM decides *that* a comparison is wanted and supplies the releases; the
+builder owns the step shape, ordering, and labels. This mirrors the
+project principle that plan topology is an invariant, not a suggestion.
+
+Directive shape (after directive normalization):
+
+    kernel_comparison:
+      baseline:  <release A, exact uname -r string>   # required
+      candidate: <release B, exact uname -r string>   # required
+      order:     AB | ABBA | BAAB                     # optional, default AB
+      package:   <rpm package name>                   # optional, default kernel
+      repo_url:  <http(s) URL serving the packages>   # optional
+
+Every kernel step boots ALL benchmark hosts (kernel.hosts stays unset);
+partial coverage is not a supported configuration in v1.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from providers.rhel_kernel import KernelSpec
+from providers.rhel_kernel import (
+    _MAX_RELEASE_LEN,
+    _PACKAGE_NAME_RE,
+    KERNEL_RELEASE_RE,
+)
+
+# A repo URL is validated here for plan-level rejection and again (with
+# the same rule) by KernelSpec at tool time. Fail at triage, not mid-run.
+_REPO_URL_RE = re.compile(r"^https?://[^'\s\\]+$")
+
+_VALID_ORDERS = ("AB", "ABBA", "BAAB")
+_LETTER_ROLES = {"A": "baseline", "B": "candidate"}
+
+MAX_REPO_URL_LEN = 512
+
+
+def validate_kernel_comparison(directive: Any) -> tuple[dict[str, Any] | None, str]:
+    """Validate and normalize a kernel_comparison directive.
+
+    Returns ``(normalized, "")`` or ``(None, reason)``. The reason is
+    written verbatim into the triage pause comment.
+    """
+    if not isinstance(directive, dict):
+        return None, "kernel_comparison directive must be a mapping"
+    baseline = directive.get("baseline")
+    if not isinstance(baseline, str) or not baseline:
+        return None, (
+            "kernel_comparison requires both 'baseline' and 'candidate' releases"
+        )
+    candidate = directive.get("candidate")
+    if not isinstance(candidate, str) or not candidate:
+        return None, (
+            "kernel_comparison requires both 'baseline' and 'candidate' releases"
+        )
+    if not baseline or not candidate:
+        return (
+            None,
+            "kernel_comparison requires both 'baseline' and 'candidate' releases",
+        )
+    for name, release in (("baseline", baseline), ("candidate", candidate)):
+        if len(release) > _MAX_RELEASE_LEN or not KERNEL_RELEASE_RE.fullmatch(release):
+            return None, (
+                f"kernel_comparison.{name} release {release!r} is not an exact "
+                "uname -r style release string (VERSION-RELEASE.ARCH)"
+            )
+    order_raw = directive.get("order")
+    order = (str(order_raw) if order_raw else "AB").upper()
+    if order not in _VALID_ORDERS:
+        return None, (
+            f"kernel_comparison.order {order!r} is not one of "
+            f"{', '.join(_VALID_ORDERS)}"
+        )
+    package = directive.get("package")
+    if package is None:
+        package = "kernel"
+    if not isinstance(package, str):
+        return None, f"kernel_comparison.package {package!r} is not a package name"
+    if not _PACKAGE_NAME_RE.fullmatch(package):
+        return None, f"kernel_comparison.package {package!r} is not a package name"
+    repo_url = directive.get("repo_url")
+    if repo_url is None:
+        repo_url = ""
+    if not isinstance(repo_url, str):
+        return None, ("kernel_comparison.repo_url must be a plain http(s) URL string")
+    if repo_url:
+        if len(repo_url) > MAX_REPO_URL_LEN or not _REPO_URL_RE.fullmatch(repo_url):
+            return None, (
+                "kernel_comparison.repo_url must be a plain http(s) URL "
+                "with no whitespace or quotes"
+            )
+    return {
+        "baseline": baseline,
+        "candidate": candidate,
+        "order": order,
+        "package": package,
+        "repo_url": repo_url,
+    }, ""
+
+
+def _kernel_step(step_id: int, release: str, params: dict[str, Any]) -> dict[str, Any]:
+    kernel: dict[str, Any] = {
+        "release": release,
+        "package": params["package"],
+        "reboot_strategy": "serial",
+        "hosts": None,
+    }
+    if params["repo_url"]:
+        kernel["repo_url"] = params["repo_url"]
+    return {
+        "id": step_id,
+        "agent_type": "provision",
+        "status": "pending",
+        "params": {"label": "kernel", "kernel": kernel},
+        "results": {},
+    }
+
+
+def _benchmark_copy(
+    step_id: int, template: dict[str, Any], role: str
+) -> dict[str, Any]:
+    copy = dict(template)
+    copy["id"] = step_id
+    copy["status"] = "pending"
+    copy["results"] = {}
+    params = dict(copy.get("params") or {})
+    base_label = str(params.get("label") or "benchmark")
+    params["label"] = f"{base_label}-kernel-{role}"
+    params["kernel_role"] = role
+    # One workload group across every benchmark copy: the group is the
+    # marker the execution path uses to enforce the epic's immutability
+    # requirement — later steps in the group must present an identical
+    # runfile fingerprint to the first one's recorded result.
+    params["workload_group"] = "kernel-ab"
+    copy["params"] = params
+    return copy
 
 
 def build_kernel_comparison_plan(
-    directive: dict[str, Any],
-    required_hosts: list[dict[str, Any]],
-    harness_directives: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    """Build the step list for a kernel A/B comparison.
+    plan: dict[str, Any], directive: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str]:
+    """Transform a plan into the canonical kernel-comparison shape.
 
-    The directive must contain baseline and candidate release strings.
-    Returns a list of step dicts ready for execution_plan.steps.
+    Returns ``(new_plan, "")`` or ``(None, reason)``. The plan must not
+    have progressed past the first benchmark step; resource and harness
+    provision steps are preserved as-is, every original benchmark step is
+    replaced by one kernel step + one benchmark step per order letter,
+    and any steps after the last benchmark (review, teardown) are kept.
     """
-    baseline_release = directive["baseline"]
-    candidate_release = directive["candidate"]
-    package = directive.get("package", "kernel")
-    order = directive.get("order", "AB")
-    reboot_strategy = directive.get("reboot_strategy", "serial")
-    reconnect_timeout = directive.get("reconnect_timeout_seconds", 900)
+    normalized, err = validate_kernel_comparison(directive)
+    if normalized is None:
+        return None, err
 
-    baseline_spec = KernelSpec.parse({"release": baseline_release, "package": package})
-    candidate_spec = KernelSpec.parse(
-        {"release": candidate_release, "package": package}
-    )
-
-    if order not in ("AB", "ABBA", "BAAB"):
-        raise ValueError(f"unsupported order: {order!r}")
-
-    kernel_a = baseline_spec.to_dict()
-    kernel_a.update(
-        {
-            "role": "baseline",
-            "hosts": None,
-            "reboot_strategy": reboot_strategy,
-            "verification": "strict",
-            "reconnect_timeout_seconds": reconnect_timeout,
-        }
-    )
-
-    kernel_b = candidate_spec.to_dict()
-    kernel_b.update(
-        {
-            "role": "candidate",
-            "hosts": None,
-            "reboot_strategy": reboot_strategy,
-            "verification": "strict",
-            "reconnect_timeout_seconds": reconnect_timeout,
-        }
-    )
-
-    steps: list[dict[str, Any]] = []
-    step_id = 0
-
-    steps.append(
-        {
-            "id": step_id,
-            "agent_type": "resource",
-            "params": {"required_hosts": required_hosts},
-        }
-    )
-    step_id += 1
-
-    steps.append(
-        {
-            "id": step_id,
-            "agent_type": "provision",
-            "params": {"label": "harness-install"},
-        }
-    )
-    step_id += 1
-
-    if order == "AB":
-        sequence = [
-            ("baseline", kernel_a, "kernel-A"),
-            ("candidate", kernel_b, "kernel-B"),
-        ]
-    elif order == "ABBA":
-        sequence = [
-            ("baseline", kernel_a, "kernel-A-1"),
-            ("candidate", kernel_b, "kernel-B-1"),
-            ("candidate", kernel_b, "kernel-B-2"),
-            ("baseline", kernel_a, "kernel-A-2"),
-        ]
-    else:  # BAAB
-        sequence = [
-            ("candidate", kernel_b, "kernel-B-1"),
-            ("baseline", kernel_a, "kernel-A-1"),
-            ("baseline", kernel_a, "kernel-A-2"),
-            ("candidate", kernel_b, "kernel-B-2"),
-        ]
-
-    baseline_benchmark_steps: list[int] = []
-    candidate_benchmark_steps: list[int] = []
-
-    for role, kernel, label in sequence:
-        steps.append(
-            {
-                "id": step_id,
-                "agent_type": "provision",
-                "params": {"label": label, "kernel": dict(kernel)},
-            }
+    steps = plan.get("steps") or []
+    if not steps:
+        return None, "execution plan has no steps to transform"
+    bench_indexes = [
+        i for i, s in enumerate(steps) if s.get("agent_type") == "benchmark"
+    ]
+    if not bench_indexes:
+        return None, "execution plan has no benchmark step to build the comparison from"
+    first_bench, last_bench = bench_indexes[0], bench_indexes[-1]
+    current = plan.get("current_step") or 0
+    if current >= first_bench:
+        return None, (
+            "execution plan already progressed past the first benchmark step; "
+            "the kernel_comparison directive must be present at submission time"
         )
-        step_id += 1
-
-        benchmark_step_id = step_id
-        steps.append(
-            {
-                "id": step_id,
-                "agent_type": "benchmark",
-                "params": {
-                    "label": label,
-                    "workload_group": "kernel-ab",
-                    "kernel_role": role,
-                },
-            }
+    if len(bench_indexes) > 1 or last_bench - first_bench > 0:
+        # Anything between (or beyond) a single benchmark step — extra
+        # benchmarks, intermediate provisioning/configuration steps —
+        # would be silently discarded by the A/B transform. Ambiguous or
+        # unsupported topologies must pause for guidance, never silently
+        # select one workload (review major on #1230).
+        return None, (
+            "the execution plan has a topology the kernel comparison "
+            "transform does not support: it expects exactly one benchmark "
+            "step with no steps between it and the preceding provision "
+            "step, but found "
+            + (
+                f"{len(bench_indexes)} benchmark steps"
+                if len(bench_indexes) > 1
+                else "intermediate steps between the resource/provision "
+                "steps and the benchmark step"
+            )
+            + ". Simplify the ticket's request or remove the "
+            "kernel_comparison directive."
         )
-        step_id += 1
+    template = steps[first_bench]
 
-        if role == "baseline":
-            baseline_benchmark_steps.append(benchmark_step_id)
-        else:
-            candidate_benchmark_steps.append(benchmark_step_id)
+    head = [dict(s) for s in steps[:first_bench]]
+    tail = [dict(s) for s in steps[last_bench + 1 :]]
 
-    comparison_params: dict[str, Any] = {
-        "comparison": {
-            "kind": "kernel_ab",
-            "baseline_steps": baseline_benchmark_steps,
-            "candidate_steps": candidate_benchmark_steps,
-        },
-    }
-    if len(baseline_benchmark_steps) == 1:
-        comparison_params["comparison"]["baseline_step"] = baseline_benchmark_steps[0]
-        comparison_params["comparison"]["candidate_step"] = candidate_benchmark_steps[0]
+    new_steps: list[dict[str, Any]] = list(head)
+    for letter in normalized["order"]:
+        release = normalized["baseline" if letter == "A" else "candidate"]
+        kernel_step = _kernel_step(len(new_steps), release, normalized)
+        kernel_step["params"]["label"] = f"kernel-{letter}"
+        new_steps.append(kernel_step)
+        new_steps.append(
+            _benchmark_copy(len(new_steps), template, _LETTER_ROLES[letter])
+        )
+    new_steps.extend(tail)
 
-    steps.append(
-        {
-            "id": step_id,
-            "agent_type": "review",
-            "params": comparison_params,
-        }
-    )
-    step_id += 1
+    for i, s in enumerate(new_steps):
+        s["id"] = i
 
-    steps.append(
-        {
-            "id": step_id,
-            "agent_type": "teardown",
-            "params": {},
-        }
-    )
-
-    return steps
+    return {
+        "current_step": plan.get("current_step", 0),
+        "run_ids": list(plan.get("run_ids") or []),
+        "steps": new_steps,
+    }, ""
 
 
 def kernel_steps(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -174,7 +228,12 @@ def preceding_kernel_step(
     plan: dict[str, Any],
     benchmark_step_id: int,
 ) -> dict[str, Any] | None:
-    """Find the most recent kernel provision step before a benchmark step."""
+    """Find the most recent kernel provision step before a benchmark step.
+
+    The handoff gate uses this to require a verified transition before a
+    benchmark may run (orchestrator/handoff.py::
+    _check_executing_benchmark).
+    """
     steps = plan.get("steps", [])
     result = None
     for step in steps:

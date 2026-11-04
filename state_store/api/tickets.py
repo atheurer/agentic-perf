@@ -16,7 +16,14 @@ from ..models import (
     TicketStatus,
     UpdateFieldsRequest,
 )
-from ..store import ClaimFenceError, TicketDispatchBlocked, TicketNotFound
+from ..store import (
+    ClaimFenceError,
+    ComparisonEvidenceChangedError,
+    ExecutionPlanChangedError,
+    TicketDispatchBlocked,
+    TicketNotFound,
+    ValidationSupersededError,
+)
 from .action_hints import after_create
 from .fencing import mutation_fence
 
@@ -375,6 +382,15 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
             epoch=epoch,
             claim_id=claim_id,
             leader_only=leader_only,
+            require_unsuperseded_validation_id=(
+                body.require_unsuperseded_validation_id
+            ),
+            expected_execution_plan=body.expected_execution_plan,
+            expected_comparison_evidence=(
+                body.expected_comparison_evidence.model_dump()
+                if body.expected_comparison_evidence is not None
+                else None
+            ),
         )
         if normalization_report:
             from state_store.models import AddCommentRequest
@@ -395,6 +411,12 @@ def update_fields(ticket_id: str, body: UpdateFieldsRequest, request: Request):
             status_code=409,
             detail={"reason": e.reason, "message": str(e)},
         ) from e
+    except ValidationSupersededError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ExecutionPlanChangedError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except ComparisonEvidenceChangedError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
