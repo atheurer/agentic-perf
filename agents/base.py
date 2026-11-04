@@ -2825,6 +2825,27 @@ class AgentBase(ABC):
                 t = await self._get_ticket(rid)
                 rcf = t.get("custom_fields", {})
                 output_dir = rcf.get("output_dir", "")
+                if not output_dir:
+                    from pathlib import Path
+
+                    from paths import ARTIFACT_DIR
+
+                    root = Path(ARTIFACT_DIR).resolve()
+                    base = (root / rid).resolve()
+                    try:
+                        base.relative_to(root)
+                        candidate = (
+                            (base / rcf["run_id"]).resolve()
+                            if rcf.get("run_id")
+                            else base
+                        )
+                        candidate.relative_to(base)
+                    except (KeyError, OSError, ValueError):
+                        candidate = None
+                    if candidate is not None and candidate.is_dir():
+                        output_dir = str(candidate)
+                    elif base.is_dir():
+                        output_dir = str(base)
                 if output_dir:
                     refs[rid] = {
                         "output_dir": output_dir,
