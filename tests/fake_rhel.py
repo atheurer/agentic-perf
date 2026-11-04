@@ -321,6 +321,7 @@ class FakeFleetSSH:
         command: str,
         timeout: int = 300,
         mutating: bool = False,
+        stdin_data: bytes | None = None,
     ) -> SSHResult:
         self.calls.append(
             {
@@ -328,6 +329,7 @@ class FakeFleetSSH:
                 "host": host,
                 "command": command,
                 "mutating": mutating,
+                "stdin_data": stdin_data,
             }
         )
         fake = self._hosts.get(host)

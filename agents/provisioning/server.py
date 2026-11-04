@@ -3494,35 +3494,65 @@ def _actions_for_host(spec: KernelSpec, inventory: dict[str, Any]) -> dict[str, 
 def _url_within_prefix(url: str, prefix: str) -> bool:
     """Path-boundary approval check (review round 2, blocker).
 
-    Both URLs are parsed and canonicalized: scheme and host must match
-    exactly (no userinfo tricks), the approved prefix's path must sit at
-    the URL's path root as complete components (so ``/approved`` never
-    approves ``/approvedevil/``), and dot-segments are resolved before
-    comparison (so ``/approved/../unapproved`` cannot escape). A prefix
+    Both URLs are parsed and canonicalized: scheme, host, and effective port
+    must match exactly (no userinfo tricks). The approved prefix's path must
+    sit at the URL's path root as complete components (so ``/approved`` never
+    approves ``/approvedevil/``), and percent-encoding is decoded before
+    dot-segments are resolved (so ``/approved/%2e%2e/unapproved`` cannot
+    escape). Ambiguous path parameters and non-dot segments with trailing
+    spaces or dots are rejected because some servers normalize them. A prefix
     without a trailing slash is treated as a component boundary anyway.
     Query strings and fragments are ignored — approval is about where
     the packages live, not the fetch parameters.
     """
     import posixpath
-    from urllib.parse import urlsplit
+    from urllib.parse import unquote, urlsplit
 
-    def _canonical(raw: str) -> tuple[str, str, list[str]] | None:
+    def _canonical(raw: str) -> tuple[str, str, int, list[str]] | None:
+        if not isinstance(raw, str) or any(
+            ord(char) < 32 or ord(char) == 127 for char in raw
+        ):
+            return None
         try:
-            parts = urlsplit(raw.strip())
-            if not parts.scheme or not parts.hostname:
+            parts = urlsplit(raw)
+            scheme = parts.scheme.lower()
+            if scheme not in {"http", "https"} or not parts.hostname:
                 return None
             # Userinfo in either URL is rejected outright: it has no
             # legitimate role in a package repository URL and enables
             # host-confusion bypasses (user@approved/ vs approved/).
             if parts.username or parts.password:
                 return None
-            # Resolve dot-segments (../ and ./) and normalize; unlike
-            # urljoin's "." resolution this preserves every component.
-            path = posixpath.normpath(parts.path or "/")
+            # Ports are part of the URL origin. Treat an omitted port and
+            # its scheme default as the same origin, but keep custom ports
+            # distinct.
+            port = parts.port
+            effective_port = (
+                port if port is not None else (443 if scheme == "https" else 80)
+            )
+
+            # Servers may decode escaped separators or dot-segments before
+            # routing. Repeatedly decode so nested escapes cannot hide them
+            # from the component-boundary check.
+            path = parts.path or "/"
+            while True:
+                decoded = unquote(path)
+                if decoded == path:
+                    break
+                path = decoded
+            if "\\" in path or any(ord(char) < 32 or ord(char) == 127 for char in path):
+                return None
+            path_segments = [segment for segment in path.split("/") if segment]
+            for segment in path_segments:
+                if ";" in segment:
+                    return None
+                if segment not in {".", ".."} and segment.endswith((".", " ")):
+                    return None
+            path = posixpath.normpath(path)
             if not path.startswith("/"):
                 path = "/" + path
             segments = [s for s in path.split("/") if s]
-            return parts.scheme.lower(), (parts.hostname or "").lower(), segments
+            return scheme, (parts.hostname or "").lower(), effective_port, segments
         except ValueError:
             return None
 
@@ -3530,9 +3560,9 @@ def _url_within_prefix(url: str, prefix: str) -> bool:
     prefix_c = _canonical(prefix)
     if url_c is None or prefix_c is None:
         return False
-    url_scheme, url_host, url_segments = url_c
-    p_scheme, p_host, prefix_segments = prefix_c
-    if url_scheme != p_scheme or url_host != p_host:
+    url_scheme, url_host, url_port, url_segments = url_c
+    p_scheme, p_host, p_port, prefix_segments = prefix_c
+    if (url_scheme, url_host, url_port) != (p_scheme, p_host, p_port):
         return False
     if len(url_segments) < len(prefix_segments):
         return False
@@ -3611,17 +3641,17 @@ async def _deploy_repository_trust(
             return "", ""
         if not content:
             return "", ""
-        # The secret bytes are base64-encoded and decoded on the host —
-        # no secret text is interpolated into the remote shell, so a
-        # secret containing shell metacharacters or a heredoc delimiter
-        # cannot inject commands (review round 2, major).
-        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        # Send secret bytes through SSH stdin so they never enter command
+        # arguments, logs, or shell parsing. Keep the directory private while
+        # writing, then set root ownership and restrictive file permissions.
         result = await _ssh.run(
             target,
-            f"mkdir -p /etc/pki/agentic-perf && chmod 755 /etc/pki/agentic-perf"
-            f" && printf '%s' '{encoded}' | base64 -d > {remote}"
-            f" && chmod 644 {remote}",
+            "install -o root -g root -m 0700 -d /etc/pki/agentic-perf"
+            " && chmod 0700 /etc/pki/agentic-perf"
+            f" && umask 077 && cat > {remote}"
+            f" && chown root:root {remote} && chmod 0600 {remote}",
             timeout=30,
+            stdin_data=content.encode("utf-8"),
             mutating=True,
         )
         if result.exit_code != 0:

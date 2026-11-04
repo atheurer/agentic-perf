@@ -941,8 +941,23 @@ class TestUrlPrefixMatching:
     def test_dot_segment_escape_rejected(self, matcher):
         prefix = "https://host/approved/"
         assert matcher("https://host/approved/../unapproved/x", prefix) is False
-        # (percent-encoded dot segments are resolved by the server/dnf
-        # side; literal dot segments are the escape vector handled here)
+        assert matcher("https://host/approved/%2e%2e/unapproved/x", prefix) is False
+        assert matcher("https://host/approved/%252e%252e/unapproved/x", prefix) is False
+        assert matcher("https://host/approved%2f..%2funapproved/x", prefix) is False
+
+    def test_ambiguous_path_segments_rejected(self, matcher):
+        prefix = "https://host/approved/"
+        for path in (
+            "/approved/..;/unapproved",
+            "/approved/..%3b/unapproved",
+            "/approved/..%253b/unapproved",
+            "/approved/..%20/unapproved",
+            "/approved/..%2520/unapproved",
+            "/approved/..%2e/unapproved",
+            "/approved/item./metadata",
+            "/approved/item%20/metadata",
+        ):
+            assert matcher(f"https://host{path}", prefix) is False
 
     def test_prefix_without_slash_does_not_approve_siblings(self, matcher):
         assert matcher("https://host/approvedevil/", "https://host/approved") is False
@@ -953,6 +968,16 @@ class TestUrlPrefixMatching:
         assert matcher("https://other/approved/x", prefix) is False
         assert matcher("https://host.evil/approved/x", prefix) is False
         assert matcher("http://host/approved/x", prefix) is False  # scheme
+
+    def test_origin_port_is_part_of_approval(self, matcher):
+        assert (
+            matcher("https://host:8443/approved/x", "https://host/approved/") is False
+        )
+        assert (
+            matcher("https://host/approved/x", "https://host:8443/approved/") is False
+        )
+        assert matcher("https://host:443/approved/x", "https://host/approved/") is True
+        assert matcher("http://host:80/approved/x", "http://host/approved/") is True
 
     def test_userinfo_trick_rejected(self, matcher):
         prefix = "https://host/approved/"
@@ -991,6 +1016,19 @@ class TestUrlPrefixMatching:
         )
         trust = await srv._resolve_repository_trust(sibling)
         assert trust["approved"] is False
+        encoded_escape = REPO_URL.rstrip("/") + "/%2e%2e/unapproved"
+        trust = await srv._resolve_repository_trust(encoded_escape)
+        assert trust["approved"] is False
+        path_parameter = REPO_URL.rstrip("/") + "/..%3b/unapproved"
+        trust = await srv._resolve_repository_trust(path_parameter)
+        assert trust["approved"] is False
+        alternate_port = REPO_URL.replace(
+            "https://download.eng.rdu.redhat.com/",
+            "https://download.eng.rdu.redhat.com:8443/",
+            1,
+        )
+        trust = await srv._resolve_repository_trust(alternate_port)
+        assert trust["approved"] is False
         # And the real URL still approves:
         trust = await srv._resolve_repository_trust(REPO_URL)
         assert trust["approved"] is True
@@ -1003,9 +1041,10 @@ class TestUrlPrefixMatching:
 
 class TestSecretTransferSafety:
     @pytest.mark.asyncio
-    async def test_hostile_secret_cannot_inject(self, monkeypatch):
-        """A secret containing heredoc delimiters, backticks, or shell
-        metacharacters must reach the host as inert data."""
+    async def test_secret_uses_ssh_stdin_and_root_only_remote_files(self, monkeypatch):
+        """Secret bytes travel separately from shell arguments into private files."""
+        import base64
+
         import agents.provisioning.server as srv
         from tests.conftest import MockSkillProvider
         from tests.fake_rhel import FakeRHELHost
@@ -1045,14 +1084,26 @@ class TestSecretTransferSafety:
 
         gpg, ca = await srv._deploy_repository_trust("10.0.0.1", trust)
         assert gpg and ca  # deployment succeeds
-        # Every SSH command carrying secret material must be base64
-        # (single-quoted, alphabet-only) — no raw secret text, no heredoc.
-        for call in ssh.calls:
+        trust_calls = [
+            call for call in ssh.calls if "/etc/pki/agentic-perf/" in call["command"]
+        ]
+        assert len(trust_calls) == 2
+        assert all(call["stdin_data"] is not None for call in trust_calls)
+        secret_calls = trust_calls
+        assert len(secret_calls) == 2
+        encoded = base64.b64encode(hostile.encode("utf-8")).decode("ascii")
+        for call in secret_calls:
             cmd = call["command"]
-            if "/etc/pki/agentic-perf/" in cmd:
-                assert "AGENTIC_PERF_TRUST_EOF" not in cmd
-                assert "rm -rf" not in cmd
-                assert "`reboot`" not in cmd
+            assert call["stdin_data"] == hostile.encode("utf-8")
+            assert hostile not in cmd
+            assert encoded not in cmd
+            assert "install -o root -g root -m 0700 -d /etc/pki/agentic-perf" in cmd
+            assert "chmod 0700 /etc/pki/agentic-perf" in cmd
+            assert "cat > /etc/pki/agentic-perf/" in cmd
+            assert "chown root:root /etc/pki/agentic-perf/" in cmd
+            assert "chmod 0600 /etc/pki/agentic-perf/" in cmd
+            assert "rm -rf" not in cmd
+            assert "`reboot`" not in cmd
 
 
 # ---------------------------------------------------------------------------
