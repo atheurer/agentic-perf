@@ -163,7 +163,10 @@ directives: kernel_comparison={"baseline": "5.14.0-427.13.1.el9_4.x86_64",
 The baseline release must match the hosts' currently running kernel for the
 first (parity) reboot; the candidate release is booted for the second run.
 Results land in two benchmark runs tagged with their `kernel_role`, which the
-review agent compares.
+review agent compares. Comparison steps require Crucible's ticket-bound
+validation and durable execution receipt. Generic harness adapters, Arcaflow
+workflow/plugin tools, and boot-time analysis are rejected for comparison
+steps until they can provide equivalent durable run identity.
 
 ### Fleet Investigation
 

@@ -1279,6 +1279,30 @@ class TriageAgent(AgentBase):
                     )
                     logger.info("[triage] %s", note)
 
+        # Kernel comparison currently has durable execution receipts only for
+        # Crucible. Resolve this before constructing or dispatching the plan:
+        # a comparison that is rejected by the benchmark agent could already
+        # have installed a kernel and rebooted its hosts. The harness may be
+        # filled from an exact suite catalog match above or from the provider's
+        # configured default; if it is still unresolved, require the owner to
+        # select Crucible explicitly before any provisioning can begin.
+        if "kernel_comparison" in directives and harness != "crucible":
+            if harness:
+                message = (
+                    f"Kernel comparisons currently require Crucible's durable "
+                    f"execution receipt; selected harness '{harness}' cannot "
+                    "provide it. Select Crucible or remove the "
+                    "kernel_comparison directive."
+                )
+            else:
+                message = (
+                    "Kernel comparison requires a harness to be resolved "
+                    "before provisioning, and triage could not determine one. "
+                    "Select Crucible or remove the kernel_comparison directive."
+                )
+            await pause_for_harness_guidance(message)
+            return
+
         # Resolve execution model from the harness metadata.
         # This is a harness-level property declared in BenchmarkSuite,
         # not a per-ticket decision or a hardcoded list.

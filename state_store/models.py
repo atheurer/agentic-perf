@@ -333,6 +333,9 @@ class KernelControlRequest(BaseModel):
 
 class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
+    require_unsuperseded_validation_id: StrictStr | None = Field(
+        default=None, min_length=1, max_length=255
+    )
 
 
 class ExtendIterationsRequest(BaseModel):

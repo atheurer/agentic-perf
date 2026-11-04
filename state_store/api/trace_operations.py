@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from ..auth import Principal
@@ -35,6 +35,24 @@ class FencedRequest(BaseModel):
     external_ids: dict[str, Any] | None = None
     ttl_seconds: float | None = Field(default=None, gt=0, le=86_400)
     reconciliation_outcome: str = "indeterminate"
+
+
+@router.get("")
+async def get_operation(
+    request: Request,
+    _: Annotated[Principal, Depends(_service_principal)],
+    operation_key: Annotated[str, Query(min_length=1, max_length=512)],
+) -> dict[str, Any]:
+    """Read one durable operation for service-side result reconciliation."""
+    try:
+        record = request.app.state.trace_store.get_operation(operation_key)
+        if record is None:
+            raise HTTPException(404, "operation not found")
+        return {"operation": record.__dict__}
+    except HTTPException:
+        raise
+    except TraceStoreWriteError as exc:
+        raise _error(exc) from exc
 
 
 def _error(exc: Exception) -> HTTPException:

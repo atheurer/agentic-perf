@@ -67,6 +67,10 @@ class TicketNotFound(Exception):
     pass
 
 
+class ValidationSupersededError(ValueError):
+    """A conditional field update referenced a retired validation."""
+
+
 class ClaimFenceError(Exception):
     """A claim mutation was rejected by the state-store fencing contract."""
 
@@ -1210,12 +1214,32 @@ class TicketStore:
         claim_id: str | None = None,
         leader_only: bool = False,
         iteration_limits: tuple[dict[str, int], int] | None = None,
+        require_unsuperseded_validation_id: str | None = None,
     ) -> Ticket:
         with self._lock:
             ticket = self._resolve(ticket_id)
             self._validate_mutation_fence(
                 ticket_id, session_id, epoch, claim_id, leader_only=leader_only
             )
+            if require_unsuperseded_validation_id is not None:
+                manifest = self._validation_manifest(ticket)
+                validation = manifest["records"].get(require_unsuperseded_validation_id)
+                superseded = any(
+                    isinstance(record, dict)
+                    and record.get("record_type") == "supersession"
+                    and record.get("supersedes_validation_id")
+                    == require_unsuperseded_validation_id
+                    for record in manifest["records"].values()
+                )
+                if (
+                    not isinstance(validation, dict)
+                    or validation.get("record_type", "validation") != "validation"
+                    or superseded
+                ):
+                    raise ValidationSupersededError(
+                        "the executed benchmark validation was superseded before "
+                        "the comparison step could be committed"
+                    )
             if self._contains_kernel_reserved(fields):
                 raise ValueError("kernel control and approval fields are server-owned")
             durable_grant = fields.get("max_iterations_override") is not None

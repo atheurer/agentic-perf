@@ -24,6 +24,7 @@ if _project_root not in sys.path:
 
 from agents.mcp_audit import create_ticket_mcp
 from agents.tool_ownership import ownership_metadata, require_ticket_harness
+from providers.benchmark_identity import comparison_step_requested
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +244,17 @@ async def execute_arcaflow_plugin(
             if not specified.
     """
     await _require_tool_owner(_ARCAFLOW_PLUGIN_OWNER)
+    if comparison_step_requested(_ticket or {}):
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "workload_group_harness_unsupported",
+                "message": (
+                    "Arcaflow plugins cannot provide the durable execution "
+                    "receipt required for a kernel comparison."
+                ),
+            }
+        )
     if _ssh is None:
         return json.dumps({"error": "SSH not initialized"})
 

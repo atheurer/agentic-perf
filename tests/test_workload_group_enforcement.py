@@ -451,6 +451,17 @@ def _run_file(seconds=None):
     return {"schema": {"version": "2023.09.27"}, "benchmarks": [bench], "tags": {}}
 
 
+def _comparison_fingerprint(run_file):
+    return benchmark_server.comparison_fingerprint(
+        {
+            "runfile_fingerprint": benchmark_server._runfile_fingerprint(run_file),
+            "harness": "crucible",
+            "controller": "controller",
+            "run_command": "crucible run",
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_execute_rejects_workload_drift_through_the_real_path(
     tmp_path, monkeypatch
@@ -459,7 +470,7 @@ async def test_execute_rejects_workload_drift_through_the_real_path(
     run B presents a differently-built run file (no mv-params → 600s
     default). execute_benchmark must reject before any controller work."""
     ticket = _group_plan_ticket(
-        prior_fingerprint=benchmark_server._runfile_fingerprint(_run_file(30))
+        prior_fingerprint=_comparison_fingerprint(_run_file(30))
     )
     _wire_execute(
         monkeypatch, tmp_path, plan_ticket=ticket, record_run_file=_run_file()
@@ -515,7 +526,7 @@ async def test_execute_passes_matching_runfile_through_the_real_path(
     the launch path (which the fake controller answers)."""
     correct = _run_file(30)
     ticket = _group_plan_ticket(
-        prior_fingerprint=benchmark_server._runfile_fingerprint(correct),
+        prior_fingerprint=_comparison_fingerprint(correct),
         mv_params={"seconds": "30"},
     )
     _wire_execute(monkeypatch, tmp_path, plan_ticket=ticket, record_run_file=correct)

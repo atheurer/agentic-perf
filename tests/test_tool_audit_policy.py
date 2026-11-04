@@ -174,6 +174,10 @@ def _side_effect_category(path: str, call: str) -> str | None:
     # surfaced by the scanner.
     if path == "agents/resource/server.py" and call in _RESOURCE_HOST_PARSING_CALLS:
         return None
+    # PayloadBlobStore.put writes an audited ticket-scoped file. Keep its
+    # method name distinct from state-store HTTP PUT requests.
+    if path == "agents/benchmark/server.py" and call == "result_blob_store.put":
+        return "filesystem"
     if "mcp" in lowered and any(
         token in lowered for token in ("call_tool", "call_internal_tool", "fastmcp")
     ):
@@ -985,6 +989,18 @@ def test_checked_in_side_effect_inventory_has_zero_unexplained_boundaries() -> N
         assert disposition in {"audited", "system_only", "unsupported", "exception"}
         assert owner and scope == f"{entry[0]}:{entry[1]}"
         assert date.fromisoformat(expires_on) >= date.today()
+
+
+def test_comparison_result_blob_has_an_audited_inventory_boundary() -> None:
+    assert (
+        _side_effect_category("agents/benchmark/server.py", "result_blob_store.put")
+        == "filesystem"
+    )
+    assert (
+        "agents/benchmark/server.py",
+        "_prepare_operation_result",
+        "filesystem",
+    ) in INVENTORIED_SIDE_EFFECTS
 
 
 def test_directive_normalization_boundary_is_system_only() -> None:
