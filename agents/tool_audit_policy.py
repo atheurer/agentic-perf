@@ -237,6 +237,7 @@ TOOL_AUDIT_POLICY = (
     *_side_effecting(
         "providers.resource.ResourceProvider.reserve",
         "agents/resource/server.py:reserve_resources",
+        "agents/resource/server.py:reprovision_resources",
     ),
     *_read_only(
         "agents/retrospective/server.py:get_transcript_analysis",

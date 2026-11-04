@@ -95,7 +95,9 @@ and the [setup and verification how-to](docs/context-gateway-howto.md).
 
 - **Null** — user provides hosts and SSH keys directly in the ticket
 - **QUADS** — automated bare-metal reservation from a self-service lab
-  (filters by model, NIC vendor/speed, disk type)
+  (filters by model, NIC vendor/speed, disk type; OS selection at reservation
+  time, plus optional in-place OS reprovisioning through the lab's Foreman —
+  see [secrets](docs/secrets.md) for the required Foreman settings)
 - **AWS EC2** — on-demand cloud instances with configurable instance types,
   AMIs, and root volume sizing
 - **PSAP Control Center** — GPU cluster reservations for AI/ML workloads

@@ -417,6 +417,178 @@ class TestQuadsResourceProvider:
         assert result["status"] == "terminated"
         mock_client.terminate_assignment.assert_called_once_with(42)
 
+    @staticmethod
+    def _reprovision_client() -> AsyncMock:
+        """Client whose Foreman knows one OS and whose hosts rebuild cleanly."""
+        mock_client = AsyncMock()
+        mock_client.ssh_key_path = "/fake/key"
+        mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
+        foreman = AsyncMock()
+        foreman.find_operatingsystem.return_value = {"id": 4, "title": "RHEL 10.0"}
+        foreman.get_media.return_value = [{"id": 9, "name": "RHEL media"}]
+        foreman.get_ptables.return_value = [{"id": 125, "name": "Kickstart"}]
+        foreman.get_build_flag.return_value = False
+        mock_client.foreman_for_assignment = MagicMock(return_value=foreman)
+        mock_client.reboot_host.return_value = True
+        mock_client.setup_ssh.return_value = {
+            "status": "success",
+            "hosts": {"host1.example.com": "ok"},
+        }
+        return mock_client
+
+    @pytest.mark.asyncio
+    async def test_reprovision_rebuilds_host_through_foreman(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = self._reprovision_client()
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.reprovision(
+            hosts=["host1.example.com"],
+            os="rhel 10.0",
+            provider_metadata={"cloud_name": "cloud05", "ticket": "1234"},
+            build_timeout=0,
+            ssh_timeout=0,
+            poll_interval=0,
+        )
+
+        assert result["status"] == "success"
+        assert result["os"] == "RHEL 10.0"
+        assert result["hosts"] == {"host1.example.com": "ok"}
+        mock_client.foreman_for_assignment.assert_called_once_with("cloud05", "1234")
+        foreman = mock_client.foreman_for_assignment.return_value
+        foreman.set_host_provisioning.assert_awaited_once_with(
+            "host1.example.com", 4, 9, 125
+        )
+        mock_client.reboot_host.assert_awaited_once_with("host1.example.com")
+        foreman.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reprovision_rejects_unavailable_os(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = self._reprovision_client()
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.reprovision(
+            hosts=["host1.example.com"],
+            os="Fedora 44",
+            provider_metadata={"cloud_name": "cloud05", "ticket": "1234"},
+        )
+
+        assert result["status"] == "failed"
+        assert result["available_os"] == ["RHEL 10.0"]
+        mock_client.foreman_for_assignment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reprovision_requires_assignment_metadata(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = self._reprovision_client()
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.reprovision(
+            hosts=["host1.example.com"],
+            os="RHEL 10.0",
+            provider_metadata={},
+        )
+
+        assert result["status"] == "failed"
+        assert "cloud_name" in result["error"]
+        mock_client.foreman_for_assignment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reprovision_reports_unconfigured_foreman(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = self._reprovision_client()
+        mock_client.foreman_for_assignment = MagicMock(
+            side_effect=ValueError("QUADS reprovisioning is not configured")
+        )
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.reprovision(
+            hosts=["host1.example.com"],
+            os="RHEL 10.0",
+            provider_metadata={"cloud_name": "cloud05", "ticket": "1234"},
+        )
+
+        assert result["status"] == "failed"
+        assert "not configured" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_reprovision_failed_reboot_leaves_build_flag_note(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = self._reprovision_client()
+        mock_client.reboot_host.return_value = False
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.reprovision(
+            hosts=["host1.example.com"],
+            os="RHEL 10.0",
+            provider_metadata={"cloud_name": "cloud05", "ticket": "1234"},
+            build_timeout=0,
+            ssh_timeout=0,
+            poll_interval=0,
+        )
+
+        assert result["status"] == "failed"
+        assert "reboot was not confirmed" in result["hosts"]["host1.example.com"]
+        mock_client.setup_ssh.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reprovision_build_timeout_marks_host_failed(self):
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = self._reprovision_client()
+        foreman = mock_client.foreman_for_assignment.return_value
+        foreman.get_build_flag.return_value = True
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.reprovision(
+            hosts=["host1.example.com"],
+            os="RHEL 10.0",
+            provider_metadata={"cloud_name": "cloud05", "ticket": "1234"},
+            build_timeout=0,
+            ssh_timeout=0,
+            poll_interval=0,
+        )
+
+        assert result["status"] == "failed"
+        assert "still pending" in result["hosts"]["host1.example.com"]
+
+    @pytest.mark.asyncio
+    async def test_reprovision_partial_when_one_host_fails(self):
+        from providers.foreman import ForemanAPIError
+        from providers.resource.quads import QuadsResourceProvider
+
+        mock_client = self._reprovision_client()
+        foreman = mock_client.foreman_for_assignment.return_value
+        foreman.set_host_provisioning.side_effect = [
+            ForemanAPIError(403, "Access denied", "/hosts/host2.example.com"),
+            None,
+        ]
+        mock_client.setup_ssh.return_value = {
+            "status": "success",
+            "hosts": {"host1.example.com": "ok"},
+        }
+        provider = QuadsResourceProvider(mock_client)
+        result = await provider.reprovision(
+            hosts=["host2.example.com", "host1.example.com"],
+            os="RHEL 10.0",
+            provider_metadata={"cloud_name": "cloud05", "ticket": "1234"},
+            build_timeout=0,
+            ssh_timeout=0,
+            poll_interval=0,
+        )
+
+        assert result["status"] == "partial"
+        assert result["hosts"]["host1.example.com"] == "ok"
+        assert "failed" in result["hosts"]["host2.example.com"]
+
+    @pytest.mark.asyncio
+    async def test_base_provider_rejects_reprovision(self):
+        from providers.resource.jumpstarter import JumpstarterResourceProvider
+
+        provider = JumpstarterResourceProvider.__new__(JumpstarterResourceProvider)
+        with pytest.raises(NotImplementedError, match="jumpstarter"):
+            await provider.reprovision(["board1"], "RHEL 10.0")
+
 
 # ---------------------------------------------------------------------------
 # AWS provider tests

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -8,6 +9,12 @@ from typing import Any
 from .base import ResourceProvider
 
 logger = logging.getLogger(__name__)
+
+# A fresh OS install on Scale Lab hardware typically lands in 20-40 minutes;
+# the SSH window covers the final reboot plus first-boot services.
+REPROVISION_BUILD_TIMEOUT = 3600
+REPROVISION_SSH_TIMEOUT = 1800
+REPROVISION_POLL_INTERVAL = 60
 
 
 class QuadsOSResolutionError(ValueError):
@@ -369,6 +376,194 @@ class QuadsResourceProvider(ResourceProvider):
             },
             "message": f"Reserved {len(hostnames)} hosts via QUADS",
         }
+
+    def _failure(self, error: str, **extra: Any) -> dict[str, Any]:
+        return {
+            "status": "failed",
+            "provider": self.provider_name,
+            "hosts": {},
+            "error": error,
+            "message": "No host was reprovisioned.",
+            **extra,
+        }
+
+    @staticmethod
+    def _pick_os_resource(
+        items: list[dict[str, Any]], resource: str, os_type: str
+    ) -> dict[str, Any] | None:
+        if not items:
+            return None
+        if len(items) > 1:
+            # Mirrors QUADS' own move_and_rebuild behavior: Foreman offers no
+            # per-assignment default, so the first entry is the convention.
+            logger.warning(
+                "OS %r has %d %s entries, defaulting to first: %r",
+                os_type,
+                len(items),
+                resource,
+                items[0].get("name"),
+            )
+        return items[0]
+
+    async def reprovision(
+        self,
+        hosts: list[str],
+        os: str,
+        provider_metadata: dict[str, Any] | None = None,
+        *,
+        build_timeout: int = REPROVISION_BUILD_TIMEOUT,
+        ssh_timeout: int = REPROVISION_SSH_TIMEOUT,
+        poll_interval: int = REPROVISION_POLL_INTERVAL,
+    ) -> dict[str, Any]:
+        """Rebuild reserved hosts with a different OS inside the assignment.
+
+        QUADS only reprovisions on cloud-to-cloud moves, so a mid-assignment
+        OS change goes through Foreman directly: point each host at the new
+        OS, mark it for build, and reboot it — QUADS boot order is PXE-first,
+        so the reboot lands in the installer.
+        """
+        from providers.foreman import ForemanAPIError
+
+        if not hosts or not all(isinstance(h, str) and h.strip() for h in hosts):
+            return self._failure("Reprovisioning requires a nonempty host list")
+        hosts = [h.strip() for h in hosts]
+        if not isinstance(os, str) or not os.strip():
+            return self._failure("Reprovisioning requires a nonempty OS name")
+        try:
+            os_type = await self._resolve_os_type(os.strip())
+        except QuadsOSUnavailableError as exc:
+            return self._failure(str(exc), available_os=exc.available_os)
+        except QuadsOSResolutionError as exc:
+            return self._failure(str(exc))
+
+        metadata = provider_metadata or {}
+        cloud_name = metadata.get("cloud_name")
+        ticket = metadata.get("ticket")
+        if not cloud_name or not ticket:
+            return self._failure(
+                "Reprovisioning requires the assignment's cloud_name and "
+                "ticket in provider_metadata"
+            )
+        try:
+            foreman = self._client.foreman_for_assignment(cloud_name, str(ticket))
+        except ValueError as exc:
+            return self._failure(str(exc))
+
+        host_results: dict[str, str] = {}
+        try:
+            os_entry = await foreman.find_operatingsystem(os_type)
+            if not os_entry or os_entry.get("id") is None:
+                return self._failure(
+                    f"OS {os_type!r} is in the QUADS catalog but not in Foreman"
+                )
+            os_id = os_entry["id"]
+            medium = self._pick_os_resource(
+                await foreman.get_media(os_id), "medium", os_type
+            )
+            ptable = self._pick_os_resource(
+                await foreman.get_ptables(os_id), "ptable", os_type
+            )
+            if not medium or not ptable:
+                return self._failure(
+                    f"OS {os_type!r} has no installation medium or partition "
+                    "table in Foreman"
+                )
+
+            rebooting: list[str] = []
+            for host in hosts:
+                try:
+                    await foreman.set_host_provisioning(
+                        host, os_id, medium["id"], ptable["id"]
+                    )
+                except ForemanAPIError as exc:
+                    host_results[host] = f"failed: {exc}"
+                    continue
+                # Reboot immediately: the provisioning SSH key only works
+                # while the old OS is still running.
+                if await self._client.reboot_host(host):
+                    rebooting.append(host)
+                else:
+                    host_results[host] = (
+                        "failed: reboot was not confirmed; the Foreman build "
+                        "flag is still set, so the next manual reboot will "
+                        "reinstall this host"
+                    )
+
+            waits = await asyncio.gather(
+                *(
+                    self._wait_for_rebuild(
+                        foreman,
+                        host,
+                        os_type,
+                        build_timeout=build_timeout,
+                        ssh_timeout=ssh_timeout,
+                        poll_interval=poll_interval,
+                    )
+                    for host in rebooting
+                )
+            )
+            host_results.update(dict(zip(rebooting, waits)))
+        finally:
+            await foreman.close()
+
+        ok = sum(1 for v in host_results.values() if v == "ok")
+        status = "success" if ok == len(hosts) else "partial" if ok else "failed"
+        return {
+            "status": status,
+            "provider": self.provider_name,
+            "os": os_type,
+            "hosts": host_results,
+            "ssh_key_path": self._client.ssh_key_path,
+            "message": f"Reprovisioned {ok}/{len(hosts)} hosts to {os_type}",
+        }
+
+    async def _wait_for_rebuild(
+        self,
+        foreman,
+        host: str,
+        os_type: str,
+        *,
+        build_timeout: int,
+        ssh_timeout: int,
+        poll_interval: int,
+    ) -> str:
+        """Wait for one host's Foreman build to finish and SSH to return."""
+        from providers.foreman import ForemanAPIError
+
+        elapsed = 0
+        while True:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            try:
+                if not await foreman.get_build_flag(host):
+                    break
+            except ForemanAPIError as exc:
+                # Transient API errors must not abandon a host mid-install;
+                # the timeout below bounds how long we keep retrying.
+                logger.warning("Foreman build poll failed for %s: %s", host, exc)
+            if elapsed >= build_timeout:
+                return f"failed: Foreman build still pending after {build_timeout}s"
+            logger.info(
+                "[quads-provider] %s still installing %s (%ds elapsed)",
+                host,
+                os_type,
+                elapsed,
+            )
+
+        # The fresh install wiped authorized_keys and the host key, so SSH
+        # setup (password-based key copy) is retried until first boot is up.
+        elapsed = 0
+        while True:
+            result = await self._client.setup_ssh([host])
+            if result.get("hosts", {}).get(host) == "ok":
+                return "ok"
+            elapsed += poll_interval
+            if elapsed >= ssh_timeout:
+                return (
+                    f"failed: build finished but SSH did not come back within "
+                    f"{ssh_timeout}s"
+                )
+            await asyncio.sleep(poll_interval)
 
     async def get_reservation_status(
         self, reservation_id: str, provider_metadata: dict[str, Any] | None = None

@@ -1355,3 +1355,158 @@ class TestReservationFailureTracking:
         assert persist.await_args_list[1].kwargs["provider"] == "aws"
         assert persist.await_args_list[1].kwargs["result"]["status"] == "unknown"
         assert srv._reservation_uncertain is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: reprovision_resources guardrails
+# ---------------------------------------------------------------------------
+
+
+def _reprovision_ticket() -> dict:
+    return {
+        "custom_fields": {
+            "resource_provider": "quads",
+            "resource_provider_metadata": {
+                "assignment_id": 42,
+                "cloud_name": "cloud05",
+                "ticket": "1234",
+                "reservation_selections": [
+                    {"hostnames": ["host1.example.com"], "duration_hours": 36}
+                ],
+            },
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_reprovision_rejects_provider_mismatch_before_provider_call():
+    import agents.resource.server as srv
+
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock()
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = _reprovision_ticket()
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="aws", hosts=["host1.example.com"], os="RHEL 10.0"
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["provider_mismatch"] is True
+    mock_registry.get_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprovision_rejects_hosts_outside_reservation():
+    import agents.resource.server as srv
+
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock()
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = _reprovision_ticket()
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="quads",
+            hosts=["host1.example.com", "victim.example.com"],
+            os="RHEL 10.0",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert "victim.example.com" in result["error"]
+    mock_registry.get_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprovision_rejects_user_provided_tickets():
+    import agents.resource.server as srv
+
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock()
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = {"custom_fields": {"resource_provider": "user_provided"}}
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="quads", hosts=["host1.example.com"], os="RHEL 10.0"
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["provider_mismatch"] is True
+    mock_registry.get_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprovision_reports_unsupported_provider():
+    import agents.resource.server as srv
+
+    mock_provider = AsyncMock()
+    mock_provider.reprovision = AsyncMock(
+        side_effect=NotImplementedError(
+            "Resource provider 'aws' does not support in-place reprovisioning"
+        )
+    )
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock(return_value=mock_provider)
+    srv._initialized = True
+    srv._registry = mock_registry
+    ticket = _reprovision_ticket()
+    ticket["custom_fields"]["resource_provider"] = "aws"
+    srv._ticket = ticket
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="aws", hosts=["host1.example.com"], os="RHEL 10.0"
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert "does not support" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_reprovision_passes_merged_metadata_to_provider():
+    import agents.resource.server as srv
+
+    mock_provider = AsyncMock()
+    mock_provider.reprovision = AsyncMock(
+        return_value={
+            "status": "success",
+            "provider": "quads",
+            "os": "RHEL 10.0",
+            "hosts": {"host1.example.com": "ok"},
+            "message": "Reprovisioned 1/1 hosts to RHEL 10.0",
+        }
+    )
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock(return_value=mock_provider)
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = _reprovision_ticket()
+    # The in-session reservation carries a fresher ticket value; it must win.
+    srv._last_reservation = {
+        "hosts": ["host2.example.com"],
+        "provider_metadata": {"ticket": "5678"},
+    }
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="quads",
+            hosts=["host1.example.com", "host2.example.com"],
+            os="RHEL 10.0",
+        )
+    )
+
+    assert result["status"] == "success"
+    call = mock_provider.reprovision.await_args
+    assert call.kwargs["hosts"] == ["host1.example.com", "host2.example.com"]
+    assert call.kwargs["os"] == "RHEL 10.0"
+    assert call.kwargs["provider_metadata"]["cloud_name"] == "cloud05"
+    assert call.kwargs["provider_metadata"]["ticket"] == "5678"

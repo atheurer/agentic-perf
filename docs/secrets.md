@@ -53,9 +53,21 @@ agentic-perf service:
   "password": "<quads-password>",
   "owner": "<quads-owner>",
   "ssh_key_path": "/path/to/ssh/key",
-  "default_root_password": "<default-root-password>"
+  "default_root_password": "<default-root-password>",
+  "foreman_api_url": "https://foreman.example.com/api/v2",
+  "infra_location": "<lab-location-prefix>"
 }
 ```
+
+`foreman_api_url` and `infra_location` are optional and enable in-place OS
+reprovisioning (`reprovision_resources`). They must be set together: QUADS
+gives each active assignment a Foreman account named after its cloud whose
+password is `<infra_location>@<assignment-ticket>`, so the client derives
+per-assignment Foreman credentials from these two values and the assignment
+metadata — no separate Foreman secret exists. Both may also come from the
+organization connection defaults (`service-config/resource/quads.json`), with
+local values overriding. When they are unset, `reprovision_resources` reports
+that reprovisioning is not configured; reservations are unaffected.
 
 When `ca_bundle` is set in either source, that file is the QUADS client's trust
 source. Include any public roots the endpoint needs in that file. TLS

@@ -214,6 +214,24 @@ class ResourceProvider(ABC):
         """
         ...
 
+    async def reprovision(
+        self,
+        hosts: list[str],
+        os: str,
+        provider_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Reinstall already-reserved hosts with a different OS, in place.
+
+        Providers that cannot rebuild a host without releasing it keep this
+        default. Implementations return the same shape as ``reserve``:
+        a ``status`` of success/partial/failed, per-host results, and a
+        ``message``.
+        """
+        raise NotImplementedError(
+            f"Resource provider '{self.provider_name}' does not support "
+            "in-place reprovisioning"
+        )
+
     @abstractmethod
     async def get_reservation_status(
         self, reservation_id: str, provider_metadata: dict[str, Any] | None = None

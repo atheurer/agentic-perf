@@ -1429,6 +1429,117 @@ async def get_reservation_status(provider: str, reservation_id: str) -> str:
     return json.dumps(result)
 
 
+def _reserved_hostnames() -> set[str]:
+    """Hostnames this ticket's reservations are known to cover.
+
+    Union of the in-session reservation and the durable ticket fields, since
+    a reprovision may run in a later dispatch than the reserve.
+    """
+    allowed: set[str] = set()
+    hosts = _last_reservation.get("hosts")
+    if isinstance(hosts, list):
+        allowed.update(h for h in hosts if isinstance(h, str))
+    custom_fields = _ticket.get("custom_fields", {})
+    for metadata in (
+        _last_reservation.get("provider_metadata"),
+        custom_fields.get("resource_provider_metadata"),
+    ):
+        if not isinstance(metadata, dict):
+            continue
+        selections = metadata.get("reservation_selections")
+        if not isinstance(selections, list):
+            continue
+        for selection in selections:
+            if not isinstance(selection, dict):
+                continue
+            hostnames = selection.get("hostnames")
+            if isinstance(hostnames, list):
+                allowed.update(h for h in hostnames if isinstance(h, str))
+    assigned = custom_fields.get("assigned_hardware_ips")
+    if isinstance(assigned, dict):
+        for value in assigned.values():
+            if isinstance(value, str):
+                allowed.add(value)
+            elif isinstance(value, list):
+                allowed.update(v for v in value if isinstance(v, str))
+    return allowed
+
+
+def _reprovision_metadata() -> dict[str, Any]:
+    """Merge durable and in-session provider metadata, session winning."""
+    merged: dict[str, Any] = {}
+    durable = _ticket.get("custom_fields", {}).get("resource_provider_metadata")
+    if isinstance(durable, dict):
+        merged.update(durable)
+    session = _last_reservation.get("provider_metadata")
+    if isinstance(session, dict):
+        merged.update(session)
+    return merged
+
+
+@mcp.tool()
+async def reprovision_resources(provider: str, hosts: list[str], os: str) -> str:
+    """Reinstall already-reserved hosts with a different OS, without releasing the reservation. Only hosts this ticket reserved may be named, and the OS must come from the provider's available OS list (see check_available_resources). Blocks until the rebuild finishes and SSH access is restored — expect 20-40 minutes per call."""
+    await _ensure_init()
+    expected_provider, user_provided_only = _ticket_resource_provider()
+    if user_provided_only or (expected_provider and provider != expected_provider):
+        expected = expected_provider or "user_provided"
+        return json.dumps(
+            {
+                "status": "failed",
+                "provider": expected,
+                "provider_mismatch": True,
+                "error": (
+                    f"Ticket is configured for resource provider '{expected}', "
+                    f"but reprovision_resources was called for '{provider}'."
+                ),
+                "message": (
+                    "No host was reprovisioned. User-provided hosts and other "
+                    "providers' reservations cannot be rebuilt by this ticket."
+                ),
+            }
+        )
+    requested = [h for h in hosts if isinstance(h, str) and h.strip()]
+    allowed = _reserved_hostnames()
+    unknown = sorted(set(requested) - allowed)
+    if not requested or unknown:
+        return json.dumps(
+            {
+                "status": "failed",
+                "provider": provider,
+                "error": (
+                    f"Hosts not reserved by this ticket: {', '.join(unknown)}"
+                    if unknown
+                    else "Reprovisioning requires a nonempty host list"
+                ),
+                "message": (
+                    "No host was reprovisioned. Only hosts from this ticket's "
+                    "reservation may be rebuilt."
+                ),
+            }
+        )
+    prov = await _registry.get_provider(provider)
+    try:
+        result = await prov.reprovision(
+            hosts=requested,
+            os=os,
+            provider_metadata=_reprovision_metadata(),
+        )
+    except NotImplementedError as exc:
+        return json.dumps(
+            {
+                "status": "failed",
+                "provider": provider,
+                "error": str(exc),
+                "message": (
+                    "No host was reprovisioned. Release the reservation and "
+                    "reserve with the desired OS instead."
+                ),
+            }
+        )
+    return json.dumps(result)
+
+
 @mcp.tool()
 async def validate_host(
     host: str, ssh_key_path: str = "", ssh_user: str = "root"

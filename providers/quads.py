@@ -37,6 +37,8 @@ class QuadsClient:
         default_root_password: str,
         api_scheme: str = "https",
         ca_bundle: str | None = None,
+        foreman_api_url: str | None = None,
+        infra_location: str | None = None,
     ) -> None:
         self.api_host = api_host
         self._base_url = f"{api_scheme}://{api_host}"
@@ -45,6 +47,15 @@ class QuadsClient:
         self.owner = owner
         self.ssh_key_path = str(Path(ssh_key_path).expanduser())
         self.default_root_password = default_root_password
+        # Both are needed to derive a cloud's Foreman login, so requiring them
+        # together keeps "reprovisioning configured" a single yes/no state.
+        if bool(foreman_api_url) != bool(infra_location):
+            raise ValueError(
+                "QUADS foreman_api_url and infra_location must be set together"
+            )
+        self.foreman_api_url = foreman_api_url
+        self.infra_location = infra_location
+        self._ca_bundle = ca_bundle
         client_kwargs: dict[str, Any] = {"timeout": 30.0}
         if api_scheme == "https":
             ca_file = str(Path(ca_bundle).expanduser()) if ca_bundle else None
@@ -78,7 +89,13 @@ class QuadsClient:
         # Keep existing local settings as per-install overrides during the
         # migration. Null optional values mean "not set" and leave the shared
         # organization default in place.
-        for key in ("api_host", "api_scheme", "ca_bundle"):
+        for key in (
+            "api_host",
+            "api_scheme",
+            "ca_bundle",
+            "foreman_api_url",
+            "infra_location",
+        ):
             value = config.pop(key, None)
             if value is not None:
                 connection[key] = value
@@ -100,6 +117,11 @@ class QuadsClient:
             raise ValueError("QUADS API scheme must be http or https")
         if "ca_bundle" in config and config["ca_bundle"] == "":
             raise ValueError("QUADS CA bundle path must not be empty")
+        for key in ("foreman_api_url", "infra_location"):
+            if key in config and (
+                not isinstance(config[key], str) or not config[key].strip()
+            ):
+                raise ValueError(f"QUADS {key} must be a nonempty string")
         return cls(
             api_host=config["api_host"],
             email=config["email"],
@@ -109,6 +131,8 @@ class QuadsClient:
             default_root_password=config["default_root_password"],
             api_scheme=config.get("api_scheme", "https"),
             ca_bundle=config.get("ca_bundle"),
+            foreman_api_url=config.get("foreman_api_url"),
+            infra_location=config.get("infra_location"),
         )
 
     async def close(self) -> None:
@@ -349,6 +373,63 @@ class QuadsClient:
             "status": "terminated",
             "response": r.json() if r.content else {},
         }
+
+    @property
+    def supports_reprovision(self) -> bool:
+        return bool(self.foreman_api_url and self.infra_location)
+
+    def foreman_for_assignment(self, cloud_name: str, ticket: str):
+        """Build a Foreman client with the assignment's own cloud account.
+
+        QUADS provisions each active assignment a Foreman user named after
+        the cloud whose password is ``<infra_location>@<ticket>`` (the same
+        credential QUADS emails to the assignment owner), so no extra secret
+        is needed beyond the lab's location prefix.
+        """
+        from providers.foreman import ForemanClient
+
+        if not self.supports_reprovision:
+            raise ValueError(
+                "QUADS reprovisioning is not configured: set foreman_api_url "
+                "and infra_location in secrets/quads/config.json"
+            )
+        if not cloud_name or not ticket:
+            raise ValueError(
+                "Foreman access requires the assignment's cloud name and ticket"
+            )
+        return ForemanClient(
+            api_url=self.foreman_api_url,
+            username=cloud_name,
+            password=f"{self.infra_location}@{ticket}",
+            ca_bundle=self._ca_bundle,
+        )
+
+    async def reboot_host(self, host: str) -> bool:
+        """Reboot a reserved host over SSH with the provisioning key.
+
+        The reboot is detached from the SSH session so sshd closing the
+        connection cannot cancel it, and the marker on stdout confirms the
+        command was accepted before the connection drops.
+        """
+        from providers.rhel_kernel import build_reboot_command
+
+        result = await AuditedSubprocessRunner().run(
+            [
+                "ssh",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-i",
+                self.ssh_key_path,
+                f"root@{host}",
+                build_reboot_command(),
+            ],
+            mutating=True,
+        )
+        return result.returncode == 0 and b"@@rebooting" in result.stdout
 
     async def setup_ssh(self, hosts: list[str]) -> dict[str, Any]:
         key_path = Path(self.ssh_key_path)
