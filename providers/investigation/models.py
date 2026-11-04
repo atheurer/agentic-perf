@@ -85,7 +85,13 @@ class BuildHistoryEntry(BaseModel):
 
     build_id: str
     ticket_id: str = ""
-    action: str  # FULL_INVESTIGATION or SKIP_MATCHED
+    # Documented actions:
+    #   FULL_INVESTIGATION   – fresh investigation completed
+    #   SKIP_MATCHED         – deterministic dedup skipped this ticket
+    #   REINVESTIGATING      – inconclusive record triggered reinvestigation
+    #   REINVESTIGATION_COMPLETE – reinvestigation finished with new findings
+    #   REINVESTIGATION_CANCELLED – LLM overrode advisory (different anomaly)
+    action: str
     comment: str = ""
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),

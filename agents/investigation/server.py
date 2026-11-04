@@ -244,6 +244,103 @@ async def create_investigation_record(
 
 
 @mcp.tool()
+async def update_investigation_record(
+    investigation_id: str,
+    root_cause_summary: str = "",
+    confidence: float = 0.0,
+    convergence_outcome: str = "",
+    provision_cycles: int = 0,
+    wall_clock_mins: float = 0.0,
+    info_gain_trajectory: str = "",
+    stall_events: int = 0,
+    llm_tokens_total: int = 0,
+    llm_invocations: int = 0,
+    estimated_cost_usd: float = 0.0,
+    hardware_time_mins: float = 0.0,
+    change_classification: str = "",
+    causal_commits: str = "",
+    change_summary: str = "",
+) -> str:
+    """Update findings on an existing Investigation Record.
+
+    Use this when reinvestigating a previously inconclusive record.
+    Only records with empty or inconclusive convergence_outcome can
+    be updated. Records with conclusive outcomes cannot be overwritten.
+    """
+    from providers.investigation.models import (
+        ChangeAttribution as CA,
+    )
+    from providers.investigation.models import (
+        OperationalMetrics as OM,
+    )
+    from providers.investigation.models import (
+        ResourceConsumption as RC,
+    )
+
+    provider = _get_provider()
+
+    om = OM(
+        provision_cycles=provision_cycles,
+        wall_clock_mins=wall_clock_mins,
+        convergence_outcome=convergence_outcome,
+        stall_events=stall_events,
+        resource_consumption=RC(
+            llm_tokens_total=llm_tokens_total,
+            llm_invocations=llm_invocations,
+            estimated_cost_usd=estimated_cost_usd,
+            hardware_time_mins=hardware_time_mins,
+        ),
+    )
+    if info_gain_trajectory:
+        try:
+            om.info_gain_trajectory = json.loads(info_gain_trajectory)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "Malformed info_gain_trajectory for update — data dropped: %r",
+                info_gain_trajectory,
+            )
+
+    ca = CA()
+    if change_classification:
+        ca.classification = change_classification
+    if causal_commits:
+        ca.causal_commits = [c.strip() for c in causal_commits.split(",") if c.strip()]
+    if change_summary:
+        ca.change_summary = change_summary
+
+    try:
+        await provider.update_findings(
+            investigation_id=investigation_id,
+            root_cause_summary=root_cause_summary,
+            confidence=confidence,
+            convergence_outcome=convergence_outcome,
+            operational_metrics=om,
+            change_attribution=ca,
+        )
+        return json.dumps(
+            {
+                "status": "updated",
+                "investigation_id": investigation_id,
+            },
+            indent=2,
+        )
+    except KeyError:
+        return json.dumps(
+            {
+                "status": "not_found",
+                "message": f"No record found: {investigation_id}",
+            }
+        )
+    except ValueError as e:
+        return json.dumps(
+            {
+                "status": "not_allowed",
+                "message": str(e),
+            }
+        )
+
+
+@mcp.tool()
 async def append_build_history(
     investigation_id: str,
     build_id: str,

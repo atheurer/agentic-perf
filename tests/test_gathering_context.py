@@ -171,6 +171,13 @@ class TestHandleCompletion:
                 raise_for_status=lambda: None,
             ),
         )
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
 
         response = LLMResponse(
             text=None,
@@ -226,6 +233,13 @@ class TestHandleCompletion:
             return_value=AsyncMock(
                 status_code=200,
                 json=lambda: {},
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
                 raise_for_status=lambda: None,
             ),
         )
@@ -292,6 +306,13 @@ class TestHandleCompletion:
                 raise_for_status=lambda: None,
             ),
         )
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
 
         response = LLMResponse(
             text=None,
@@ -343,6 +364,7 @@ class TestHandleCompletion:
         agent._update_fields = AsyncMock()
         agent._add_comment = AsyncMock()
         agent._transition_ticket = AsyncMock()
+        agent._get_ticket = AsyncMock(return_value={"custom_fields": {}})
         response = LLMResponse(
             text=None,
             tool_calls=[
@@ -397,6 +419,7 @@ class TestHandleCompletion:
         agent._update_fields = AsyncMock()
         agent._add_comment = AsyncMock()
         agent._transition_ticket = AsyncMock()
+        agent._get_ticket = AsyncMock(return_value={"custom_fields": {}})
         response = LLMResponse(
             text=None,
             tool_calls=[
@@ -933,3 +956,265 @@ class TestDedupTemporalDecay:
         update_call = agent._update_fields.call_args_list[0]
         dedup_result = update_call[0][1]["dedup_result"]
         assert dedup_result["match_confidence"] == 1.0
+
+
+class TestDedupInconclusiveOutcome:
+    """Inconclusive investigation records should not block new investigations."""
+
+    def _make_agent(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from agents.gathering_context.agent import GatheringContextAgent
+
+        agent = MagicMock()
+        agent._update_fields = AsyncMock()
+        agent._add_comment = AsyncMock()
+        agent._transition_ticket = AsyncMock()
+        agent._deterministic_dedup = GatheringContextAgent._deterministic_dedup.__get__(
+            agent
+        )
+        return agent
+
+    def _make_record(self, outcome="", age_days=5):
+        from datetime import datetime, timedelta, timezone
+
+        from providers.investigation.models import (
+            AnomalyContext,
+            InvestigationRecord,
+            OperationalMetrics,
+        )
+
+        ts = datetime.now(timezone.utc) - timedelta(days=age_days)
+        record = InvestigationRecord(
+            anomaly_context=AnomalyContext(
+                subsystem="test",
+                metric="test-metric",
+                platform="test-platform",
+            ),
+            operational_metrics=OperationalMetrics(
+                convergence_outcome=outcome,
+            ),
+        )
+        record.created_at = ts
+        record.updated_at = ts
+        record.record_url = ""
+        return record
+
+    def _make_ticket(self):
+        return {
+            "custom_fields": {
+                "dedup_key": {
+                    "metric": "test-metric",
+                    "platform": "test-platform",
+                },
+                "anomaly_context": {"source": "test"},
+                "run_metadata": {"build": "build-123"},
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_inconclusive_outcome_does_not_block(self):
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(outcome="inconclusive")
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST", self._make_ticket())
+
+        assert result is False
+        # Should set dedup_advisory, not dedup_result
+        fields = agent._update_fields.call_args[0][1]
+        assert "dedup_advisory" in fields
+        assert fields["dedup_advisory"]["prior_outcome"] == "inconclusive"
+
+    @pytest.mark.asyncio
+    async def test_empty_outcome_does_not_block(self):
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(outcome="")
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST", self._make_ticket())
+
+        assert result is False
+        fields = agent._update_fields.call_args[0][1]
+        assert "dedup_advisory" in fields
+        assert fields["dedup_advisory"]["prior_outcome"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_entropy_stall_outcome_does_not_block(self):
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(outcome="ENTROPY_STALL")  # uppercase from evaluate
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST", self._make_ticket())
+
+        assert result is False
+        fields = agent._update_fields.call_args[0][1]
+        assert "dedup_advisory" in fields
+        assert fields["dedup_advisory"]["prior_outcome"] == "entropy_stall"
+
+    @pytest.mark.asyncio
+    async def test_conclusive_outcome_still_blocks(self):
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(outcome="ISOLATION")
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_provider.append_build_history = AsyncMock()
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-TEST", self._make_ticket())
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "outcome,should_proceed",
+        [
+            ("", True),
+            ("ENTROPY_STALL", True),
+            ("MAX_ITERATIONS", True),
+            ("undetermined", True),
+            ("manual_interruption", True),
+            ("ISOLATION", False),
+            ("EXPECTED_REGRESSION", False),
+            ("EXPECTED_BEHAVIOR", False),
+        ],
+    )
+    async def test_dedup_respects_convergence_outcome(self, outcome, should_proceed):
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record(outcome=outcome)
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_provider.append_build_history = AsyncMock()
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-PARAM", self._make_ticket())
+
+        if should_proceed:
+            assert result is False, (
+                f"outcome '{outcome}' should NOT block (proceed=True)"
+            )
+        else:
+            assert result is True, f"outcome '{outcome}' should block (proceed=False)"
+
+    @pytest.mark.asyncio
+    async def test_llm_match_overridden_by_advisory(self):
+        """When dedup_advisory is set and LLM returns MATCH_FOUND,
+        the agent reinvestigates (transitions to analyzing) while
+        keeping the record link."""
+        from unittest.mock import AsyncMock
+
+        from agents.gathering_context.agent import GatheringContextAgent
+        from providers.llm.base import LLMResponse, ToolCall
+        from providers.llm.mock import MockLLMProvider
+
+        agent = GatheringContextAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._client = AsyncMock()
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "custom_fields": {
+                    "dedup_advisory": {
+                        "matched_investigation_id": "RCA-INCONC",
+                        "prior_outcome": "none",
+                    },
+                },
+            }
+        )
+        response = LLMResponse(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    id="tc_1",
+                    name="submit_gathering_context_result",
+                    input={
+                        "decision": "MATCH_FOUND",
+                        "matched_investigation_id": "RCA-INCONC",
+                        "match_confidence": 1.0,
+                        "match_rationale": "Same",
+                    },
+                ),
+            ],
+        )
+        await agent._handle_completion("PERF-OVERRIDE", response)
+
+        # Verify transition is to "analyzing", not "retrospective_pending"
+        transitioned_to_analyzing = False
+        has_reinvestigating_comment = False
+        for call in agent._client.post.call_args_list:
+            url = call.args[0] if call.args else ""
+            if "transition" in str(url):
+                body = call.kwargs.get("json", {})
+                assert body.get("status") != "retrospective_pending"
+                if body.get("status") == "analyzing":
+                    transitioned_to_analyzing = True
+            if "comment" in str(url):
+                body = call.kwargs.get("json", {})
+                comment_text = body.get("body", "") or body.get("comment", "")
+                if "Reinvestigating" in str(comment_text):
+                    has_reinvestigating_comment = True
+
+        assert transitioned_to_analyzing, "Should transition to analyzing"
+        assert has_reinvestigating_comment, "Should post a Reinvestigating comment"
+
+        # Verify dedup_result preserves MATCH_FOUND and matched_investigation_id
+        for call in agent._client.patch.call_args_list:
+            body = call.kwargs.get("json", {})
+            dedup_result = body.get("custom_fields", {}).get("dedup_result")
+            if dedup_result:
+                assert dedup_result["decision"] == "MATCH_FOUND"
+                assert dedup_result["matched_investigation_id"] == "RCA-INCONC"

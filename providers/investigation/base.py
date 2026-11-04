@@ -19,7 +19,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from .models import BuildHistoryEntry, InvestigationRecord
+from .models import (
+    BuildHistoryEntry,
+    ChangeAttribution,
+    InvestigationRecord,
+    OperationalMetrics,
+)
 
 
 class InvestigationRecordProvider(ABC):
@@ -76,6 +81,28 @@ class InvestigationRecordProvider(ABC):
 
         Raises:
             KeyError: If the record does not exist.
+        """
+        ...
+
+    @abstractmethod
+    async def update_findings(
+        self,
+        investigation_id: str,
+        root_cause_summary: str,
+        confidence: float,
+        convergence_outcome: str,
+        operational_metrics: "OperationalMetrics | None" = None,
+        change_attribution: "ChangeAttribution | None" = None,
+    ) -> None:
+        """Update findings on an existing record.
+
+        Only allowed when the record's current convergence_outcome
+        is empty or 'inconclusive'. Records with conclusive outcomes
+        cannot be overwritten.
+
+        Raises:
+            KeyError: If the record does not exist.
+            ValueError: If the record already has a conclusive outcome.
         """
         ...
 

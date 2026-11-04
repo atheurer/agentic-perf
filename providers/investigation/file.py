@@ -25,8 +25,10 @@ from paths import INVESTIGATION_RECORDS_DIR as _DEFAULT_DIR
 from .base import InvestigationRecordProvider
 from .models import (
     BuildHistoryEntry,
+    ChangeAttribution,
     InvestigationRecord,
     InvestigationState,
+    OperationalMetrics,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,6 +145,47 @@ class FileRecordProvider(InvestigationRecordProvider):
             f"[investigation] Appended build history to "
             f"{investigation_id}: {entry.build_id}"
         )
+
+    async def update_findings(
+        self,
+        investigation_id: str,
+        root_cause_summary: str,
+        confidence: float,
+        convergence_outcome: str,
+        operational_metrics: OperationalMetrics | None = None,
+        change_attribution: ChangeAttribution | None = None,
+    ) -> None:
+        """Update findings on an existing inconclusive record."""
+        record = await self.get(investigation_id)
+        if record is None:
+            raise KeyError(f"Record not found: {investigation_id}")
+
+        current = (record.operational_metrics.convergence_outcome or "").lower().strip()
+        _inconclusive = {
+            "inconclusive",
+            "entropy_stall",
+            "max_iterations",
+            "manual_interruption",
+            "undetermined",
+        }
+        if current and current not in _inconclusive:
+            raise ValueError(
+                f"Record {investigation_id} already has conclusive outcome: {current}"
+            )
+
+        record.root_cause_summary = root_cause_summary
+        record.confidence = confidence
+        record.operational_metrics.convergence_outcome = convergence_outcome
+        record.updated_at = datetime.now(timezone.utc)
+        if operational_metrics is not None:
+            # Preserve convergence_outcome we just set
+            saved_outcome = record.operational_metrics.convergence_outcome
+            record.operational_metrics = operational_metrics
+            record.operational_metrics.convergence_outcome = saved_outcome
+        if change_attribution is not None:
+            record.change_attribution = change_attribution
+        self._write(record)
+        logger.info(f"[investigation] Updated findings on {investigation_id}")
 
     async def link_jira(
         self,
