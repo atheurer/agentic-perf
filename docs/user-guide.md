@@ -91,6 +91,14 @@ http://localhost:8090
 
 The dashboard shows live updates: agent activity, tool calls, token usage, and costs.
 
+While a QUADS reservation waits for validation, the ticket also shows the
+assignment and cloud, the latest host move stages and reported errors, and
+host validation and switch-configuration flags. Updates appear when the
+reported state changes and periodically while it remains unchanged. QUADS move
+records can contain old errors or completion timestamps, so they do not by
+themselves prove that a move is currently running. If status details cannot be
+read, the update says they are unavailable; reservation polling continues.
+
 #### Chat Assistant
 
 If chat is enabled (`chat.enabled: true` in config), a chat bar

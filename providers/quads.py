@@ -4,8 +4,10 @@ import asyncio
 import json
 import logging
 import ssl
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -311,30 +313,70 @@ class QuadsClient:
             "description": data.get("description"),
             "cloud": data.get("cloud", {}).get("name"),
             "owner": data.get("owner"),
-            "validated": data.get("validated", False),
-            "provisioned": data.get("provisioned", False),
+            "validated": data.get("validated"),
+            "provisioned": data.get("provisioned"),
         }
+
+    async def get_move_progress(self, cloud_name: str) -> list[dict[str, Any]]:
+        """Read QUADS' last reported move records for an allocation."""
+        response = await self._client.get(
+            f"{self._base_url}/api/v3/moves/progress/",
+            params={"cloud": cloud_name},
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, list):
+            raise ValueError("QUADS move progress response is not a list")
+        return [item for item in data if isinstance(item, dict)]
+
+    async def get_host_progress(self, hostname: str) -> dict[str, Any]:
+        """Read the host fields relevant to QUADS validation."""
+        response = await self._client.get(
+            f"{self._base_url}/api/v3/hosts/{quote(hostname, safe='')}"
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("QUADS host response is not an object")
+        return data
 
     async def poll_until_validated(
         self,
         assignment_id: int,
         interval: int = 120,
         timeout: int = 3600,
+        *,
+        progress_callback: Callable[[dict[str, Any], int, str], Awaitable[None]]
+        | None = None,
     ) -> dict[str, Any]:
         elapsed = 0
+        status: dict[str, Any] = {}
+
+        async def report(phase: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                # Reporting is useful but must never strand an allocation.
+                await asyncio.wait_for(progress_callback(status, elapsed, phase), 15)
+            except Exception:
+                logger.debug("QUADS progress reporting failed")
+
         while elapsed < timeout:
             status = await self.get_assignment_status(assignment_id)
             logger.info(
                 f"[quads] Assignment {assignment_id}: "
-                f"validated={status['validated']}, "
-                f"provisioned={status['provisioned']} "
+                f"validated={status.get('validated')}, "
+                f"provisioned={status.get('provisioned')} "
                 f"({elapsed}s elapsed)"
             )
-            if status["validated"]:
+            if status.get("validated") is True:
+                await report("validated")
                 return status
-            await asyncio.sleep(interval)
+            # Fetching diagnostics should not extend the reservation poll interval.
+            await asyncio.gather(report("waiting"), asyncio.sleep(interval))
             elapsed += interval
 
+        await report("timed_out")
         raise TimeoutError(
             f"QUADS assignment {assignment_id} not validated after {timeout}s"
         )
