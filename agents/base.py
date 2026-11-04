@@ -418,16 +418,43 @@ class AgentBase(ABC):
         if self._events:
             self._events.emit(ticket_id, self.agent_name, event_type, data)
 
+    # Agent roles where investigation context is relevant.
+    # Introspection and retrospective agents serve different
+    # purposes and should not receive alert grounding.
+    _INVESTIGATION_AGENTS: frozenset = frozenset(
+        {
+            "triage-agent",
+            "gathering-context-agent",
+            "analyze-agent",
+            "resource-agent",
+            "platform-agent",
+            "provisioning-agent",
+            "benchmark-agent",
+            "review-agent",
+            "evaluate-agent",
+            "synthesis-agent",
+            "fleet-agent",
+        }
+    )
+
     def _build_investigation_context(self, ticket: dict[str, Any]) -> str:
-        """Build a structured investigation context section for webhook tickets.
+        """Build a structured investigation context for webhook tickets.
 
-        When anomaly_context or run_metadata is present, returns a formatted
-        section that agents must reference in their outputs. Returns empty
-        string for non-webhook tickets.
+        When anomaly_context or run_metadata is present, returns a
+        formatted section summarizing the alert and system context.
+        Returns empty string for non-webhook tickets or for agent
+        roles where the context is not relevant (introspection,
+        retrospective).
 
-        This is injected by the base class — agents don't need to handle
-        webhook context individually.
+        The output is source-agnostic: both dicts are serialized
+        generically so any webhook source's fields are preserved
+        and visible to the agent.
         """
+        # Skip for agents that don't need alert grounding.
+        agent_name = getattr(self, "agent_name", "")
+        if agent_name and agent_name not in self._INVESTIGATION_AGENTS:
+            return ""
+
         cf = ticket.get("custom_fields", {})
         anomaly = cf.get("anomaly_context")
         run_meta = cf.get("run_metadata")
@@ -435,50 +462,43 @@ class AgentBase(ABC):
         if not anomaly and not run_meta:
             return ""
 
-        lines = ["\n\n## Investigation Context\n"]
-        lines.append(
+        lines = [
+            "\n\n## Investigation Context\n",
             "This ticket was triggered by an external alert. "
-            "Reference the system identifiers below in your "
-            "hypothesis, analysis, and conclusions — do not discuss "
-            "findings only in terms of run IDs.\n"
-        )
+            "Ensure your analysis explicitly references the "
+            "alert context and system identifiers provided "
+            "below.\n",
+        ]
+
+        def _format_dict(d: dict[str, Any], exclude: set | None = None) -> list[str]:
+            """Format a dict as bullet points, preserving all keys."""
+            import json as _json
+
+            out: list[str] = []
+            for k, v in d.items():
+                if exclude and k in exclude:
+                    continue
+                if v is None or v == "" or v == []:
+                    continue
+                label = k.replace("_", " ").title()
+                if isinstance(v, dict):
+                    out.append(f"- **{label}:** `{_json.dumps(v, default=str)}`")
+                elif isinstance(v, list):
+                    out.append(f"- **{label}:** {', '.join(str(i) for i in v)}")
+                else:
+                    out.append(f"- **{label}:** {v}")
+            return out
 
         if isinstance(run_meta, dict) and run_meta:
-            target = run_meta.get("target", "")
-            os_id = run_meta.get("os_id", "")
-            build = run_meta.get("build", "")
-            mode = run_meta.get("mode", "")
-            if target:
-                lines.append(f"- **Target system:** {target}")
-            if os_id or build:
-                parts = []
-                if os_id:
-                    parts.append(os_id)
-                if mode:
-                    parts.append(mode)
-                if build:
-                    parts.append(f"build {build}")
-                lines.append(f"- **OS / Build:** {' / '.join(parts)}")
-            start = run_meta.get("start_time", "")
-            if start:
-                lines.append(f"- **Run timestamp:** {start}")
+            lines.append("### System Context")
+            lines.extend(_format_dict(run_meta, exclude={"labels"}))
 
         if isinstance(anomaly, dict) and anomaly:
-            source = anomaly.get("source", "")
-            if source:
-                lines.append(f"- **Alert source:** {source}")
-            metric = anomaly.get("variable_name") or anomaly.get("metric", "")
-            if metric:
-                lines.append(f"- **Metric:** {metric}")
-            change_desc = anomaly.get("change_description", "")
-            if change_desc:
-                lines.append(f"- **Change:** {change_desc}")
-            run_id = anomaly.get("run_id")
-            if run_id is not None:
-                lines.append(f"- **Run ID:** {run_id}")
+            lines.append("### Alert Details")
+            lines.extend(_format_dict(anomaly))
 
-        if len(lines) <= 2:
-            # Only header + instruction, no actual data
+        # Only header + instruction, no actual data
+        if not any(line.startswith("- ") for line in lines):
             return ""
 
         return "\n".join(lines)
