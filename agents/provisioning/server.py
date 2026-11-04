@@ -3673,6 +3673,7 @@ async def _install_kernel_one(
         return {
             "host": host,
             "state": "unreachable",
+            "reason_code": "inventory_before_install_unavailable",
             "error": "could not read inventory before install",
         }
 
@@ -3697,6 +3698,7 @@ async def _install_kernel_one(
             return {
                 "host": host,
                 "state": "install_failed",
+                "reason_code": "repository_not_approved",
                 "error": (
                     f"repository {spec.repo_url!r} is not in the "
                     "organization's approved_repositories configuration; "
@@ -3710,6 +3712,7 @@ async def _install_kernel_one(
             return {
                 "host": host,
                 "state": "install_failed",
+                "reason_code": "repository_trust_material_unavailable",
                 "error": (
                     "repository trust material could not be deployed to "
                     f"{host}; refusing unverified dnf access"
@@ -3726,6 +3729,7 @@ async def _install_kernel_one(
             return {
                 "host": host,
                 "state": "install_failed",
+                "reason_code": "repository_setup_failed",
                 "error": (
                     "kernel repository bootstrap failed: "
                     f"{repo_result.stderr or repo_result.stdout}"
@@ -3741,6 +3745,7 @@ async def _install_kernel_one(
         return {
             "host": host,
             "state": "install_failed",
+            "reason_code": "package_install_failed",
             "error": result.stderr or result.stdout,
             "before": before.to_dict(),
         }
@@ -3756,6 +3761,7 @@ async def _install_kernel_one(
         return {
             "host": host,
             "state": "indeterminate",
+            "reason_code": "post_install_inventory_unavailable",
             "error": "could not read inventory after install",
             "before": before.to_dict(),
         }
@@ -3772,6 +3778,9 @@ async def _install_kernel_one(
     return {
         "host": host,
         "state": "indeterminate" if timed_out else "install_failed",
+        "reason_code": (
+            "package_install_timed_out" if timed_out else "package_install_unconfirmed"
+        ),
         "error": (
             "dnf timed out and the release is not installed"
             if timed_out

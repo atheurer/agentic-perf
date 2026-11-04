@@ -442,6 +442,7 @@ class TestInstallKernelRepoBootstrap:
         for host in ("10.0.0.1", "10.0.0.2"):
             record = result["results"][host]
             assert record["state"] == "install_failed"
+            assert record["reason_code"] == "repository_setup_failed"
             assert "repository bootstrap failed" in record["error"]
 
 
@@ -496,7 +497,10 @@ def not_found_script():
         },
         "reboot_hosts_and_verify": {
             "status": "verified",
-            "hosts": {h: {"state": "verified"} for h in ("10.0.0.1", "10.0.0.2")},
+            "hosts": {
+                h: {"state": "verified", "observed_kernel": KERNEL_B}
+                for h in ("10.0.0.1", "10.0.0.2")
+            },
         },
     }
 
@@ -523,7 +527,10 @@ class TestRunnerNotFoundHandling:
         ticket = runner_ticket(with_repo=True)
         agent = _agent(ticket)
         script = not_found_script()
-        script["run_repo_cleanup"] = {"status": "ok"}
+        script["run_repo_cleanup"] = {
+            "status": "ok",
+            "results": {h: {"host": h, "state": "clean"} for h in HOSTS},
+        }
         mcp = ScriptedMCP(script)
 
         await agent._run_kernel_step(ticket["id"], ticket, mcp)
@@ -537,8 +544,10 @@ class TestRunnerNotFoundHandling:
             "reboot_hosts_and_verify",
             "run_repo_cleanup",
         ]
-        comment = agent._add_comment.await_args.args[1]
-        assert "repo_url" in comment
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert REPO_URL in comments
         agent._handle_completion.assert_awaited_once()
 
 
@@ -840,6 +849,7 @@ class TestRepoCleanup:
         kernel step exists in the plan."""
 
         from tests.test_provisioning_kernel_step import (
+            HOSTS,
             ScriptedMCP,
             _agent,
             full_script,
@@ -854,7 +864,10 @@ class TestRepoCleanup:
         )  # current_step=2, only kernel step
         agent = _agent(ticket)
         script = full_script()
-        script["run_repo_cleanup"] = {"status": "ok"}
+        script["run_repo_cleanup"] = {
+            "status": "ok",
+            "results": {h: {"host": h, "state": "clean"} for h in HOSTS},
+        }
         mcp = ScriptedMCP(script)
 
         import asyncio
@@ -1082,44 +1095,23 @@ class TestCleanupGuarantee:
         assert "run_repo_cleanup" in names
         agent._transition_ticket.assert_awaited_once()  # paused, not submitted
         agent._handle_completion.assert_not_awaited()
-        comment = agent._add_comment.await_args.args[1]
-        assert "cleanup failed" in comment
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "cleanup failed" in comments
 
 
 class TestApprovalTransparency:
-    def test_approval_question_includes_package_source(self):
-        """Humans must see the package source they are authorizing."""
+    def test_source_explanation_does_not_claim_package_origin(self):
+        """The requested URL is visible without claiming it supplied the RPM."""
 
         from agents.provisioning.agent import ProvisioningAgent
 
-        agent = ProvisioningAgent.__new__(ProvisioningAgent)
-        agent._ticket_id = "PERF-T"
-        agent._add_comment = AsyncMock()
-        intent = {
-            "kernel": {
-                "package": "kernel",
-                "release": KERNEL_B,
-                "repo_url": REPO_URL,
-            },
-            "hosts": ["10.0.0.1"],
-            "addresses": {"10.0.0.1": "10.0.0.1"},
-            "actions_required": ["install", "select_default", "reboot"],
-            "reboot_policy": "always",
-        }
-        # Reconstruct the question exactly as _request_kernel_approval does.
-        kernel = intent["kernel"]
-        question = (
-            f"Approval request apr-1 for a kernel change.\n"
-            f"Kernel: {kernel.get('package', 'kernel')}-{kernel.get('release', '?')}\n"
-            f"Hosts: {', '.join(intent.get('hosts', []))}\n"
-            f"Actions: {', '.join(intent.get('actions_required', []))}\n"
-            + (
-                f"Package source: {kernel.get('repo_url')}\n"
-                "(from the organization's approved_repositories; installed "
-                "with GPG and TLS verification)\n"
-                if kernel.get("repo_url")
-                else ""
-            )
-        )
-        assert REPO_URL in question
-        assert "approved_repositories" in question
+        explanation = ProvisioningAgent._kernel_source_explanation(REPO_URL)
+        assert REPO_URL in explanation
+        assert "approved_repositories entry" in explanation
+        assert "configured GPG key and CA" in explanation
+        assert "installation is refused" in explanation
+        assert "any enabled repository" in explanation
+        assert "not report which repository supplied the package" in explanation
+        assert "signing key was used; both remain unconfirmed" in explanation

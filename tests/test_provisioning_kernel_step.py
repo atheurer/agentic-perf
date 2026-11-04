@@ -91,7 +91,9 @@ def full_script(actions=("install", "select_default", "reboot")):
         },
         "reboot_hosts_and_verify": {
             "status": "verified",
-            "hosts": {h: {"state": "verified"} for h in HOSTS},
+            "hosts": {
+                h: {"state": "verified", "observed_kernel": KERNEL_B} for h in HOSTS
+            },
         },
     }
 
@@ -145,6 +147,241 @@ class TestDeterministicKernelStep:
         agent._transition_ticket.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_ticket_comments_report_each_host_outcome(self):
+        ticket = kernel_step_ticket()
+        agent = _agent(ticket)
+        script = full_script()
+        script["install_kernel"]["results"] = {
+            HOSTS[0]: {"host": HOSTS[0], "state": "installed"},
+            HOSTS[1]: {"host": HOSTS[1], "state": "already_installed"},
+        }
+        script["select_default_kernel"]["results"] = {
+            HOSTS[0]: {
+                "host": HOSTS[0],
+                "state": "ok",
+                "after": f"/boot/vmlinuz-{KERNEL_B}",
+            },
+            HOSTS[1]: {"host": HOSTS[1], "state": "already_default"},
+        }
+        script["reboot_hosts_and_verify"]["hosts"] = {
+            HOSTS[0]: {"state": "verified", "observed_kernel": KERNEL_B},
+            HOSTS[1]: {"state": "already_verified", "observed_kernel": KERNEL_B},
+        }
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert f"{HOSTS[0]}:** kernel {KERNEL_B} installed" in comments
+        assert f"{HOSTS[1]}:** kernel {KERNEL_B} was already present" in comments
+        assert (
+            f"{HOSTS[0]}:** default boot entry set to /boot/vmlinuz-{KERNEL_B}"
+            in comments
+        )
+        assert f"{HOSTS[1]}:** requested kernel was already the default" in comments
+        assert f"{HOSTS[0]}:** running kernel {KERNEL_B} was verified" in comments
+
+    @pytest.mark.asyncio
+    async def test_requested_repo_is_redacted_and_cleanup_is_reported(self):
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": (
+                    "https://user:secret@repo.example.test/kernel"
+                    "?token=query-secret#fragment-secret"
+                ),
+            }
+        )
+        agent = _agent(ticket)
+        script = full_script()
+        script["run_repo_cleanup"] = {
+            "status": "ok",
+            "results": {host: {"state": "clean"} for host in HOSTS},
+        }
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "https://repo.example.test/kernel" in comments
+        assert "secret" not in comments
+        assert "token" not in comments
+        assert "fragment" not in comments
+        assert "Actual package source and signing key:** not confirmed" in comments
+        assert "Temporary repository cleanup confirmed" in comments
+
+    @pytest.mark.asyncio
+    async def test_partial_cleanup_reports_confirmed_and_uncertain_hosts(self):
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel?token=secret",
+            }
+        )
+        agent = _agent(ticket)
+        script = full_script()
+        script["run_repo_cleanup"] = {
+            "status": "incomplete",
+            "results": {
+                HOSTS[0]: {"state": "clean"},
+                HOSTS[1]: {
+                    "state": "cleanup_failed",
+                    "error": "https://user:secret@repo.example.test/?token=secret",
+                },
+            },
+        }
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        comment_list = [call.args[1] for call in agent._add_comment.await_args_list]
+        comments = "\n".join(comment_list)
+        assert "Temporary repository cleanup not confirmed" in comments
+        assert f"{HOSTS[0]}:** temporary repository entry removed" in comments
+        assert f"{HOSTS[1]}:** removal not confirmed (cleanup failed)" in comments
+        assert "secret" not in comments
+        assert "may remain" in comments
+        pause_comment = next(
+            comment for comment in comment_list if "Kernel change paused" in comment
+        )
+        assert HOSTS[0] not in pause_comment
+        assert HOSTS[1] in pause_comment
+        agent._handle_completion.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_is_reported_pending_when_later_kernel_steps_remain(self):
+        ticket = kernel_step_ticket(
+            kernel={
+                "release": KERNEL_B,
+                "package": "kernel",
+                "repo_url": "https://repo.example.test/kernel",
+            }
+        )
+        ticket["custom_fields"]["execution_plan"]["steps"].append(
+            {
+                "id": 3,
+                "agent_type": "provision",
+                "params": {"label": "another kernel", "kernel": KERNEL_B},
+            }
+        )
+        agent = _agent(ticket)
+        mcp = ScriptedMCP(full_script())
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert "Temporary repository cleanup pending" in comments
+        assert "Cleanup was not attempted at this step" in comments
+        assert not any(name == "run_repo_cleanup" for name, _ in mcp.calls)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("result", "expected_text"),
+        [
+            (
+                {
+                    "status": "paused",
+                    "hosts": {
+                        HOSTS[0]: {
+                            "state": "reconnect_timeout",
+                            "error": "host did not reconnect",
+                        },
+                        HOSTS[1]: {"state": "not_attempted"},
+                    },
+                },
+                "reconnect timeout",
+            ),
+            (
+                {
+                    "status": "verified",
+                    "hosts": {
+                        HOSTS[0]: {
+                            "state": "kernel_mismatch",
+                            "observed_kernel": "5.14.0-1.el9.x86_64",
+                        },
+                        HOSTS[1]: {
+                            "state": "verified",
+                            "observed_kernel": KERNEL_B,
+                        },
+                    },
+                },
+                "was observed",
+            ),
+        ],
+    )
+    async def test_reboot_failure_or_mismatch_is_reported_without_success(
+        self, result, expected_text
+    ):
+        ticket = kernel_step_ticket()
+        agent = _agent(ticket)
+        script = full_script(actions=("reboot",))
+        script["reboot_hosts_and_verify"] = result
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert expected_text in comments
+        assert "not confirmed" in comments or "not verified" in comments
+        agent._handle_completion.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_host_action_result_pauses_and_is_reported(self):
+        ticket = kernel_step_ticket()
+        agent = _agent(ticket)
+        script = full_script(actions=("install",))
+        script["install_kernel"]["results"].pop(HOSTS[1])
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert f"{HOSTS[1]}:** outcome not confirmed" in comments
+        assert "no host result was returned" in comments
+        agent._handle_completion.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_later_reboot_failure_keeps_earlier_verified_host_clear(self):
+        ticket = kernel_step_ticket()
+        agent = _agent(ticket)
+        script = full_script(actions=("reboot",))
+        script["reboot_hosts_and_verify"] = {
+            "status": "paused",
+            "hosts": {
+                HOSTS[0]: {"state": "verified", "observed_kernel": KERNEL_B},
+                HOSTS[1]: {"state": "reconnect_timeout"},
+            },
+        }
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        comments = [call.args[1] for call in agent._add_comment.await_args_list]
+        action_comment = next(comment for comment in comments if "result**" in comment)
+        pause_comment = next(
+            comment for comment in comments if "Kernel change paused" in comment
+        )
+        assert f"{HOSTS[0]}:** running kernel {KERNEL_B} was verified" in action_comment
+        assert "not confirmed (reconnect timeout)" in action_comment
+        assert HOSTS[0] not in pause_comment
+        assert (
+            f"{HOSTS[1]}:** outcome not confirmed (reconnect timeout)" in pause_comment
+        )
+        agent._handle_completion.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_arguments_match_the_real_tool_schemas(self):
         """Lab regression (PERF-29157B06): prepare_kernel_change was called
         with a dict for its string parameter and the MCP layer rejected it.
@@ -186,7 +423,9 @@ class TestDeterministicKernelStep:
         await agent._run_kernel_step(ticket["id"], ticket, mcp)
         agent._handle_completion.assert_not_called()
         agent._transition_ticket.assert_awaited_once()
-        assert "validation error" in agent._add_comment.await_args.args[1]
+        assert "could not check the requested kernel" in "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_approval_runs_under_a_fence_context_with_tool_call_id(self):
@@ -324,6 +563,32 @@ class TestDeterministicKernelStep:
         agent._transition_ticket.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_install_failure_reports_safe_cause_without_raw_error(self):
+        ticket = kernel_step_ticket()
+        agent = _agent(ticket)
+        script = full_script()
+        script["install_kernel"]["results"][HOSTS[1]] = {
+            "host": HOSTS[1],
+            "state": "install_failed",
+            "reason_code": "repository_trust_material_unavailable",
+            "error": "https://user:secret@repo.example.test/?token=secret",
+        }
+        mcp = ScriptedMCP(script)
+
+        await agent._run_kernel_step(ticket["id"], ticket, mcp)
+
+        comments = "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
+        assert (
+            "repository signing or certificate settings could not be applied"
+            in comments
+        )
+        assert "secret" not in comments and "token" not in comments
+        assert "https://" not in comments
+        agent._handle_completion.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_reboot_pause_is_not_doubled(self):
         """The reboot tool already paused the ticket; the runner only comments."""
         ticket = kernel_step_ticket()
@@ -340,7 +605,9 @@ class TestDeterministicKernelStep:
         await agent._run_kernel_step(ticket["id"], ticket, mcp)
         agent._handle_completion.assert_not_called()
         agent._transition_ticket.assert_not_called()
-        assert "reconnect_timeout" in agent._add_comment.await_args.args[1]
+        assert "reboot or running-kernel check did not complete" in "\n".join(
+            call.args[1] for call in agent._add_comment.await_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_reboot_policy_directive_is_forwarded(self):

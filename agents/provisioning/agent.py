@@ -6,6 +6,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
@@ -276,27 +277,37 @@ class ProvisioningAgent(AgentBase):
         self._active_kernel_approval = approval
 
         kernel = intent.get("kernel", {})
+        requested_source = self._display_kernel_source(kernel.get("repo_url"))
+        actions = set(intent.get("actions_required", []))
+        planned_changes = []
+        if "install" in actions:
+            planned_changes.append("install the kernel if it is not already present")
+        if "select_default" in actions:
+            planned_changes.append("set it as the default boot kernel")
+        if "reboot" in actions:
+            planned_changes.append("reboot and check which kernel is running")
+        if not planned_changes:
+            planned_changes.append("check the requested kernel on the hosts")
         question = (
-            f"Approval request {approval_id} for a kernel change.\n"
-            f"Intent ID: {intent_id}\n"
-            f"Kernel: {kernel.get('package', 'kernel')}-{kernel.get('release', '?')}\n"
-            f"Hosts: {', '.join(intent.get('hosts', []))}\n"
-            f"Approved addresses: {json.dumps(intent.get('addresses', {}), sort_keys=True)}\n"
-            f"Actions: {', '.join(intent.get('actions_required', []))}\n"
-            f"Reboot policy: {intent.get('reboot_policy', 'missing')}\n"
-            + (
-                f"Package source: {kernel.get('repo_url')}\n"
-                "(from the organization's approved_repositories; installed "
-                "with GPG and TLS verification)\n"
-                if kernel.get("repo_url")
-                else ""
-            )
-            + f"Intent digest: {digest}\n\n"
+            f"**Kernel change approval requested**\n\n"
+            f"- **Approval request:** {approval_id}\n"
+            f"- **Change reference:** {intent_id}\n"
+            f"- **Requested kernel:** {kernel.get('package', 'kernel')}-"
+            f"{kernel.get('release', '?')}\n"
+            f"- **Hosts:** {', '.join(intent.get('hosts', []))}\n"
+            f"- **Connection targets:** "
+            f"{json.dumps(intent.get('addresses', {}), sort_keys=True)}\n"
+            f"- **Planned changes:** {'; '.join(planned_changes)}\n"
+            f"- **Reboot behavior:** "
+            f"{self._kernel_reboot_description(intent.get('reboot_policy'))}\n"
+            f"- **Requested package source:** {requested_source}\n\n"
+            f"{self._kernel_source_explanation(kernel.get('repo_url'))}\n\n"
+            f"{self._kernel_approval_host_lines(intent)}\n\n"
             f"{summary or ''}\n\n"
-            "Reply approve / request changes / reject, or use the structured "
-            "approval action."
+            "Reply approve, request changes, or reject, or use the structured "
+            "approval action to decide whether this kernel change should proceed."
         )
-        await self._add_comment(self._ticket_id, f"**Approval requested:**\n{question}")
+        await self._add_comment(self._ticket_id, question)
         return await self._wait_for_kernel_approval(approval_id)
 
     async def _wait_for_kernel_approval(self, approval_id: str) -> str:
@@ -382,6 +393,318 @@ class ProvisioningAgent(AgentBase):
     _KERNEL_SELECT_OK = frozenset({"ok", "already_default"})
 
     @staticmethod
+    def _display_kernel_source(repo_url: str | None) -> str:
+        if not repo_url:
+            return (
+                "the repositories already enabled on each host "
+                "(no additional repository URL was requested)"
+            )
+        try:
+            parsed = urlsplit(repo_url)
+            hostname = parsed.hostname
+            if not hostname or parsed.scheme not in {"http", "https"}:
+                return "configured repository URL"
+            port = parsed.port
+        except ValueError:
+            return "configured repository URL"
+        display_host = f"[{hostname}]" if ":" in hostname else hostname
+        if port is not None:
+            display_host = f"{display_host}:{port}"
+        return urlunsplit((parsed.scheme, display_host, parsed.path, "", ""))
+
+    @staticmethod
+    def _kernel_source_explanation(repo_url: str | None) -> str:
+        if repo_url:
+            return (
+                f"The requested URL "
+                f"{ProvisioningAgent._display_kernel_source(repo_url)} may be "
+                "added as an additional DNF repository when installation is "
+                "needed. It must have an approved_repositories entry with a "
+                "configured GPG key and CA; installation is refused if that "
+                "entry or trust configuration is missing. DNF can still choose "
+                "a package from any enabled repository. Other enabled "
+                "repositories follow their existing host repository and "
+                "signing-key settings. The host results do not report which "
+                "repository supplied the package or which signing key was "
+                "used; both remain unconfirmed."
+            )
+        return (
+            "No additional repository URL was requested. DNF uses the "
+            "repositories and signing-key settings enabled on each host, "
+            "under the host owner's policy. The "
+            "host results do not report which repository supplied the package "
+            "or which signing key was used; both remain unconfirmed."
+        )
+
+    @staticmethod
+    def _kernel_reboot_description(policy: str | None) -> str:
+        if policy == "always":
+            return (
+                "reboot each host, even if it is already running the requested kernel"
+            )
+        if policy == "if_needed":
+            return "skip reboot on hosts already running the requested kernel"
+        return "reboot behavior could not be determined"
+
+    @staticmethod
+    def _kernel_approval_host_lines(intent: dict[str, Any]) -> str:
+        from providers.rhel_kernel import KernelSpec
+
+        try:
+            spec = KernelSpec.parse(intent.get("kernel", {}))
+        except (TypeError, ValueError):
+            spec = None
+        before = intent.get("inventory_before", {})
+        if not isinstance(before, dict):
+            before = {}
+        actions = set(intent.get("actions_required", []))
+        reboot_policy = intent.get("reboot_policy")
+        lines = ["**Before-state and planned changes by host**"]
+        for host in intent.get("hosts", []):
+            record = before.get(host)
+            inventory = record.get("inventory") if isinstance(record, dict) else None
+            if (
+                not isinstance(record, dict)
+                or record.get("state") != "ok"
+                or not isinstance(inventory, dict)
+                or spec is None
+            ):
+                lines.append(
+                    f"- **{host}:** initial kernel state was not available; "
+                    "per-host planned changes cannot be confirmed."
+                )
+                continue
+
+            running = inventory.get("running") or "not reported"
+            default_entry = inventory.get("default_entry") or "not reported"
+            installed = inventory.get("installed")
+            target = record.get("requested", {})
+            requested_state = target.get("state") if isinstance(target, dict) else None
+            if isinstance(installed, list):
+                target_installed: bool | None = spec.release in installed
+            else:
+                target_installed = (
+                    True
+                    if requested_state == "installed"
+                    else False
+                    if requested_state in {"available", "not_found"}
+                    else None
+                )
+
+            planned = []
+            if target_installed is True:
+                installed_state = "present"
+                planned.append("no installation needed")
+            elif target_installed is False:
+                installed_state = "absent"
+                availability = {
+                    "available": "available in checked repository metadata",
+                    "not_found": "not found in checked repository metadata",
+                    "not_checked": "availability not checked",
+                }.get(requested_state, "availability unknown")
+                installed_state += f"; {availability}"
+                if "install" in actions:
+                    planned.append(f"attempt installation; {availability}")
+                else:
+                    planned.append("installation not listed in the prepared changes")
+            else:
+                installed_state = "not confirmed"
+                planned.append("installation status unknown")
+
+            if default_entry == spec.vmlinuz:
+                planned.append("no default boot change needed")
+            elif default_entry != "not reported":
+                planned.append(
+                    "set target as default boot kernel"
+                    if "select_default" in actions
+                    else "default change not listed in the prepared changes"
+                )
+            else:
+                planned.append("default boot entry not reported")
+
+            if "reboot" in actions:
+                if reboot_policy == "if_needed" and running == spec.release:
+                    planned.append("verify running kernel without reboot")
+                else:
+                    planned.append("reboot and verify running kernel")
+
+            lines.append(
+                f"- **{host}:** running {running}; default {default_entry}; "
+                f"target kernel {installed_state}. Planned: {'; '.join(planned)}."
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _kernel_safe_action_cause(action: str, record: dict[str, Any]) -> str | None:
+        state = record.get("state")
+        reason = record.get("reason_code")
+        if action == "install":
+            causes = {
+                "inventory_before_install_unavailable": (
+                    "host kernel details could not be read before installation"
+                ),
+                "repository_not_approved": (
+                    "the requested repository is not approved for this install"
+                ),
+                "repository_trust_material_unavailable": (
+                    "repository signing or certificate settings could not be applied"
+                ),
+                "repository_setup_failed": "repository setup failed",
+                "package_install_failed": (
+                    "the host's package manager reported an installation error; "
+                    "details are unavailable"
+                ),
+                "package_install_timed_out": (
+                    "package installation timed out and the target kernel was not "
+                    "confirmed"
+                ),
+                "post_install_inventory_unavailable": (
+                    "kernel details could not be read after installation"
+                ),
+                "package_install_unconfirmed": (
+                    "the package manager did not confirm the target kernel"
+                ),
+            }
+            if reason in causes:
+                return causes[reason]
+            if state == "install_failed":
+                return "the host reported an installation error; the cause is unknown"
+            if state == "indeterminate":
+                return "the installation result could not be confirmed"
+        if action == "select_default":
+            if state == "not_bootable":
+                return "required kernel boot files are missing"
+            if state == "indeterminate":
+                return "the default boot entry could not be confirmed"
+        if action == "reboot":
+            causes = {
+                "precheck_failed": "the pre-reboot kernel or boot-entry check failed",
+                "reconnect_timeout": "the host did not reconnect within the check window",
+                "indeterminate": "the host state could not be confirmed",
+                "not_attempted": "not attempted because an earlier host did not verify",
+            }
+            return causes.get(state)
+        return None
+
+    @staticmethod
+    def _kernel_action_comment(
+        action: str,
+        result: dict[str, Any],
+        hosts: list[str],
+        expected_kernel: str,
+        requested_source: str | None = None,
+    ) -> str:
+        """Describe only per-host outcomes present in the tool result."""
+        labels = {
+            "install": "Kernel installation",
+            "select_default": "Default boot kernel selection",
+            "reboot": "Reboot and running-kernel check",
+        }
+        records = result.get("results", result.get("hosts", {}))
+        if not isinstance(records, dict):
+            records = {}
+        lines = [f"**{labels.get(action, 'Kernel change')} result**"]
+        for host in hosts:
+            record = records.get(host)
+            if not isinstance(record, dict):
+                outcome = "outcome not confirmed (no host result was returned)"
+            else:
+                state = record.get("state")
+                if action == "install" and state == "installed":
+                    outcome = f"kernel {expected_kernel} installed"
+                elif action == "install" and state == "already_installed":
+                    outcome = f"kernel {expected_kernel} was already present"
+                elif action == "select_default" and state == "ok":
+                    selected = record.get("after")
+                    outcome = (
+                        f"default boot entry set to {selected}"
+                        if selected
+                        else "default boot entry selection reported successful"
+                    )
+                elif action == "select_default" and state == "already_default":
+                    outcome = "requested kernel was already the default boot entry"
+                elif action == "reboot" and state in {"verified", "already_verified"}:
+                    observed = record.get("observed_kernel")
+                    if observed == expected_kernel:
+                        outcome = f"running kernel {observed} was verified"
+                    else:
+                        outcome = (
+                            f"reported running kernel {observed or 'unknown'}; "
+                            f"{expected_kernel} was not confirmed"
+                        )
+                elif action == "reboot" and record.get("observed_kernel"):
+                    outcome = (
+                        f"running kernel {record['observed_kernel']} was observed, "
+                        f"but {expected_kernel} was not verified"
+                    )
+                else:
+                    state_text = " ".join(str(state or "unknown").split("_"))
+                    outcome = f"not confirmed ({state_text})"
+                    cause = ProvisioningAgent._kernel_safe_action_cause(action, record)
+                    if cause:
+                        outcome += f": {cause}"
+            lines.append(f"- **{host}:** {outcome}")
+
+        if action == "install":
+            source = ProvisioningAgent._display_kernel_source(requested_source)
+            lines.extend(
+                [
+                    f"- **Requested package source:** {source}",
+                    "- **Actual package source and signing key:** not confirmed by "
+                    "the returned host results.",
+                ]
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _kernel_cleanup_comment(
+        result: dict[str, Any], hosts: list[str], confirmed: bool
+    ) -> str:
+        records = result.get("results", {})
+        if not isinstance(records, dict):
+            records = {}
+        title = (
+            "**Temporary repository cleanup confirmed**"
+            if confirmed
+            else "**Temporary repository cleanup not confirmed**"
+        )
+        lines = [title]
+        for host in hosts:
+            record = records.get(host)
+            if isinstance(record, dict) and record.get("state") == "clean":
+                outcome = "temporary repository entry removed"
+            elif isinstance(record, dict):
+                state = " ".join(str(record.get("state") or "unknown").split("_"))
+                outcome = f"removal not confirmed ({state})"
+            else:
+                outcome = "removal not confirmed (no host result was returned)"
+            lines.append(f"- **{host}:** {outcome}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _ticket_safe_kernel_configuration(configuration: Any) -> Any:
+        """Redact repository URL credentials before ticket/workspace projection."""
+        if not isinstance(configuration, dict):
+            return configuration
+        projected = dict(configuration)
+        transition = projected.get("kernel_transition")
+        if not isinstance(transition, dict):
+            return projected
+        transition = dict(transition)
+        kernel = transition.get("kernel")
+        if isinstance(kernel, dict) and "repo_url" in kernel:
+            kernel = dict(kernel)
+            source = kernel.get("repo_url")
+            kernel["repo_url"] = (
+                ProvisioningAgent._display_kernel_source(source)
+                if isinstance(source, str)
+                else "configured repository URL"
+            )
+            transition["kernel"] = kernel
+        projected["kernel_transition"] = transition
+        return projected
+
+    @staticmethod
     def _kernel_step_is_deterministic(cf: dict[str, Any]) -> bool:
         from agents.provisioning.kernel import current_kernel_step
 
@@ -421,10 +744,30 @@ class ProvisioningAgent(AgentBase):
         self, ticket_id: str, headline: str, detail: Any
     ) -> None:
         """Pause for the user unless a tool already paused the ticket."""
-        body = (
-            f"**Kernel transition stopped:** {headline}\n\n"
-            f"```json\n{json.dumps(detail, indent=2)[:3000]}\n```"
-        )
+        body = f"**Kernel change paused:** {headline}"
+        if isinstance(detail, dict) and detail:
+            host_lines = []
+            records = detail.get("results", detail.get("hosts", detail))
+            if not isinstance(records, dict):
+                records = {}
+            for host, record in records.items():
+                if isinstance(record, dict):
+                    raw_state = record.get("state")
+                    if raw_state in {
+                        "installed",
+                        "already_installed",
+                        "ok",
+                        "already_default",
+                        "verified",
+                        "already_verified",
+                        "clean",
+                    }:
+                        continue
+                    state = " ".join(str(raw_state or "unknown").split("_"))
+                    host_lines.append(f"- **{host}:** outcome not confirmed ({state})")
+            if host_lines:
+                body += "\n\n" + "\n".join(host_lines)
+        body += "\n\nNo further kernel changes were started."
         await self._add_comment(ticket_id, body)
         ticket = await self._get_ticket(ticket_id)
         if ticket.get("status") == "awaiting_customer_guidance":
@@ -433,9 +776,9 @@ class ProvisioningAgent(AgentBase):
             ticket_id,
             "awaiting_customer_guidance",
             comment=(
-                "Kernel transition needs a decision. Fix the host or the plan "
-                "and reply; a new prepare_kernel_change + approval is needed "
-                "for any new reboot."
+                "The kernel change needs attention. Fix the host or plan, then "
+                "restart the kernel change request and get approval before "
+                "another reboot."
             ),
         )
 
@@ -465,6 +808,7 @@ class ProvisioningAgent(AgentBase):
         reboot_policy = (cf.get("directives") or {}).get(
             "kernel_reboot_policy", "always"
         )
+        requested_source = self._display_kernel_source(spec.repo_url)
         if not hosts:
             await self._kernel_step_stop(
                 ticket_id,
@@ -475,16 +819,26 @@ class ProvisioningAgent(AgentBase):
 
         await self._add_comment(
             ticket_id,
-            f"**Kernel transition (deterministic)** — plan step {step_id}: "
-            f"`{spec.nevra}` on {', '.join(hosts)}. No model reasoning is used "
-            "for this step; the only decision is your approval.",
+            f"**Kernel change requested**\n\n"
+            f"- **Kernel:** {spec.nevra}\n"
+            f"- **Hosts:** {', '.join(hosts)}\n"
+            "- **Next:** check the installed version, install it if absent, "
+            "make it the default boot kernel, then check which kernel is "
+            "running.\n"
+            f"- **Reboot behavior:** "
+            f"{self._kernel_reboot_description(reboot_policy)}\n"
+            f"- **Requested package source:** "
+            f"{requested_source}.\n\n"
+            f"{self._kernel_source_explanation(spec.repo_url)}",
         )
 
         inventory = await self._kernel_tool(
             mcp, "get_kernel_inventory", hosts=hosts, kernel=spec.release
         )
         if inventory.get("status") in ("rejected", "error"):
-            await self._kernel_step_stop(ticket_id, "inventory rejected", inventory)
+            await self._kernel_step_stop(
+                ticket_id, "could not check the requested kernel", inventory
+            )
             return
         not_ok = {
             host: record
@@ -493,7 +847,7 @@ class ProvisioningAgent(AgentBase):
         }
         if not_ok:
             await self._kernel_step_stop(
-                ticket_id, "some hosts could not be inventoried", not_ok
+                ticket_id, "could not read kernel details from every host", not_ok
             )
             return
         missing = {
@@ -528,21 +882,15 @@ class ProvisioningAgent(AgentBase):
         )
         if prepared.get("status") != "ok":
             await self._kernel_step_stop(
-                ticket_id, "prepare_kernel_change refused", prepared
+                ticket_id, "could not prepare the kernel change", prepared
             )
             return
         intent_id = prepared["intent_id"]
         actions = list(prepared.get("actions_required", []))
 
         summary = (
-            f"Plan step {step_id}: {spec.nevra} on {', '.join(hosts)}; "
-            f"actions: {', '.join(actions)}; reboot policy: {reboot_policy}."
-            + (
-                f" Package source: {spec.repo_url} (approved_repositories; "
-                "GPG+TLS verified)."
-                if spec.repo_url
-                else ""
-            )
+            f"Install {spec.nevra} if needed, make it the default boot kernel, "
+            f"and verify it is running on {', '.join(hosts)}."
         )
         # The approval endpoint requires a trusted fence context with an
         # invocation id AND a tool-call id.  The model loop derives one per
@@ -585,7 +933,7 @@ class ProvisioningAgent(AgentBase):
                     )
                     await self._kernel_step_stop(
                         ticket_id,
-                        "the reply was not a clear approval (say 'approve' to proceed)",
+                        "the reply did not approve the kernel change",
                         {"reply": user_text.strip()},
                     )
                     return
@@ -625,34 +973,80 @@ class ProvisioningAgent(AgentBase):
                     approval_request_id=approval_id,
                     reboot_policy=reboot_policy,
                 )
+                await self._add_comment(
+                    ticket_id,
+                    self._kernel_action_comment(
+                        action, result, hosts, spec.release, spec.repo_url
+                    ),
+                )
                 if result.get("status") != "verified":
                     # The reboot tool pauses the ticket itself on failure.
                     await self._kernel_step_stop(
                         ticket_id,
-                        f"reboot/verify ended in {result.get('status')}",
+                        "reboot or running-kernel check did not complete",
                         result,
+                    )
+                    return
+                host_results = result.get("hosts", {})
+                if not isinstance(host_results, dict):
+                    host_results = {}
+                failed_reboots = {
+                    host: host_results.get(host, {"state": "missing_result"})
+                    for host in hosts
+                    if not isinstance(host_results.get(host), dict)
+                    or host_results[host].get("state")
+                    not in {"verified", "already_verified"}
+                    or host_results[host].get("observed_kernel") != spec.release
+                }
+                if failed_reboots:
+                    await self._kernel_step_stop(
+                        ticket_id,
+                        "running kernel was not verified on every host",
+                        failed_reboots,
                     )
                     return
                 continue
             else:
                 await self._kernel_step_stop(
-                    ticket_id, f"unknown action {action!r}", prepared
+                    ticket_id,
+                    "the requested kernel change could not be completed",
+                    prepared,
                 )
                 return
+            await self._add_comment(
+                ticket_id,
+                self._kernel_action_comment(
+                    action, result, hosts, spec.release, spec.repo_url
+                ),
+            )
             if result.get("status") in ("rejected", "paused", "error"):
-                await self._kernel_step_stop(ticket_id, f"{action} refused", result)
-                return
-            failed = {
-                host: record
-                for host, record in result.get("results", {}).items()
-                if host in hosts
-                and (
-                    not isinstance(record, dict) or record.get("state") not in ok_states
+                action_name = (
+                    "kernel installation"
+                    if action == "install"
+                    else "default boot kernel selection"
                 )
+                await self._kernel_step_stop(
+                    ticket_id, f"{action_name} could not be completed", result
+                )
+                return
+            host_results = result.get("results", {})
+            if not isinstance(host_results, dict):
+                host_results = {}
+            failed = {
+                host: host_results.get(host, {"state": "missing_result"})
+                for host in hosts
+                if not isinstance(host_results.get(host), dict)
+                or host_results[host].get("state") not in ok_states
             }
             if failed:
                 await self._kernel_step_stop(
-                    ticket_id, f"{action} failed on some hosts", failed
+                    ticket_id,
+                    (
+                        "kernel installation did not complete on every host"
+                        if action == "install"
+                        else "default boot kernel was not confirmed on every host"
+                    ),
+                    failed,
                 )
                 return
 
@@ -676,7 +1070,33 @@ class ProvisioningAgent(AgentBase):
                 "run_repo_cleanup",
                 hosts=hosts,
             )
-            if cleanup.get("status") not in ("ok", "already_clean"):
+            cleanup_results = cleanup.get("results", {})
+            cleanup_confirmed = (
+                cleanup.get("status") == "ok"
+                and isinstance(cleanup_results, dict)
+                and all(
+                    isinstance(cleanup_results.get(host), dict)
+                    and cleanup_results[host].get("state") == "clean"
+                    for host in hosts
+                )
+            )
+            if cleanup_confirmed:
+                await self._add_comment(
+                    ticket_id,
+                    self._kernel_cleanup_comment(cleanup, hosts, confirmed=True),
+                )
+            else:
+                uncertain_hosts = [
+                    host
+                    for host in hosts
+                    if not isinstance(cleanup_results, dict)
+                    or not isinstance(cleanup_results.get(host), dict)
+                    or cleanup_results[host].get("state") != "clean"
+                ]
+                await self._add_comment(
+                    ticket_id,
+                    self._kernel_cleanup_comment(cleanup, hosts, confirmed=False),
+                )
                 # Fail closed (review round 2): an unremoved repository
                 # is an unverified package source left behind for the
                 # next ticket on these hosts. Stop the step instead of
@@ -685,12 +1105,19 @@ class ProvisioningAgent(AgentBase):
                 # the repo or a cleanup retry succeeds.
                 await self._kernel_step_stop(
                     ticket_id,
-                    "repository cleanup failed after the kernel "
-                    "transition; the ticket repo file may remain on "
-                    f"{', '.join(hosts)}",
+                    "temporary DNF repository cleanup could not be confirmed; "
+                    "its entry may remain on "
+                    f"{', '.join(uncertain_hosts) or 'one or more hosts'}",
                     cleanup,
                 )
                 return
+        elif spec.repo_url:
+            await self._add_comment(
+                ticket_id,
+                "**Temporary repository cleanup pending**\n\n"
+                "Cleanup was not attempted at this step because later kernel "
+                "steps remain in the plan.",
+            )
 
         # Hand the result to the normal completion path: it derives the
         # verification from the checkpoint and advances the plan.
@@ -1573,7 +2000,9 @@ class ProvisioningAgent(AgentBase):
             "provisioning_complete": prov_complete,
             "harness_version": result.get("harness_version", "unknown"),
             "harness_name": harness,
-            "configuration_applied": result.get("configuration_applied", {}),
+            "configuration_applied": self._ticket_safe_kernel_configuration(
+                result.get("configuration_applied", {})
+            ),
             "k3s_installed": result.get("k3s_installed", False),
             "k3s_version": result.get("k3s_version", ""),
             "provisioning_verification": verification

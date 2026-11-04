@@ -614,6 +614,7 @@ class TestInstallOutcomes:
         )
         assert result["results"]["10.0.0.1"]["state"] == "installed"
         assert result["results"]["10.0.0.2"]["state"] == "install_failed"
+        assert result["results"]["10.0.0.2"]["reason_code"] == "package_install_failed"
         assert (
             fake_store.intent(intent["intent_id"])["progress"]["install"] == "started"
         )
@@ -648,6 +649,9 @@ class TestInstallOutcomes:
             approval_request_id=approval_id,
         )
         assert result["results"]["10.0.0.1"]["state"] == "indeterminate"
+        assert (
+            result["results"]["10.0.0.1"]["reason_code"] == "package_install_timed_out"
+        )
 
 
 class TestSelectDefaultKernel:

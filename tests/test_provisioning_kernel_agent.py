@@ -9,7 +9,8 @@ reboot tool's checkpoint.
 from __future__ import annotations
 
 import copy
-from unittest.mock import AsyncMock, MagicMock
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -140,6 +141,111 @@ class TestPresentKernelChangeForApproval:
         # The user saw the kernel, hosts and actions, not just an id.
         comment = agent._add_comment.await_args.args[1]
         assert KERNEL_B in comment and "10.0.0.2" in comment and "reboot" in comment
+        assert "no additional repository URL was requested" in comment
+        assert "may be added as an additional DNF repository" not in comment
+        assert "which signing key was used; both remain unconfirmed" in comment
+        assert "reboot each host, even if it is already running" in comment
+
+    @pytest.mark.asyncio
+    async def test_approval_redacts_repository_credentials_query_and_fragment(self):
+        agent = _make_agent()
+        ticket, intent = _ticket_with_intent()
+        intent["kernel"]["repo_url"] = (
+            "https://user:secret@repo.example.test/kernel"
+            "?token=query-secret#fragment-secret"
+        )
+        agent._get_ticket = AsyncMock(return_value=ticket)
+        approval = {
+            "approval_request_id": "apr-" + "5" * 32,
+            "kind": "kernel_change",
+            "validation_id": intent["intent_id"],
+            "status": "pending",
+        }
+        agent._client.post = AsyncMock(return_value=_response(approval, 201))
+        agent._request_human_input = AsyncMock(return_value="approve")
+        agent._client.get = AsyncMock(
+            return_value=_response({"approvals": [dict(approval, status="approved")]})
+        )
+
+        await agent._request_kernel_approval(
+            intent_id=intent["intent_id"], summary="Install and verify the kernel"
+        )
+
+        comment = agent._add_comment.await_args.args[1]
+        assert "https://repo.example.test/kernel" in comment
+        assert "secret" not in comment
+        assert "token" not in comment
+        assert "fragment" not in comment
+        assert "additional DNF repository" in comment
+        assert "approved_repositories entry" in comment
+        assert "configured GPG key and CA" in comment
+        assert "installation is refused" in comment
+        assert (
+            "other enabled repositories follow their existing host" in comment.lower()
+        )
+
+    @pytest.mark.asyncio
+    async def test_approval_shows_mixed_per_host_before_state_and_plan(self):
+        agent = _make_agent()
+        ticket, intent = _ticket_with_intent()
+        intent["actions_required"] = ["install", "select_default", "reboot"]
+        intent["inventory_before"] = {
+            HOSTS[0]: {
+                "state": "ok",
+                "inventory": {
+                    "running": "5.14.0-503.14.1.el9_5.x86_64",
+                    "default_entry": "/boot/vmlinuz-5.14.0-503.14.1.el9_5.x86_64",
+                    "installed": ["5.14.0-503.14.1.el9_5.x86_64"],
+                },
+                "requested": {"release": KERNEL_B, "state": "not_checked"},
+            },
+            HOSTS[1]: {
+                "state": "ok",
+                "inventory": {
+                    "running": KERNEL_B,
+                    "default_entry": f"/boot/vmlinuz-{KERNEL_B}",
+                    "installed": ["5.14.0-503.14.1.el9_5.x86_64", KERNEL_B],
+                },
+            },
+        }
+        agent._get_ticket = AsyncMock(return_value=ticket)
+        approval = {
+            "approval_request_id": "apr-" + "6" * 32,
+            "kind": "kernel_change",
+            "validation_id": intent["intent_id"],
+            "status": "pending",
+        }
+        agent._client.post = AsyncMock(return_value=_response(approval, 201))
+        agent._request_human_input = AsyncMock(return_value="approve")
+        agent._client.get = AsyncMock(
+            return_value=_response({"approvals": [dict(approval, status="approved")]})
+        )
+
+        await agent._request_kernel_approval(
+            intent_id=intent["intent_id"], summary="Install and verify kernel B"
+        )
+
+        comment = agent._add_comment.await_args.args[1]
+        assert approval["approval_request_id"] in comment
+        assert intent["intent_id"] in comment
+        assert "Connection targets" in comment and HOSTS[0] in comment
+        assert (
+            f"{HOSTS[0]}:** running 5.14.0-503.14.1.el9_5.x86_64; default "
+            "/boot/vmlinuz-5.14.0-503.14.1.el9_5.x86_64; target kernel absent; "
+            "availability not checked"
+        ) in comment
+        assert (
+            "Planned: attempt installation; availability not checked; set target as "
+            "default boot kernel" in comment
+        )
+        assert (
+            f"{HOSTS[1]}:** running {KERNEL_B}; default /boot/vmlinuz-{KERNEL_B}; "
+            "target kernel present"
+        ) in comment
+        assert (
+            "Planned: no installation needed; no default boot change needed" in comment
+        )
+        assert "structured approval action" in comment
 
     @pytest.mark.asyncio
     async def test_unknown_intent_is_rejected_without_posting(self):
@@ -284,6 +390,63 @@ class TestCompletionDerivesVerification:
         assert KERNEL_B in verification["details"]
         assert "LLM says so" not in verification["details"]
         agent._transition_ticket.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_completion_redacts_repo_url_from_ticket_and_workspace_summary(self):
+        ticket, _ = _ticket_with_intent("verified")
+        repo_url = (
+            "https://user:completion-secret@repo.example.test/kernel"
+            "?token=query-secret#fragment-secret"
+        )
+        ticket["custom_fields"]["execution_plan"]["steps"][2]["params"]["kernel"][
+            "repo_url"
+        ] = repo_url
+        spec = KernelSpec.parse(
+            ticket["custom_fields"]["execution_plan"]["steps"][2]["params"]["kernel"]
+        )
+        ticket["custom_fields"]["kernel_transitions"]["2"]["kernel_spec"] = (
+            spec.to_dict()
+        )
+
+        agent = _make_agent()
+        agent._get_ticket = AsyncMock(return_value=copy.deepcopy(ticket))
+        agent._plan_controls_next_transition = AsyncMock(return_value=True)
+        agent._transition_ticket = AsyncMock()
+        response = _llm_response(
+            dict(
+                COMPLETE,
+                configuration_applied={
+                    "kernel_transition": {
+                        "step_id": 2,
+                        "kernel": spec.to_dict(),
+                        "actions": ["install", "select_default", "reboot"],
+                    }
+                },
+            )
+        )
+
+        with patch("providers.workspace.manager.WorkspaceManager.save_file") as save:
+            await agent._handle_completion("PERF-TEST", response)
+
+        fields = agent._update_fields.await_args_list[0].args[1]
+        projected = fields["configuration_applied"]["kernel_transition"]["kernel"]
+        assert projected["repo_url"] == "https://repo.example.test/kernel"
+        assert "completion-secret" not in str(fields)
+        assert "query-secret" not in str(fields)
+        assert "fragment-secret" not in str(fields)
+
+        workspace_summary = json.loads(save.call_args.args[1])
+        assert (
+            workspace_summary["configuration_applied"]["kernel_transition"]["kernel"][
+                "repo_url"
+            ]
+            == "https://repo.example.test/kernel"
+        )
+        comment = agent._add_comment.await_args.args[1]
+        assert "https://repo.example.test/kernel" in comment
+        assert "completion-secret" not in comment
+        assert "query-secret" not in comment
+        assert "fragment-secret" not in comment
 
     @pytest.mark.asyncio
     async def test_unverified_checkpoint_forces_incomplete_and_pauses(self):
