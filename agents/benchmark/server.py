@@ -6649,9 +6649,18 @@ async def _append_output_dir(ticket_id: str, output_dir_path: str) -> None:
     headers = ticket_state_headers()
     async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
         r = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
-        existing_dirs: list[str] = (
-            r.json().get("custom_fields", {}).get("output_dirs") or []
-        )
+        r.raise_for_status()
+        ticket = r.json()
+        if not isinstance(ticket, dict) or not isinstance(
+            ticket.get("custom_fields"), dict
+        ):
+            raise ValueError("Ticket custom_fields must be an object")
+        existing = ticket["custom_fields"].get("output_dirs", [])
+        if existing is None:
+            existing = []
+        if not isinstance(existing, list):
+            raise ValueError("Ticket output_dirs must be a list")
+        existing_dirs = list(existing)
         if output_dir_path not in existing_dirs:
             existing_dirs.append(output_dir_path)
         patch_resp = await client.patch(
