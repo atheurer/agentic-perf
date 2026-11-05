@@ -107,10 +107,20 @@ class AnalyzeAgent(AgentBase):
             return None
         if not payload.get("conclusive"):
             return None
-        if (payload.get("root_cause") or "").strip():
+        root_cause = payload.get("root_cause")
+        if isinstance(root_cause, str) and root_cause.strip():
             return None
 
-        ticket = await self._get_ticket(ticket_id)
+        try:
+            ticket = await self._get_ticket(ticket_id)
+        except Exception:
+            # The review handoff checks again using the stored ticket.
+            logger.warning(
+                "Unable to check alert context for analysis submission on %s",
+                ticket_id,
+                exc_info=True,
+            )
+            return None
         cf = ticket.get("custom_fields", {}) if ticket else {}
         if not cf.get("anomaly_context"):
             return None

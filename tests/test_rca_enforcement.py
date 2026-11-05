@@ -11,6 +11,9 @@ Covers two enforcement points:
 
 from __future__ import annotations
 
+import asyncio
+
+import httpx
 import pytest
 
 from orchestrator.handoff import check_handoff
@@ -73,6 +76,36 @@ class TestAwaitingReviewHandoff:
         }
         ok, reason = check_handoff("awaiting_review", ticket)
         assert ok, reason
+
+    @pytest.mark.parametrize("analysis", ["legacy result", ["legacy result"], 1])
+    def test_non_alert_legacy_analysis_values_keep_passing(self, analysis: object):
+        ticket = {"custom_fields": {"analysis_result": analysis}}
+        ok, reason = check_handoff("awaiting_review", ticket)
+        assert ok, reason
+
+    @pytest.mark.parametrize("analysis", ["legacy result", ["legacy result"], 1])
+    def test_alert_malformed_analysis_is_blocked(self, analysis: object):
+        ticket = {
+            "custom_fields": {
+                "anomaly_context": {"source": "horreum"},
+                "analysis_result": analysis,
+            }
+        }
+        ok, reason = check_handoff("awaiting_review", ticket)
+        assert not ok
+        assert "invalid analysis result" in reason
+
+    @pytest.mark.parametrize("root_cause", [123, ["change"], {"change": "kernel"}])
+    def test_alert_non_string_root_cause_is_blocked(self, root_cause: object):
+        ticket = {
+            "custom_fields": {
+                "anomaly_context": {"source": "horreum"},
+                "analysis_result": {"conclusive": True, "root_cause": root_cause},
+            }
+        }
+        ok, reason = check_handoff("awaiting_review", ticket)
+        assert not ok
+        assert "root_cause" in reason
 
     # --- analysis-only path, alert-triggered ticket ---
 
@@ -304,3 +337,45 @@ class TestValidateSubmitCall:
             "PERF-TEST", _make_tool_call(conclusive=True, root_cause="")
         )
         assert result is None
+
+    @pytest.mark.parametrize("root_cause", [123, ["change"], {"change": "kernel"}])
+    async def test_alert_non_string_root_cause_is_rejected(
+        self, monkeypatch, root_cause: object
+    ):
+        agent = _make_agent()
+        self._patch_get_ticket(monkeypatch, agent, has_anomaly=True)
+        call = _make_tool_call(conclusive=True)
+        call.input["root_cause"] = root_cause
+
+        result = await agent._validate_submit_call("PERF-TEST", call)
+        assert result is not None
+        assert "root_cause" in result
+
+    @pytest.mark.parametrize("failure", ["connection", "http_status"])
+    async def test_actual_ticket_read_failure_fails_open(self, caplog, failure: str):
+        agent = _make_agent()
+        await agent._client.aclose()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if failure == "connection":
+                raise httpx.ConnectError("connection refused", request=request)
+            return httpx.Response(503, request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            agent._client = client
+            result = await agent._validate_submit_call(
+                "PERF-TEST", _make_tool_call(conclusive=True)
+            )
+
+        assert result is None
+        assert "Unable to check alert context" in caplog.text
+
+    async def test_ticket_read_cancellation_propagates(self, monkeypatch):
+        agent = _make_agent()
+
+        async def cancel(_ticket_id: str):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(agent, "_get_ticket", cancel)
+        with pytest.raises(asyncio.CancelledError):
+            await agent._validate_submit_call("PERF-TEST", _make_tool_call(True))
