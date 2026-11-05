@@ -19,7 +19,7 @@ from agents.mcp_client import AgentMCPClient
 from agents.skill_context import skill_context_prompt
 from agents.tool_ownership import selected_harness_from_ticket
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
 
 from .prompts import ANALYZE_SYSTEM_PROMPT
 
@@ -88,6 +88,51 @@ class AnalyzeAgent(AgentBase):
     ) -> list[dict[str, Any]]:
         cf = ticket.get("custom_fields", {})
         return [{"role": "user", "content": self._build_context(ticket, cf)}]
+
+    async def _validate_submit_call(
+        self,
+        ticket_id: str,
+        submit_call: ToolCall,
+    ) -> str | None:
+        """Reject conclusive results with no root_cause for alert-triggered tickets.
+
+        Alert-triggered tickets (those with anomaly_context) must identify
+        a root cause before analysis can be declared conclusive. Confirming
+        that a regression is real is not sufficient — the agent must explain
+        why it occurred, or declare inconclusive so the benchmark path can
+        gather the evidence needed to do so.
+        """
+        payload = submit_call.input
+        if not isinstance(payload, dict):
+            return None
+        if not payload.get("conclusive"):
+            return None
+        root_cause = payload.get("root_cause")
+        if isinstance(root_cause, str) and root_cause.strip():
+            return None
+
+        try:
+            ticket = await self._get_ticket(ticket_id)
+        except Exception:
+            # The review handoff checks again using the stored ticket.
+            logger.warning(
+                "Unable to check alert context for analysis submission on %s",
+                ticket_id,
+                exc_info=True,
+            )
+            return None
+        cf = ticket.get("custom_fields", {}) if ticket else {}
+        if not cf.get("anomaly_context"):
+            return None
+
+        return (
+            "REJECTED: This is an alert-triggered ticket. A conclusive result "
+            "requires root_cause to identify the causal change (e.g. kernel "
+            "version delta, build change, configuration update). Confirming "
+            "the regression is real is not sufficient. If the cause cannot be "
+            "determined from available data, set conclusive=false and populate "
+            "benchmark_needed_reason."
+        )
 
     async def _handle_completion(
         self,
