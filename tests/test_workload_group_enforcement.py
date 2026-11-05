@@ -12,6 +12,7 @@ fingerprint, and execute_benchmark rejects drift and plan mismatch.
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -305,6 +306,10 @@ def _wire_execute(monkeypatch, tmp_path, *, plan_ticket, record_run_file):
     tests/test_benchmark_idempotency.py does, with a validation record
     carrying *record_run_file*."""
 
+    # These tests use the local operation registry, even if another test or
+    # the surrounding environment configured a state-store API token.
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "")
+
     record = {
         "validation_id": "val-788",
         "attempt_id": "attempt-1",
@@ -484,6 +489,41 @@ async def test_execute_rejects_workload_drift_through_the_real_path(
     assert result["status"] == "rejected"
     assert result["reason_code"] == "workload_drift"
     assert "kernel-ab" in result["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ambient_token", [None, "synthetic-test-token"])
+async def test_execute_uses_local_registry_with_ambient_token(
+    tmp_path, monkeypatch, ambient_token
+):
+    """The real execution path remains isolated and restores the caller's token."""
+    if ambient_token is None:
+        monkeypatch.delenv("AGENTIC_PERF_API_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", ambient_token)
+    remote_attempts = []
+
+    def reject_remote_registry(*args, **kwargs):
+        remote_attempts.append(True)
+        raise AssertionError("The test must use the local operation registry")
+
+    ticket = _group_plan_ticket(
+        prior_fingerprint=_comparison_fingerprint(_run_file(30))
+    )
+    with monkeypatch.context() as isolated:
+        isolated.setattr("providers.tracing.client.TraceClient", reject_remote_registry)
+        _wire_execute(
+            isolated, tmp_path, plan_ticket=ticket, record_run_file=_run_file()
+        )
+        result = json.loads(
+            await benchmark_server.execute_benchmark(
+                "controller", validation_id="val-788", approval_request_id="apr-1"
+            )
+        )
+
+    assert result["reason_code"] == "workload_drift"
+    assert not remote_attempts
+    assert os.environ.get("AGENTIC_PERF_API_TOKEN") == ambient_token
 
 
 @pytest.mark.asyncio
