@@ -259,8 +259,26 @@ def _check_awaiting_review(ticket: dict[str, Any]) -> tuple[bool, str]:
     """
     cf = ticket.get("custom_fields", {})
 
-    # Analysis-only path: analysis_result is sufficient for review
-    if cf.get("analysis_result"):
+    # Analysis-only path: analysis_result is sufficient for review,
+    # with one exception: alert-triggered tickets (anomaly_context)
+    # require root_cause to be identified before advancing. Confirming
+    # that a regression exists is not a complete investigation — the
+    # cause must be identified or the analysis must be declared
+    # inconclusive so the benchmark path can gather more data.
+    analysis = cf.get("analysis_result")
+    if analysis:
+        if (
+            analysis.get("conclusive")
+            and cf.get("anomaly_context")
+            and not (analysis.get("root_cause") or "").strip()
+        ):
+            return (
+                False,
+                "Alert-triggered ticket has a conclusive analysis result "
+                "but no root_cause — the analyze agent must identify the "
+                "causal change or declare the analysis inconclusive so the "
+                "benchmark path can gather more data.",
+            )
         return True, ""
 
     benchmark_status = cf.get("benchmark_status")

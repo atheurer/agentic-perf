@@ -248,9 +248,57 @@ async def submit_analysis_result(
     conclusive=false if new benchmark data is needed (ticket
     advances to hardware provisioning).
 
+    For alert-triggered tickets (those with anomaly_context),
+    conclusive=true requires a non-empty root_cause identifying
+    the causal change — a build version delta, kernel update,
+    configuration change, or similar. Confirming that the
+    regression is real is not sufficient; the cause must be
+    identified. If the cause cannot be determined from available
+    data, set conclusive=false and use benchmark_needed_reason
+    to describe what measurement would resolve it.
+
     benchmark_needed_params is a JSON string of suggested
     benchmark parameters (e.g. '{"samples": 50, "duration": 60}').
     """
+    # Alert-triggered tickets require root_cause for a conclusive
+    # result. The analyze agent must identify the causal change,
+    # not just confirm the regression exists.
+    if conclusive and not root_cause:
+        ticket_id = os.environ.get("TICKET_ID", "")
+        if ticket_id:
+            try:
+                from providers.execution import AuditedAsyncHTTPClient
+
+                async with AuditedAsyncHTTPClient(timeout=10) as client:
+                    resp = await client.get(
+                        f"{_STORE_URL}/api/v1/tickets/{ticket_id}",
+                        headers=_headers(),
+                    )
+                    if resp.status_code == 200:
+                        cf = resp.json().get("custom_fields", {})
+                        if cf.get("anomaly_context"):
+                            return json.dumps(
+                                {
+                                    "error": "root_cause_required",
+                                    "message": (
+                                        "This is an alert-triggered ticket. "
+                                        "A conclusive result requires root_cause "
+                                        "to identify the causal change (e.g. kernel "
+                                        "version delta, build change, configuration "
+                                        "update). Confirming the regression is real "
+                                        "is not sufficient. If the cause cannot be "
+                                        "determined from available data, set "
+                                        "conclusive=false and populate "
+                                        "benchmark_needed_reason."
+                                    ),
+                                }
+                            )
+            except Exception:
+                # Fail open — do not block submission if the
+                # ticket fetch fails. The handoff check in the
+                # orchestrator provides the enforcement backstop.
+                pass
+
     result: dict = {
         "conclusive": conclusive,
         "finding": finding,
