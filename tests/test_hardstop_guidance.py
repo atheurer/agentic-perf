@@ -225,8 +225,12 @@ class TestHardstopGuidanceIntegration:
         """Force-closed user hard stops do not get a guidance summary."""
         from orchestrator.main import run_agent_task
 
+        started = asyncio.Event()
+        closed = False
+
         async def hanging_run(tid):
-            await asyncio.sleep(100)
+            started.set()
+            await asyncio.Event().wait()
 
         agent = MagicMock()
         agent.run = hanging_run
@@ -248,11 +252,11 @@ class TestHardstopGuidanceIntegration:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
 
-        # GET returns a closed ticket
+        # The agent starts on an open ticket; it is closed before cancellation.
         ticket_response = MagicMock()
         ticket_response.status_code = 200
-        ticket_response.json.return_value = {
-            "status": "closed",
+        ticket_response.json.side_effect = lambda: {
+            "status": "closed" if closed else "executing_benchmark",
             "comments": [],
             "custom_fields": {},
         }
@@ -260,20 +264,148 @@ class TestHardstopGuidanceIntegration:
         mock_client.patch = AsyncMock()
         mock_client.post = AsyncMock()
 
-        with patch(
-            "orchestrator.main.AuditedAsyncHTTPClient",
-            return_value=mock_client,
+        with (
+            patch("orchestrator.main.AuditedAsyncHTTPClient", return_value=mock_client),
+            patch(
+                "orchestrator.main._cleanup_closed_ticket_skill_context",
+                new_callable=AsyncMock,
+            ),
         ):
             task = asyncio.create_task(
                 run_agent_task(dispatcher, "executing_benchmark", "PERF-CLOSED")
             )
-            await asyncio.sleep(0.05)
+            await asyncio.wait_for(started.wait(), 2)
+            closed = True
             task.cancel()
             await task
 
         # No PATCH or POST should have been made
         mock_client.patch.assert_not_awaited()
         mock_client.post.assert_not_awaited()
+        dispatcher.mark_done.assert_awaited_once_with("PERF-CLOSED")
+
+    @pytest.mark.parametrize(
+        "phase", ["plan", "triage", "retry", "close", "snapshots", "release"]
+    )
+    @pytest.mark.asyncio
+    async def test_cancellation_during_completion_waits_for_claim_cleanup(self, phase):
+        """Every completion await preserves ownership through claim cleanup."""
+        from orchestrator.main import run_agent_task
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        calls = []
+
+        async def pause(name):
+            calls.append(name)
+            if phase == name:
+                entered.set()
+                await release.wait()
+
+        async def agent_run(_ticket_id):
+            return None
+
+        agent = MagicMock()
+        agent.run = agent_run
+
+        async def close():
+            await pause("close")
+
+        agent.close = AsyncMock(side_effect=close)
+
+        dispatcher = MagicMock()
+        dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
+        dispatcher.create_agent.return_value = agent
+        dispatcher.store_url = "http://store"
+        dispatcher.events = None
+        dispatcher._trace_contexts = {}
+        dispatcher._claim_ids = {"PERF-CLEANUP": "old-claim"}
+        dispatcher.is_deposed.return_value = False
+
+        async def mark_done(_ticket_id):
+            await pause("release")
+
+        dispatcher.mark_done = AsyncMock(side_effect=mark_done)
+
+        async def snapshots(*_args):
+            cleanup_started.set()
+            await pause("snapshots")
+            if phase in {"plan", "triage", "retry"}:
+                await release.wait()
+
+        async def advance(*_args, **_kwargs):
+            await pause("plan")
+
+        async def retry(*_args, **_kwargs):
+            await pause("retry")
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "status": "executing_benchmark",
+            "custom_fields": {},
+        }
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+        get_count = 0
+
+        async def get(*_args, **_kwargs):
+            nonlocal get_count
+            get_count += 1
+            if phase == "triage" and get_count == 2:
+                await pause("triage")
+            return response
+
+        client.get = AsyncMock(side_effect=get)
+        status = "triage_pending" if phase == "triage" else "executing_benchmark"
+        with (
+            patch("orchestrator.main.AuditedAsyncHTTPClient", return_value=client),
+            patch("orchestrator.main._advance_plan", side_effect=advance),
+            patch(
+                "orchestrator.main._record_dispatch_retry_outcome", side_effect=retry
+            ),
+            patch(
+                "orchestrator.main._cleanup_closed_ticket_skill_context",
+                side_effect=snapshots,
+            ),
+        ):
+            task = asyncio.create_task(
+                run_agent_task(dispatcher, status, "PERF-CLEANUP")
+            )
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            if phase in {"plan", "triage", "retry"}:
+                await asyncio.wait_for(cleanup_started.wait(), 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        dispatcher.mark_done.assert_awaited_once_with("PERF-CLEANUP")
+        if phase in {"plan", "triage"}:
+            assert "retry" not in calls
+
+    @pytest.mark.asyncio
+    async def test_snapshot_failure_still_releases_dispatch(self):
+        from orchestrator.main import _await_agent_dispatch_cleanup
+
+        dispatcher = MagicMock()
+        dispatcher._cleanup_counts = {}
+        dispatcher.mark_done = AsyncMock()
+        agent = MagicMock()
+        agent.close = AsyncMock(side_effect=RuntimeError("close failed"))
+        with patch(
+            "orchestrator.main._cleanup_closed_ticket_skill_context",
+            new_callable=AsyncMock,
+            side_effect=ValueError("snapshot failed"),
+        ):
+            with pytest.raises(ValueError, match="snapshot failed"):
+                await _await_agent_dispatch_cleanup(dispatcher, "PERF-1", agent)
+        dispatcher.mark_done.assert_awaited_once_with("PERF-1")
+        assert not dispatcher._cleanup_counts
 
     @pytest.mark.asyncio
     async def test_active_hard_stop_keeps_ticket_force_closed(self, tmp_path):
