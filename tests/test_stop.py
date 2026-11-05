@@ -398,12 +398,43 @@ class TestDispatcherStop:
             llm_provider=MagicMock(),
             skill_provider=MagicMock(),
         )
+
+        async def finished_work():
+            return None
+
+        task = asyncio.create_task(finished_work())
+        await task
         dispatcher._agents["PERF-test"] = MagicMock()
-        dispatcher._tasks["PERF-test"] = MagicMock()
+        dispatcher.set_task("PERF-test", task, "awaiting_teardown")
         dispatcher.release_claim = AsyncMock()
         await dispatcher.mark_done("PERF-test")
         assert "PERF-test" not in dispatcher._agents
         assert "PERF-test" not in dispatcher._tasks
+        assert "PERF-test" not in dispatcher._task_statuses
+
+    async def test_mark_done_retains_live_task_until_it_exits(self):
+        from orchestrator.dispatcher import Dispatcher
+
+        dispatcher = Dispatcher(
+            state_store_url="http://localhost:8090",
+            llm_provider=MagicMock(),
+            skill_provider=MagicMock(),
+        )
+        finish = asyncio.Event()
+        task = asyncio.create_task(finish.wait())
+        dispatcher.set_task("PERF-test", task, "awaiting_teardown")
+        dispatcher.release_claim = AsyncMock()
+        try:
+            await dispatcher.mark_done("PERF-test")
+            assert dispatcher.is_active("PERF-test")
+            assert dispatcher.active_tasks_for_status("awaiting_teardown") == 1
+            finish.set()
+            await task
+            assert not dispatcher.is_active("PERF-test")
+            assert "PERF-test" not in dispatcher._task_statuses
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 # ── Process Stop Requests Integration ────────────────────

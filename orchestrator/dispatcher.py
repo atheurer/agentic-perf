@@ -579,8 +579,10 @@ class Dispatcher:
         dispatch_task = self._tasks.get(ticket_id)
         if dispatch_task is not None:
             dispatch_task._agentic_perf_cleanup_complete = True
-        # Keep a still-running dispatch registered until it actually exits;
-        # active_tasks() and is_active() prune completed tasks.
+            if dispatch_task.done():
+                self._tasks.pop(ticket_id, None)
+                getattr(self, "_task_statuses", {}).pop(ticket_id, None)
+        # A still-running dispatch remains registered until it actually exits.
         # Note: introspection is NOT stopped here. It runs
         # across the full ticket lifecycle and self-stops on
         # terminal status. Stopping it on every agent handoff
