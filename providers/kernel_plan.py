@@ -171,22 +171,27 @@ def build_kernel_comparison_plan(
             "execution plan already progressed past the first benchmark step; "
             "the kernel_comparison directive must be present at submission time"
         )
-    if len(bench_indexes) > 1 or last_bench - first_bench > 0:
-        # Anything between (or beyond) a single benchmark step — extra
+    has_gap = last_bench - first_bench > len(bench_indexes) - 1
+    if len(bench_indexes) > 2 or has_gap:
+        # Anything between (or beyond) the benchmark steps — extra
         # benchmarks, intermediate provisioning/configuration steps —
         # would be silently discarded by the A/B transform. Ambiguous or
         # unsupported topologies must pause for guidance, never silently
         # select one workload (review major on #1230).
+        #
+        # Exactly two benchmarks with nothing between them IS supported:
+        # that is triage's own A/B shape (the LLM emits two benchmark
+        # steps when the description asks for a before/after comparison),
+        # and the transform below replaces them with the canonical
+        # kernel-A/bench-A/kernel-B/bench-B sequence.
         return None, (
             "the execution plan has a topology the kernel comparison "
-            "transform does not support: it expects exactly one benchmark "
-            "step with no steps between it and the preceding provision "
-            "step, but found "
+            "transform does not support: it expects one benchmark step, or "
+            "two benchmark steps with nothing between them, but found "
             + (
                 f"{len(bench_indexes)} benchmark steps"
-                if len(bench_indexes) > 1
-                else "intermediate steps between the resource/provision "
-                "steps and the benchmark step"
+                if len(bench_indexes) > 2
+                else "intermediate steps between the first and last benchmark steps"
             )
             + ". Simplify the ticket's request or remove the "
             "kernel_comparison directive."

@@ -1437,3 +1437,56 @@ class TestApprovalTransparency:
         assert "any enabled repository" in explanation
         assert "not report which repository supplied the package" in explanation
         assert "signing key was used; both remain unconfirmed" in explanation
+
+
+# ---------------------------------------------------------------------------
+# Triage-emitted A/B shape: two benchmark steps, nothing between them
+# ---------------------------------------------------------------------------
+
+
+class TestTriageEmittedABShape:
+    def test_two_benchmark_steps_transform_cleanly(self):
+        """PERF-0B8D163B regression: triage emits TWO adjacent benchmark
+        steps when the description asks for a before/after comparison. The
+        transform must accept that shape and replace both with the
+        canonical kernel/bench sequence."""
+        triage_plan = {
+            "current_step": 0,
+            "run_ids": [],
+            "steps": [
+                {"id": 0, "agent_type": "resource", "params": {}},
+                {"id": 1, "agent_type": "provision", "params": {}},
+                {"id": 2, "agent_type": "benchmark", "params": {"label": "sleep"}},
+                {
+                    "id": 3,
+                    "agent_type": "benchmark",
+                    "params": {"label": "sleep-2"},
+                },
+                {"id": 4, "agent_type": "review", "params": {}},
+                {"id": 5, "agent_type": "teardown", "params": {}},
+            ],
+        }
+        new_plan, err = build_kernel_comparison_plan(triage_plan, dict(GOOD))
+        assert err == "", err
+        labels = [s["params"].get("label") for s in new_plan["steps"]]
+        assert labels.count("kernel-A") == 1
+        assert labels.count("kernel-B") == 1
+        benches = [s for s in new_plan["steps"] if s["agent_type"] == "benchmark"]
+        assert len(benches) == 2
+        assert [s["params"]["kernel_role"] for s in benches] == [
+            "baseline",
+            "candidate",
+        ]
+        assert new_plan["steps"][0]["agent_type"] == "resource"
+        assert new_plan["steps"][1]["agent_type"] == "provision"
+        assert new_plan["steps"][-1]["agent_type"] == "teardown"
+
+    def test_two_benchmarks_with_intermediate_step_still_rejected(self):
+        plan = default_plan()
+        plan["steps"].insert(3, {"id": 3, "agent_type": "provision", "params": {}})
+        plan["steps"].insert(5, {"id": 5, "agent_type": "benchmark", "params": {}})
+        for i, s in enumerate(plan["steps"]):
+            s["id"] = i
+        _, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert err
+        assert "intermediate steps" in err
