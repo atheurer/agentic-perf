@@ -129,6 +129,11 @@ class TicketStore:
         self._trace_store = trace_store
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lease_path = self._persist_dir / "orchestrator-lease.json"
+        # In-memory lease cache: populated once from disk at startup, then kept
+        # current by _write_orchestrator_lease().  Avoids a disk read on every
+        # claim validation and lease renewal — which at 8 concurrent agents
+        # amounts to hundreds of reads per minute under the store lock.
+        self._lease_cache: OrchestratorLease | None = self._read_lease_from_disk()
         self._load_from_disk()
 
     def _lease_now(self) -> datetime:
@@ -137,7 +142,8 @@ class TicketStore:
             now = now.replace(tzinfo=timezone.utc)
         return now.astimezone(timezone.utc)
 
-    def _read_orchestrator_lease(self) -> OrchestratorLease | None:
+    def _read_lease_from_disk(self) -> OrchestratorLease | None:
+        """Read the lease from disk.  Called once at startup to populate the cache."""
         try:
             return OrchestratorLease.model_validate(
                 json.loads(self._lease_path.read_text(encoding="utf-8"))
@@ -151,7 +157,14 @@ class TicketStore:
         ):
             return None
 
+    def _read_orchestrator_lease(self) -> OrchestratorLease | None:
+        """Return the in-memory lease cache.  O(1) — no disk I/O."""
+        return self._lease_cache
+
     def _write_orchestrator_lease(self, lease: OrchestratorLease | None) -> None:
+        # Update the in-memory cache first so all subsequent reads are
+        # immediately consistent, even before the disk write completes.
+        self._lease_cache = lease
         if lease is None:
             try:
                 self._system_filesystem.unlink(self._lease_path.name)
