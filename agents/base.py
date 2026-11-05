@@ -1206,6 +1206,15 @@ class AgentBase(ABC):
                     ),
                     None,
                 )
+                if clarification_call is None:
+                    clarification_call = next(
+                        (
+                            tc
+                            for tc in response.tool_calls
+                            if tc.name == "replace_controller_host_key"
+                        ),
+                        None,
+                    )
                 submit_call = next(
                     (tc for tc in response.tool_calls if tc.name.startswith("submit_")),
                     None,
@@ -1332,14 +1341,14 @@ class AgentBase(ABC):
                 if clarification_call is not None:
                     calls_to_run = [clarification_call]
                     skipped_tool_message = (
-                        "Skipped because request_clarification takes precedence. "
-                        "Wait for the user's reply, then retry this call if needed."
+                        f"Skipped because {clarification_call.name} takes precedence. "
+                        "Wait for that tool to finish, then retry this call if needed."
                     )
                     for tc in response.tool_calls:
                         if tc.id == clarification_call.id:
                             continue
                         skipped_context = tool_contexts[tc.id]
-                        reason = "request_clarification takes precedence"
+                        reason = f"{clarification_call.name} takes precedence"
                         self._trace.record(
                             skipped_context,
                             ActionType.TOOL,

@@ -155,7 +155,12 @@ async def test_analyze_mcp_tool_merge_reuses_stable_native_tools():
 
 
 @pytest.mark.asyncio
-async def test_analyze_clarification_precedes_mixed_submit_and_tools(monkeypatch):
+@pytest.mark.parametrize(
+    "interactive_tool", ["request_clarification", "replace_controller_host_key"]
+)
+async def test_analyze_clarification_precedes_mixed_submit_and_tools(
+    monkeypatch, interactive_tool
+):
     import asyncio
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
@@ -183,6 +188,14 @@ async def test_analyze_clarification_precedes_mixed_submit_and_tools(monkeypatch
             ),
         ]
     )
+    if interactive_tool != "request_clarification":
+        agent.tools.append(
+            ToolDefinition(
+                name=interactive_tool,
+                description="Interactive tool",
+                input_schema={"type": "object"},
+            )
+        )
     ticket = {
         "id": ticket_id,
         "summary": "Context conflict test",
@@ -213,7 +226,7 @@ async def test_analyze_clarification_precedes_mixed_submit_and_tools(monkeypatch
             ),
             ToolCall(
                 id="clarify-same-turn",
-                name="request_clarification",
+                name=interactive_tool,
                 input={"question": "Which conflicting source should guide this?"},
             ),
         ],
@@ -269,6 +282,12 @@ async def test_analyze_clarification_precedes_mixed_submit_and_tools(monkeypatch
         transitions.append(status)
 
     agent._request_human_input = request_human_input
+    if interactive_tool != "request_clarification":
+
+        async def interactive_handler(question):
+            return await agent._request_human_input(ticket_id, question)
+
+        agent._tool_handlers[interactive_tool] = interactive_handler
     agent._update_fields = update_fields
     agent._add_comment = add_comment
     agent._plan_controls_next_transition = plan_controls_next_transition
@@ -309,11 +328,11 @@ async def test_analyze_clarification_precedes_mixed_submit_and_tools(monkeypatch
     ]
     results_by_call_id = {item["tool_use_id"]: item for item in result_messages}
     assert (
-        "request_clarification takes precedence"
+        f"{interactive_tool} takes precedence"
         in results_by_call_id["submit-same-turn"]["content"]
     )
     assert (
-        "request_clarification takes precedence"
+        f"{interactive_tool} takes precedence"
         in results_by_call_id["other-same-turn"]["content"]
     )
 

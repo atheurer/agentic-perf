@@ -1168,11 +1168,10 @@ async def test_ensure_existing_install_preserves_identity_warning(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_verify_annotates_changed_host_key_with_refresh_recipe(
+async def test_verify_annotates_changed_host_key_with_tool_guidance(
     mock_ssh, monkeypatch
 ):
-    """A reimage presents new host keys; the verification error must name
-    the offending known_hosts entry and the both-forms refresh recipe."""
+    """Report the target and point to tool-based handling."""
     from agents.provisioning import server
 
     monkeypatch.setattr(server, "_ssh", mock_ssh)
@@ -1197,5 +1196,6 @@ async def test_verify_annotates_changed_host_key_with_refresh_recipe(
     )
 
     assert result["verified"] is False
-    assert "ssh-keygen -R 10.6.60.88" in result["error"]
-    assert "ssh-keygen -R /root/.ssh/known_hosts" not in result["error"]
+    assert "10.6.60.88" in result["error"]
+    assert "host-key replacement tool" in result["error"]
+    assert "ssh-keygen" not in result["error"]

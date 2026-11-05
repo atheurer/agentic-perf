@@ -130,9 +130,18 @@ To target a specific board instance:
 |---|---|---|
 | `on_existing_install` | How to handle existing harness | `reinstall`, `update`, `skip`, `ask_user` (default is provider/agent choice) |
 | `user_pre_run_approval` | Require approval before benchmark | `true`, `false` |
+| `ssh_host_key_policy` | Handling of changed controller-to-endpoint host keys | `ask` (default), `replace` |
 | `host_cleanup` | Host cleanup policy | `required` (default), `skip` |
 | `firewall_policy` | Firewall handling | `flush` |
 | `skip_teardown` | Keep hosts after run | `true` |
+
+`ssh_host_key_policy: replace` authorizes the benchmark agent to replace a
+changed host key for an assigned endpoint without a separate confirmation.
+The tool trusts the key presented through the network path to that hostname;
+the ticket owner is responsible for trusting the supplied host identity. It
+records the fingerprint and changes only the affected host's record on the
+controller. With `ask`, the user confirms the presented fingerprint for each
+replacement. This policy does not update the orchestrator's host records.
 
 ### Kernel A/B Comparison
 
