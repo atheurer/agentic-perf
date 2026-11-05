@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -45,7 +46,9 @@ async def get_operation(
 ) -> dict[str, Any]:
     """Read one durable operation for service-side result reconciliation."""
     try:
-        record = request.app.state.trace_store.get_operation(operation_key)
+        record = await asyncio.to_thread(
+            request.app.state.trace_store.get_operation, operation_key
+        )
         if record is None:
             raise HTTPException(404, "operation not found")
         return {"operation": record.__dict__}
@@ -63,6 +66,75 @@ def _error(exc: Exception) -> HTTPException:
     return HTTPException(503, "trace store unavailable")
 
 
+def _dispatch_transition(
+    store: Any,
+    action: str,
+    operation_key: str,
+    principal_username: str,
+    body: FencedRequest,
+) -> dict[str, Any]:
+    """Synchronous dispatch for all transition actions.
+
+    Called via asyncio.to_thread() so SQLite writes stay off the event loop.
+    HTTPException is propagated normally by the caller.
+    """
+    if action == "renew":
+        if body.ttl_seconds is None:
+            raise HTTPException(422, "ttl_seconds is required for renew")
+        record = store.renew_operation(
+            operation_key, principal_username, body.fencing_token, body.ttl_seconds
+        )
+    elif action == "prepared":
+        record = store.mark_prepared(
+            operation_key, principal_username, body.fencing_token
+        )
+    elif action == "side-effect-started":
+        record = store.mark_side_effect_started(
+            operation_key, principal_username, body.fencing_token
+        )
+    elif action == "complete":
+        record = store.complete(
+            operation_key, principal_username, body.fencing_token, body.descriptor or {}
+        )
+    elif action == "fail":
+        record = store.fail(
+            operation_key, principal_username, body.fencing_token, body.descriptor or {}
+        )
+    elif action == "reject":
+        record = store.reject(
+            operation_key, principal_username, body.fencing_token, body.descriptor or {}
+        )
+    elif action == "indeterminate":
+        record = store.mark_indeterminate(
+            operation_key, principal_username, body.fencing_token, body.descriptor or {}
+        )
+    elif action == "reconcile":
+        if body.reconciliation_outcome not in {
+            "success",
+            "failure",
+            "rejected",
+            "indeterminate",
+        }:
+            raise HTTPException(422, "invalid reconciliation outcome")
+        record = store.reconcile(
+            operation_key,
+            principal_username,
+            body.fencing_token,
+            body.descriptor or {},
+            body.reconciliation_outcome,
+        )
+    elif action == "external-id":
+        record = store.attach_external_id(
+            operation_key,
+            principal_username,
+            body.fencing_token,
+            body.external_ids or {},
+        )
+    else:
+        raise HTTPException(404, "unknown operation action")
+    return {"operation": record.__dict__}
+
+
 @router.post("/register")
 async def register(
     body: RegisterRequest,
@@ -70,8 +142,9 @@ async def register(
     _: Annotated[Principal, Depends(_service_principal)],
 ) -> dict[str, Any]:
     try:
-        record, existed = request.app.state.trace_store.register_or_get(
-            OperationRecord(body.operation_key, body.request_hash, "registered")
+        record, existed = await asyncio.to_thread(
+            request.app.state.trace_store.register_or_get,
+            OperationRecord(body.operation_key, body.request_hash, "registered"),
         )
         return {
             "operation": record.__dict__,
@@ -93,8 +166,12 @@ async def acquire(
     principal: Annotated[Principal, Depends(_service_principal)],
 ) -> dict[str, Any]:
     try:
-        record, status = request.app.state.trace_store.acquire_operation_result(
-            body.operation_key, body.request_hash, principal.username, body.ttl_seconds
+        record, status = await asyncio.to_thread(
+            request.app.state.trace_store.acquire_operation_result,
+            body.operation_key,
+            body.request_hash,
+            principal.username,
+            body.ttl_seconds,
         )
         return {"operation": record.__dict__, "status": status}
     except (
@@ -114,75 +191,15 @@ async def transition(
     request: Request,
     principal: Annotated[Principal, Depends(_service_principal)],
 ) -> dict[str, Any]:
-    store = request.app.state.trace_store
     try:
-        if action == "renew":
-            if body.ttl_seconds is None:
-                raise HTTPException(422, "ttl_seconds is required for renew")
-            record = store.renew_operation(
-                operation_key, principal.username, body.fencing_token, body.ttl_seconds
-            )
-        elif action == "prepared":
-            record = store.mark_prepared(
-                operation_key, principal.username, body.fencing_token
-            )
-        elif action == "side-effect-started":
-            record = store.mark_side_effect_started(
-                operation_key, principal.username, body.fencing_token
-            )
-        elif action == "complete":
-            record = store.complete(
-                operation_key,
-                principal.username,
-                body.fencing_token,
-                body.descriptor or {},
-            )
-        elif action == "fail":
-            record = store.fail(
-                operation_key,
-                principal.username,
-                body.fencing_token,
-                body.descriptor or {},
-            )
-        elif action == "reject":
-            record = store.reject(
-                operation_key,
-                principal.username,
-                body.fencing_token,
-                body.descriptor or {},
-            )
-        elif action == "indeterminate":
-            record = store.mark_indeterminate(
-                operation_key,
-                principal.username,
-                body.fencing_token,
-                body.descriptor or {},
-            )
-        elif action == "reconcile":
-            if body.reconciliation_outcome not in {
-                "success",
-                "failure",
-                "rejected",
-                "indeterminate",
-            }:
-                raise HTTPException(422, "invalid reconciliation outcome")
-            record = store.reconcile(
-                operation_key,
-                principal.username,
-                body.fencing_token,
-                body.descriptor or {},
-                body.reconciliation_outcome,
-            )
-        elif action == "external-id":
-            record = store.attach_external_id(
-                operation_key,
-                principal.username,
-                body.fencing_token,
-                body.external_ids or {},
-            )
-        else:
-            raise HTTPException(404, "unknown operation action")
-        return {"operation": record.__dict__}
+        return await asyncio.to_thread(
+            _dispatch_transition,
+            request.app.state.trace_store,
+            action,
+            operation_key,
+            principal.username,
+            body,
+        )
     except HTTPException:
         raise
     except (OperationLeaseError, OperationTransitionError, TraceStoreWriteError) as exc:

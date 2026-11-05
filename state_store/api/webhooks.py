@@ -9,6 +9,7 @@ Two endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import secrets
@@ -254,13 +255,15 @@ async def receive_webhook(
     if dedup_key_value:
         custom_fields["dedup_key"] = dedup_key_value
 
-    # Create ticket
+    # Create ticket — file I/O; run in thread to keep the event loop free.
     create_req = CreateTicketRequest(
         summary=ticket_fields["summary"],
         description=ticket_fields.get("description", ""),
         custom_fields=custom_fields,
     )
-    ticket = store.create_ticket(create_req, created_by=username)
+    ticket = await asyncio.to_thread(
+        store.create_ticket, create_req, created_by=username
+    )
 
     # Emit event so the dashboard timeline shows the trigger.
     event_bus = getattr(request.app.state, "event_bus", None)
@@ -277,7 +280,8 @@ async def receive_webhook(
         )
 
     # Transition to triage_pending so the orchestrator picks it up.
-    store.transition_ticket(
+    await asyncio.to_thread(
+        store.transition_ticket,
         ticket.id,
         TransitionRequest(status=TicketStatus.TRIAGE_PENDING),
     )
