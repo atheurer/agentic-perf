@@ -59,6 +59,14 @@ agentic-perf service:
 }
 ```
 
+`email` and `password` are the **quads-self-serve** credentials: the login for
+the fully automated short-term allocation API (`/api/v3/login/` and
+`/api/v3/assignments/self`) that the resource agent reserves through. They are
+not related to the formal, council-approved QUADS allocation workflow, which
+happens outside this system; hosts from a formal assignment enter a ticket as
+user-provided `required_hosts` with a `quads` directive (see
+[ticket directives](ticket-directives.md#resource-provider)).
+
 `foreman_api_url` and `infra_location` are optional and enable in-place OS
 reprovisioning (`reprovision_resources`). They must be set together: QUADS
 gives each active assignment a Foreman account named after its cloud whose

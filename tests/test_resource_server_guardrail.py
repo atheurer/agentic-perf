@@ -1510,3 +1510,198 @@ async def test_reprovision_passes_merged_metadata_to_provider():
     assert call.kwargs["os"] == "RHEL 10.0"
     assert call.kwargs["provider_metadata"]["cloud_name"] == "cloud05"
     assert call.kwargs["provider_metadata"]["ticket"] == "5678"
+
+
+# ---------------------------------------------------------------------------
+# Tests: reprovision_resources on formal (externally allocated) assignments
+# ---------------------------------------------------------------------------
+
+
+def _formal_assignment_ticket() -> dict:
+    return {
+        "custom_fields": {
+            "resource_provider": "user_provided",
+            "required_hosts": [
+                {"host": "f14-h01-000-r650.example.com", "roles": ["target"]},
+                {"roles": ["controller"]},
+            ],
+            "directives": {
+                "quads": {"cloud": "cloud14", "ticket": "5113"},
+            },
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_reprovision_formal_assignment_uses_directive_identity():
+    import agents.resource.server as srv
+
+    mock_provider = AsyncMock()
+    mock_provider.reprovision = AsyncMock(
+        return_value={
+            "status": "success",
+            "provider": "quads",
+            "os": "RHEL 10.0",
+            "hosts": {"f14-h01-000-r650.example.com": "ok"},
+            "message": "Reprovisioned 1/1 hosts to RHEL 10.0",
+        }
+    )
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock(return_value=mock_provider)
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = _formal_assignment_ticket()
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="quads",
+            hosts=["f14-h01-000-r650.example.com"],
+            os="RHEL 10.0",
+        )
+    )
+
+    assert result["status"] == "success"
+    call = mock_provider.reprovision.await_args
+    assert call.kwargs["provider_metadata"]["cloud_name"] == "cloud14"
+    assert call.kwargs["provider_metadata"]["ticket"] == "5113"
+
+
+@pytest.mark.asyncio
+async def test_reprovision_formal_assignment_rejects_hosts_not_in_ticket():
+    import agents.resource.server as srv
+
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock()
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = _formal_assignment_ticket()
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="quads",
+            hosts=["victim.example.com"],
+            os="RHEL 10.0",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert "victim.example.com" in result["error"]
+    mock_registry.get_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprovision_directive_only_applies_to_quads():
+    import agents.resource.server as srv
+
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock()
+    srv._initialized = True
+    srv._registry = mock_registry
+    srv._ticket = _formal_assignment_ticket()
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="aws",
+            hosts=["f14-h01-000-r650.example.com"],
+            os="RHEL 10.0",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["provider_mismatch"] is True
+    mock_registry.get_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprovision_directive_requires_cloud_and_ticket():
+    import agents.resource.server as srv
+
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock()
+    srv._initialized = True
+    ticket = _formal_assignment_ticket()
+    ticket["custom_fields"]["directives"]["quads"] = {"cloud": "cloud14"}
+    srv._ticket = ticket
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="quads",
+            hosts=["f14-h01-000-r650.example.com"],
+            os="RHEL 10.0",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["provider_mismatch"] is True
+    mock_registry.get_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprovision_directive_ignores_unrelated_ticket_fields():
+    import agents.resource.server as srv
+
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock()
+    srv._initialized = True
+    # A bare Jira ticket id and cloud-ish fields at the top level must not be
+    # mistaken for a QUADS assignment identity.
+    srv._ticket = {
+        "custom_fields": {
+            "resource_provider": "user_provided",
+            "ticket": "PERF-123",
+            "cloud": "cloud99",
+            "required_hosts": [{"host": "f14-h01-000-r650.example.com"}],
+        }
+    }
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="quads",
+            hosts=["f14-h01-000-r650.example.com"],
+            os="RHEL 10.0",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["provider_mismatch"] is True
+    mock_registry.get_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprovision_directive_overrides_stale_reservation_metadata():
+    import agents.resource.server as srv
+
+    mock_provider = AsyncMock()
+    mock_provider.reprovision = AsyncMock(
+        return_value={
+            "status": "success",
+            "provider": "quads",
+            "os": "RHEL 10.0",
+            "hosts": {"f14-h01-000-r650.example.com": "ok"},
+            "message": "Reprovisioned 1/1 hosts to RHEL 10.0",
+        }
+    )
+    mock_registry = MagicMock()
+    mock_registry.get_provider = AsyncMock(return_value=mock_provider)
+    srv._initialized = True
+    srv._registry = mock_registry
+    ticket = _formal_assignment_ticket()
+    ticket["custom_fields"]["resource_provider"] = "quads"
+    ticket["custom_fields"]["resource_provider_metadata"] = {
+        "cloud_name": "cloud02",
+        "ticket": "5065",
+    }
+    srv._ticket = ticket
+
+    result = json.loads(
+        await srv.reprovision_resources(
+            provider="quads",
+            hosts=["f14-h01-000-r650.example.com"],
+            os="RHEL 10.0",
+        )
+    )
+
+    assert result["status"] == "success"
+    call = mock_provider.reprovision.await_args
+    assert call.kwargs["provider_metadata"]["cloud_name"] == "cloud14"
+    assert call.kwargs["provider_metadata"]["ticket"] == "5113"

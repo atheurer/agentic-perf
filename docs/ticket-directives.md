@@ -123,6 +123,13 @@ To target a specific board instance:
 | Directive | Description | Examples |
 |---|---|---|
 | `resource_provider` | Which provider to use; prefer top-level `custom_fields.resource_provider` | `jumpstarter`, `quads`, `aws`, `user_provided` |
+| `quads` | Identity of a formal QUADS assignment allocated outside this system, enabling in-place OS reprovisioning (`reprovision_resources`) of its hosts | `{"cloud": "cloud14", "ticket": "5113"}` |
+
+The `quads` directive is only honored for hosts the ticket itself names in
+`required_hosts` (user-provided host identities). The derived Foreman account
+is scoped to the named cloud, so a wrong cloud/ticket pair fails closed at
+authentication. Quads-self-serve reservations made by the resource agent need
+no directive — their assignment identity is recorded at reservation time.
 
 ### Harness Behavior
 

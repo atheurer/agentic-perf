@@ -1477,12 +1477,65 @@ def _reprovision_metadata() -> dict[str, Any]:
     return merged
 
 
+def _quads_assignment_directive() -> dict[str, Any] | None:
+    """Read a user-authored QUADS assignment identity from the ticket.
+
+    Formal (council-allocated) assignments never pass through this agent, so
+    there is no reservation record for them. A `quads` directive naming the
+    assignment's cloud and ticket is the user's explicit statement of that
+    identity; it is only read from quads-specific dicts, never from bare
+    custom fields, so an unrelated top-level `ticket` cannot leak in.
+    """
+    custom_fields = _ticket.get("custom_fields", {})
+    directives = custom_fields.get("directives", {})
+    if not isinstance(directives, dict):
+        directives = {}
+    for source in (custom_fields, directives):
+        for key in ("resource_selection", "quads_selection", "quads"):
+            value = source.get(key)
+            if not isinstance(value, dict):
+                continue
+            nested = value.get("quads")
+            candidate = nested if isinstance(nested, dict) else value
+            cloud = candidate.get("cloud") or candidate.get("cloud_name")
+            ticket = candidate.get("ticket")
+            if (
+                isinstance(cloud, str)
+                and cloud.strip()
+                and isinstance(ticket, (str, int))
+                and str(ticket).strip()
+            ):
+                return {
+                    "cloud_name": cloud.strip(),
+                    "ticket": str(ticket).strip(),
+                }
+    return None
+
+
+def _user_required_hostnames() -> set[str]:
+    """Host identities the user wrote into required_hosts entries."""
+    required_hosts = _ticket.get("custom_fields", {}).get("required_hosts", [])
+    hostnames: set[str] = set()
+    if isinstance(required_hosts, list):
+        for entry in required_hosts:
+            if isinstance(entry, dict):
+                host = entry.get("host")
+                if isinstance(host, str) and host.strip():
+                    hostnames.add(host.strip())
+    return hostnames
+
+
 @mcp.tool()
 async def reprovision_resources(provider: str, hosts: list[str], os: str) -> str:
-    """Reinstall already-reserved hosts with a different OS, without releasing the reservation. Only hosts this ticket reserved may be named, and the OS must come from the provider's available OS list (see check_available_resources). Blocks until the rebuild finishes and SSH access is restored — expect 20-40 minutes per call."""
+    """Reinstall already-reserved hosts with a different OS, without releasing the reservation. Hosts must come from this ticket's reservation, or — for a formal QUADS assignment made outside this system — from the ticket's required_hosts together with a user-authored `quads: {cloud, ticket}` directive naming the assignment. The OS must come from the provider's available OS list (see check_available_resources). Blocks until the rebuild finishes and SSH access is restored — expect 20-40 minutes per call."""
     await _ensure_init()
+    # A user-authored assignment directive is explicit consent to rebuild the
+    # named formal assignment's hosts, which this agent never reserved itself.
+    directive = _quads_assignment_directive() if provider == "quads" else None
     expected_provider, user_provided_only = _ticket_resource_provider()
-    if user_provided_only or (expected_provider and provider != expected_provider):
+    if directive is None and (
+        user_provided_only or (expected_provider and provider != expected_provider)
+    ):
         expected = expected_provider or "user_provided"
         return json.dumps(
             {
@@ -1494,13 +1547,16 @@ async def reprovision_resources(provider: str, hosts: list[str], os: str) -> str
                     f"but reprovision_resources was called for '{provider}'."
                 ),
                 "message": (
-                    "No host was reprovisioned. User-provided hosts and other "
-                    "providers' reservations cannot be rebuilt by this ticket."
+                    "No host was reprovisioned. Rebuilding hosts from a formal "
+                    "QUADS assignment requires a user-authored quads directive "
+                    "naming the assignment's cloud and ticket."
                 ),
             }
         )
     requested = [h for h in hosts if isinstance(h, str) and h.strip()]
     allowed = _reserved_hostnames()
+    if directive is not None:
+        allowed |= _user_required_hostnames()
     unknown = sorted(set(requested) - allowed)
     if not requested or unknown:
         return json.dumps(
@@ -1514,16 +1570,21 @@ async def reprovision_resources(provider: str, hosts: list[str], os: str) -> str
                 ),
                 "message": (
                     "No host was reprovisioned. Only hosts from this ticket's "
-                    "reservation may be rebuilt."
+                    "reservation or its required_hosts may be rebuilt."
                 ),
             }
         )
+    metadata = _reprovision_metadata()
+    if directive is not None:
+        # The directive names the assignment whose Foreman account owns the
+        # requested hosts; it outranks metadata from unrelated reservations.
+        metadata.update(directive)
     prov = await _registry.get_provider(provider)
     try:
         result = await prov.reprovision(
             hosts=requested,
             os=os,
-            provider_metadata=_reprovision_metadata(),
+            provider_metadata=metadata,
         )
     except NotImplementedError as exc:
         return json.dumps(

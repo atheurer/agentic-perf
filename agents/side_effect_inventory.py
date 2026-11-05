@@ -290,6 +290,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/resource/server.py", "get_reservation_status", "cloud_resource"),
     ("agents/resource/server.py", "list_resource_providers", "cloud_resource"),
     ("agents/resource/server.py", "parse_host_config", "cloud_resource"),
+    ("agents/resource/server.py", "_quads_assignment_directive", "cloud_resource"),
+    ("agents/resource/server.py", "_user_required_hostnames", "cloud_resource"),
     ("agents/resource/server.py", "reprovision_resources", "cloud_resource"),
     ("agents/resource/server.py", "_reprovision_metadata", "cloud_resource"),
     ("agents/resource/server.py", "_reserved_hostnames", "cloud_resource"),
@@ -2273,6 +2275,26 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/server.py:reprovision_resources",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_quads_assignment_directive",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_quads_assignment_directive",
+        "2027-12-31",
+    ),
+    (
+        "agents/resource/server.py",
+        "_user_required_hostnames",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_user_required_hostnames",
         "2027-12-31",
     ),
     ("agents/resource/server.py", "_reprovision_metadata", "cloud_resource"): (
