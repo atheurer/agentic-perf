@@ -7,7 +7,10 @@ import pytest
 
 from providers.foreman import ForemanError
 from providers.foreman_config import foreman_credentials, resolve_foreman_config
-from providers.resource.quads_foreman import verify_quads_ownership
+from providers.resource.quads_foreman import (
+    quads_assignment_directive,
+    verify_quads_ownership,
+)
 
 
 def site_config():
@@ -96,6 +99,45 @@ async def test_verify_ownership_rejects_inactive_or_wrong_cloud():
     client.get_foreman_assignment_identity.return_value["active"] = False
     with pytest.raises(ForemanError, match="not active"):
         await verify_quads_ownership(client, metadata, ["host.example"])
+
+
+async def test_verify_ownership_formal_assignment_checks_hosts_without_local_id():
+    client = MagicMock()
+    client.get_foreman_assignment_identity = AsyncMock()
+    client.get_host_cloud = AsyncMock(return_value="cloud14")
+
+    await verify_quads_ownership(
+        client,
+        {"cloud_name": "cloud14", "ticket": "5113"},
+        ["host.example"],
+        require_active_assignment=False,
+    )
+
+    client.get_foreman_assignment_identity.assert_not_awaited()
+    client.get_host_cloud.assert_awaited_once_with("host.example")
+
+
+def test_quads_assignment_directive_reads_only_quads_dictionaries():
+    assert quads_assignment_directive({"ticket": "PERF-1", "cloud": "cloud99"}) is None
+    assert (
+        quads_assignment_directive(
+            {
+                "quads_selection": {
+                    "os": "RHEL 10.0",
+                    "hostnames": ["host.example"],
+                }
+            }
+        )
+        is None
+    )
+    assert quads_assignment_directive(
+        {"directives": {"quads": {"cloud": "cloud14", "ticket": "5113"}}}
+    ) == {"cloud_name": "cloud14", "ticket": "5113"}
+    assert quads_assignment_directive(
+        {"quads_selection": {"quads": {"cloud": "cloud14", "ticket": 5113}}}
+    ) == {"cloud_name": "cloud14", "ticket": "5113"}
+    with pytest.raises(ForemanError, match="requires cloud and ticket"):
+        quads_assignment_directive({"directives": {"quads": {"cloud": "cloud14"}}})
 
 
 async def test_real_gateway_path_and_conflict(tmp_path):

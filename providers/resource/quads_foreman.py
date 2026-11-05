@@ -6,6 +6,67 @@ from typing import Any
 
 from providers.foreman import ForemanError
 
+_QUADS_DIRECTIVE_CONTAINERS = ("quads_selection",)
+
+
+def quads_assignment_directive(custom_fields: Any) -> dict[str, str] | None:
+    """Read a user-authored formal QUADS assignment identity.
+
+    Formal (council-allocated) assignments never pass through this system, so
+    there is no reservation metadata for them. Read the directive only from
+    QUADS-specific dictionaries; an unrelated top-level ``ticket`` or ``cloud``
+    field must never become a Foreman credential.
+    """
+    if not isinstance(custom_fields, dict):
+        return None
+    candidates: list[tuple[Any, bool]] = []
+    directives = custom_fields.get("directives")
+    if isinstance(directives, dict):
+        candidates.append((directives.get("quads"), True))
+        for key in _QUADS_DIRECTIVE_CONTAINERS:
+            candidates.append((directives.get(key), False))
+    for key in _QUADS_DIRECTIVE_CONTAINERS:
+        candidates.append((custom_fields.get(key), False))
+    resolved: dict[str, str] | None = None
+    for value, explicit in candidates:
+        if not isinstance(value, dict):
+            continue
+        nested = value.get("quads")
+        if isinstance(nested, dict):
+            candidate = nested
+            explicit = True
+        else:
+            candidate = value
+        cloud = candidate.get("cloud") or candidate.get("cloud_name")
+        ticket = candidate.get("ticket")
+        if cloud is None and ticket is None:
+            # quads_selection also carries normal reservation data such as
+            # os/hostnames; only an explicit quads directive or a candidate
+            # that already names part of an identity is treated as formal.
+            if explicit:
+                raise ForemanError(
+                    "configuration",
+                    "QUADS assignment directive requires cloud and ticket",
+                )
+            continue
+        if (
+            not isinstance(cloud, str)
+            or not cloud.strip()
+            or not isinstance(ticket, (str, int))
+            or isinstance(ticket, bool)
+            or not str(ticket).strip()
+        ):
+            raise ForemanError(
+                "configuration", "QUADS assignment directive requires cloud and ticket"
+            )
+        identity = {"cloud_name": cloud.strip(), "ticket": str(ticket).strip()}
+        if resolved is not None and resolved != identity:
+            raise ForemanError(
+                "configuration", "QUADS assignment directive is ambiguous"
+            )
+        resolved = identity
+    return resolved
+
 
 def derive_quads_credentials(
     auth: dict[str, Any], metadata: dict[str, Any]
@@ -26,16 +87,23 @@ def derive_quads_credentials(
 
 
 async def verify_quads_ownership(
-    client: Any, metadata: dict[str, Any], hostnames: list[str]
+    client: Any,
+    metadata: dict[str, Any],
+    hostnames: list[str],
+    *,
+    require_active_assignment: bool = True,
 ) -> None:
-    """Check current assignment identity and every host's current cloud."""
+    """Check assignment identity and every host's current cloud.
+
+    Formal assignments have no local assignment id, so callers with a
+    user-authored directive can require only the cloud/ticket and each host's
+    current cloud. The default keeps the self-serve active-assignment check.
+    """
     assignment = metadata.get("assignment_id")
     cloud = metadata.get("cloud_name")
     ticket = metadata.get("ticket")
     if (
-        isinstance(assignment, bool)
-        or not str(assignment or "").isdigit()
-        or not isinstance(cloud, str)
+        not isinstance(cloud, str)
         or not cloud
         or not isinstance(ticket, str)
         or not ticket
@@ -44,16 +112,19 @@ async def verify_quads_ownership(
     ):
         raise ForemanError("host", "QUADS allocation identity is incomplete")
     try:
-        status = await client.get_foreman_assignment_identity(int(assignment))
-        if (
-            status.get("active") is not True
-            or status.get("validated") is not True
-            or status.get("cloud") != cloud
-            or str(status.get("ticket") or "") != ticket
-        ):
-            raise ForemanError(
-                "host", "QUADS assignment is not active or does not match"
-            )
+        if require_active_assignment:
+            if isinstance(assignment, bool) or not str(assignment or "").isdigit():
+                raise ForemanError("host", "QUADS allocation identity is incomplete")
+            status = await client.get_foreman_assignment_identity(int(assignment))
+            if (
+                status.get("active") is not True
+                or status.get("validated") is not True
+                or status.get("cloud") != cloud
+                or str(status.get("ticket") or "") != ticket
+            ):
+                raise ForemanError(
+                    "host", "QUADS assignment is not active or does not match"
+                )
         for host in hostnames:
             if await client.get_host_cloud(host) != cloud:
                 raise ForemanError("host", "Host is not in the active QUADS assignment")

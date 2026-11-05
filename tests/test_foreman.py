@@ -161,6 +161,54 @@ async def test_implicit_install_options_must_be_unique():
         await client.close()
 
 
+async def test_os_title_matching_ignores_case_and_whitespace():
+    def handler(request):
+        if request.url.path.endswith("/operatingsystems"):
+            return httpx.Response(
+                200, json={"total": 1, "results": [{"id": 17, "title": "RHEL 10.0"}]}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "architectures": [{"id": 2}],
+                "media": [{"id": 3}],
+                "ptables": [{"id": 4}],
+            },
+        )
+
+    client = client_for(handler)
+    try:
+        options = await client.resolve_install_options(
+            {"architecture_id": 2}, "rhel  10.0"
+        )
+        assert options["operatingsystem_id"] == 17
+    finally:
+        await client.close()
+
+
+async def test_os_title_matching_requires_exactly_one_match():
+    def handler(request):
+        if request.url.path.endswith("/operatingsystems"):
+            return httpx.Response(
+                200,
+                json={
+                    "total": 2,
+                    "results": [
+                        {"id": 17, "title": "RHEL 10.0"},
+                        {"id": 18, "title": "rhel   10.0"},
+                    ],
+                },
+            )
+        raise AssertionError("ambiguous OS must not be resolved")
+
+    client = client_for(handler)
+    try:
+        with pytest.raises(ForemanError, match="missing or ambiguous"):
+            await client.resolve_install_options({"architecture_id": 2}, "RHEL 10.0")
+    finally:
+        await client.close()
+
+
 def test_tls_uses_configured_ca_bundle(monkeypatch):
     from unittest.mock import MagicMock
 

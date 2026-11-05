@@ -76,9 +76,15 @@ unknown; a successful empty list is distinct. This catalog is useful for plannin
 initial reservations, but is not proof of Foreman compatibility for an allocated
 host. Foreman reinstall intent is separate from the QUADS reservation OS.
 Selective roles across multiple hosts are not supported until a verified
-role-to-host mapping is available; such requests fail closed. Destructive
-Foreman operations for non-QUADS hosts are not yet supported because their
-authorization contract is not implemented, although the client is reusable.
+role-to-host mapping is available; such requests fail closed. Formal
+(council-allocated) QUADS assignments can be rebuilt through a user-authored
+`quads` directive naming the assignment's cloud and ticket. That path is
+limited to hosts named in `required_hosts` and to `quads` or `user_provided`
+tickets; the directive identity outranks stale reservation metadata. Because a
+formal assignment has no local assignment ID, ownership is verified by
+confirming each target host's current QUADS cloud before every destructive
+step. Other non-QUADS hosts remain unsupported because their authorization
+contract is not implemented, although the client is reusable.
 
 In multi-user mode, checkpoint updates require service authentication and an
 active platform dispatch claim. Legacy deployments use a shared service token:

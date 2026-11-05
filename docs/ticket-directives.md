@@ -81,6 +81,25 @@ limits the reinstall to the named host roles; omit it when the request applies
 to all allocated hosts. Actual installability is checked against the selected
 Foreman deployment and target host.
 
+### Formal QUADS Assignment Identity
+
+When the user supplies existing hosts from a council-allocated QUADS
+assignment, record the assignment identity as a `quads` directive:
+
+```json
+{
+  "quads": {"cloud": "cloud14", "ticket": "5113"}
+}
+```
+
+Both values must be copied verbatim from the allocation. The directive is
+honored only for `resource_provider: quads` and `resource_provider:
+user_provided` tickets, only for hosts named in `required_hosts`, and only as
+part of a `platform_reinstall` request. It is read solely from QUADS-specific
+dictionaries; unrelated top-level `ticket` or `cloud` fields are ignored. The
+directive overrides stale reservation metadata so the derived Foreman account
+and ownership checks use the formal assignment's cloud and ticket.
+
 ### Benchmark
 
 | Directive | Description | Examples |

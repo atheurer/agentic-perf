@@ -135,7 +135,13 @@ class ForemanClient:
     ) -> dict[str, int]:
         """Revalidate the exact OS and select only unambiguous options."""
         catalog = await self.list_operating_systems()
-        matches = [entry for entry in catalog if entry.get("title") == os_name]
+        wanted = self._normalize_os_title(os_name)
+        matches = [
+            entry
+            for entry in catalog
+            if isinstance(entry.get("title"), str)
+            and self._normalize_os_title(entry["title"]) == wanted
+        ]
         if len(matches) != 1 or type(matches[0].get("id")) is not int:
             raise ForemanError("os", "Requested OS is missing or ambiguous in Foreman")
         os_id = matches[0]["id"]
@@ -181,6 +187,11 @@ class ForemanClient:
                 )
             selected[field] = chosen
         return selected
+
+    @staticmethod
+    def _normalize_os_title(value: str) -> str:
+        """Match Foreman titles without case or insignificant whitespace."""
+        return " ".join(value.split()).casefold()
 
     async def set_build(self, host_id: int, options: dict[str, int]) -> None:
         """Initiate installation once the caller has durably recorded intent.

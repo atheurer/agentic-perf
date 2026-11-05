@@ -12,13 +12,18 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/resource/quads.py", "without_os", "cloud_resource"),
     ("agents/platform/agent.py", "_handle_completion", "mcp"),
     ("agents/platform/foreman_workflow.py", "_monitor_host", "ssh"),
+    ("agents/platform/foreman_workflow.py", "_prepare_host", "ssh"),
     ("agents/platform/foreman_workflow.py", "_save_state", "mutating_http_state"),
-    ("agents/platform/foreman_workflow.py", "provision_foreman", "ssh"),
     ("agents/resource/server.py", "discover_quads_os_catalog", "cloud_resource"),
     ("providers/resource/quads.py", "discover_os_catalog", "cloud_resource"),
     ("agents/resource/server.py", "_quads_reserve_without_os", "cloud_resource"),
     ("agents/resource/server.py", "_without_reservation_os", "cloud_resource"),
     ("providers/foreman.py", "set_build", "mutating_http_state"),
+    (
+        "providers/resource/quads_foreman.py",
+        "quads_assignment_directive",
+        "cloud_resource",
+    ),
     (
         "providers/resource/quads_foreman.py",
         "derive_quads_credentials",
@@ -929,16 +934,16 @@ INVENTORY_DISPOSITIONS = {
         "agents/platform/foreman_workflow.py:_monitor_host",
         "2027-12-31",
     ),
+    ("agents/platform/foreman_workflow.py", "_prepare_host", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/foreman_workflow.py:_prepare_host",
+        "2027-12-31",
+    ),
     ("agents/platform/foreman_workflow.py", "_save_state", "mutating_http_state"): (
         "audited",
         "observability-maintainers",
         "agents/platform/foreman_workflow.py:_save_state",
-        "2027-12-31",
-    ),
-    ("agents/platform/foreman_workflow.py", "provision_foreman", "ssh"): (
-        "audited",
-        "observability-maintainers",
-        "agents/platform/foreman_workflow.py:provision_foreman",
         "2027-12-31",
     ),
     ("agents/resource/server.py", "discover_quads_os_catalog", "cloud_resource"): (
@@ -969,6 +974,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/foreman.py:set_build",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/quads_foreman.py",
+        "quads_assignment_directive",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads_foreman.py:quads_assignment_directive",
         "2027-12-31",
     ),
     (

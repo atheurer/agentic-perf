@@ -570,6 +570,33 @@ _LOCAL_TOOLS = [
                             },
                             "required": ["provider", "os"],
                         },
+                        "quads": {
+                            "type": "object",
+                            "description": (
+                                "Only when the user states that the named "
+                                "existing hosts belong to a formal QUADS "
+                                "assignment allocated outside this system."
+                            ),
+                            "properties": {
+                                "cloud": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": (
+                                        "QUADS cloud name from the assignment, "
+                                        "copied verbatim."
+                                    ),
+                                },
+                                "ticket": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": (
+                                        "QUADS assignment ticket from the "
+                                        "allocation, copied verbatim."
+                                    ),
+                                },
+                            },
+                            "required": ["cloud", "ticket"],
+                        },
                         "on_existing_install": {
                             "type": "string",
                             "enum": [

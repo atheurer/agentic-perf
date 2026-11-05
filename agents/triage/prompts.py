@@ -57,6 +57,13 @@ Your job is to analyze a performance test request ticket and:
    only when the user explicitly asks to omit the reservation OS. An OS explicitly
    requested for the initial reservation remains a separate requirement.
 
+   Formal QUADS assignments are allocated outside this system. When the user
+   names existing hosts from such an assignment and supplies its assignment
+   ticket and cloud, set directives.quads = {"cloud": "<cloud>", "ticket":
+   "<ticket>"} with both values copied verbatim, and keep those hosts in
+   required_hosts with their exact `host` identities. Never infer a cloud or
+   ticket from an Agentic Perf ticket id or any other unrelated field.
+
    **Existing hosts:** When the user names specific existing hosts (FQDNs or
    IP addresses), set the `host` field on the corresponding required_hosts
    entry to the EXACT string the user provided — character-for-character,

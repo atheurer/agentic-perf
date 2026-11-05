@@ -40,6 +40,7 @@ _CORE_DIRECTIVES: set[str] = {
     "endpoint_type",
     "exclude_hosts",
     "platform_reinstall",
+    "quads",
     # Image
     "image_version",
     "image_name",
@@ -79,6 +80,10 @@ _CORE_DESCRIPTIONS: dict[str, str] = {
     "platform_reinstall": (
         "Explicit platform OS reinstall: object with provider, os, optional "
         "roles, and optional reserve_without_os"
+    ),
+    "quads": (
+        "Formal QUADS assignment identity: object with cloud and ticket for "
+        "user-provided hosts allocated outside this system"
     ),
     "endpoint_type": "Host connection type (default: 'remotehosts')",
     "image_version": "OS image version (e.g. 'AutoSD-10', 'RHIVOS-2')",

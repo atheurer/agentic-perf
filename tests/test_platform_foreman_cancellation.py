@@ -24,11 +24,15 @@ async def test_cancellation_during_build_preserves_unknown_and_does_not_resend(
 
     client.set_build = cancel_after_send
     with pytest.raises(asyncio.CancelledError):
-        await workflow.provision_foreman(ticket, ssh, timeout=1, interval=0)
+        await workflow.provision_foreman(
+            ticket, ssh, build_timeout=1, ssh_timeout=1, interval=0
+        )
     assert snapshots[-1]["hosts"]["node.example"]["phase"] == "build_unknown"
     assert client.set_calls == 1
     client.set_build = original
-    result = await workflow.provision_foreman(ticket, ssh, timeout=1, interval=0)
+    result = await workflow.provision_foreman(
+        ticket, ssh, build_timeout=1, ssh_timeout=1, interval=0
+    )
     assert result["success"] is True
     assert client.set_calls == 1
     assert reboots == ["node.example"]
@@ -42,17 +46,21 @@ async def test_cancellation_during_reboot_preserves_unknown_and_does_not_resend(
 
     async def cancel_after_send(host, command, **kwargs):
         result = await original(host, command, **kwargs)
-        if command == "systemctl reboot":
+        if command == workflow.build_reboot_command():
             raise asyncio.CancelledError
         return result
 
     ssh.run = cancel_after_send
     with pytest.raises(asyncio.CancelledError):
-        await workflow.provision_foreman(ticket, ssh, timeout=1, interval=0)
+        await workflow.provision_foreman(
+            ticket, ssh, build_timeout=1, ssh_timeout=1, interval=0
+        )
     assert snapshots[-1]["hosts"]["node.example"]["phase"] == "reboot_unknown"
     assert reboots == ["node.example"]
     ssh.run = original
-    result = await workflow.provision_foreman(ticket, ssh, timeout=1, interval=0)
+    result = await workflow.provision_foreman(
+        ticket, ssh, build_timeout=1, ssh_timeout=1, interval=0
+    )
     assert result["success"] is True
     assert client.set_calls == 1
     assert reboots == ["node.example"]
