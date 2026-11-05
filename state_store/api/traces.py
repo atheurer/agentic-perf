@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 from typing import Annotated, Literal
@@ -540,7 +541,10 @@ async def ingest(
     request: Request,
     principal: Annotated[Principal, Depends(_service_principal)],
 ) -> dict[str, object]:
-    stored, duplicate = _insert(request, event, principal)
+    # _insert() calls SQLite synchronously; run it in a thread so the event
+    # loop remains free to serve health probes and claim renewals while the
+    # write completes.  Exceptions (HTTPException) propagate normally.
+    stored, duplicate = await asyncio.to_thread(_insert, request, event, principal)
     return {
         "event": stored.model_dump(mode="json"),
         "status": "duplicate" if duplicate else "stored",
@@ -557,7 +561,9 @@ async def ingest_batch(
     acknowledgements: list[dict[str, object]] = []
     for event in batch.events:
         try:
-            stored, duplicate = _insert(request, event, principal)
+            stored, duplicate = await asyncio.to_thread(
+                _insert, request, event, principal
+            )
             acknowledgements.append(
                 {
                     "event_id": str(event.event_id),
