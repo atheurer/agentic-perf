@@ -297,3 +297,44 @@ class TestSynthesisReinvestigation:
         tool_calls = [c[0][0] for c in mock_mcp.call_tool.call_args_list]
         assert "create_investigation_record" in tool_calls
         assert "update_investigation_record" not in tool_calls
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_create_when_update_returns_not_found(self):
+        """Synthesis falls back to create_investigation_record when
+        update_investigation_record returns {"status": "not_found"}."""
+        agent = self._make_agent(
+            {
+                "anomaly_context": {
+                    "subsystem": "network",
+                    "metric": "latency",
+                    "direction": "degrading",
+                },
+                "evaluation_result": {
+                    "convergence_gate": "isolation",
+                },
+                "dedup_result": {
+                    "matched_investigation_id": "RCA-GONE",
+                },
+                "investigation_ledger": [],
+                "execution_plan": {"steps": []},
+            }
+        )
+
+        call_count = 0
+
+        async def _side_effect(tool_name, args):
+            nonlocal call_count
+            call_count += 1
+            if tool_name == "update_investigation_record":
+                return '{"status": "not_found", "message": "Record not found"}'
+            return '{"status": "created", "investigation_id": "RCA-NEW"}'
+
+        mock_mcp = AsyncMock()
+        mock_mcp.call_tool = AsyncMock(side_effect=_side_effect)
+        agent._mcp = mock_mcp
+
+        await agent._handle_completion("PERF-REINV", self._make_response())
+
+        tool_calls = [c[0][0] for c in mock_mcp.call_tool.call_args_list]
+        assert "update_investigation_record" in tool_calls
+        assert "create_investigation_record" in tool_calls

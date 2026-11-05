@@ -151,7 +151,7 @@ def _find_dedup(
         cf = ticket.custom_fields
         if cf.get("trigger_source") != trigger_source:
             continue
-        if cf.get("dedup_key") == dedup_key_value:
+        if cf.get("webhook_dedup_key") == dedup_key_value:
             return ticket.id
     return None
 
@@ -186,7 +186,7 @@ def _dedup_or_create_ticket(
                     "duplicate_suppressed",
                     {
                         "source": source,
-                        "dedup_key": dedup_key_value,
+                        "webhook_dedup_key": dedup_key_value,
                         "submitted_by": username,
                     },
                 )
@@ -201,7 +201,7 @@ def _dedup_or_create_ticket(
                 {
                     "source": source,
                     "created_by": username,
-                    "dedup_key": dedup_key_value,
+                    "webhook_dedup_key": dedup_key_value,
                 },
             )
         store.transition_ticket(
@@ -286,7 +286,7 @@ async def receive_webhook(
     # Inject dedup key into custom_fields
     custom_fields = ticket_fields.get("custom_fields", {})
     if dedup_key_value:
-        custom_fields["dedup_key"] = dedup_key_value
+        custom_fields["webhook_dedup_key"] = dedup_key_value
 
     create_req = CreateTicketRequest(
         summary=ticket_fields["summary"],
@@ -313,7 +313,7 @@ async def receive_webhook(
         return {
             "status": "duplicate",
             "ticket_id": existing_id,
-            "dedup_key": dedup_key_value,
+            "webhook_dedup_key": dedup_key_value,
         }
 
     assert ticket is not None

@@ -244,12 +244,12 @@ class SynthesisAgent(AgentBase):
         metrics = self._collect_operational_metrics(ticket_id, cf)
 
         # Create the Investigation Record via MCP.
-        # Use dedup_key (set by enrichment) for metric/platform
-        # so future alerts with the same dedup_key match this
+        # Use investigation_dedup (set by enrichment) for metric/platform
+        # so future alerts with the same investigation_dedup match this
         # record deterministically. Fall back to anomaly_context
-        # fields if dedup_key is not set.
+        # fields if investigation_dedup is not set.
         anomaly = cf.get("anomaly_context", {})
-        dedup_key = cf.get("dedup_key", {})
+        dedup_key = cf.get("investigation_dedup", {})
         rc = metrics.get("resource_consumption", {})
         record_created = False
 
@@ -282,6 +282,17 @@ class SynthesisAgent(AgentBase):
                         "change_summary": change_summary,
                     },
                 )
+                # MCP tools return errors as JSON, not exceptions
+                import json as _json
+
+                parsed = (
+                    _json.loads(record_result) if isinstance(record_result, str) else {}
+                )
+                if parsed.get("status") not in ("updated",):
+                    raise RuntimeError(
+                        f"update_investigation_record failed: "
+                        f"{parsed.get('message', parsed.get('status', 'unknown'))}"
+                    )
                 record_created = True
                 logger.info(
                     "[synthesis-agent] Investigation Record updated: %s",

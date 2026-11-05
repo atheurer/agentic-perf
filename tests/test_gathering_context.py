@@ -385,6 +385,9 @@ class TestHandleCompletion:
             get=AsyncMock(
                 return_value=SimpleNamespace(
                     record_url="https://horreum.example.com/run/101",
+                    operational_metrics=SimpleNamespace(
+                        convergence_outcome="ISOLATION",
+                    ),
                 )
             )
         )
@@ -435,7 +438,14 @@ class TestHandleCompletion:
             stop_reason="tool_use",
         )
         provider = SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(record_url=""))
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    record_url="",
+                    operational_metrics=SimpleNamespace(
+                        convergence_outcome="ISOLATION",
+                    ),
+                )
+            )
         )
 
         with patch(
@@ -677,12 +687,12 @@ class TestDeterministicDedup:
             },
         }
         # dedup_key not present → should return False
-        dedup_key = ticket["custom_fields"].get("dedup_key", {})
+        dedup_key = ticket["custom_fields"].get("investigation_dedup", {})
         assert not dedup_key.get("metric")
         assert not dedup_key.get("platform")
 
-    def test_dedup_key_set_by_enrichment(self):
-        """Verify dedup_key structure matches what enrichment sets."""
+    def test_investigation_dedup_set_by_enrichment(self):
+        """Verify investigation_dedup structure matches what enrichment sets."""
         dedup_key = {
             "metric": "CoV - BOOT2 - Kernel Duration",
             "platform": "qc8775",
@@ -745,7 +755,7 @@ class TestDedupTemporalDecay:
     def _make_ticket(self):
         return {
             "custom_fields": {
-                "dedup_key": {
+                "investigation_dedup": {
                     "metric": "CoV - BOOT2 - Kernel Duration",
                     "platform": "qc8775",
                 },
@@ -1003,7 +1013,7 @@ class TestDedupInconclusiveOutcome:
     def _make_ticket(self):
         return {
             "custom_fields": {
-                "dedup_key": {
+                "investigation_dedup": {
                     "metric": "test-metric",
                     "platform": "test-platform",
                 },
@@ -1218,3 +1228,219 @@ class TestDedupInconclusiveOutcome:
             if dedup_result:
                 assert dedup_result["decision"] == "MATCH_FOUND"
                 assert dedup_result["matched_investigation_id"] == "RCA-INCONC"
+
+
+class TestLLMInconclusiveOutcomeCheck:
+    """P2: LLM MATCH_FOUND on an inconclusive record without dedup_advisory
+    should trigger reinvestigation."""
+
+    @pytest.mark.asyncio
+    async def test_llm_match_inconclusive_triggers_reinvestigation(self):
+        """When the LLM matches an inconclusive record and no
+        dedup_advisory is set, the agent should reinvestigate."""
+        from unittest.mock import AsyncMock, patch
+
+        from agents.gathering_context.agent import GatheringContextAgent
+        from providers.investigation.models import (
+            AnomalyContext,
+            InvestigationRecord,
+            OperationalMetrics,
+        )
+        from providers.llm.base import LLMResponse, ToolCall
+        from providers.llm.mock import MockLLMProvider
+
+        agent = GatheringContextAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._client = AsyncMock()
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
+        # No dedup_advisory — deterministic dedup did not run
+        agent._get_ticket = AsyncMock(return_value={"custom_fields": {}})
+
+        # Mock the record provider to return an inconclusive record
+        inconclusive_record = InvestigationRecord(
+            anomaly_context=AnomalyContext(subsystem="cpu", metric="throughput"),
+            operational_metrics=OperationalMetrics(
+                convergence_outcome="inconclusive",
+            ),
+        )
+        inconclusive_record.record_url = ""
+
+        mock_provider = AsyncMock()
+        mock_provider.get = AsyncMock(return_value=inconclusive_record)
+
+        with (
+            patch(
+                "agents.gathering_context.agent.create_record_provider",
+                return_value=mock_provider,
+                create=True,
+            ),
+            patch(
+                "providers.investigation.registry.create_record_provider",
+                return_value=mock_provider,
+            ),
+        ):
+            response = LLMResponse(
+                text=None,
+                tool_calls=[
+                    ToolCall(
+                        id="tc_1",
+                        name="submit_gathering_context_result",
+                        input={
+                            "decision": "MATCH_FOUND",
+                            "matched_investigation_id": "RCA-INCONC-LLM",
+                            "match_confidence": 0.9,
+                            "match_rationale": "Same anomaly",
+                        },
+                    ),
+                ],
+            )
+            await agent._handle_completion("PERF-LLM-INCONC", response)
+
+        # Should transition to analyzing (reinvestigation), not
+        # retrospective_pending
+        transitioned_to_analyzing = False
+        for call in agent._client.post.call_args_list:
+            url = call.args[0] if call.args else ""
+            if "transition" in str(url):
+                body = call.kwargs.get("json", {})
+                if body.get("status") == "analyzing":
+                    transitioned_to_analyzing = True
+                assert body.get("status") != "retrospective_pending"
+
+        assert transitioned_to_analyzing, (
+            "Should transition to analyzing for inconclusive match"
+        )
+
+
+class TestStateLeak:
+    """P3: Clean up REINVESTIGATING entry when LLM matches a different
+    record than deterministic dedup."""
+
+    @pytest.mark.asyncio
+    async def test_cleanup_when_llm_matches_different_record(self):
+        """When deterministic dedup matched Record A (inconclusive) but
+        LLM matches Record B (conclusive), the REINVESTIGATING entry
+        on Record A should be cleaned up."""
+        from unittest.mock import AsyncMock, patch
+
+        from agents.gathering_context.agent import GatheringContextAgent
+        from providers.investigation.models import (
+            AnomalyContext,
+            InvestigationRecord,
+            OperationalMetrics,
+        )
+        from providers.llm.base import LLMResponse, ToolCall
+        from providers.llm.mock import MockLLMProvider
+
+        agent = GatheringContextAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._client = AsyncMock()
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
+        # Deterministic dedup matched Record A
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "custom_fields": {
+                    "dedup_advisory": {
+                        "matched_investigation_id": "RCA-A",
+                        "prior_outcome": "inconclusive",
+                    },
+                },
+            }
+        )
+
+        # LLM matches Record B (conclusive)
+        conclusive_record = InvestigationRecord(
+            anomaly_context=AnomalyContext(subsystem="cpu", metric="throughput"),
+            operational_metrics=OperationalMetrics(
+                convergence_outcome="ISOLATION",
+            ),
+        )
+        conclusive_record.record_url = "http://example.com/RCA-B"
+
+        mock_provider = AsyncMock()
+        mock_provider.get = AsyncMock(return_value=conclusive_record)
+        mock_provider.append_build_history = AsyncMock()
+
+        with (
+            patch(
+                "agents.gathering_context.agent.create_record_provider",
+                return_value=mock_provider,
+                create=True,
+            ),
+            patch(
+                "providers.investigation.registry.create_record_provider",
+                return_value=mock_provider,
+            ),
+        ):
+            response = LLMResponse(
+                text=None,
+                tool_calls=[
+                    ToolCall(
+                        id="tc_1",
+                        name="submit_gathering_context_result",
+                        input={
+                            "decision": "MATCH_FOUND",
+                            "matched_investigation_id": "RCA-B",
+                            "match_confidence": 0.95,
+                            "match_rationale": "Same anomaly",
+                        },
+                    ),
+                ],
+            )
+            await agent._handle_completion("PERF-LEAK", response)
+
+        # Should transition to retrospective_pending (conclusive match)
+        transitioned_to_retrospective = False
+        for call in agent._client.post.call_args_list:
+            url = call.args[0] if call.args else ""
+            if "transition" in str(url):
+                body = call.kwargs.get("json", {})
+                if body.get("status") == "retrospective_pending":
+                    transitioned_to_retrospective = True
+        assert transitioned_to_retrospective, (
+            "Should transition to retrospective_pending for conclusive match"
+        )
+
+        # Should have cleaned up the REINVESTIGATING entry on Record A
+        mock_provider.append_build_history.assert_called_once()
+        call_args = mock_provider.append_build_history.call_args
+        assert call_args[0][0] == "RCA-A"
+        entry = call_args[0][1]
+        assert entry.action == "REINVESTIGATION_CANCELLED"
+        assert "RCA-B" in entry.comment

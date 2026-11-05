@@ -106,14 +106,14 @@ class GatheringContextAgent(AgentBase):
     ) -> bool:
         """Check for dedup match using canonical dedup fields.
 
-        The ticket's ``dedup_key`` (set at ingestion by webhook
+        The ticket's ``investigation_dedup`` (set at ingestion by webhook
         enrichment, ticket creation, or any upstream process)
         contains normalized ``metric`` and ``platform`` values.
         These are compared against open investigation records
         using exact matching.
 
         This is source-agnostic — any ticket creator that sets
-        ``dedup_key.metric`` and ``dedup_key.platform`` gets
+        ``investigation_dedup.metric`` and ``investigation_dedup.platform`` gets
         deterministic dedup. Source-specific field extraction
         belongs in the webhook translator or enrichment layer,
         not here.
@@ -122,13 +122,8 @@ class GatheringContextAgent(AgentBase):
         transitioned.
         """
         cf = ticket.get("custom_fields", {})
-        dedup_key = cf.get("dedup_key", {})
+        dedup_key = cf.get("investigation_dedup", {})
         if not isinstance(dedup_key, dict):
-            logger.debug(
-                "[gathering-context] dedup_key is %s, not dict "
-                "— skipping deterministic dedup",
-                type(dedup_key).__name__,
-            )
             return False
 
         dedup_metric = dedup_key.get("metric", "")
@@ -484,6 +479,38 @@ class GatheringContextAgent(AgentBase):
 
         await self._update_fields(ticket_id, fields)
 
+        if decision == "MATCH_FOUND" and matched_id and not reinvestigate:
+            # Check if the matched record is inconclusive — the LLM
+            # doesn't know about outcome awareness.
+            try:
+                from providers.investigation.registry import (
+                    create_record_provider,
+                )
+
+                provider = create_record_provider()
+                matched_record = await provider.get(matched_id)
+                if matched_record:
+                    metrics = getattr(matched_record, "operational_metrics", None)
+                    record_outcome = (
+                        (getattr(metrics, "convergence_outcome", "") or "")
+                        .strip()
+                        .lower()
+                    )
+                    if record_outcome in _INCONCLUSIVE_OUTCOMES:
+                        reinvestigate = True
+                        logger.info(
+                            "[gathering-context] LLM matched inconclusive "
+                            "record %s (outcome='%s') — reinvestigating",
+                            matched_id,
+                            record_outcome,
+                        )
+            except Exception:
+                logger.debug(
+                    "[gathering-context] Could not check record outcome for %s",
+                    matched_id,
+                    exc_info=True,
+                )
+
         if decision == "MATCH_FOUND" and matched_id:
             # Resolve the record URL from the provider
             # rather than trusting LLM output.
@@ -508,7 +535,11 @@ class GatheringContextAgent(AgentBase):
             record_label = f"[{matched_id}]({record_url})" if record_url else matched_id
 
             if reinvestigate:
-                prior_outcome = advisory.get("prior_outcome", "none")
+                prior_outcome = (
+                    advisory.get("prior_outcome", "none")
+                    if isinstance(advisory, dict)
+                    else "none"
+                )
                 summary = (
                     f"**Reinvestigating**\n\n"
                     f"- **Matched Record:** {record_label}\n"
@@ -544,6 +575,35 @@ class GatheringContextAgent(AgentBase):
                     "retrospective_pending",
                     comment=(f"Dedup match: {matched_id}. Skipping investigation."),
                 )
+                # If deterministic dedup matched a different record,
+                # clean up the orphaned REINVESTIGATING entry.
+                if (
+                    isinstance(advisory, dict)
+                    and advisory.get("matched_investigation_id") != matched_id
+                ):
+                    try:
+                        from providers.investigation.models import (
+                            BuildHistoryEntry,
+                        )
+                        from providers.investigation.registry import (
+                            create_record_provider,
+                        )
+
+                        cleanup_provider = create_record_provider()
+                        await cleanup_provider.append_build_history(
+                            advisory["matched_investigation_id"],
+                            BuildHistoryEntry(
+                                build_id="",
+                                ticket_id=ticket_id,
+                                action="REINVESTIGATION_CANCELLED",
+                                comment=(f"LLM matched different record {matched_id}"),
+                            ),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to cancel reinvestigation entry",
+                            exc_info=True,
+                        )
         else:
             # LLM decided NO_MATCH. If deterministic dedup had
             # appended a REINVESTIGATING entry, clean it up.
