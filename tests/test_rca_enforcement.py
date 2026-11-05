@@ -1,15 +1,15 @@
 """Tests for root-cause enforcement on alert-triggered tickets.
 
 Covers two enforcement points:
-  1. submit_analysis_result tool (agents/analyze/server.py) — rejects
-     conclusive=True with empty root_cause for anomaly_context tickets.
-  2. _check_awaiting_review handoff (orchestrator/handoff.py) — blocks
-     the awaiting_review transition under the same condition.
+  1. AnalyzeAgent._validate_submit_call (agents/analyze/agent.py) — rejects
+     conclusive=True with empty root_cause for anomaly_context tickets before
+     _handle_completion runs, feeding the rejection back to the LLM.
+  2. _check_awaiting_review handoff (orchestrator/handoff.py) — belt-and-
+     suspenders gate that blocks the awaiting_review transition under the
+     same condition regardless of how the agent run resolved.
 """
 
 from __future__ import annotations
-
-import json
 
 import pytest
 
@@ -184,15 +184,37 @@ class TestAwaitingReviewHandoff:
 
 
 # ---------------------------------------------------------------------------
-# Tool enforcement (submit_analysis_result)
+# Agent-level enforcement (AnalyzeAgent._validate_submit_call)
 # ---------------------------------------------------------------------------
 
 
-class TestSubmitAnalysisResultTool:
-    """submit_analysis_result: rejects conclusive+empty root_cause for alerts."""
+def _make_tool_call(conclusive: bool, root_cause: str = ""):
+    from providers.llm.base import ToolCall
 
-    def _make_client(self, monkeypatch, has_anomaly: bool):
-        """Patch AuditedAsyncHTTPClient at its source module."""
+    return ToolCall(
+        id="tc-test",
+        name="submit_analysis_result",
+        input={"conclusive": conclusive, "root_cause": root_cause},
+    )
+
+
+def _make_agent(store_url: str = "http://fake:9090"):
+    from unittest.mock import MagicMock
+
+    from agents.analyze.agent import AnalyzeAgent
+    from providers.llm.base import LLMProvider
+
+    llm = MagicMock(spec=LLMProvider)
+    return AnalyzeAgent(
+        llm_provider=llm,
+        state_store_url=store_url,
+    )
+
+
+class TestValidateSubmitCall:
+    """AnalyzeAgent._validate_submit_call: enforces root_cause for alert tickets."""
+
+    def _patch_get_ticket(self, monkeypatch, agent, has_anomaly: bool):
         cf: dict = {}
         if has_anomaly:
             cf["anomaly_context"] = {
@@ -200,157 +222,85 @@ class TestSubmitAnalysisResultTool:
                 "metric": "boot.phase.kernel_ms",
                 "platform": "SA8775P",
             }
-        payload = {"custom_fields": cf}
+        ticket = {"id": "PERF-TEST", "custom_fields": cf}
 
-        class _Resp:
-            status_code = 200
+        async def _fake_get_ticket(_ticket_id):
+            return ticket
 
-            def json(self):
-                return payload
-
-        class _Client:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                pass
-
-            async def get(self, *_args, **_kwargs):
-                return _Resp()
-
-        monkeypatch.setattr(
-            "providers.execution.AuditedAsyncHTTPClient",
-            lambda **_kw: _Client(),
-        )
+        monkeypatch.setattr(agent, "_get_ticket", _fake_get_ticket)
 
     @pytest.mark.asyncio
     async def test_alert_conclusive_no_root_cause_rejected(self, monkeypatch):
-        """conclusive=True + no root_cause + anomaly_context → error response."""
-        import agents.analyze.server as server_module
+        """conclusive=True + no root_cause + anomaly_context → rejection string."""
+        agent = _make_agent()
+        self._patch_get_ticket(monkeypatch, agent, has_anomaly=True)
 
-        monkeypatch.setenv("TICKET_ID", "PERF-999")
-        self._make_client(monkeypatch, has_anomaly=True)
-
-        result = json.loads(
-            await server_module.submit_analysis_result(
-                conclusive=True,
-                finding="Kernel boot time regressed 31%.",
-                evidence="z-score 4.2 vs baseline.",
-                root_cause="",
-            )
+        result = await agent._validate_submit_call(
+            "PERF-TEST", _make_tool_call(conclusive=True, root_cause="")
         )
-        assert result.get("error") == "root_cause_required"
-        assert "conclusive" not in result  # not stored as a valid result
+        assert result is not None
+        assert "REJECTED" in result
+        assert "root_cause" in result
 
     @pytest.mark.asyncio
     async def test_alert_conclusive_with_root_cause_accepted(self, monkeypatch):
-        """conclusive=True + root_cause populated → accepted even for alerts."""
-        import agents.analyze.server as server_module
+        """conclusive=True + root_cause populated → None (allow)."""
+        agent = _make_agent()
+        self._patch_get_ticket(monkeypatch, agent, has_anomaly=True)
 
-        monkeypatch.setenv("TICKET_ID", "PERF-999")
-
-        result = json.loads(
-            await server_module.submit_analysis_result(
-                conclusive=True,
-                finding="Kernel boot time regressed 31%.",
-                evidence="z-score 4.2 vs baseline.",
-                root_cause="Kernel updated 6.12.8→6.12.10 between builds.",
-            )
+        result = await agent._validate_submit_call(
+            "PERF-TEST",
+            _make_tool_call(
+                conclusive=True, root_cause="Kernel updated 6.12.8→6.12.10."
+            ),
         )
-        assert result.get("conclusive") is True
-        assert (
-            result.get("root_cause") == "Kernel updated 6.12.8→6.12.10 between builds."
-        )
-        assert "error" not in result
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_non_alert_conclusive_no_root_cause_accepted(self, monkeypatch):
-        """Non-alert conclusive result without root_cause is accepted.
+        """Non-alert conclusive result without root_cause → None (allow)."""
+        agent = _make_agent()
+        self._patch_get_ticket(monkeypatch, agent, has_anomaly=False)
 
-        The root_cause requirement is scoped to anomaly_context tickets only.
-        """
-        import agents.analyze.server as server_module
-
-        monkeypatch.setenv("TICKET_ID", "PERF-888")
-        self._make_client(monkeypatch, has_anomaly=False)
-
-        result = json.loads(
-            await server_module.submit_analysis_result(
-                conclusive=True,
-                finding="RHEL10 is 15% faster than RHEL9.",
-                evidence="Mean throughput: RHEL9 28.4 Gbps, RHEL10 32.7 Gbps.",
-                root_cause="",
-            )
+        result = await agent._validate_submit_call(
+            "PERF-TEST", _make_tool_call(conclusive=True, root_cause="")
         )
-        assert result.get("conclusive") is True
-        assert "error" not in result
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_inconclusive_no_root_cause_accepted(self, monkeypatch):
-        """Inconclusive result never requires root_cause."""
-        import agents.analyze.server as server_module
+        """Inconclusive result with no root_cause → None (allow)."""
+        agent = _make_agent()
+        self._patch_get_ticket(monkeypatch, agent, has_anomaly=True)
 
-        monkeypatch.setenv("TICKET_ID", "PERF-777")
-
-        result = json.loads(
-            await server_module.submit_analysis_result(
-                conclusive=False,
-                finding="Historical data too sparse.",
-                benchmark_needed_reason="Need A/B kernel comparison.",
-            )
+        result = await agent._validate_submit_call(
+            "PERF-TEST", _make_tool_call(conclusive=False, root_cause="")
         )
-        assert result.get("conclusive") is False
-        assert "error" not in result
+        assert result is None
 
     @pytest.mark.asyncio
-    async def test_fetch_failure_fails_open(self, monkeypatch):
-        """If the ticket fetch fails, submission is not blocked.
+    async def test_alert_whitespace_root_cause_rejected(self, monkeypatch):
+        """Whitespace-only root_cause does not satisfy the requirement."""
+        agent = _make_agent()
+        self._patch_get_ticket(monkeypatch, agent, has_anomaly=True)
 
-        The handoff check is the enforcement backstop.
-        """
-        import agents.analyze.server as server_module
-
-        monkeypatch.setenv("TICKET_ID", "PERF-666")
-
-        class _Client:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                pass
-
-            async def get(self, *_args, **_kwargs):
-                raise ConnectionError("store unreachable")
-
-        monkeypatch.setattr(
-            "providers.execution.AuditedAsyncHTTPClient",
-            lambda **_kw: _Client(),
+        result = await agent._validate_submit_call(
+            "PERF-TEST", _make_tool_call(conclusive=True, root_cause="   ")
         )
-
-        result = json.loads(
-            await server_module.submit_analysis_result(
-                conclusive=True,
-                finding="Regression confirmed.",
-                root_cause="",
-            )
-        )
-        # Fail open: submission accepted despite missing root_cause
-        assert "error" not in result
-        assert result.get("conclusive") is True
+        assert result is not None
+        assert "REJECTED" in result
 
     @pytest.mark.asyncio
-    async def test_no_ticket_id_env_skips_check(self, monkeypatch):
-        """With no TICKET_ID env var the fetch is skipped; submission accepted."""
-        import agents.analyze.server as server_module
+    async def test_get_ticket_returns_none_skips_check(self, monkeypatch):
+        """If _get_ticket returns None, the check is skipped (fail open)."""
+        agent = _make_agent()
 
-        monkeypatch.delenv("TICKET_ID", raising=False)
+        async def _null_get_ticket(_ticket_id):
+            return None
 
-        result = json.loads(
-            await server_module.submit_analysis_result(
-                conclusive=True,
-                finding="Regression confirmed.",
-                root_cause="",
-            )
+        monkeypatch.setattr(agent, "_get_ticket", _null_get_ticket)
+
+        result = await agent._validate_submit_call(
+            "PERF-TEST", _make_tool_call(conclusive=True, root_cause="")
         )
-        assert "error" not in result
-        assert result.get("conclusive") is True
+        assert result is None
