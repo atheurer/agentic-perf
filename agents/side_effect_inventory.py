@@ -295,8 +295,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/resource/server.py", "validate_host", "cloud_resource"),
     ("agents/resource/server.py", "validate_host", "ssh"),
     ("agents/review/agent.py", "_handle_completion", "filesystem"),
-    ("agents/review/server.py", "cdm_api_request", "ssh"),
-    ("agents/review/server.py", "compare_results", "ssh"),
+    ("agents/review/server.py", "cdm_api_request", "mutating_http_state"),
     ("agents/review/server.py", "get_run_summary", "ssh"),
     ("agents/review/server.py", "read_run_results", "ssh"),
     ("agents/server_utils.py", "_read_controller_document", "ssh"),
@@ -2296,16 +2295,10 @@ INVENTORY_DISPOSITIONS = {
         "agents/review/agent.py:_handle_completion",
         "2027-12-31",
     ),
-    ("agents/review/server.py", "cdm_api_request", "ssh"): (
+    ("agents/review/server.py", "cdm_api_request", "mutating_http_state"): (
         "audited",
         "observability-maintainers",
         "agents/review/server.py:cdm_api_request",
-        "2027-12-31",
-    ),
-    ("agents/review/server.py", "compare_results", "ssh"): (
-        "audited",
-        "observability-maintainers",
-        "agents/review/server.py:compare_results",
         "2027-12-31",
     ),
     ("agents/review/server.py", "get_run_summary", "ssh"): (
