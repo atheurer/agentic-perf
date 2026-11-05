@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import httpx
@@ -709,6 +709,157 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_repeated_cancellation_finishes_teardown(monkeypatch):
+    import orchestrator.main as orchestrator_main
+
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    config = _poll_config()
+    config.poll_interval = 60
+    config.stale_task_timeout = 0
+    config.raw["external_mcp_servers"] = [
+        {"name": "arcaflow", "transport": "stdio", "command": ["fake"]}
+    ]
+    polling = asyncio.Event()
+    shutdown_started = asyncio.Event()
+    allow_shutdown = asyncio.Event()
+    finished = []
+
+    class Lease(_PollLoopLease):
+        async def renew(self):
+            return {"epoch": self.epoch}
+
+    class Events:
+        def __init__(self, **_kwargs):
+            pass
+
+        def close(self):
+            finished.append("events")
+
+    class Dispatcher:
+        def __init__(self, *_args, **kwargs):
+            self._session_id = kwargs["session_id"]
+            self._fencing_epoch = kwargs["fencing_epoch"]
+
+        def reconcile_handoff_blocked(self, _tickets):
+            pass
+
+        async def shutdown(self):
+            shutdown_started.set()
+            await allow_shutdown.wait()
+            finished.append("dispatcher")
+
+    async def fetch_tickets(_url):
+        polling.set()
+        return []
+
+    async def renew_lease(_lease, _interval, _on_loss, started):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finished.append("lease")
+
+    async def disconnect():
+        finished.append("mcp")
+
+    mcp = MagicMock()
+    mcp.connect_command = AsyncMock()
+    mcp.disconnect = AsyncMock(side_effect=disconnect)
+    monkeypatch.setattr("agents.mcp_client.AgentMCPClient", lambda: mcp)
+    monkeypatch.setattr(orchestrator_main, "RepoCache", lambda: object())
+    monkeypatch.setattr(
+        orchestrator_main,
+        "build_skill_provider_async",
+        AsyncMock(return_value=object()),
+    )
+    monkeypatch.setattr(orchestrator_main, "LocalSecretsProvider", lambda: object())
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_make_llm_provider",
+        lambda _config: SimpleNamespace(
+            default_timeout=None, reasoning_effort=None, max_tokens=None
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "_make_llm_factory", lambda _config: object()
+    )
+    monkeypatch.setattr(orchestrator_main, "_validate_models", AsyncMock())
+    monkeypatch.setattr(orchestrator_main, "EventBus", Events)
+    monkeypatch.setattr(orchestrator_main, "Dispatcher", Dispatcher)
+    monkeypatch.setattr(
+        orchestrator_main, "record_orchestrator_status", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(orchestrator_main, "_process_stop_requests", AsyncMock())
+    monkeypatch.setattr(orchestrator_main, "_sweep_trace_spools", lambda: None)
+    monkeypatch.setattr(orchestrator_main, "fetch_all_tickets", fetch_tickets)
+    monkeypatch.setattr(orchestrator_main, "_renew_leader_lease", renew_lease)
+    telemetry_module = ModuleType("providers.telemetry")
+    telemetry_module.setup_telemetry = lambda **_kwargs: None
+    monkeypatch.setitem(sys.modules, "providers.telemetry", telemetry_module)
+    monkeypatch.setattr("providers.redaction.get_shared_redactor", lambda: object())
+
+    lease_state = {"renew_task": None, "started": asyncio.Event()}
+    task = asyncio.create_task(
+        _poll_loop_after_lease(config, Lease(), _LeaseLossGate(), lease_state)
+    )
+    await asyncio.wait_for(polling.wait(), 5)
+    task.cancel()
+    await asyncio.wait_for(shutdown_started.wait(), 5)
+    task.cancel()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    allow_shutdown.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished == ["dispatcher", "lease", "mcp", "events"]
+    mcp.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_repeated_cancellation_finishes_leader_release(monkeypatch):
+    import orchestrator.main as orchestrator_main
+
+    started = asyncio.Event()
+    releasing = asyncio.Event()
+    allow_release = asyncio.Event()
+    lease = MagicMock()
+
+    async def release():
+        releasing.set()
+        await allow_release.wait()
+
+    async def run_until_cancelled(*_args):
+        started.set()
+        await asyncio.Event().wait()
+
+    lease.release = AsyncMock(side_effect=release)
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.LeaderLeaseClient", lambda *_a, **_k: lease
+    )
+    monkeypatch.setattr("orchestrator.config.write_effective_config", lambda *_a: None)
+    monkeypatch.setattr(
+        orchestrator_main, "_ensure_state_store_environment", lambda *_a: None
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "_poll_loop_after_lease", run_until_cancelled
+    )
+    task = asyncio.create_task(poll_loop(_poll_config()))
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    await asyncio.wait_for(releasing.wait(), 2)
+    task.cancel()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    allow_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    lease.release.assert_awaited_once()
 
 
 @pytest.mark.asyncio

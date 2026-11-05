@@ -3,14 +3,14 @@
 Verifies that:
 - max_concurrent_teardowns config defaults to 1 and respects env/config overrides
 - dispatcher tracks task statuses and reports active_tasks_for_status accurately
-- dispatcher cleans up _task_statuses on task completion and mark_done
+- dispatcher cleans up _task_statuses after tasks complete
 - dispatch loop defers excess awaiting_teardown tickets while allowing other tickets
 """
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -98,16 +98,24 @@ class TestDispatcherTaskStatuses:
         assert "ticket-1" not in dispatcher._task_statuses
 
     @pytest.mark.asyncio
-    async def test_mark_done_cleans_status(self, dispatcher):
+    async def test_mark_done_keeps_live_task_counted_until_it_exits(self, dispatcher):
+        finish = asyncio.Event()
+
         async def dummy_coro():
-            await asyncio.sleep(10)
+            await finish.wait()
 
         t1 = asyncio.create_task(dummy_coro())
+        dispatcher.release_claim = AsyncMock()
         try:
             dispatcher.set_task("ticket-1", t1, status="awaiting_teardown")
             assert dispatcher.active_tasks_for_status("awaiting_teardown") == 1
 
             await dispatcher.mark_done("ticket-1")
+            assert dispatcher.is_active("ticket-1")
+            assert dispatcher.active_tasks_for_status("awaiting_teardown") == 1
+            finish.set()
+            await t1
+            assert not dispatcher.is_active("ticket-1")
             assert "ticket-1" not in dispatcher._task_statuses
             assert dispatcher.active_tasks_for_status("awaiting_teardown") == 0
         finally:

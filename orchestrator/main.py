@@ -48,7 +48,7 @@ from state_store.status import (
 )
 
 from .config import OrchestratorConfig, _provider_family
-from .dispatcher import STATUS_AGENT_MAP, Dispatcher
+from .dispatcher import STATUS_AGENT_MAP, Dispatcher, _await_cleanup
 from .handoff import check_handoff
 from .poller import fetch_all_tickets
 from .retry_guard import (
@@ -1506,6 +1506,59 @@ def _cleanup_ticket_skill_snapshots(
     return removed
 
 
+async def _finish_agent_dispatch(
+    dispatcher: Dispatcher, ticket_id: str, agent: Any
+) -> None:
+    """Complete ticket cleanup even if closing an agent or snapshot fails."""
+    try:
+        dispatcher.clear_agent(ticket_id)
+        if agent is not None:
+            try:
+                await agent.close()
+            except Exception:
+                logger.exception("Failed to close agent for %s", ticket_id)
+    finally:
+        try:
+            await _cleanup_closed_ticket_skill_context(dispatcher, ticket_id)
+        finally:
+            tasks = getattr(dispatcher, "_tasks", {})
+            dispatch = tasks.get(ticket_id) if isinstance(tasks, dict) else None
+            if getattr(dispatch, "_agentic_perf_cleanup_complete", False) is not True:
+                await dispatcher.mark_done(ticket_id)
+                logger.info("mark_done completed for %s", ticket_id)
+
+
+async def _await_agent_dispatch_cleanup(
+    dispatcher: Dispatcher, ticket_id: str, agent: Any
+) -> None:
+    """Keep the dispatch active until cleanup completes, despite cancellation."""
+    counts = getattr(dispatcher, "_cleanup_counts", None)
+    if not isinstance(counts, dict):
+        counts = dispatcher._cleanup_counts = {}
+    counts[ticket_id] = counts.get(ticket_id, 0) + 1
+    try:
+        contexts = getattr(dispatcher, "_trace_contexts", {})
+        context = contexts.get(ticket_id) if isinstance(contexts, dict) else None
+        token = bind_trace_context(context) if context is not None else None
+        try:
+            cleanup = asyncio.create_task(
+                _finish_agent_dispatch(dispatcher, ticket_id, agent)
+            )
+        finally:
+            if token is not None:
+                reset_trace_context(token)
+        await _await_cleanup(cleanup)
+    finally:
+        counts[ticket_id] -= 1
+        if not counts[ticket_id]:
+            counts.pop(ticket_id)
+            tasks = getattr(dispatcher, "_cleanup_tasks", None)
+            if isinstance(tasks, dict):
+                completed = tasks.get(ticket_id)
+                if completed is not None and completed.done():
+                    tasks.pop(ticket_id)
+
+
 async def run_agent_task(
     dispatcher: Dispatcher,
     status: str,
@@ -1938,89 +1991,87 @@ async def run_agent_task(
                 f"Failed to transition failed ticket {ticket_id} to guidance"
             )
     finally:
-        logger.info(f"run_agent_task finally block for {ticket_id}")
+        try:
+            logger.info(f"run_agent_task finally block for {ticket_id}")
 
-        deposed = dispatcher.is_deposed()
-        plan_managed = status in PLAN_AGENT_STATUS.values()
-        logger.info(
-            "Completion gate for %s: success=%s deposed=%s plan_managed=%s status=%s",
-            ticket_id,
-            success,
-            deposed,
-            plan_managed,
-            status,
-        )
-        if success and not deposed and plan_managed:
+            deposed = dispatcher.is_deposed()
+            plan_managed = status in PLAN_AGENT_STATUS.values()
+            logger.info(
+                "Completion gate for %s: success=%s deposed=%s plan_managed=%s status=%s",
+                ticket_id,
+                success,
+                deposed,
+                plan_managed,
+                status,
+            )
+            if success and not deposed and plan_managed:
+                try:
+                    await _advance_plan(
+                        dispatcher.store_url,
+                        ticket_id,
+                        status,
+                        event_bus=dispatcher.events,
+                        claim_id=dispatcher._claim_ids.get(ticket_id),
+                    )
+                except Exception:
+                    logger.exception(f"_advance_plan failed for {ticket_id}")
+
+            # Debug halt for triage: triage_pending is not in
+            # PLAN_AGENT_STATUS, so _advance_plan never runs for it.
+            # The triage agent transitions the ticket to awaiting_hardware
+            # itself; we force-close here if stop_after_step == "triage".
+            if success and not deposed and status == "triage_pending":
+                try:
+                    async with AuditedAsyncHTTPClient(
+                        timeout=10.0, headers=mutation_headers
+                    ) as _stop_client:
+                        r = await _stop_client.get(
+                            f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
+                        )
+                        if r.status_code == 200:
+                            stop_after = (
+                                r.json().get("custom_fields", {}).get("stop_after_step")
+                            )
+                            if stop_after == "triage":
+                                await _stop_client.post(
+                                    f"{dispatcher.store_url}"
+                                    f"/api/v1/tickets/{ticket_id}/comments",
+                                    json={
+                                        "author": "orchestrator",
+                                        "body": (
+                                            "**Debug halt:** `stop_after_step=triage` — "
+                                            "closing after triage step as requested."
+                                        ),
+                                    },
+                                )
+                                await _stop_client.post(
+                                    f"{dispatcher.store_url}"
+                                    f"/api/v1/tickets/{ticket_id}/force-close",
+                                )
+                                logger.info(
+                                    f"stop_after_step=triage: closed {ticket_id}"
+                                )
+                except Exception:
+                    logger.exception(
+                        f"stop_after_step triage check failed for {ticket_id}"
+                    )
+
             try:
-                await _advance_plan(
-                    dispatcher.store_url,
+                await _record_dispatch_retry_outcome(
+                    dispatcher,
                     ticket_id,
                     status,
-                    event_bus=dispatcher.events,
-                    claim_id=dispatcher._claim_ids.get(ticket_id),
+                    claim_id=claim_id,
                 )
             except Exception:
-                logger.exception(f"_advance_plan failed for {ticket_id}")
+                logger.exception(
+                    "Could not update dispatch retry state for %s at %s",
+                    ticket_id,
+                    status,
+                )
 
-        # Debug halt for triage: triage_pending is not in
-        # PLAN_AGENT_STATUS, so _advance_plan never runs for it.
-        # The triage agent transitions the ticket to awaiting_hardware
-        # itself; we force-close here if stop_after_step == "triage".
-        if success and not deposed and status == "triage_pending":
-            try:
-                async with AuditedAsyncHTTPClient(
-                    timeout=10.0, headers=mutation_headers
-                ) as _stop_client:
-                    r = await _stop_client.get(
-                        f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
-                    )
-                    if r.status_code == 200:
-                        stop_after = (
-                            r.json().get("custom_fields", {}).get("stop_after_step")
-                        )
-                        if stop_after == "triage":
-                            await _stop_client.post(
-                                f"{dispatcher.store_url}"
-                                f"/api/v1/tickets/{ticket_id}/comments",
-                                json={
-                                    "author": "orchestrator",
-                                    "body": (
-                                        "**Debug halt:** `stop_after_step=triage` — "
-                                        "closing after triage step as requested."
-                                    ),
-                                },
-                            )
-                            await _stop_client.post(
-                                f"{dispatcher.store_url}"
-                                f"/api/v1/tickets/{ticket_id}/force-close",
-                            )
-                            logger.info(f"stop_after_step=triage: closed {ticket_id}")
-            except Exception:
-                logger.exception(f"stop_after_step triage check failed for {ticket_id}")
-
-        try:
-            await _record_dispatch_retry_outcome(
-                dispatcher,
-                ticket_id,
-                status,
-                claim_id=claim_id,
-            )
-        except Exception:
-            logger.exception(
-                "Could not update dispatch retry state for %s at %s",
-                ticket_id,
-                status,
-            )
-
-        dispatcher.clear_agent(ticket_id)
-        if agent is not None:
-            try:
-                await agent.close()
-            except Exception:
-                pass
-        await _cleanup_closed_ticket_skill_context(dispatcher, ticket_id)
-        await dispatcher.mark_done(ticket_id)
-        logger.info(f"mark_done completed for {ticket_id}")
+        finally:
+            await _await_agent_dispatch_cleanup(dispatcher, ticket_id, agent)
 
 
 def _cancellation_guidance_reason(cancel_reason: str) -> str:
@@ -2186,8 +2237,15 @@ async def _check_stale_tasks(
                         logger.info(
                             f"Cleaning up active_tasks entry for closed ticket {tid}"
                         )
-                        await dispatcher.mark_done(tid)
-                        task.cancel()
+                        if task.done():
+                            if not getattr(
+                                task, "_agentic_perf_cleanup_complete", False
+                            ):
+                                await dispatcher.mark_done(tid)
+                        else:
+                            # The dispatch owns its claim until cancellation has
+                            # stopped the agent and its finalizer has completed.
+                            task.cancel()
                         continue
                     updated_at = ticket_data.get("updated_at", "")
                     if updated_at:
@@ -3089,14 +3147,18 @@ async def poll_loop(config: OrchestratorConfig) -> None:
             lease_state,
         )
     finally:
-        renew_task = lease_state["renew_task"]
-        started = lease_state["started"]
-        if renew_task is None:
-            await leader_lease.release()
-        else:
-            await _cancel_and_await(renew_task)
-            if not started.is_set():
+
+        async def finish_leader_lease() -> None:
+            renew_task = lease_state["renew_task"]
+            started = lease_state["started"]
+            if renew_task is None:
                 await leader_lease.release()
+            else:
+                await _cancel_and_await(renew_task)
+                if not started.is_set():
+                    await leader_lease.release()
+
+        await _await_cleanup(asyncio.create_task(finish_leader_lease()))
 
 
 async def _poll_loop_after_lease(
@@ -3868,20 +3930,24 @@ async def _poll_loop_after_lease(
 
             await asyncio.sleep(config.poll_interval)
     finally:
-        await _cancel_and_await(trace_sweep_task)
-        await _cancel_and_await(jumpstarter_sweep_task)
-        if dispatcher is not None:
-            await dispatcher.shutdown()
-        await _cancel_and_await(lease_renew_task)
-        if arcaflow_mcp is not None:
-            try:
-                await arcaflow_mcp.disconnect()
-            except Exception:
-                logger.warning(
-                    "[orchestrator] Failed to disconnect Arcaflow MCP",
-                    exc_info=True,
-                )
-        events.close()
+
+        async def finish_poll_loop() -> None:
+            await _cancel_and_await(trace_sweep_task)
+            await _cancel_and_await(jumpstarter_sweep_task)
+            if dispatcher is not None:
+                await dispatcher.shutdown()
+            await _cancel_and_await(lease_renew_task)
+            if arcaflow_mcp is not None:
+                try:
+                    await arcaflow_mcp.disconnect()
+                except Exception:
+                    logger.warning(
+                        "[orchestrator] Failed to disconnect Arcaflow MCP",
+                        exc_info=True,
+                    )
+            events.close()
+
+        await _await_cleanup(asyncio.create_task(finish_poll_loop()))
 
 
 _lock_fd: int | None = None

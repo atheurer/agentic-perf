@@ -29,8 +29,10 @@ from providers.tracing import (
     LifecycleState,
     TraceClient,
     TraceRecorder,
+    bind_trace_context,
     child_context,
     new_trace_context,
+    reset_trace_context,
     trace_headers,
 )
 
@@ -38,6 +40,25 @@ if TYPE_CHECKING:
     from state_store.identity import UserStore
 
 logger = logging.getLogger(__name__)
+
+
+async def _await_cleanup(task: asyncio.Task[Any]) -> None:
+    """Wait for cleanup without detaching it; propagate cancellation afterward."""
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            cancellation = exc
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
 
 
 class Dispatcher:
@@ -87,6 +108,7 @@ class Dispatcher:
         self._redactor = redactor
         self._tasks: dict[str, asyncio.Task] = {}
         self._cleanup_counts: dict[str, int] = {}
+        self._cleanup_tasks: dict[str, asyncio.Task] = {}
         self._agents: dict[str, Any] = {}
         self._renewal_tasks: dict[str, asyncio.Task] = {}
         self._claim_ids: dict[str, str] = {}
@@ -114,6 +136,7 @@ class Dispatcher:
             return False
         if task.done():
             self._tasks.pop(ticket_id, None)
+            getattr(self, "_task_statuses", {}).pop(ticket_id, None)
             return False
         return True
 
@@ -273,11 +296,13 @@ class Dispatcher:
         task = asyncio.create_task(self._renewal_loop(ticket_id))
         self._renewal_tasks[ticket_id] = task
 
-    def stop_renewal(self, ticket_id: str) -> None:
+    def stop_renewal(self, ticket_id: str) -> asyncio.Task | None:
         """Cancel the background claim renewal task for a ticket."""
-        task = self._renewal_tasks.pop(ticket_id, None)
+        task = self._renewal_tasks.get(ticket_id)
         if task is not None and not task.done():
-            task.cancel()
+            if task is not asyncio.current_task() and not task.cancelling():
+                task.cancel()
+        return task
 
     def set_task(self, ticket_id: str, task: asyncio.Task, status: str = "") -> None:
         self._tasks[ticket_id] = task
@@ -293,17 +318,24 @@ class Dispatcher:
         """Stop all agent work after losing the control-plane fence."""
         self._deposed = True
         self._claim_lost = True
+        renewals = set(self._renewal_tasks.values())
         for task in (
             list(self._tasks.values())
             + list(self._renewal_tasks.values())
             + list(self._introspection_tasks.values())
         ):
-            if not task.done():
+            if not task.done() and (task not in renewals or not task.cancelling()):
                 task.cancel()
-        self._renewal_tasks.clear()
+        # Retain cancelled renewals so ticket cleanup or shutdown can join them
+        # before releasing their claims.
 
     async def shutdown(self) -> None:
         """Cancel and await dispatcher work before its EventBus is closed."""
+        caller = asyncio.current_task()
+        cleanup = asyncio.create_task(self._shutdown(caller))
+        await _await_cleanup(cleanup)
+
+    async def _shutdown(self, caller: asyncio.Task | None) -> None:
         self._deposed = True
 
         for agent in list(self._introspection_agents.values()):
@@ -313,17 +345,21 @@ class Dispatcher:
                 logger.exception("Failed to request introspection shutdown")
 
         current = asyncio.current_task()
+        cleanups = set(self._cleanup_tasks.values())
         tasks = {
             task
             for task in (
                 list(self._tasks.values())
                 + list(self._renewal_tasks.values())
                 + list(self._introspection_tasks.values())
+                + list(cleanups)
             )
-            if task is not current and not task.done()
+            if task is not current and task is not caller and not task.done()
         }
+        renewals = set(self._renewal_tasks.values())
         for task in tasks:
-            task.cancel()
+            if task not in cleanups and (task not in renewals or not task.cancelling()):
+                task.cancel()
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for result in results:
@@ -331,7 +367,13 @@ class Dispatcher:
                     logger.error("Dispatcher task failed during shutdown: %s", result)
 
         for ticket_id in list(self._claim_ids):
-            await self.release_claim(ticket_id)
+            context = self._trace_contexts.get(ticket_id)
+            token = bind_trace_context(context) if context is not None else None
+            try:
+                await self.release_claim(ticket_id)
+            finally:
+                if token is not None:
+                    reset_trace_context(token)
 
         self._tasks.clear()
         self._renewal_tasks.clear()
@@ -470,38 +512,77 @@ class Dispatcher:
         if counts is None:
             counts = self._cleanup_counts = {}
         counts[ticket_id] = counts.get(ticket_id, 0) + 1
-        try:
-            self._agents.pop(ticket_id, None)
-            getattr(self, "_stopped_tickets", set()).discard(ticket_id)
-            self.stop_renewal(ticket_id)
-            await self.release_claim(ticket_id)
-            getattr(self, "_claim_ids", {}).pop(ticket_id, None)
-            self.clear_handoff_blocked(ticket_id)
-            if self._redactor:
-                self._redactor.deregister_ticket(ticket_id)
-            self.clear_quota_blocked(ticket_id)
-            # Some focused integrations construct a dispatcher without running
-            # __init__. Cleanup remains valid when tracing was not configured.
-            context = getattr(self, "_trace_contexts", {}).pop(ticket_id, None)
-            if context is not None:
-                self._previous_invocations[ticket_id] = context
-                self._trace.record(
-                    context,
-                    ActionType.DISPATCH,
-                    LifecycleState.COMPLETED,
-                    phase="cleanup",
-                    duration_ms=0,
+        tasks = getattr(self, "_cleanup_tasks", None)
+        if tasks is None:
+            tasks = self._cleanup_tasks = {}
+        cleanup = tasks.get(ticket_id)
+        if cleanup is None:
+            context = getattr(self, "_trace_contexts", {}).get(ticket_id)
+            token = bind_trace_context(context) if context is not None else None
+            try:
+                cleanup = asyncio.create_task(
+                    self._mark_done(ticket_id, asyncio.current_task())
                 )
-            if self.events is not None:
-                self.events.unregister_ticket_owner(ticket_id)
-            # A ticket must remain active until its old claim and tracing state
-            # are gone; otherwise this cleanup can erase a new dispatch's claim.
-            self._tasks.pop(ticket_id, None)
-            getattr(self, "_task_statuses", {}).pop(ticket_id, None)
+            finally:
+                if token is not None:
+                    reset_trace_context(token)
+            tasks[ticket_id] = cleanup
+        try:
+            await _await_cleanup(cleanup)
         finally:
             counts[ticket_id] -= 1
             if not counts[ticket_id]:
                 counts.pop(ticket_id)
+                if cleanup.done() and tasks.get(ticket_id) is cleanup:
+                    tasks.pop(ticket_id)
+
+    async def _mark_done(self, ticket_id: str, caller: asyncio.Task | None) -> None:
+        self._agents.pop(ticket_id, None)
+        getattr(self, "_stopped_tickets", set()).discard(ticket_id)
+        renewal = self._renewal_tasks.get(ticket_id)
+        # A renewal task that invokes mark_done cannot await or cancel itself.
+        if renewal is not caller:
+            renewal = self.stop_renewal(ticket_id)
+        if renewal is not None:
+            try:
+                if renewal is not caller:
+                    await renewal
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception(
+                    "Claim renewal failed during cleanup for %s", ticket_id
+                )
+            finally:
+                if self._renewal_tasks.get(ticket_id) is renewal:
+                    self._renewal_tasks.pop(ticket_id)
+        await self.release_claim(ticket_id)
+        getattr(self, "_claim_ids", {}).pop(ticket_id, None)
+        self.clear_handoff_blocked(ticket_id)
+        if self._redactor:
+            self._redactor.deregister_ticket(ticket_id)
+        self.clear_quota_blocked(ticket_id)
+        # Some focused integrations construct a dispatcher without running
+        # __init__. Cleanup remains valid when tracing was not configured.
+        context = getattr(self, "_trace_contexts", {}).pop(ticket_id, None)
+        if context is not None:
+            self._previous_invocations[ticket_id] = context
+            self._trace.record(
+                context,
+                ActionType.DISPATCH,
+                LifecycleState.COMPLETED,
+                phase="cleanup",
+                duration_ms=0,
+            )
+        if self.events is not None:
+            self.events.unregister_ticket_owner(ticket_id)
+        dispatch_task = self._tasks.get(ticket_id)
+        if dispatch_task is not None:
+            dispatch_task._agentic_perf_cleanup_complete = True
+            if dispatch_task.done():
+                self._tasks.pop(ticket_id, None)
+                getattr(self, "_task_statuses", {}).pop(ticket_id, None)
+        # A still-running dispatch remains registered until it actually exits.
         # Note: introspection is NOT stopped here. It runs
         # across the full ticket lifecycle and self-stops on
         # terminal status. Stopping it on every agent handoff
