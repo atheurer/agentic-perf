@@ -178,7 +178,7 @@ async def test_run_redacts_nested_sensitive_keys_and_registered_values():
     assert "external alert" not in system.lower()
 
 
-async def test_resumed_history_keeps_one_context_and_tool_order():
+async def test_resumed_history_adds_fresh_context_and_keeps_tool_order():
     ticket = {
         "status": "triage_pending",
         "custom_fields": {"anomaly_context": {"metric": "latency"}},
@@ -200,9 +200,17 @@ async def test_resumed_history_keeps_one_context_and_tool_order():
     original = copy.deepcopy(previous)
     ticket["custom_fields"].update(remember_previous=True, previous_messages=previous)
     _, resumed = await _run(ticket)
-    assert resumed == original
+    assert resumed[1:] == original[1:]
     assert previous == original
-    assert resumed[0]["content"].count(AgentBase._INVESTIGATION_CONTEXT_MARKER) == 1
+    resumed_content = resumed[0]["content"]
+    marker = AgentBase._INVESTIGATION_CONTEXT_MARKER
+    assert resumed_content.count(marker) == 2
+    assert [
+        json.loads(payload.strip()) for payload in resumed_content.split(marker)[1:]
+    ] == [
+        {"anomaly_context": {"metric": "latency"}},
+        {"anomaly_context": {"metric": "latency"}},
+    ]
     converted = OpenAICompatLLMProvider._convert_messages("static", resumed)
     assert [message["role"] for message in converted] == [
         "system",
@@ -243,7 +251,10 @@ async def test_old_resumed_history_adds_context_without_altering_tool_pair():
 
 async def test_user_marker_does_not_suppress_generated_context():
     marker = AgentBase._INVESTIGATION_CONTEXT_MARKER
-    original = f"User directive includes this literal: {marker}"
+    context = f"\n\n{marker}\n" + json.dumps(
+        {"anomaly_context": {"metric": "latency"}}, separators=(",", ":")
+    )
+    original = f"User directive includes this literal and matching suffix:{context}"
     ticket = {
         "status": "triage_pending",
         "custom_fields": {"anomaly_context": {"metric": "latency"}},
@@ -254,14 +265,7 @@ async def test_user_marker_does_not_suppress_generated_context():
     )
 
     content = messages[0]["content"]
-    assert content.startswith(original)
-    assert content.count(marker) == 2
-    context_suffix = content[len(original) :]
-    assert context_suffix.startswith(f"\n\n{marker}\n")
-    assert json.loads(context_suffix.split(marker, 1)[1].strip()) == {
-        "anomaly_context": {"metric": "latency"}
-    }
-    assert content.count(context_suffix) == 1
+    assert content == original + context
 
 
 async def test_resumed_text_blocks_preserve_tool_result_pair():
@@ -297,6 +301,41 @@ async def test_resumed_text_blocks_preserve_tool_result_pair():
         "assistant",
         "tool",
     ]
+
+
+async def test_mixed_text_image_user_content_preserves_blocks_and_skips_tool_results():
+    tool_result = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "result"}],
+    }
+    original_blocks = [
+        {"type": "text", "text": "Inspect this image"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "aW1n"},
+        },
+    ]
+    ticket = {
+        "status": "triage_pending",
+        "custom_fields": {"anomaly_context": {"metric": "latency"}},
+    }
+    _, messages = await _run(
+        ticket,
+        messages=[
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "c1"}]},
+            tool_result,
+            {"role": "user", "content": original_blocks},
+        ],
+    )
+
+    assert messages[1] == tool_result
+    assert messages[2]["content"][:2] == original_blocks
+    assert messages[2]["content"][2]["type"] == "text"
+    assert json.loads(
+        messages[2]["content"][2]["text"]
+        .split(AgentBase._INVESTIGATION_CONTEXT_MARKER, 1)[1]
+        .strip()
+    ) == {"anomaly_context": {"metric": "latency"}}
 
 
 async def test_review_agent_run_preserves_alert_trust_boundary():

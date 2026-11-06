@@ -624,23 +624,9 @@ class AgentBase(ABC):
     def _include_investigation_context(
         self, messages: list[dict[str, Any]], context: str
     ) -> list[dict[str, Any]]:
-        """Add context once to a text user turn without changing message order."""
+        """Add context to an eligible user turn without changing message order."""
         if not context:
             return messages
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "user":
-                continue
-            content = message.get("content")
-            if isinstance(content, str) and content.endswith(context):
-                return messages
-            if isinstance(content, list) and any(
-                isinstance(block, dict)
-                and block.get("type") == "text"
-                and isinstance(block.get("text"), str)
-                and block["text"] == context
-                for block in content
-            ):
-                return messages
         for index, message in enumerate(messages):
             if (
                 isinstance(message, dict)
@@ -652,8 +638,13 @@ class AgentBase(ABC):
                 return updated
             if isinstance(message, dict) and message.get("role") == "user":
                 content = message.get("content")
-                if isinstance(content, list) and all(
-                    isinstance(block, dict) and block.get("type") == "text"
+                if not isinstance(content, list) or any(
+                    not isinstance(block, dict) or block.get("type") == "tool_result"
+                    for block in content
+                ):
+                    continue
+                if any(
+                    block.get("type") in {"text", "image", "image_url", "input_image"}
                     for block in content
                 ):
                     updated = list(messages)
