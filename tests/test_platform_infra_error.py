@@ -250,6 +250,61 @@ class TestVariantRetryBlocking:
         assert srv._last_infra_error is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("payload", "expected_error"),
+        [
+            (
+                {
+                    "success": False,
+                    "status": "failed",
+                    "host_results": {"node.example": {"status": "failed"}},
+                },
+                True,
+            ),
+            (
+                {
+                    "success": False,
+                    "status": "partial",
+                    "host_results": {"node.example": {"status": "verified"}},
+                },
+                True,
+            ),
+            (
+                {
+                    "success": True,
+                    "status": "success",
+                    "host_results": {"node.example": {"status": "verified"}},
+                },
+                False,
+            ),
+        ],
+    )
+    async def test_foreman_outcome_sets_mcp_error_flag(self, payload, expected_error):
+        import agents.platform.server as srv
+
+        srv._ticket = {
+            "id": "T-TEST",
+            "custom_fields": {
+                "directives": {
+                    "platform_reinstall": {
+                        "provider": "foreman",
+                        "os": "RHEL 10.0",
+                    }
+                }
+            },
+        }
+        with patch(
+            "agents.platform.foreman_workflow.provision_foreman",
+            new_callable=AsyncMock,
+            return_value=payload,
+        ):
+            result = await srv.provision_platform()
+
+        assert result.is_error is expected_error
+        assert json.loads(result.content[0].text) == payload
+        assert result.structured_content == payload
+
+    @pytest.mark.asyncio
     async def test_non_infra_failure_allows_variant_retry(self):
         """A non-infra failure should allow retrying with a different variant."""
         import agents.platform.server as srv

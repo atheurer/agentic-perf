@@ -101,20 +101,36 @@ async def test_verify_ownership_rejects_inactive_or_wrong_cloud():
         await verify_quads_ownership(client, metadata, ["host.example"])
 
 
-async def test_verify_ownership_formal_assignment_checks_hosts_without_local_id():
+async def test_verify_ownership_formal_assignment_checks_active_cloud():
     client = MagicMock()
     client.get_foreman_assignment_identity = AsyncMock()
+    client.get_active_cloud_assignment = AsyncMock(
+        return_value={
+            "active": True,
+            "validated": True,
+            "cloud": "cloud14",
+            "ticket": "5113",
+        }
+    )
     client.get_host_cloud = AsyncMock(return_value="cloud14")
 
     await verify_quads_ownership(
         client,
         {"cloud_name": "cloud14", "ticket": "5113"},
         ["host.example"],
-        require_active_assignment=False,
     )
 
     client.get_foreman_assignment_identity.assert_not_awaited()
+    client.get_active_cloud_assignment.assert_awaited_once_with("cloud14")
     client.get_host_cloud.assert_awaited_once_with("host.example")
+
+    client.get_active_cloud_assignment.return_value["ticket"] = "5000"
+    with pytest.raises(ForemanError, match="not active or does not match"):
+        await verify_quads_ownership(
+            client,
+            {"cloud_name": "cloud14", "ticket": "5113"},
+            ["host.example"],
+        )
 
 
 def test_quads_assignment_directive_reads_only_quads_dictionaries():

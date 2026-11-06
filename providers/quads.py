@@ -338,6 +338,27 @@ class QuadsClient:
             "ticket": data.get("ticket"),
         }
 
+    async def get_active_cloud_assignment(
+        self, cloud_name: str
+    ) -> dict[str, Any] | None:
+        """Return the active assignment for a cloud, or None when there is none."""
+        from urllib.parse import quote
+
+        response = await self._client.get(
+            f"{self._base_url}/api/v3/assignments/active/{quote(cloud_name, safe='')}/"
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or not data:
+            return None
+        cloud = data.get("cloud")
+        return {
+            "active": data.get("active"),
+            "validated": data.get("validated"),
+            "cloud": cloud.get("name") if isinstance(cloud, dict) else None,
+            "ticket": data.get("ticket"),
+        }
+
     async def get_assignment_status(self, assignment_id: int) -> dict[str, Any]:
         r = await self._client.get(
             f"{self._base_url}/api/v3/assignments/{assignment_id}"
@@ -421,7 +442,7 @@ class QuadsClient:
 
         return {
             "status": "success"
-            if all(v == "ok" for v in results.values())
+            if all(v in {"added", "existing"} for v in results.values())
             else "partial",
             "ssh_key_path": self.ssh_key_path,
             "hosts": results,
@@ -478,12 +499,18 @@ class QuadsClient:
         self._validate_ssh_hostname(host)
         if not pubkey or "\n" in pubkey or "\r" in pubkey:
             raise ValueError("Invalid SSH public key")
-        key = shlex.quote(pubkey)
+        fields = pubkey.split()
+        if len(fields) < 2:
+            raise ValueError("Invalid SSH public key")
+        key_material = shlex.quote(" ".join(fields[:2]))
+        key = shlex.quote(f"{pubkey} {self.PROVISIONING_KEY_COMMENT}")
         remote_cmd = (
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
             "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && "
-            f"(grep -Fqx -- {key} ~/.ssh/authorized_keys || "
-            f"printf '%s\\n' {key} >> ~/.ssh/authorized_keys) && echo KEY_COPIED"
+            f"if awk '{{print $1\" \"$2}}' ~/.ssh/authorized_keys | "
+            f"grep -Fqx -- {key_material}; then echo KEY_PRESENT; "
+            f"else printf '%s\\n' {key} >> ~/.ssh/authorized_keys; "
+            "echo KEY_ADDED; fi"
         )
         proc = await AuditedSubprocessRunner().run(
             [
@@ -497,7 +524,9 @@ class QuadsClient:
                     " child.expect('[Pp]assword')\n"
                     " child.sendline(password)\n"
                     " child.expect(pexpect.EOF)\n"
-                    " print('ok' if b'KEY_COPIED' in child.before else 'failed')\n"
+                    " text = child.before.decode(errors='replace')\n"
+                    " print('added' if 'KEY_ADDED' in text else "
+                    "'existing' if 'KEY_PRESENT' in text else 'failed')\n"
                     "except Exception:\n"
                     " print('failed')\n"
                 ),
@@ -514,6 +543,6 @@ class QuadsClient:
             mutating=True,
         )
         output = proc.stdout.decode(errors="replace").strip()
-        if proc.returncode == 0 and output == "ok":
-            return "ok"
+        if proc.returncode == 0 and output in {"added", "existing"}:
+            return output
         return "failed: SSH key bootstrap failed"

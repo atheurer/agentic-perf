@@ -128,6 +128,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/mcp_audit.py", "create_ticket_mcp", "mcp"),
     ("agents/mcp_client.py", "call_internal_tool", "mcp"),
     ("agents/mcp_client.py", "_dispatch_mcp_request", "mcp"),
+    ("agents/platform/server.py", "_foreman_tool_result", "mcp"),
     ("agents/provisioning/agent.py", "_apply_system_config", "filesystem"),
     ("agents/provisioning/agent.py", "_ssh_run", "subprocess"),
     ("agents/provisioning/server.py", "_check_existing_install_one", "ssh"),
@@ -182,6 +183,7 @@ INVENTORIED_SIDE_EFFECTS = (
         "cloud_resource",
     ),
     ("agents/resource/agent.py", "_auto_reservation_selection", "cloud_resource"),
+    ("agents/resource/agent.py", "_ssh_cleanup_provider", "cloud_resource"),
     ("agents/resource/agent.py", "_duration_requirement_changed", "cloud_resource"),
     ("agents/resource/agent.py", "_explicit_provider_selection", "cloud_resource"),
     ("agents/resource/agent.py", "_jumpstarter_selector_changed", "cloud_resource"),
@@ -1612,6 +1614,12 @@ INVENTORY_DISPOSITIONS = {
         "agents/mcp_client.py:_dispatch_mcp_request",
         "2027-12-31",
     ),
+    ("agents/platform/server.py", "_foreman_tool_result", "mcp"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/server.py:_foreman_tool_result",
+        "2027-12-31",
+    ),
     ("agents/provisioning/agent.py", "_apply_system_config", "filesystem"): (
         "audited",
         "observability-maintainers",
@@ -1946,6 +1954,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/agent.py:_auto_reservation_selection",
+        "2027-12-31",
+    ),
+    ("agents/resource/agent.py", "_ssh_cleanup_provider", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/agent.py:_ssh_cleanup_provider",
         "2027-12-31",
     ),
     (

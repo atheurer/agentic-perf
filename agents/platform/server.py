@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from fastmcp.tools.base import ToolResult
+
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
@@ -42,6 +44,15 @@ _last_infra_error: str | None = None
 _last_infra_variant: str | None = None
 
 
+def _foreman_tool_result(payload: dict[str, Any]) -> ToolResult:
+    """Preserve structured Foreman outcomes while marking failures for audit."""
+    return ToolResult(
+        content=json.dumps(payload),
+        structured_content=payload,
+        is_error=payload.get("success") is not True,
+    )
+
+
 async def _ensure_init():
     """Lazily initialize from env vars on first tool call."""
     global _initialized, _ticket, _ssh
@@ -60,7 +71,7 @@ async def provision_platform(
     image_variant: str = "",
     flash_timeout_seconds: int = 600,
     boot_wait_seconds: int = 60,
-) -> str:
+) -> str | ToolResult:
     """Provision the platform — flash OS, boot, verify SSH.
 
     Runs the deterministic provisioning sequence for the
@@ -90,13 +101,13 @@ async def provision_platform(
         from providers.foreman import ForemanError
 
         try:
-            return json.dumps(await provision_foreman(_ticket, _ssh))
+            return _foreman_tool_result(await provision_foreman(_ticket, _ssh))
         except ForemanError as exc:
-            return json.dumps(
+            return _foreman_tool_result(
                 {"success": False, "category": exc.category, "error": str(exc)}
             )
         except Exception:
-            return json.dumps(
+            return _foreman_tool_result(
                 {
                     "success": False,
                     "category": "internal",

@@ -98,7 +98,11 @@ user_provided` tickets, only for hosts named in `required_hosts`, and only as
 part of a `platform_reinstall` request. It is read solely from QUADS-specific
 dictionaries; unrelated top-level `ticket` or `cloud` fields are ignored. The
 directive overrides stale reservation metadata so the derived Foreman account
-and ownership checks use the formal assignment's cloud and ticket.
+and ownership checks use the formal assignment's cloud and ticket. Before any
+destructive step, QUADS must report a matching active, validated assignment for
+that cloud and ticket, and every target host must still report that cloud.
+Managed QUADS tickets retain their assignment ID, so a directive cannot bypass
+the active-assignment check.
 
 ### Benchmark
 

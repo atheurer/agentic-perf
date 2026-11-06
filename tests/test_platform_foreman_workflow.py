@@ -456,14 +456,104 @@ async def test_failed_ownership_does_not_begin_build(setup_workflow, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_failed_post_checkpoint_authorization_keeps_build_not_sent(
+    setup_workflow, monkeypatch
+):
+    ticket, client, ssh, snapshots, reboots = setup_workflow
+    verify = workflow.verify_quads_ownership
+    calls = 0
+
+    async def fail_post_checkpoint(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise ForemanError("host", "authorization changed")
+
+    monkeypatch.setattr(workflow, "verify_quads_ownership", fail_post_checkpoint)
+    result = await workflow.provision_foreman(ticket, ssh)
+    assert result["success"] is False
+    assert snapshots[-1]["hosts"]["node.example"]["phase"] == "build_ready"
+    assert client.set_calls == 0
+
+    monkeypatch.setattr(workflow, "verify_quads_ownership", verify)
+    result = await workflow.provision_foreman(
+        ticket, ssh, build_timeout=1, ssh_timeout=1, interval=0
+    )
+    assert result["success"] is True
+    assert client.set_calls == 1
+    assert reboots == ["node.example"]
+
+
+@pytest.mark.asyncio
+async def test_failed_post_checkpoint_authorization_keeps_reboot_not_sent(
+    setup_workflow, monkeypatch
+):
+    ticket, client, ssh, snapshots, reboots = setup_workflow
+    verify = workflow.verify_quads_ownership
+    calls = 0
+
+    async def fail_post_checkpoint(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 5:
+            raise ForemanError("host", "authorization changed")
+
+    monkeypatch.setattr(workflow, "verify_quads_ownership", fail_post_checkpoint)
+    result = await workflow.provision_foreman(ticket, ssh)
+    assert result["success"] is False
+    assert snapshots[-1]["hosts"]["node.example"]["phase"] == "reboot_ready"
+    assert client.set_calls == 1
+    assert reboots == []
+
+    monkeypatch.setattr(workflow, "verify_quads_ownership", verify)
+    result = await workflow.provision_foreman(
+        ticket, ssh, build_timeout=1, ssh_timeout=1, interval=0
+    )
+    assert result["success"] is True
+    assert client.set_calls == 1
+    assert reboots == ["node.example"]
+
+
+@pytest.mark.asyncio
+async def test_later_host_prepare_failure_preserves_partial_results(
+    setup_multi_host_workflow, monkeypatch
+):
+    ticket, _client, ssh, _snapshots, reboots = setup_multi_host_workflow
+    prepare = workflow._prepare_host
+
+    async def fail_target(**kwargs):
+        if kwargs["host"] == "target.example":
+            raise ForemanError("ssh", "target is unreachable")
+        return await prepare(**kwargs)
+
+    monkeypatch.setattr(workflow, "_prepare_host", fail_target)
+    result = await workflow.provision_foreman(
+        ticket, ssh, build_timeout=1, ssh_timeout=1, interval=0
+    )
+    assert result["success"] is False
+    assert result["status"] == "partial"
+    assert result["host_results"]["controller.example"]["status"] == "verified"
+    assert result["host_results"]["target.example"]["status"] == "failed"
+    assert (
+        "target is unreachable" in result["host_results"]["target.example"]["message"]
+    )
+    assert reboots == ["controller.example"]
+
+
+@pytest.mark.asyncio
 async def test_missing_install_timestamp_stops_before_build(setup_workflow):
     ticket, client, ssh, snapshots, _reboots = setup_workflow
     client.find_host = AsyncMock(
         return_value={"id": 12, "name": "node.example", "build": False}
     )
-    with pytest.raises(ForemanError, match="does not expose installation"):
-        await workflow.provision_foreman(ticket, ssh)
-    assert snapshots == []
+    result = await workflow.provision_foreman(ticket, ssh)
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert (
+        "does not expose installation"
+        in (result["host_results"]["node.example"]["message"])
+    )
+    assert not any(snapshot["hosts"] for snapshot in snapshots)
     assert client.set_calls == 0
 
 
@@ -603,7 +693,6 @@ async def test_formal_assignment_directive_overrides_stale_metadata(setup_workfl
     assert reboots == ["node.example"]
     first = workflow.verify_quads_ownership.await_args_list[0]
     assert first.args[1] == {"cloud_name": "cloud14", "ticket": "5113"}
-    assert first.kwargs["require_active_assignment"] is False
 
 
 @pytest.mark.asyncio

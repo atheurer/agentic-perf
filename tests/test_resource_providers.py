@@ -184,6 +184,30 @@ class TestResourceProviderRegistry:
 
         assert agent._registry._organization_resolver is resolver
 
+    def test_formal_quads_cleanup_uses_quads_provider(self):
+        from agents.resource.agent import _ssh_cleanup_provider
+
+        assert (
+            _ssh_cleanup_provider(
+                {
+                    "resource_provider": "user_provided",
+                    "foreman_reinstall_state": {"status": "verified"},
+                }
+            )
+            == "quads"
+        )
+        assert (
+            _ssh_cleanup_provider(
+                {
+                    "resource_provider": "user_provided",
+                    "foreman_reinstall_state": {"status": "verified"},
+                    "quads_assignment_id": None,
+                }
+            )
+            == "quads"
+        )
+        assert _ssh_cleanup_provider({"resource_provider": "aws"}) == "aws"
+
 
 # ---------------------------------------------------------------------------
 # QUADS adapter tests

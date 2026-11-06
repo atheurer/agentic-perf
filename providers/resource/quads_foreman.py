@@ -90,15 +90,8 @@ async def verify_quads_ownership(
     client: Any,
     metadata: dict[str, Any],
     hostnames: list[str],
-    *,
-    require_active_assignment: bool = True,
 ) -> None:
-    """Check assignment identity and every host's current cloud.
-
-    Formal assignments have no local assignment id, so callers with a
-    user-authored directive can require only the cloud/ticket and each host's
-    current cloud. The default keeps the self-serve active-assignment check.
-    """
+    """Check the active assignment identity and every host's current cloud."""
     assignment = metadata.get("assignment_id")
     cloud = metadata.get("cloud_name")
     ticket = metadata.get("ticket")
@@ -112,19 +105,22 @@ async def verify_quads_ownership(
     ):
         raise ForemanError("host", "QUADS allocation identity is incomplete")
     try:
-        if require_active_assignment:
-            if isinstance(assignment, bool) or not str(assignment or "").isdigit():
+        if assignment is not None:
+            if isinstance(assignment, bool) or not str(assignment).isdigit():
                 raise ForemanError("host", "QUADS allocation identity is incomplete")
             status = await client.get_foreman_assignment_identity(int(assignment))
-            if (
-                status.get("active") is not True
-                or status.get("validated") is not True
-                or status.get("cloud") != cloud
-                or str(status.get("ticket") or "") != ticket
-            ):
-                raise ForemanError(
-                    "host", "QUADS assignment is not active or does not match"
-                )
+        else:
+            status = await client.get_active_cloud_assignment(cloud)
+        if (
+            not isinstance(status, dict)
+            or status.get("active") is not True
+            or status.get("validated") is not True
+            or status.get("cloud") != cloud
+            or str(status.get("ticket") or "") != ticket
+        ):
+            raise ForemanError(
+                "host", "QUADS assignment is not active or does not match"
+            )
         for host in hostnames:
             if await client.get_host_cloud(host) != cloud:
                 raise ForemanError("host", "Host is not in the active QUADS assignment")

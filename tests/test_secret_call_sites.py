@@ -226,7 +226,7 @@ class TestV4QuadsStdin:
         captured_args: list[tuple] = []
 
         mock_proc = MagicMock()
-        mock_proc.communicate = AsyncMock(return_value=(b"ok\n", b""))
+        mock_proc.communicate = AsyncMock(return_value=(b"added\n", b""))
         mock_proc.returncode = 0
         mock_proc.stdin = MagicMock()
         mock_proc.stdin.drain = AsyncMock()
@@ -259,7 +259,7 @@ class TestV4QuadsStdin:
         finally:
             reset_trace_context(token)
 
-        assert result == "ok"
+        assert result == "added"
         assert [event.lifecycle.state.value for event in events] == [
             "requested",
             "started",

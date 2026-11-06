@@ -65,7 +65,7 @@ async def test_key_copy_is_idempotent_and_quotes_public_key(tmp_path, monkeypatc
     runner = MagicMock()
     runner.run = AsyncMock(
         side_effect=lambda args, **kwargs: captured.append((args, kwargs))
-        or SimpleNamespace(stdout=b"ok\n", stderr=b"", returncode=0)
+        or SimpleNamespace(stdout=b"added\n", stderr=b"", returncode=0)
     )
     monkeypatch.setattr("providers.quads.AuditedSubprocessRunner", lambda: runner)
     client = QuadsClient(
@@ -74,7 +74,7 @@ async def test_key_copy_is_idempotent_and_quotes_public_key(tmp_path, monkeypatc
     marker = tmp_path / "injected"
     public_key = f"ssh-ed25519 AAAAB3 comment'$(touch {marker})"
     try:
-        assert await client._copy_ssh_key("host.example", public_key) == "ok"
+        assert await client._copy_ssh_key("host.example", public_key) == "added"
     finally:
         await client.close()
     args, kwargs = captured[0]
@@ -84,14 +84,49 @@ async def test_key_copy_is_idempotent_and_quotes_public_key(tmp_path, monkeypatc
     assert "root-secret" not in repr(args)
     assert kwargs["stdin"] == b"root-secret\n"
     env = {**os.environ, "HOME": str(tmp_path)}
+    outputs = []
     for _ in range(2):
-        subprocess.run(
+        result = subprocess.run(
             ["/bin/sh", "-c", args[-1]], check=True, env=env, capture_output=True
         )
+        outputs.append(result.stdout.decode().strip())
     assert (tmp_path / ".ssh" / "authorized_keys").read_text().splitlines() == [
-        public_key
+        f"{public_key} {client.PROVISIONING_KEY_COMMENT}"
     ]
+    assert outputs == ["KEY_ADDED", "KEY_PRESENT"]
     assert not marker.exists()
+
+
+async def test_key_copy_preserves_an_existing_plain_key(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    from types import SimpleNamespace
+
+    captured = []
+    runner = MagicMock()
+    runner.run = AsyncMock(
+        side_effect=lambda args, **kwargs: captured.append((args, kwargs))
+        or SimpleNamespace(stdout=b"existing\n", stderr=b"", returncode=0)
+    )
+    monkeypatch.setattr("providers.quads.AuditedSubprocessRunner", lambda: runner)
+    client = QuadsClient(
+        "quads.example", "user", "password", "owner", "/unused", "root-secret"
+    )
+    public_key = "ssh-ed25519 AAAAB3 existing"
+    keys = tmp_path / ".ssh" / "authorized_keys"
+    keys.parent.mkdir(mode=0o700)
+    keys.write_text(f"{public_key}\n")
+    try:
+        assert await client._copy_ssh_key("host.example", public_key) == "existing"
+    finally:
+        await client.close()
+    args, _kwargs = captured[0]
+    env = {**os.environ, "HOME": str(tmp_path)}
+    result = subprocess.run(
+        ["/bin/sh", "-c", args[-1]], check=True, env=env, capture_output=True
+    )
+    assert result.stdout.decode().strip() == "KEY_PRESENT"
+    assert keys.read_text().splitlines() == [public_key]
 
 
 async def test_key_copy_rejects_shell_metacharacters_in_hostname(monkeypatch):

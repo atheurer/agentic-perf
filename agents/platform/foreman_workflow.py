@@ -110,7 +110,8 @@ def assignment_metadata(
     if directive is not None:
         metadata["cloud_name"] = directive["cloud_name"]
         metadata["ticket"] = directive["ticket"]
-        metadata.pop("assignment_id", None)
+        if cf.get("resource_provider") != "quads":
+            metadata.pop("assignment_id", None)
     return metadata, directive
 
 
@@ -302,7 +303,6 @@ async def _monitor_host(
     build_timeout: float = 3600,
     ssh_timeout: float = 1800,
     interval: float = 20,
-    require_active_assignment: bool = True,
 ) -> None:
     build_deadline = time.monotonic() + build_timeout
     last_observation = "Foreman build remains in progress"
@@ -331,7 +331,6 @@ async def _monitor_host(
                 quads,
                 metadata,
                 [host],
-                require_active_assignment=require_active_assignment,
             )
 
     while True:
@@ -432,7 +431,6 @@ async def _prepare_host(
     configured_options: dict[str, Any],
     provenance: dict[str, Any],
     metadata: dict[str, Any],
-    require_active_assignment: bool,
 ) -> bool:
     """Advance one host to monitor-ready, or reverify a completed one.
 
@@ -441,12 +439,7 @@ async def _prepare_host(
     """
     await _assert_active(ticket_id, fingerprint)
     if quads is not None:
-        await verify_quads_ownership(
-            quads,
-            metadata,
-            [host],
-            require_active_assignment=require_active_assignment,
-        )
+        await verify_quads_ownership(quads, metadata, [host])
     current = await client.find_host(host)
     record = records.get(host)
     if record is None:
@@ -480,7 +473,7 @@ async def _prepare_host(
         if result.exit_code != 0 or not result.stdout.strip():
             raise ForemanError("ssh", "Cannot verify host access before reinstall")
         record = {
-            "phase": "build_unknown",
+            "phase": "build_ready",
             "host_id": current["id"],
             "options": options,
             "expected_release": expected,
@@ -490,17 +483,8 @@ async def _prepare_host(
         records[host] = record
         state["provenance"] = provenance
         await _save_state(ticket, state)
-        await _assert_active(ticket_id, fingerprint)
-        await verify_quads_ownership(
-            quads,
-            metadata,
-            [host],
-            require_active_assignment=require_active_assignment,
-        )
-        await client.set_build(record["host_id"], options)
-        record["phase"] = "build_armed"
-        await _save_state(ticket, state)
-    if record.get("phase") == "verified":
+    phase = record.get("phase")
+    if phase == "verified":
         if (
             current.get("id") != record["host_id"]
             or current.get("build") is not False
@@ -527,7 +511,23 @@ async def _prepare_host(
                 "ssh", "Previously verified host could not be reverified"
             )
         return False
-    if record.get("phase") == "build_unknown":
+    if phase == "build_ready":
+        if (
+            current.get("id") != record["host_id"]
+            or current.get("build") is not False
+            or current.get("installed_at") != record["previous_installed_at"]
+        ):
+            raise ForemanError("host", "Prepared host changed before build")
+        await _assert_active(ticket_id, fingerprint)
+        if quads is not None:
+            await verify_quads_ownership(quads, metadata, [host])
+        record["phase"] = "build_unknown"
+        await _save_state(ticket, state)
+        await client.set_build(record["host_id"], record["options"])
+        record["phase"] = "build_armed"
+        await _save_state(ticket, state)
+        phase = "build_armed"
+    elif phase == "build_unknown":
         if not _build_matches(current, record["options"]):
             raise ForemanError(
                 "build_unknown",
@@ -535,7 +535,8 @@ async def _prepare_host(
             )
         record["phase"] = "build_armed"
         await _save_state(ticket, state)
-    if record.get("phase") == "build_armed":
+        phase = "build_armed"
+    if phase == "build_armed":
         current = await client.find_host(host)
         if not _build_matches(current, record["options"]):
             raise ForemanError(
@@ -543,21 +544,22 @@ async def _prepare_host(
                 "Foreman build is not armed; manual reconciliation required",
             )
         if quads is not None:
-            await verify_quads_ownership(
-                quads,
-                metadata,
-                [host],
-                require_active_assignment=require_active_assignment,
+            await verify_quads_ownership(quads, metadata, [host])
+        record["phase"] = "reboot_ready"
+        await _save_state(ticket, state)
+        phase = "reboot_ready"
+    if phase == "reboot_ready":
+        current = await client.find_host(host)
+        if not _build_matches(current, record["options"]):
+            raise ForemanError(
+                "build_unknown",
+                "Foreman build is not armed; manual reconciliation required",
             )
+        await _assert_active(ticket_id, fingerprint)
+        if quads is not None:
+            await verify_quads_ownership(quads, metadata, [host])
         record["phase"] = "reboot_unknown"
         await _save_state(ticket, state)
-        await _assert_active(ticket_id, fingerprint)
-        await verify_quads_ownership(
-            quads,
-            metadata,
-            [host],
-            require_active_assignment=require_active_assignment,
-        )
         try:
             reboot = await ssh.run(
                 host, build_reboot_command(), timeout=30, mutating=True
@@ -572,7 +574,8 @@ async def _prepare_host(
                 "reboot",
                 "Host did not confirm the detached reboot; manual reconciliation required",
             )
-    if record.get("phase") != "reboot_unknown":
+        phase = "reboot_unknown"
+    if phase != "reboot_unknown":
         raise ForemanError("state", "Unknown Foreman reinstall checkpoint")
     return True
 
@@ -660,7 +663,6 @@ async def provision_foreman(
         )
     if provider != "quads" and directive is None:
         raise ForemanError("host", "Provider does not support verified Foreman targets")
-    require_active_assignment = directive is None
     quads = None
     client = None
     try:
@@ -678,12 +680,7 @@ async def provision_foreman(
             raise ForemanError(
                 "configuration", "QUADS ownership requires verified HTTPS"
             )
-        await verify_quads_ownership(
-            quads,
-            metadata,
-            hosts,
-            require_active_assignment=require_active_assignment,
-        )
+        await verify_quads_ownership(quads, metadata, hosts)
         if bootstrap["mode"] == "quads":
             _verify_key_pair(quads, ssh)
         username, password = await foreman_credentials(config, secrets, metadata)
@@ -700,22 +697,37 @@ async def provision_foreman(
         host_results: dict[str, dict[str, Any]] = {}
         monitor_hosts: list[str] = []
         for host in hosts:
-            needs_monitor = await _prepare_host(
-                client=client,
-                quads=quads,
-                ssh=ssh,
-                host=host,
-                records=records,
-                state=state,
-                ticket=ticket,
-                ticket_id=ticket_id,
-                fingerprint=fingerprint,
-                os_name=os_name,
-                configured_options=configured_options,
-                provenance=provenance,
-                metadata=metadata,
-                require_active_assignment=require_active_assignment,
-            )
+            try:
+                needs_monitor = await _prepare_host(
+                    client=client,
+                    quads=quads,
+                    ssh=ssh,
+                    host=host,
+                    records=records,
+                    state=state,
+                    ticket=ticket,
+                    ticket_id=ticket_id,
+                    fingerprint=fingerprint,
+                    os_name=os_name,
+                    configured_options=configured_options,
+                    provenance=provenance,
+                    metadata=metadata,
+                )
+            except ForemanError as exc:
+                if exc.category in {
+                    "state",
+                    "configuration",
+                    "build_unknown",
+                    "reboot_unknown",
+                    "reboot",
+                }:
+                    raise
+                host_results[host] = {
+                    "status": "failed",
+                    "category": exc.category,
+                    "message": str(exc),
+                }
+                continue
             if needs_monitor:
                 monitor_hosts.append(host)
             else:
@@ -737,7 +749,6 @@ async def provision_foreman(
                         build_timeout=build_timeout,
                         ssh_timeout=ssh_timeout,
                         interval=interval,
-                        require_active_assignment=require_active_assignment,
                     )
                     for host in monitor_hosts
                 ),

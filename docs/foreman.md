@@ -55,7 +55,9 @@ may explicitly opt into
 old known-host entry, accepts an unauthenticated new host key, and uses the
 site-managed QUADS password to install the existing configured SSH public key.
 Use this only where that host-key trust model is acceptable. It does not create
-an SSH key pair. Missing identity files stop the operation.
+an SSH key pair. Missing identity files stop the operation. A key added by this
+workflow is tagged with the QUADS provisioning marker and removed during ticket
+cleanup; a key that was already present is preserved.
 
 For QUADS deployments that have independently confirmed their credential
 convention, `auth` may instead be:
@@ -81,10 +83,13 @@ role-to-host mapping is available; such requests fail closed. Formal
 `quads` directive naming the assignment's cloud and ticket. That path is
 limited to hosts named in `required_hosts` and to `quads` or `user_provided`
 tickets; the directive identity outranks stale reservation metadata. Because a
-formal assignment has no local assignment ID, ownership is verified by
-confirming each target host's current QUADS cloud before every destructive
-step. Other non-QUADS hosts remain unsupported because their authorization
-contract is not implemented, although the client is reusable.
+formal assignment has no local assignment ID, ownership is verified against the
+active QUADS assignment for the directive's cloud (including its ticket and
+validated state) and each target host's current cloud before every destructive
+step. Managed QUADS tickets keep their assignment ID even when a directive is
+present, so the active assignment must also match the directive. Other
+non-QUADS hosts remain unsupported because their authorization contract is not
+implemented, although the client is reusable.
 
 In multi-user mode, checkpoint updates require service authentication and an
 active platform dispatch claim. Legacy deployments use a shared service token:
