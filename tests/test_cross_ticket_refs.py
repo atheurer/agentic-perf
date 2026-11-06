@@ -135,6 +135,90 @@ async def test_missing_artifacts_do_not_block_or_leak_context(
     assert "## Referenced Ticket Artifacts" not in content
 
 
+async def test_fallback_artifact_dir_from_run_id(
+    artifact_agent: AgentBase,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """When output_dir is absent, fall back to ARTIFACT_DIR/<id>/<run_id>."""
+    import paths
+
+    monkeypatch.setattr(paths, "ARTIFACT_DIR", tmp_path)
+    run_dir = tmp_path / "PERF-11111111" / "run-1"
+    run_dir.mkdir(parents=True)
+    ticket = {
+        "id": "PERF-00000000",
+        "description": "Compare PERF-11111111",
+        "custom_fields": {"reference_tickets": ["PERF-11111111"]},
+    }
+    monkeypatch.setattr(
+        artifact_agent,
+        "_get_ticket",
+        AsyncMock(return_value={"custom_fields": {"run_id": "run-1"}}),
+    )
+
+    await artifact_agent._resolve_referenced_artifacts(ticket)
+
+    assert artifact_agent._referenced_artifacts == {
+        "PERF-11111111": {"output_dir": str(run_dir), "run_id": "run-1"}
+    }
+
+
+async def test_fallback_artifact_dir_without_run_id(
+    artifact_agent: AgentBase,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Without a run_id, fall back to the ticket-level artifact directory."""
+    import paths
+
+    monkeypatch.setattr(paths, "ARTIFACT_DIR", tmp_path)
+    ticket_dir = tmp_path / "PERF-11111111"
+    ticket_dir.mkdir(parents=True)
+    ticket = {
+        "id": "PERF-00000000",
+        "description": "Compare PERF-11111111",
+        "custom_fields": {"reference_tickets": ["PERF-11111111"]},
+    }
+    monkeypatch.setattr(
+        artifact_agent,
+        "_get_ticket",
+        AsyncMock(return_value={"custom_fields": {}}),
+    )
+
+    await artifact_agent._resolve_referenced_artifacts(ticket)
+
+    assert artifact_agent._referenced_artifacts == {
+        "PERF-11111111": {"output_dir": str(ticket_dir), "run_id": ""}
+    }
+
+
+async def test_fallback_rejects_reference_escaping_artifact_root(
+    artifact_agent: AgentBase,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A reference that resolves outside ARTIFACT_DIR is ignored."""
+    import paths
+
+    monkeypatch.setattr(paths, "ARTIFACT_DIR", tmp_path / "artifacts")
+    (tmp_path / "artifacts").mkdir()
+    (tmp_path / "escape").mkdir()
+    ticket = {
+        "id": "PERF-00000000",
+        "custom_fields": {"reference_tickets": ["../escape"]},
+    }
+    monkeypatch.setattr(
+        artifact_agent,
+        "_get_ticket",
+        AsyncMock(return_value={"custom_fields": {}}),
+    )
+
+    await artifact_agent._resolve_referenced_artifacts(ticket)
+
+    assert artifact_agent._referenced_artifacts == {}
+
+
 class TestExtractTicketReferences:
     """Test PERF-XXXXXXXX extraction from text."""
 

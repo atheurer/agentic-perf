@@ -95,6 +95,8 @@ TOOL_AUDIT_POLICY = (
         "agents/analyze/server.py:list_skill_docs",
         "agents/analyze/server.py:get_ticket_results",
         "agents/analyze/server.py:search_tickets",
+        "agents/analyze/server.py:list_benchmark_artifacts",
+        "agents/analyze/server.py:read_benchmark_artifact",
     ),
     *_side_effecting(
         "state_store.ticket_transition",
