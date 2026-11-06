@@ -562,6 +562,16 @@ _LOCAL_TOOLS = [
                                 "'don't ask me for approval' or 'just run it'."
                             ),
                         },
+                        "ssh_host_key_policy": {
+                            "type": "string",
+                            "enum": ["ask", "replace"],
+                            "description": (
+                                "Handling of changed SSH host keys. Use 'replace' "
+                                "only when the user explicitly authorizes automatic "
+                                "replacement for this ticket; otherwise omit it "
+                                "or use 'ask'."
+                            ),
+                        },
                         "host_cleanup": {
                             "type": "string",
                             "enum": ["required", "skip"],

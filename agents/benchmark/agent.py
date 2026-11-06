@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -124,6 +125,27 @@ _LOCAL_TOOLS = [
                 },
             },
             "required": ["question"],
+        },
+    ),
+    ToolDefinition(
+        name="replace_controller_host_key",
+        description=(
+            "Replace a changed controller-to-endpoint host key for an assigned "
+            "host. Inspects the presented fingerprint, asks the user unless "
+            "the ticket explicitly allows replacement, and updates only that "
+            "host's record. Use after a changed-host-key error."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "controller": {"type": "string"},
+                "target_host": {"type": "string"},
+                "observed_fingerprint": {
+                    "type": "string",
+                    "description": "Fingerprint from the changed-host-key error, if available.",
+                },
+            },
+            "required": ["controller", "target_host"],
         },
     ),
     ToolDefinition(
@@ -272,6 +294,13 @@ class BenchmarkAgent(AgentBase):
         async def _request_clarification(question: str) -> str:
             return await self._do_request_clarification(question)
 
+        async def _replace_controller_host_key(
+            controller: str, target_host: str, observed_fingerprint: str | None = None
+        ) -> str:
+            return await self._replace_changed_host_key(
+                controller, target_host, observed_fingerprint
+            )
+
         async def _present_runfile_for_approval(
             benchmark: str | None = None,
             summary: str | None = None,
@@ -294,6 +323,7 @@ class BenchmarkAgent(AgentBase):
 
         local_handlers = {
             "request_clarification": _request_clarification,
+            "replace_controller_host_key": _replace_controller_host_key,
             "present_runfile_for_approval": _present_runfile_for_approval,
             "resolve_benchmark_approval": _resolve_benchmark_approval,
         }
@@ -306,6 +336,181 @@ class BenchmarkAgent(AgentBase):
             tool_handlers=local_handlers,
             event_bus=event_bus,
         )
+
+    async def _replace_changed_host_key(
+        self, controller: str, target_host: str, observed_fingerprint: str | None = None
+    ) -> str:
+        """Bind consent to the assigned hosts and the key presented by the target."""
+        from agents.server_utils import assert_ticket_active, build_ssh_from_ticket
+        from providers.host_trust import (
+            HostKey,
+            inspect_controller_host_key,
+            replace_controller_host_key,
+            validate_host,
+        )
+
+        if not self._ticket_id:
+            return json.dumps(
+                {"status": "rejected", "message": "Ticket context is required."}
+            )
+        try:
+            validate_host(controller)
+            validate_host(target_host)
+        except ValueError as exc:
+            return json.dumps({"status": "rejected", "message": str(exc)})
+
+        def authorized_binding(
+            ticket: dict[str, Any],
+        ) -> tuple[str, str | None, int, str, str | None] | None:
+            fields = ticket.get("custom_fields") or {}
+            if not isinstance(fields, dict):
+                return None
+            assigned = fields.get("assigned_hardware_ips") or {}
+            if not isinstance(assigned, dict):
+                return None
+            assigned_controller = assigned.get("controller")
+            assigned_targets = assigned.get("targets")
+            if not isinstance(assigned_controller, str) or not assigned_controller:
+                return None
+            if not isinstance(assigned_targets, list) or not assigned_targets:
+                return None
+            controllers = {assigned_controller}
+            ssh_controller = None
+            ssh_targets: list[Any] = []
+            ssh_addresses = fields.get("ssh_hardware_ips")
+            if isinstance(ssh_addresses, dict):
+                candidate = ssh_addresses.get("controller")
+                if isinstance(candidate, str) and candidate:
+                    ssh_controller = candidate
+                    controllers.add(candidate)
+                candidates = ssh_addresses.get("targets")
+                if isinstance(candidates, list):
+                    ssh_targets = candidates
+            if controller not in controllers or target_host in controllers:
+                return None
+            matches = []
+            for index, assigned_target in enumerate(assigned_targets):
+                if not isinstance(assigned_target, str) or not assigned_target:
+                    continue
+                alias = ssh_targets[index] if index < len(ssh_targets) else None
+                if not isinstance(alias, str) or not alias:
+                    alias = None
+                if target_host == assigned_target or target_host == alias:
+                    matches.append((index, assigned_target, alias))
+            if len(matches) != 1:
+                return None
+            index, assigned_target, alias = matches[0]
+            return assigned_controller, ssh_controller, index, assigned_target, alias
+
+        ticket = await assert_ticket_active(
+            self._ticket_id, self.store_url, "executing_benchmark"
+        )
+        if ticket.get("status") == "rejected":
+            return json.dumps(ticket)
+        binding = authorized_binding(ticket)
+        if binding is None:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "message": "Controller or target is not assigned to this ticket.",
+                }
+            )
+        directives = (ticket.get("custom_fields") or {}).get("directives") or {}
+        if not isinstance(directives, dict):
+            return json.dumps(
+                {"status": "rejected", "message": "Ticket directives are malformed."}
+            )
+        policy = directives.get("ssh_host_key_policy", "ask")
+        if policy not in ("ask", "replace"):
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "message": "Invalid ssh_host_key_policy; expected ask or replace.",
+                }
+            )
+
+        ssh, _ = await asyncio.create_task(
+            build_ssh_from_ticket(self._ticket_id, self.store_url)
+        )
+        tool_context = current_trace_context()
+        if tool_context is not None:
+            ssh.trace_context = tool_context
+        inspection = await inspect_controller_host_key(
+            ssh, controller, target_host, observed_fingerprint
+        )
+        if inspection.get("status") != "changed":
+            return json.dumps(inspection)
+        fingerprint = inspection["fingerprint"]
+        key = HostKey(inspection["algorithm"], inspection["key"], fingerprint)
+        if policy == "ask":
+            reply = await self._request_human_input(
+                self._ticket_id,
+                f"The host key for {target_host} on controller {controller} changed. "
+                f"The currently presented {key.algorithm} fingerprint is {fingerprint}. "
+                "Replace its stored key with this one? Reply yes or no.",
+            )
+            if reply.strip().lower().rstrip(".! ") not in {
+                "yes",
+                "y",
+                "approve",
+                "approved",
+            }:
+                return json.dumps(
+                    {"status": "not_approved", "fingerprint": fingerprint}
+                )
+            authorization = "user confirmation"
+        else:
+            authorization = "ticket policy"
+
+        async def recheck_authorization() -> dict[str, Any] | None:
+            current = await assert_ticket_active(
+                self._ticket_id, self.store_url, "executing_benchmark"
+            )
+            if current.get("status") == "rejected":
+                return current
+            if authorized_binding(current) != binding:
+                return {
+                    "status": "rejected",
+                    "message": "Ticket host assignment changed.",
+                }
+            current_directives = (current.get("custom_fields") or {}).get(
+                "directives"
+            ) or {}
+            if not isinstance(current_directives, dict):
+                return {
+                    "status": "rejected",
+                    "message": "Ticket directives are malformed.",
+                }
+            current_policy = current_directives.get("ssh_host_key_policy", "ask")
+            if current_policy not in ("ask", "replace"):
+                return {
+                    "status": "rejected",
+                    "message": "Ticket replacement policy is invalid.",
+                }
+            if policy == "replace" and current_policy != "replace":
+                return {
+                    "status": "rejected",
+                    "message": "Ticket replacement policy changed.",
+                }
+            return None
+
+        rejection = await recheck_authorization()
+        if rejection is not None:
+            return json.dumps(rejection)
+        await self._add_comment(
+            self._ticket_id,
+            f"Replacing the host key for {target_host} on {controller}; "
+            f"fingerprint {fingerprint}; authorization: {authorization}.",
+        )
+        result = await replace_controller_host_key(
+            ssh, controller, target_host, key, authorize=recheck_authorization
+        )
+        await self._add_comment(
+            self._ticket_id,
+            f"Host-key replacement for {target_host} on {controller}: {result['status']}; "
+            f"fingerprint {fingerprint}.",
+        )
+        return json.dumps(result)
 
     async def _do_request_clarification(self, question: str) -> str:
         if self._ticket_id:

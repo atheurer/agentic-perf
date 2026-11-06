@@ -86,6 +86,9 @@ Your job is to analyze a performance test request ticket and:
    - "use the existing installation" → on_existing_install: "skip"
    - "use zathras, not crucible" → harness: "zathras"
    - "don't ask me for approval" / "just run it" → user_pre_run_approval: false
+   - "automatically replace changed SSH host keys for this ticket" → ssh_host_key_policy: "replace"
+     Only set this host-key policy when the user explicitly authorizes it;
+     a generic request to run without pauses is not host-key authorization.
    - "these are cloud instances, no cleanup needed" → host_cleanup: "skip"
    - "use AWS" / "deploy on EC2" / "use cloud instances" → resource_provider: "aws"
    - "use the Scale Lab" / "reserve from QUADS" → resource_provider: "quads"

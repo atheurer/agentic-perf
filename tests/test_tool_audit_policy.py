@@ -1676,9 +1676,9 @@ async def test_real_agentbase_native_dispatch_records_every_workspace_tool(
 
 
 @pytest.mark.asyncio
-async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair() -> (
-    None
-):
+async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Exercise every agent-local tool through the canonical native dispatcher.
 
     These are production agent instances, not a synthetic ``AgentBase``
@@ -1785,6 +1785,9 @@ async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair()
             assert isinstance(argument, dict), name
             if name == "present_runfile_for_approval":
                 argument["validation_id"] = "policy-validation"
+            if name == "replace_controller_host_key":
+                argument["controller"] = "controller.example"
+                argument["target_host"] = "endpoint.example"
             if (
                 isinstance(agent, ProvisioningAgent)
                 and name == "submit_provisioning_result"
@@ -1917,6 +1920,46 @@ async def test_real_agent_native_registration_paths_have_a_terminal_audit_pair()
     )
     assert any(effect[0] == "approval_post" for effect in effects)
     assert any(effect[0] == "approval_get" for effect in effects)
+
+    import agents.server_utils as server_utils
+    import providers.host_trust as host_trust
+
+    host_ticket = {
+        "status": "executing_benchmark",
+        "custom_fields": {
+            "assigned_hardware_ips": {
+                "controller": "controller.example",
+                "targets": ["endpoint.example"],
+            },
+            "directives": {"ssh_host_key_policy": "replace"},
+        },
+    }
+    monkeypatch.setattr(
+        server_utils, "assert_ticket_active", AsyncMock(return_value=host_ticket)
+    )
+    monkeypatch.setattr(
+        server_utils,
+        "build_ssh_from_ticket",
+        AsyncMock(return_value=(SimpleNamespace(trace_context=None), host_ticket)),
+    )
+    inspect_key = AsyncMock(
+        return_value={
+            "status": "changed",
+            "algorithm": "ssh-ed25519",
+            "key": "test-key",
+            "fingerprint": "SHA256:test",
+        }
+    )
+    replace_key = AsyncMock(return_value={"status": "replaced"})
+    monkeypatch.setattr(host_trust, "inspect_controller_host_key", inspect_key)
+    monkeypatch.setattr(host_trust, "replace_controller_host_key", replace_key)
+    _, effects = await exercise(
+        BenchmarkAgent(llm, "http://state-store.invalid"),
+        names=("replace_controller_host_key", "submit_benchmark_result"),
+    )
+    inspect_key.assert_awaited_once()
+    replace_key.assert_awaited_once()
+    assert sum(effect[0] == "add_comment" for effect in effects) >= 2
 
     _, effects = await exercise(
         ResourceAgent(llm, "http://state-store.invalid"),

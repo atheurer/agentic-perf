@@ -294,6 +294,11 @@ TOOL_AUDIT_POLICY = (
         native=True,
     ),
     *_side_effecting(
+        "providers.ssh.SSHExecutor",
+        "agents/benchmark/agent.py:replace_controller_host_key",
+        native=True,
+    ),
+    *_side_effecting(
         "state_store.ticket_transition",
         "agents/analyze/agent.py:request_clarification",
         "agents/benchmark/agent.py:submit_benchmark_result",
