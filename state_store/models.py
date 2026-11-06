@@ -303,6 +303,8 @@ class CreateTicketRequest(BaseModel):
 
     @model_validator(mode="after")
     def _reject_reserved_validation_fields(self) -> "CreateTicketRequest":
+        if "foreman_reinstall_state" in self.custom_fields:
+            raise ValueError("Foreman reinstall checkpoints are server-owned")
         if contains_kernel_reserved(self.custom_fields):
             raise ValueError("kernel control and approval fields are server-owned")
         if ITERATION_BUDGET_FIELD in self.custom_fields:

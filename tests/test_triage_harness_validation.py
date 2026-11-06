@@ -122,6 +122,78 @@ async def _complete_triage_result(
     return agent, ticket, updated_fields
 
 
+@pytest.mark.asyncio
+async def test_post_allocation_reinstall_stays_separate_from_reservation():
+    request = {
+        "provider": "foreman",
+        "os": "RHEL 10.0",
+        "reserve_without_os": True,
+    }
+    _agent, ticket, fields = await _complete_triage_result(
+        {
+            "benchmark_suite": "uperf",
+            "absent_suite": False,
+            "required_hosts": [{"roles": ["client"], "os": "RHEL 10.0"}],
+            "directives": {"platform_reinstall": request},
+        },
+        _make_provider(),
+    )
+    assert ticket["status"] == "awaiting_hardware"
+    assert fields["directives"]["platform_reinstall"] == request
+    assert fields["required_hosts"] == [{"roles": ["client"]}]
+
+
+@pytest.mark.asyncio
+async def test_user_reinstall_directive_survives_triage():
+    request = {"provider": "foreman", "os": "RHEL 9.4"}
+    _agent, _ticket, fields = await _complete_triage_result(
+        {
+            "benchmark_suite": "uperf",
+            "absent_suite": False,
+            "required_hosts": [{"roles": ["client"], "os": "RHEL 8.9"}],
+            "directives": {
+                "platform_reinstall": {"provider": "foreman", "os": "RHEL 10.0"}
+            },
+        },
+        _make_provider(),
+        custom_fields={"directives": {"platform_reinstall": request}},
+    )
+    assert fields["directives"]["platform_reinstall"] == request
+    assert fields["required_hosts"][0]["os"] == "RHEL 8.9"
+
+
+def test_quads_assignment_directive_is_in_triage_schema():
+    from agents.triage.agent import _LOCAL_TOOLS
+
+    submit = next(t for t in _LOCAL_TOOLS if t.name == "submit_triage_result")
+    quads = submit.input_schema["properties"]["directives"]["properties"]["quads"]
+    assert quads["required"] == ["cloud", "ticket"]
+    assert set(quads["properties"]) == {"cloud", "ticket"}
+
+
+@pytest.mark.asyncio
+async def test_user_quads_assignment_directive_survives_triage():
+    assignment = {"cloud": "cloud14", "ticket": "5113"}
+    _agent, ticket, fields = await _complete_triage_result(
+        {
+            "benchmark_suite": "uperf",
+            "absent_suite": False,
+            "required_hosts": [
+                {"host": "f14-h01-000-r650.example.com", "roles": ["target"]}
+            ],
+            "directives": {"quads": assignment},
+        },
+        _make_provider(),
+        custom_fields={
+            "resource_provider": "user_provided",
+            "directives": {"quads": assignment},
+        },
+    )
+    assert ticket["custom_fields"]["resource_provider"] == "user_provided"
+    assert fields["directives"]["quads"] == assignment
+    assert fields["required_hosts"][0]["host"] == "f14-h01-000-r650.example.com"
+
+
 class TestHarnessValidation:
     """Reject harness names that don't exist in the registry."""
 

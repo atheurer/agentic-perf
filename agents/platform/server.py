@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from fastmcp.tools.base import ToolResult
+
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
@@ -32,6 +34,7 @@ mcp = create_ticket_mcp("platform-agent")
 # and does not leak between tickets.
 _ticket: dict[str, Any] = {}
 _initialized = False
+_ssh: Any = None
 
 # Track infrastructure failures to block speculative variant retries.
 # Once a provisioning attempt fails with an infrastructure error, further
@@ -41,15 +44,24 @@ _last_infra_error: str | None = None
 _last_infra_variant: str | None = None
 
 
+def _foreman_tool_result(payload: dict[str, Any]) -> ToolResult:
+    """Preserve structured Foreman outcomes while marking failures for audit."""
+    return ToolResult(
+        content=json.dumps(payload),
+        structured_content=payload,
+        is_error=payload.get("success") is not True,
+    )
+
+
 async def _ensure_init():
     """Lazily initialize from env vars on first tool call."""
-    global _initialized, _ticket
+    global _initialized, _ticket, _ssh
     if _initialized:
         return
 
     from agents.server_utils import build_ssh_from_ticket
 
-    _, _ticket = await build_ssh_from_ticket()
+    _ssh, _ticket = await build_ssh_from_ticket()
     _initialized = True
 
 
@@ -59,7 +71,7 @@ async def provision_platform(
     image_variant: str = "",
     flash_timeout_seconds: int = 600,
     boot_wait_seconds: int = 60,
-) -> str:
+) -> str | ToolResult:
     """Provision the platform — flash OS, boot, verify SSH.
 
     Runs the deterministic provisioning sequence for the
@@ -83,6 +95,25 @@ async def provision_platform(
 
     cf = _ticket.get("custom_fields", {})
     prov = provider or cf.get("resource_provider", "")
+    reinstall = cf.get("directives", {}).get("platform_reinstall")
+    if reinstall is not None:
+        from agents.platform.foreman_workflow import provision_foreman
+        from providers.foreman import ForemanError
+
+        try:
+            return _foreman_tool_result(await provision_foreman(_ticket, _ssh))
+        except ForemanError as exc:
+            return _foreman_tool_result(
+                {"success": False, "category": exc.category, "error": str(exc)}
+            )
+        except Exception:
+            return _foreman_tool_result(
+                {
+                    "success": False,
+                    "category": "internal",
+                    "error": "Foreman platform setup failed; inspect the ticket checkpoint.",
+                }
+            )
 
     if prov == "jumpstarter":
         # Block speculative variant changes after infrastructure errors.

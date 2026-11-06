@@ -8,6 +8,28 @@ to be consumed.  Each tuple is (relative path, enclosing symbol, category).
 from __future__ import annotations
 
 INVENTORIED_SIDE_EFFECTS = (
+    ("providers/resource/quads.py", "normalize_availability_inputs", "cloud_resource"),
+    ("providers/resource/quads.py", "without_os", "cloud_resource"),
+    ("agents/platform/agent.py", "_handle_completion", "mcp"),
+    ("agents/platform/foreman_workflow.py", "_monitor_host", "ssh"),
+    ("agents/platform/foreman_workflow.py", "_prepare_host", "ssh"),
+    ("agents/platform/foreman_workflow.py", "_save_state", "mutating_http_state"),
+    ("agents/resource/server.py", "discover_quads_os_catalog", "cloud_resource"),
+    ("providers/resource/quads.py", "discover_os_catalog", "cloud_resource"),
+    ("agents/resource/server.py", "_quads_reserve_without_os", "cloud_resource"),
+    ("agents/resource/server.py", "_without_reservation_os", "cloud_resource"),
+    ("providers/foreman.py", "set_build", "mutating_http_state"),
+    (
+        "providers/resource/quads_foreman.py",
+        "quads_assignment_directive",
+        "cloud_resource",
+    ),
+    (
+        "providers/resource/quads_foreman.py",
+        "derive_quads_credentials",
+        "cloud_resource",
+    ),
+    ("providers/resource/quads_foreman.py", "verify_quads_ownership", "cloud_resource"),
     ("agents/analyze/agent.py", "_prefetch_cited_runs", "mcp"),
     ("agents/base.py", "_add_comment", "mutating_http_state"),
     ("agents/base.py", "_execute_tool", "mcp"),
@@ -106,6 +128,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/mcp_audit.py", "create_ticket_mcp", "mcp"),
     ("agents/mcp_client.py", "call_internal_tool", "mcp"),
     ("agents/mcp_client.py", "_dispatch_mcp_request", "mcp"),
+    ("agents/platform/server.py", "_foreman_tool_result", "mcp"),
     ("agents/provisioning/agent.py", "_apply_system_config", "filesystem"),
     ("agents/provisioning/agent.py", "_ssh_run", "subprocess"),
     ("agents/provisioning/server.py", "_check_existing_install_one", "ssh"),
@@ -160,6 +183,7 @@ INVENTORIED_SIDE_EFFECTS = (
         "cloud_resource",
     ),
     ("agents/resource/agent.py", "_auto_reservation_selection", "cloud_resource"),
+    ("agents/resource/agent.py", "_ssh_cleanup_provider", "cloud_resource"),
     ("agents/resource/agent.py", "_duration_requirement_changed", "cloud_resource"),
     ("agents/resource/agent.py", "_explicit_provider_selection", "cloud_resource"),
     ("agents/resource/agent.py", "_jumpstarter_selector_changed", "cloud_resource"),
@@ -884,6 +908,106 @@ INVENTORIED_SIDE_EFFECTS = (
 
 # Exact review disposition for every checked-in boundary.
 INVENTORY_DISPOSITIONS = {
+    (
+        "providers/resource/quads.py",
+        "normalize_availability_inputs",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:normalize_availability_inputs",
+        "2027-12-31",
+    ),
+    ("providers/resource/quads.py", "without_os", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:without_os",
+        "2027-12-31",
+    ),
+    ("agents/platform/agent.py", "_handle_completion", "mcp"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/agent.py:_handle_completion",
+        "2027-12-31",
+    ),
+    ("agents/platform/foreman_workflow.py", "_monitor_host", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/foreman_workflow.py:_monitor_host",
+        "2027-12-31",
+    ),
+    ("agents/platform/foreman_workflow.py", "_prepare_host", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/foreman_workflow.py:_prepare_host",
+        "2027-12-31",
+    ),
+    ("agents/platform/foreman_workflow.py", "_save_state", "mutating_http_state"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/foreman_workflow.py:_save_state",
+        "2027-12-31",
+    ),
+    ("agents/resource/server.py", "discover_quads_os_catalog", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:discover_quads_os_catalog",
+        "2027-12-31",
+    ),
+    ("providers/resource/quads.py", "discover_os_catalog", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads.py:discover_os_catalog",
+        "2027-12-31",
+    ),
+    ("agents/resource/server.py", "_quads_reserve_without_os", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_quads_reserve_without_os",
+        "2027-12-31",
+    ),
+    ("agents/resource/server.py", "_without_reservation_os", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/server.py:_without_reservation_os",
+        "2027-12-31",
+    ),
+    ("providers/foreman.py", "set_build", "mutating_http_state"): (
+        "audited",
+        "observability-maintainers",
+        "providers/foreman.py:set_build",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/quads_foreman.py",
+        "quads_assignment_directive",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads_foreman.py:quads_assignment_directive",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/quads_foreman.py",
+        "derive_quads_credentials",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads_foreman.py:derive_quads_credentials",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/quads_foreman.py",
+        "verify_quads_ownership",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/quads_foreman.py:verify_quads_ownership",
+        "2027-12-31",
+    ),
     ("cli.py", "_emit_user_reply", "mutating_http_state"): (
         "audited",
         "orchestration-maintainers",
@@ -1490,6 +1614,12 @@ INVENTORY_DISPOSITIONS = {
         "agents/mcp_client.py:_dispatch_mcp_request",
         "2027-12-31",
     ),
+    ("agents/platform/server.py", "_foreman_tool_result", "mcp"): (
+        "audited",
+        "observability-maintainers",
+        "agents/platform/server.py:_foreman_tool_result",
+        "2027-12-31",
+    ),
     ("agents/provisioning/agent.py", "_apply_system_config", "filesystem"): (
         "audited",
         "observability-maintainers",
@@ -1824,6 +1954,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/resource/agent.py:_auto_reservation_selection",
+        "2027-12-31",
+    ),
+    ("agents/resource/agent.py", "_ssh_cleanup_provider", "cloud_resource"): (
+        "audited",
+        "observability-maintainers",
+        "agents/resource/agent.py:_ssh_cleanup_provider",
         "2027-12-31",
     ),
     (

@@ -909,6 +909,18 @@ def _assigned_hardware_from_reservation(
     return {"controller": controller, "targets": targets}
 
 
+def _ssh_cleanup_provider(fields: dict[str, Any]) -> str | None:
+    """Return the provider whose SSH key cleanup owns this ticket's hosts."""
+    provider = fields.get("resource_provider")
+    if not provider and fields.get("quads_assignment_id"):
+        provider = "quads"
+    if provider == "user_provided" and fields.get("foreman_reinstall_state"):
+        # Formal QUADS hosts may receive the configured key during Foreman
+        # bootstrap even though the ticket has no managed reservation.
+        return "quads"
+    return provider
+
+
 class ResourceAgent(AgentBase):
     def __init__(
         self,
@@ -1802,31 +1814,29 @@ class ResourceAgent(AgentBase):
                         )
 
             # Provider-specific SSH key cleanup
-            provider_name = fields.get("resource_provider")
-            if not provider_name and fields.get("quads_assignment_id"):
-                provider_name = "quads"
+            cleanup_provider = _ssh_cleanup_provider(fields)
 
-            if provider_name and provider_name != "user_provided" and self._registry:
+            if cleanup_provider and self._registry:
                 try:
                     provider = await self._registry.get_provider(
-                        provider_name,
+                        cleanup_provider,
                     )
                     result = await provider.cleanup_ssh_keys(all_hosts)
                     cleanup_summary.append(
-                        f"{provider_name} SSH keys: {result.get('status', 'done')}",
+                        f"{cleanup_provider} SSH keys: {result.get('status', 'done')}",
                     )
                     logger.info(
                         "[resource-agent] %s key cleanup: %s",
-                        provider_name,
+                        cleanup_provider,
                         result,
                     )
                 except Exception as e:
                     cleanup_summary.append(
-                        f"{provider_name} SSH keys: failed ({e})",
+                        f"{cleanup_provider} SSH keys: failed ({e})",
                     )
                     logger.exception(
                         "[resource-agent] %s key cleanup failed",
-                        provider_name,
+                        cleanup_provider,
                     )
 
             if cleanup_summary:

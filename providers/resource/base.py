@@ -106,6 +106,18 @@ class ResourceProvider(ABC):
             require_eligible_hostnames=require_eligible_hostnames or preflight,
         )
 
+    def normalize_availability_inputs(
+        self,
+        requirements: dict[str, Any] | None,
+        requested_hosts: list[dict[str, Any]] | None,
+        ticket_hosts: list[dict[str, Any]] | None,
+        ticket_context: dict[str, Any],
+    ) -> tuple[
+        dict[str, Any] | None, list[dict[str, Any]] | None, list[dict[str, Any]] | None
+    ]:
+        """Normalize provider-specific discovery input without changing ticket state."""
+        return requirements, requested_hosts, ticket_hosts
+
     def required_hosts_for_availability(
         self,
         requested_hosts: list[dict[str, Any]] | None,

@@ -531,6 +531,7 @@ async def test_quads_unavailable_os_is_definitive_no_allocation_failure():
     from providers.resource.quads import QuadsResourceProvider
 
     mock_client = AsyncMock()
+    mock_client.validate_ssh_identity = MagicMock()
     mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
     provider = QuadsResourceProvider(mock_client)
     provider.record_availability_context(
@@ -618,6 +619,83 @@ async def test_quads_ticket_requirements_are_authoritative(
 
 
 @pytest.mark.asyncio
+async def test_quads_reinstall_omits_os_from_initial_reservation():
+    import agents.resource.server as srv
+
+    provider = MagicMock()
+    provider.reserve = AsyncMock(
+        return_value={
+            "status": "success",
+            "reservation_id": "42",
+            "provider_metadata": {"assignment_id": 42},
+        }
+    )
+    registry = MagicMock()
+    registry.get_provider = AsyncMock(return_value=provider)
+    srv._initialized = True
+    srv._registry = registry
+    srv._ticket = {
+        "id": "PERF-TEST",
+        "custom_fields": {
+            "required_hosts": [{"roles": ["client"], "os": "RHEL 10.0"}],
+            "directives": {
+                "platform_reinstall": {
+                    "provider": "foreman",
+                    "os": "RHEL 10.0",
+                    "reserve_without_os": True,
+                }
+            },
+        },
+    }
+    result = json.loads(
+        await srv.reserve_resources(
+            provider="quads",
+            selection={"hostnames": ["host-01"], "os": "RHEL 10.0"},
+            description="test",
+            ticket_id="PERF-TEST",
+        )
+    )
+    assert result["status"] == "success"
+    assert provider.reserve.await_args.args[0] == {"hostnames": ["host-01"]}
+
+
+@pytest.mark.asyncio
+async def test_quads_rejects_conflicting_explicit_reservation_os():
+    import agents.resource.server as srv
+
+    provider = MagicMock()
+    provider.reserve = AsyncMock()
+    registry = MagicMock()
+    registry.get_provider = AsyncMock(return_value=provider)
+    srv._initialized = True
+    srv._registry = registry
+    srv._ticket = {
+        "id": "PERF-TEST",
+        "custom_fields": {
+            "directives": {
+                "quads": {"os": "RHEL 9.4"},
+                "platform_reinstall": {
+                    "provider": "foreman",
+                    "os": "RHEL 10.0",
+                    "reserve_without_os": True,
+                },
+            }
+        },
+    }
+    result = json.loads(
+        await srv.reserve_resources(
+            provider="quads",
+            selection={"hostnames": ["host-01"]},
+            description="test",
+            ticket_id="PERF-TEST",
+        )
+    )
+    assert result["status"] == "invalid_selection"
+    assert result["provider_call_started"] is False
+    provider.reserve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_quads_mixed_managed_os_requirements_are_rejected():
     """QUADS cannot represent different OS requirements in one assignment."""
     import agents.resource.server as srv
@@ -661,6 +739,7 @@ async def test_quads_os_catalog_failure_is_definitive_no_allocation_failure():
     from providers.resource.quads import QuadsResourceProvider
 
     mock_client = AsyncMock()
+    mock_client.validate_ssh_identity = MagicMock()
     mock_client.get_os_list.side_effect = RuntimeError("catalog unavailable")
     provider = QuadsResourceProvider(mock_client)
     provider.record_availability_context(

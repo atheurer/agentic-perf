@@ -60,6 +60,50 @@ natural-language description.
 
 ## Available Directives
 
+### Platform OS Reinstall
+
+`platform_reinstall` requests an explicit post-allocation reinstall using a
+platform provider, independently of the initial reservation OS. For example:
+
+```json
+{
+  "platform_reinstall": {
+    "provider": "foreman",
+    "os": "RHEL 10.0",
+    "reserve_without_os": true
+  }
+}
+```
+
+Set `reserve_without_os` only when the initial QUADS reservation must omit an
+OS choice. It does not disable QUADS' normal wipe behavior. Optional `roles`
+limits the reinstall to the named host roles; omit it when the request applies
+to all allocated hosts. Actual installability is checked against the selected
+Foreman deployment and target host.
+
+### Formal QUADS Assignment Identity
+
+When the user supplies existing hosts from a council-allocated QUADS
+assignment, record the assignment identity as a `quads` directive:
+
+```json
+{
+  "quads": {"cloud": "cloud14", "ticket": "5113"}
+}
+```
+
+Both values must be copied verbatim from the allocation. The directive is
+honored only for `resource_provider: quads` and `resource_provider:
+user_provided` tickets, only for hosts named in `required_hosts`, and only as
+part of a `platform_reinstall` request. It is read solely from QUADS-specific
+dictionaries; unrelated top-level `ticket` or `cloud` fields are ignored. The
+directive overrides stale reservation metadata so the derived Foreman account
+and ownership checks use the formal assignment's cloud and ticket. Before any
+destructive step, QUADS must report a matching active, validated assignment for
+that cloud and ticket, and every target host must still report that cloud.
+Managed QUADS tickets retain their assignment ID, so a directive cannot bypass
+the active-assignment check.
+
 ### Benchmark
 
 | Directive | Description | Examples |

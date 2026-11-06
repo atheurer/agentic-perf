@@ -47,6 +47,23 @@ Your job is to analyze a performance test request ticket and:
    min_memory_gb (int), os (string), host (string). Only include specs the
    user actually requested.
 
+   An explicit post-allocation OS reinstall is a separate platform operation.
+   For example, "reserve a QUADS host without specifying an OS, then reinstall
+   RHEL 10.0 with Foreman" sets
+   directives.platform_reinstall = {"provider": "foreman", "os": "RHEL 10.0",
+   "reserve_without_os": true}. Do not put that OS in required_hosts[].os.
+   Set roles only when the user limits which host roles are reinstalled; omit
+   roles when the request covers all allocated hosts. Include reserve_without_os
+   only when the user explicitly asks to omit the reservation OS. An OS explicitly
+   requested for the initial reservation remains a separate requirement.
+
+   Formal QUADS assignments are allocated outside this system. When the user
+   names existing hosts from such an assignment and supplies its assignment
+   ticket and cloud, set directives.quads = {"cloud": "<cloud>", "ticket":
+   "<ticket>"} with both values copied verbatim, and keep those hosts in
+   required_hosts with their exact `host` identities. Never infer a cloud or
+   ticket from an Agentic Perf ticket id or any other unrelated field.
+
    **Existing hosts:** When the user names specific existing hosts (FQDNs or
    IP addresses), set the `host` field on the corresponding required_hosts
    entry to the EXACT string the user provided — character-for-character,

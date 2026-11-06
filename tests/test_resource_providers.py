@@ -184,6 +184,30 @@ class TestResourceProviderRegistry:
 
         assert agent._registry._organization_resolver is resolver
 
+    def test_formal_quads_cleanup_uses_quads_provider(self):
+        from agents.resource.agent import _ssh_cleanup_provider
+
+        assert (
+            _ssh_cleanup_provider(
+                {
+                    "resource_provider": "user_provided",
+                    "foreman_reinstall_state": {"status": "verified"},
+                }
+            )
+            == "quads"
+        )
+        assert (
+            _ssh_cleanup_provider(
+                {
+                    "resource_provider": "user_provided",
+                    "foreman_reinstall_state": {"status": "verified"},
+                    "quads_assignment_id": None,
+                }
+            )
+            == "quads"
+        )
+        assert _ssh_cleanup_provider({"resource_provider": "aws"}) == "aws"
+
 
 # ---------------------------------------------------------------------------
 # QUADS adapter tests
@@ -258,6 +282,7 @@ class TestQuadsResourceProvider:
         from providers.resource.quads import QuadsResourceProvider
 
         mock_client = AsyncMock()
+        mock_client.validate_ssh_identity = MagicMock()
         mock_client.ssh_key_path = "/fake/key"
         mock_client.create_assignment.return_value = {
             "id": 42,
@@ -291,6 +316,7 @@ class TestQuadsResourceProvider:
         from providers.resource.quads import QuadsResourceProvider
 
         mock_client = AsyncMock()
+        mock_client.validate_ssh_identity = MagicMock()
         mock_client.ssh_key_path = "/fake/key"
         mock_client.get_os_list.return_value = [
             {"Title": "RHEL 10.0"},
@@ -327,6 +353,7 @@ class TestQuadsResourceProvider:
         from providers.resource.quads import QuadsResourceProvider
 
         mock_client = AsyncMock()
+        mock_client.validate_ssh_identity = MagicMock()
         mock_client.get_os_list.return_value = [{"Title": "RHEL 10.0"}]
 
         provider = QuadsResourceProvider(mock_client)
@@ -373,6 +400,7 @@ class TestQuadsResourceProvider:
         )
 
         mock_client = AsyncMock()
+        mock_client.validate_ssh_identity = MagicMock()
         mock_client.get_os_list.side_effect = RuntimeError("catalog unavailable")
 
         provider = QuadsResourceProvider(mock_client)
