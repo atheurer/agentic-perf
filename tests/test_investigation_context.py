@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agents.base import AgentBase
-from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
 from providers.llm.openai_compat import OpenAICompatLLMProvider
 from providers.redaction import get_shared_redactor
 
@@ -18,6 +18,7 @@ from providers.redaction import get_shared_redactor
 class _CaptureLLM(LLMProvider):
     def __init__(self) -> None:
         self.calls = []
+        self.responses: list[LLMResponse] = []
 
     async def complete(
         self,
@@ -27,6 +28,8 @@ class _CaptureLLM(LLMProvider):
         max_tokens: int = 4096,
     ) -> LLMResponse:
         self.calls.append((system_prompt, copy.deepcopy(messages)))
+        if self.responses:
+            return self.responses.pop(0)
         return LLMResponse(text="done", stop_reason="end_turn")
 
 
@@ -45,13 +48,22 @@ async def _run(
     ticket: dict[str, Any],
     name: str = "review-agent",
     messages: list[dict[str, Any]] | None = None,
+    responses: list[LLMResponse] | None = None,
+    tools: list[ToolDefinition] | None = None,
+    tool_handlers: dict[str, Any] | None = None,
+    saved_history: list[list[dict[str, Any]]] | None = None,
+    captured_calls: list[tuple[str, list[dict[str, Any]]]] | None = None,
+    audit_events: list[tuple[str, dict[str, Any]]] | None = None,
 ):
     llm = _CaptureLLM()
+    llm.responses = list(responses or [])
     agent = _Agent(
         agent_name=name,
         llm_provider=llm,
         state_store_url="http://unused.invalid",
         max_iterations=0,
+        tools=tools,
+        tool_handlers=tool_handlers,
     )
     agent._get_ticket = AsyncMock(return_value=ticket)
     if messages is not None:
@@ -60,12 +72,27 @@ async def _run(
     agent._check_drift = MagicMock()
     agent._get_previous_iteration_counts = MagicMock(return_value=(0, 0))
     agent._update_fields = AsyncMock()
-    agent._save_messages = AsyncMock()
+    if saved_history is None:
+        agent._save_messages = AsyncMock()
+    else:
+
+        async def capture_saved(_ticket_id, history, *args, **kwargs):
+            saved_history.append(copy.deepcopy(history))
+
+        agent._save_messages = AsyncMock(side_effect=capture_saved)
+    if audit_events is not None:
+        agent._emit = lambda _ticket_id, event_type, data=None: audit_events.append(
+            (event_type, copy.deepcopy(data or {}))
+        )
     try:
         await agent.run("T-INVESTIGATION")
     finally:
         await agent.close()
-    assert len(llm.calls) == 1
+    assert llm.calls
+    if captured_calls is None:
+        assert len(llm.calls) == 1
+    if captured_calls is not None:
+        captured_calls.extend(copy.deepcopy(llm.calls))
     return llm.calls[0]
 
 
@@ -266,6 +293,73 @@ async def test_user_marker_does_not_suppress_generated_context():
 
     content = messages[0]["content"]
     assert content == original + context
+
+
+async def test_context_is_fresh_per_request_but_not_saved_or_accumulated():
+    ticket = {
+        "status": "triage_pending",
+        "custom_fields": {"anomaly_context": {"metric": "latency"}},
+    }
+    original_messages = [{"role": "user", "content": "Original directive"}]
+    saved_history: list[list[dict[str, Any]]] = []
+    captured_calls: list[tuple[str, list[dict[str, Any]]]] = []
+    audit_events: list[tuple[str, dict[str, Any]]] = []
+    inspect_tool = ToolDefinition(
+        name="inspect",
+        description="Inspect data",
+        input_schema={"type": "object", "properties": {}},
+    )
+
+    async def inspect_data():
+        return "inspection complete"
+
+    responses = [
+        LLMResponse(
+            text=None,
+            tool_calls=[ToolCall(id="call-1", name="inspect", input={})],
+            stop_reason="tool_use",
+            raw_content=[
+                {"type": "tool_use", "id": "call-1", "name": "inspect", "input": {}}
+            ],
+        ),
+        LLMResponse(text="done", stop_reason="end_turn"),
+    ]
+    await _run(
+        ticket,
+        messages=original_messages,
+        responses=responses,
+        tools=[inspect_tool],
+        tool_handlers={"inspect": inspect_data},
+        saved_history=saved_history,
+        captured_calls=captured_calls,
+        audit_events=audit_events,
+    )
+
+    marker = AgentBase._INVESTIGATION_CONTEXT_MARKER
+    assert len(captured_calls) == 2
+    for _, request_messages in captured_calls:
+        assert json.dumps(request_messages).count(marker) == 1
+    assert original_messages == [{"role": "user", "content": "Original directive"}]
+    assert len(saved_history) == 1
+    assert marker not in json.dumps(saved_history[0])
+    started = next(data for event, data in audit_events if event == "agent_started")
+    assert json.dumps(started["initial_messages"]).count(marker) == 1
+
+    canonical_resume = copy.deepcopy(saved_history[0])
+    resumed_ticket = {
+        "status": "triage_pending",
+        "custom_fields": {
+            "anomaly_context": {"metric": "current-latency"},
+            "remember_previous": True,
+            "previous_messages": canonical_resume,
+        },
+    }
+    resumed_calls: list[tuple[str, list[dict[str, Any]]]] = []
+    _, resumed_request = await _run(resumed_ticket, captured_calls=resumed_calls)
+    assert len(resumed_calls) == 1
+    assert json.dumps(resumed_request[0]).count(marker) == 1
+    assert "current-latency" in json.dumps(resumed_request[0])
+    assert resumed_ticket["custom_fields"]["previous_messages"] == canonical_resume
 
 
 async def test_resumed_text_blocks_preserve_tool_result_pair():

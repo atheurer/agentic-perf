@@ -773,7 +773,7 @@ class AgentBase(ABC):
             and isinstance(previous_messages, list)
             and previous_messages
         ):
-            messages = previous_messages
+            messages = list(previous_messages)
             logger.info(
                 f"[{self.agent_name}] Resuming with {len(messages)} previous messages"
             )
@@ -786,13 +786,15 @@ class AgentBase(ABC):
             )
         else:
             messages = self._build_messages(ticket)
-        messages = self._include_investigation_context(messages, investigation_ctx)
+        initial_messages = self._include_investigation_context(
+            messages, investigation_ctx
+        )
         self._emit(
             ticket_id,
             "agent_started",
             {
                 "system_prompt": system_prompt,
-                "initial_messages": messages,
+                "initial_messages": initial_messages,
             },
         )
         configured_max = self.max_iterations
@@ -952,7 +954,9 @@ class AgentBase(ABC):
                 try:
                     response = await self.llm.complete(
                         system_prompt=system_prompt,
-                        messages=messages,
+                        messages=self._include_investigation_context(
+                            messages, investigation_ctx
+                        ),
                         tools=(self.tools if self.tools else None),
                     )
                 except asyncio.CancelledError:
