@@ -31,6 +31,7 @@ INVENTORIED_SIDE_EFFECTS = (
         "mutating_http_state",
     ),
     ("agents/benchmark/server.py", "_add_execution_note", "mutating_http_state"),
+    ("agents/benchmark/server.py", "_append_output_dir", "mutating_http_state"),
     ("agents/benchmark/server.py", "_read_controller_file", "ssh"),
     ("agents/benchmark/server.py", "_refresh_controller_context", "ssh"),
     ("agents/benchmark/server.py", "execute_benchmark", "filesystem"),
@@ -990,6 +991,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/benchmark/server.py:_add_execution_note",
+        "2027-12-31",
+    ),
+    (
+        "agents/benchmark/server.py",
+        "_append_output_dir",
+        "mutating_http_state",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/server.py:_append_output_dir",
         "2027-12-31",
     ),
     ("agents/benchmark/server.py", "_read_controller_file", "ssh"): (

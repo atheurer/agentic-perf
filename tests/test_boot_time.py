@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from providers.execution import AuditedSubprocessRunner
@@ -849,3 +850,331 @@ class TestRepoRegistration:
 
         config = OrchestratorConfig()
         assert "boot-time-analysis-scripts" in config.harness_repos
+
+
+class TestOutputDirPersistence:
+    """Verify output_dir is written to custom_fields early."""
+
+    @pytest.mark.parametrize("get_status", [200, 503])
+    async def test_early_persistence_precedes_subprocess_and_is_best_effort(
+        self, tmp_path, monkeypatch, get_status
+    ):
+        from agents.benchmark import server
+
+        monkeypatch.setenv("TICKET_ID", "PERF-BOOT")
+        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+        cache = MagicMock()
+        cache.get_path.return_value = tmp_path
+        client = _FakeClient(
+            _FakeResponse(
+                {"custom_fields": {"output_dirs": []}}, status_code=get_status
+            )
+        )
+        start_observations = []
+
+        async def start(*_args, **_kwargs):
+            start_observations.append(list(client.calls))
+            return _make_mock_process(stdout_data=b"OK")
+
+        def emit(_event):
+            pass
+
+        runner = MagicMock()
+        runner.start = AsyncMock(side_effect=start)
+        token = bind_trace_context(new_trace_context(ticket_id="PERF-BOOT"))
+        try:
+            with (
+                patch.object(server, "_initialized", True),
+                patch.object(server, "_repo_cache", cache),
+                patch.object(server, "_ticket", _boot_time_ticket()),
+                patch.object(server, "durable_filesystem_emitter", return_value=emit),
+                patch.object(server, "AuditedSubprocessRunner", return_value=runner),
+                patch("paths.create_artifact_dir", return_value=tmp_path),
+                patch("socket.create_connection", return_value=MagicMock()),
+                patch(
+                    "providers.execution.AuditedAsyncHTTPClient", return_value=client
+                ),
+                patch("agents.server_utils.ticket_state_headers", return_value={}),
+            ):
+                result = json.loads(
+                    await server.execute_boot_time_test(
+                        sut_host="192.0.2.10", samples=1
+                    )
+                )
+        finally:
+            reset_trace_context(token)
+
+        assert result["status"] == "completed"
+        assert len(start_observations) == 1
+        assert [call[0] for call in start_observations[0]] == (
+            ["GET", "PATCH"] if get_status == 200 else ["GET"]
+        )
+        if get_status == 200:
+            assert start_observations[0][1][2]["fields"] == {
+                "output_dir": str(tmp_path),
+                "output_dirs": [str(tmp_path)],
+            }
+
+
+# ---------------------------------------------------------------------------
+# _append_output_dir helper tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """Minimal response stub for _append_output_dir tests."""
+
+    def __init__(self, payload: dict | None = None, *, status_code: int = 200):
+        self._payload = payload or {}
+        self._status_code = status_code
+
+    def json(self) -> dict:
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if self._status_code >= 400:
+            raise RuntimeError(f"HTTP {self._status_code}")
+
+
+class _FakeClient:
+    """Async-context-manager stub that records GET/PATCH calls."""
+
+    def __init__(
+        self, get_response: _FakeResponse, patch_response: _FakeResponse | None = None
+    ):
+        self.get_response = get_response
+        self.patch_response = patch_response or _FakeResponse()
+        self.calls: list[tuple[str, str, dict | None]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url: str, **kw):
+        self.calls.append(("GET", url, None))
+        return self.get_response
+
+    async def patch(self, url: str, *, json: dict | None = None, **kw):
+        self.calls.append(("PATCH", url, json))
+        return self.patch_response
+
+
+class TestAppendOutputDir:
+    """Unit tests for the _append_output_dir helper."""
+
+    @pytest.mark.asyncio
+    async def test_append_output_dir_appends_to_empty_list(self, monkeypatch):
+        fake_client = _FakeClient(
+            get_response=_FakeResponse({"custom_fields": {}}),
+        )
+        monkeypatch.setenv("STATE_STORE_URL", "http://fake:9090")
+        monkeypatch.setenv("TICKET_ID", "T-1")
+
+        import agents.benchmark.server as srv
+
+        monkeypatch.setattr(
+            "providers.execution.AuditedAsyncHTTPClient",
+            lambda **kw: fake_client,
+        )
+        monkeypatch.setattr(
+            "agents.server_utils.ticket_state_headers",
+            lambda: {"x-test": "1"},
+        )
+
+        await srv._append_output_dir("T-1", "/data/run-1")
+
+        _, _, patch_payload = fake_client.calls[1]
+        assert patch_payload == {
+            "fields": {
+                "output_dir": "/data/run-1",
+                "output_dirs": ["/data/run-1"],
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_append_output_dir_null_list_is_empty(self, monkeypatch):
+        import agents.benchmark.server as srv
+
+        fake_client = _FakeClient(
+            _FakeResponse({"custom_fields": {"output_dirs": None}})
+        )
+        monkeypatch.setattr(
+            "providers.execution.AuditedAsyncHTTPClient", lambda **_kw: fake_client
+        )
+        monkeypatch.setattr("agents.server_utils.ticket_state_headers", lambda: {})
+        await srv._append_output_dir("T-NULL", "/data/run-1")
+        assert fake_client.calls[1][2]["fields"]["output_dirs"] == ["/data/run-1"]
+
+    @pytest.mark.parametrize(
+        ("payload", "message"),
+        [
+            ({}, "custom_fields"),
+            ({"custom_fields": None}, "custom_fields"),
+            ({"custom_fields": ["bad"]}, "custom_fields"),
+            ({"custom_fields": "bad"}, "custom_fields"),
+            ({"custom_fields": {"output_dirs": "old-path"}}, "output_dirs"),
+            ({"custom_fields": {"output_dirs": {"old": "path"}}}, "output_dirs"),
+        ],
+    )
+    async def test_malformed_ticket_fields_do_not_patch(
+        self, monkeypatch, payload, message
+    ):
+        import agents.benchmark.server as srv
+
+        fake_client = _FakeClient(_FakeResponse(payload))
+        monkeypatch.setattr(
+            "providers.execution.AuditedAsyncHTTPClient", lambda **_kw: fake_client
+        )
+        monkeypatch.setattr("agents.server_utils.ticket_state_headers", lambda: {})
+        with pytest.raises(ValueError, match=message):
+            await srv._append_output_dir("T-BAD", "/data/run-1")
+        assert [call[0] for call in fake_client.calls] == ["GET"]
+
+    async def test_ticket_read_error_does_not_parse_or_patch(self, monkeypatch):
+        import agents.benchmark.server as srv
+
+        class ErrorResponse(_FakeResponse):
+            def json(self):
+                raise AssertionError("error response must not be parsed")
+
+        fake_client = _FakeClient(ErrorResponse(status_code=503))
+        monkeypatch.setattr(
+            "providers.execution.AuditedAsyncHTTPClient", lambda **_kw: fake_client
+        )
+        monkeypatch.setattr("agents.server_utils.ticket_state_headers", lambda: {})
+        with pytest.raises(RuntimeError, match="HTTP 503"):
+            await srv._append_output_dir("T-ERROR", "/data/run-1")
+        assert [call[0] for call in fake_client.calls] == ["GET"]
+
+    async def test_audited_update_preserves_ticket_and_fence_headers(self, monkeypatch):
+        import agents.benchmark.server as srv
+        from providers.execution import AuditedAsyncHTTPClient
+
+        requests = []
+        audit_events = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(
+                    200, json={"custom_fields": {"output_dirs": ["/data/old"]}}
+                )
+            return httpx.Response(200, json={})
+
+        async def emit(event):
+            audit_events.append(event)
+
+        def client_factory(**kwargs):
+            client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler), headers=kwargs["headers"]
+            )
+            return AuditedAsyncHTTPClient(client=client, emit=emit)
+
+        headers = {
+            "X-Agentic-Perf-Orchestrator-Session": "session-1",
+            "X-Agentic-Perf-Orchestrator-Epoch": "7",
+            "X-Agentic-Perf-Claim-Id": "claim-1",
+        }
+        monkeypatch.setattr("agents.server_utils.ticket_state_headers", lambda: headers)
+        monkeypatch.setattr(
+            "providers.execution.AuditedAsyncHTTPClient", client_factory
+        )
+        token = bind_trace_context(
+            new_trace_context(ticket_id="T-1", agent_id="benchmark")
+        )
+        try:
+            await srv._append_output_dir("T-1", "/data/run-1")
+        finally:
+            reset_trace_context(token)
+
+        assert [request.method for request in requests] == ["GET", "PATCH"]
+        assert all(
+            request.headers["x-agentic-perf-ticket-id"] == "T-1" for request in requests
+        )
+        assert all(
+            all(request.headers[key] == value for key, value in headers.items())
+            for request in requests
+        )
+        assert json.loads(requests[1].content)["fields"]["output_dirs"] == [
+            "/data/old",
+            "/data/run-1",
+        ]
+        assert audit_events
+        assert {event.ticket_id for event in audit_events} == {"T-1"}
+
+    @pytest.mark.asyncio
+    async def test_append_output_dir_appends_to_existing(self, monkeypatch):
+        fake_client = _FakeClient(
+            get_response=_FakeResponse(
+                {"custom_fields": {"output_dirs": ["/data/run-0"]}}
+            ),
+        )
+        monkeypatch.setenv("STATE_STORE_URL", "http://fake:9090")
+
+        import agents.benchmark.server as srv
+
+        monkeypatch.setattr(
+            "providers.execution.AuditedAsyncHTTPClient",
+            lambda **kw: fake_client,
+        )
+        monkeypatch.setattr(
+            "agents.server_utils.ticket_state_headers",
+            lambda: {},
+        )
+
+        await srv._append_output_dir("T-2", "/data/run-1")
+
+        _, _, patch_payload = fake_client.calls[1]
+        assert patch_payload["fields"]["output_dirs"] == [
+            "/data/run-0",
+            "/data/run-1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_append_output_dir_skips_duplicate(self, monkeypatch):
+        fake_client = _FakeClient(
+            get_response=_FakeResponse(
+                {"custom_fields": {"output_dirs": ["/data/run-1"]}}
+            ),
+        )
+        monkeypatch.setenv("STATE_STORE_URL", "http://fake:9090")
+
+        import agents.benchmark.server as srv
+
+        monkeypatch.setattr(
+            "providers.execution.AuditedAsyncHTTPClient",
+            lambda **kw: fake_client,
+        )
+        monkeypatch.setattr(
+            "agents.server_utils.ticket_state_headers",
+            lambda: {},
+        )
+
+        await srv._append_output_dir("T-3", "/data/run-1")
+
+        _, _, patch_payload = fake_client.calls[1]
+        assert patch_payload["fields"]["output_dirs"] == ["/data/run-1"]
+
+    @pytest.mark.asyncio
+    async def test_append_output_dir_raises_on_http_error(self, monkeypatch):
+        fake_client = _FakeClient(
+            get_response=_FakeResponse({"custom_fields": {}}),
+            patch_response=_FakeResponse(status_code=500),
+        )
+        monkeypatch.setenv("STATE_STORE_URL", "http://fake:9090")
+
+        import agents.benchmark.server as srv
+
+        monkeypatch.setattr(
+            "providers.execution.AuditedAsyncHTTPClient",
+            lambda **kw: fake_client,
+        )
+        monkeypatch.setattr(
+            "agents.server_utils.ticket_state_headers",
+            lambda: {},
+        )
+
+        with pytest.raises(RuntimeError, match="HTTP 500"):
+            await srv._append_output_dir("T-4", "/data/run-1")
