@@ -134,6 +134,7 @@ class TestTerminateProviderResourcesJumpstarter:
                 "lease_id": "test-lease",
                 "status": "error",
                 "error": "lease not found or already been released",
+                "already_released": True,
             }
         )
         agent._registry.get_provider = AsyncMock(return_value=mock_provider)
@@ -194,6 +195,40 @@ class TestTerminateProviderResourcesJumpstarter:
         agent._add_comment.assert_called_once()
         comment_call = agent._add_comment.call_args
         assert "could not confirm" in comment_call[0][1].lower()
+
+    @pytest.mark.asyncio
+    async def test_error_text_mentioning_not_found_is_not_success(self):
+        """Text alone must not mark success; only the structured flag counts."""
+        from agents.resource.agent import ResourceAgent
+
+        agent = ResourceAgent(
+            llm_provider=MagicMock(),
+            state_store_url="http://test",
+            mode="teardown",
+            secrets_provider=MagicMock(),
+        )
+        agent._registry = MagicMock()
+        agent._add_comment = AsyncMock()
+
+        mock_provider = AsyncMock()
+        mock_provider.terminate = AsyncMock(
+            return_value={
+                "provider": "jumpstarter",
+                "lease_id": "test-lease",
+                "status": "error",
+                "error": "permission denied: provider endpoint not found",
+            }
+        )
+        agent._registry.get_provider = AsyncMock(return_value=mock_provider)
+
+        result = await agent._terminate_provider_resources(
+            ticket_id="TEST-123",
+            provider_name="jumpstarter",
+            reservation_id="test-lease",
+            provider_metadata={},
+        )
+
+        assert result is False
 
     @pytest.mark.asyncio
     async def test_jumpstarter_terminated_status_succeeds(self):

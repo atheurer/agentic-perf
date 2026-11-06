@@ -450,6 +450,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/resource/jumpstarter.py", "<module>", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "_ensure_connected", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "_is_enabled", "cloud_resource"),
+    (
+        "providers/resource/jumpstarter.py",
+        "_lease_already_released",
+        "cloud_resource",
+    ),
     ("providers/resource/jumpstarter.py", "_check_named_device", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "check_available", "cloud_resource"),
     ("providers/resource/jumpstarter.py", "close", "cloud_resource"),
@@ -3104,6 +3109,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/resource/jumpstarter.py:_is_enabled",
+        "2027-12-31",
+    ),
+    (
+        "providers/resource/jumpstarter.py",
+        "_lease_already_released",
+        "cloud_resource",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "providers/resource/jumpstarter.py:_lease_already_released",
         "2027-12-31",
     ),
     ("providers/resource/jumpstarter.py", "_check_named_device", "cloud_resource"): (
