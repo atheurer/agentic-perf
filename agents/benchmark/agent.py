@@ -603,12 +603,16 @@ class BenchmarkAgent(AgentBase):
             ),
             "X-Agentic-Perf-Claim-Id": os.environ.get("AGENTIC_PERF_CLAIM_ID", "")
             or (cf.get("claim") or {}).get("claim_id", ""),
-            "X-Agentic-Perf-Invocation-Id": str(approval_context.invocation_id)
-            if approval_context and approval_context.invocation_id
-            else "",
-            "X-Agentic-Perf-Tool-Call-Id": approval_context.tool_call_id
-            if approval_context and approval_context.tool_call_id
-            else "",
+            "X-Agentic-Perf-Invocation-Id": (
+                str(approval_context.invocation_id)
+                if approval_context and approval_context.invocation_id
+                else ""
+            ),
+            "X-Agentic-Perf-Tool-Call-Id": (
+                approval_context.tool_call_id
+                if approval_context and approval_context.tool_call_id
+                else ""
+            ),
         }
         request = await self._client.post(
             f"{self.store_url}/api/v1/tickets/{self._ticket_id}/approvals",
@@ -620,12 +624,14 @@ class BenchmarkAgent(AgentBase):
                 "execution_intent_id": validation.get("execution_intent_id"),
                 "attempt_id": validation.get("attempt_id"),
                 "summary": summary or benchmark or "Benchmark run-file approval",
-                "invocation_id": str(approval_context.invocation_id)
-                if approval_context and approval_context.invocation_id
-                else None,
-                "tool_call_id": approval_context.tool_call_id
-                if approval_context
-                else None,
+                "invocation_id": (
+                    str(approval_context.invocation_id)
+                    if approval_context and approval_context.invocation_id
+                    else None
+                ),
+                "tool_call_id": (
+                    approval_context.tool_call_id if approval_context else None
+                ),
                 "session_id": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID"),
                 "session_epoch": os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH"),
                 "waiter_owner": (
@@ -954,6 +960,12 @@ class BenchmarkAgent(AgentBase):
         )
         if directive_schema:
             prompt += f"\n\n{directive_schema}"
+
+        if cf.get("anomaly_context"):
+            prompt += "\n\n" + skill_context_prompt("investigation")
+
+        if provider == "jumpstarter":
+            prompt += "\n\n" + skill_context_prompt("jumpstarter")
 
         return prompt
 
@@ -1457,6 +1469,33 @@ class BenchmarkAgent(AgentBase):
                     "current execution plan step. Build a fresh "
                     "run-file.*\n"
                 )
+
+        # Surface analysis findings if available (from analyze agent)
+        analysis_result = cf.get("analysis_result")
+        if analysis_result:
+            content += "\n## Analysis Findings\n"
+            conclusive = analysis_result.get("conclusive", False)
+            content += f"**Conclusive:** {conclusive}\n"
+            finding = analysis_result.get("finding", "")
+            if finding:
+                content += f"**Finding:** {finding}\n"
+            root_cause = analysis_result.get("root_cause")
+            if root_cause:
+                content += f"**Root Cause:** {root_cause}\n"
+            benchmark_needed = analysis_result.get("benchmark_needed", {})
+            if benchmark_needed:
+                if isinstance(benchmark_needed, dict):
+                    reason = benchmark_needed.get("reason", "")
+                    if reason:
+                        content += f"**Benchmark Needed Reason:** {reason}\n"
+                    suggested = benchmark_needed.get("suggested_params")
+                    if suggested:
+                        content += (
+                            f"**Suggested Parameters for Benchmark:**\n"
+                            f"```json\n{json.dumps(suggested, indent=2)}\n```\n"
+                        )
+                else:
+                    content += f"**Benchmark Needed:** {benchmark_needed}\n"
 
         user_comments = self._user_comments(ticket)
         if user_comments:

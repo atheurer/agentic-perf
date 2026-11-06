@@ -144,3 +144,23 @@ automatically when `run_metadata` is available (webhook
 tickets). For manual tickets, the server is determined by
 `image_version` — `AutoSD-*` uses the AutoSD server,
 `RHIVOS-*` uses the RHIVOS server.
+
+## Resolving Image/Mode Conflicts from Webhook Metadata
+
+When a ticket is created by a Horreum webhook, `anomaly_context` may
+contain metadata that conflicts with other ticket fields (e.g.,
+`mode=package` while the test name implies ostree). Resolve using this
+hierarchy — highest priority wins:
+
+1. **Exact mode token in test name**: A dash-delimited token that is
+   exactly `ostree` or `package` (e.g., `boot-time-ostree`,
+   `autosd-package-nightly`). Avoid partial matches — `no-ostree` or
+   `ostree-package-comparison` are ambiguous; move to the next level.
+2. **`anomaly_context.mode` field**: If set to exactly `"ostree"` or
+   `"package"` and the test name was ambiguous, use this.
+3. **Default fallback**: ostree.
+
+When resolving a conflict, add a ticket comment explaining your
+choice — e.g., "Resolved image/mode: selected ostree — test name
+token 'ostree' in 'boot-time-ostree-autosd10' takes precedence over
+metadata mode=package."
