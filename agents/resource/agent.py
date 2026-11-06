@@ -1678,13 +1678,29 @@ class ResourceAgent(AgentBase):
             result = await provider.terminate(reservation_id, provider_metadata)
             status = str(result.get("status", "")).strip().lower()
             if status not in {"terminated", "released"}:
-                await self._add_comment(
-                    ticket_id,
-                    f"Could not confirm release of {provider_name} reservation "
-                    f"{reservation_id} (provider status: {status or 'missing'}). "
-                    "Allocation details were retained.",
+                # Some providers return status="error" with a "not_found" or
+                # "already_released" message when the lease is already gone.
+                # Treat these as idempotent success — the goal is achieved.
+                error_msg = str(result.get("error", "")).lower()
+                is_already_released = any(
+                    indicator in error_msg
+                    for indicator in (
+                        "not found",
+                        "not_found",
+                        "already released",
+                        "already_released",
+                    )
                 )
-                return False
+                if not is_already_released:
+                    await self._add_comment(
+                        ticket_id,
+                        f"Could not confirm release of {provider_name} reservation "
+                        f"{reservation_id} (provider status: {status or 'missing'}). "
+                        "Allocation details were retained.",
+                    )
+                    return False
+                # Lease was already released — treat as success
+                status = "released"
             await self._add_comment(
                 ticket_id,
                 f"{provider_name} reservation {reservation_id} terminated.",
