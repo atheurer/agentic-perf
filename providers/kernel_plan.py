@@ -103,10 +103,26 @@ def validate_kernel_comparison(directive: Any) -> tuple[dict[str, Any] | None, s
     }, ""
 
 
-def _kernel_step(step_id: int, release: str, params: dict[str, Any]) -> dict[str, Any]:
+def _kernel_step(
+    step_id: int,
+    release: str,
+    params: dict[str, Any],
+    *,
+    role: str = "candidate",
+) -> dict[str, Any]:
+    """Build one kernel transition step.
+
+    The candidate step installs the directive's package (kernel-rt for the
+    RT-vs-stock demo); the baseline step is always a parity reboot of the
+    preinstalled stock kernel, so it uses the stock ``kernel`` package —
+    installing the candidate package at the baseline release would clobber
+    the stock kernel's vmlinuz path and silently boot the wrong kernel
+    (observed on PERF-88520DC5).
+    """
+    package = params["package"] if role == "candidate" else "kernel"
     kernel: dict[str, Any] = {
         "release": release,
-        "package": params["package"],
+        "package": package,
         "reboot_strategy": "serial",
         "hosts": None,
     }
@@ -204,7 +220,12 @@ def build_kernel_comparison_plan(
     new_steps: list[dict[str, Any]] = list(head)
     for letter in normalized["order"]:
         release = normalized["baseline" if letter == "A" else "candidate"]
-        kernel_step = _kernel_step(len(new_steps), release, normalized)
+        kernel_step = _kernel_step(
+            len(new_steps),
+            release,
+            normalized,
+            role=_LETTER_ROLES[letter],
+        )
         kernel_step["params"]["label"] = f"kernel-{letter}"
         new_steps.append(kernel_step)
         new_steps.append(
