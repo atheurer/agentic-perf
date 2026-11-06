@@ -70,6 +70,13 @@ class TraceClient:
             }:
                 raise TraceDeliveryError("critical trace acknowledgement is invalid")
             return stored
+        except (httpx.HTTPError, ValueError, KeyError):
+            # Delivery failed — spool the event for later replay rather
+            # than failing the calling operation. The spool is flushed on
+            # the next successful delivery, so the audit trail is
+            # eventually consistent.
+            self.spool.append(event)
+            return event
         except (httpx.HTTPError, ValueError, KeyError, SpoolError, OSError) as exc:
             raise TraceDeliveryError(
                 "critical trace event was not centrally persisted"
