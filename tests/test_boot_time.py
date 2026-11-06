@@ -245,14 +245,8 @@ class TestSelfHostGuard:
     """The _is_self_host guardrail must reject localhost variants."""
 
     def _import_guard(self):
-        import importlib
-        import sys
+        import agents.benchmark.server as mod
 
-        # Force re-import to get the function
-        mod_name = "agents.benchmark.server"
-        if mod_name in sys.modules:
-            del sys.modules[mod_name]
-        mod = importlib.import_module(mod_name)
         return mod._is_self_host
 
     def test_localhost(self):
