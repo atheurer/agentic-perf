@@ -631,16 +631,13 @@ class AgentBase(ABC):
             if not isinstance(message, dict) or message.get("role") != "user":
                 continue
             content = message.get("content")
-            if (
-                isinstance(content, str)
-                and self._INVESTIGATION_CONTEXT_MARKER in content
-            ):
+            if isinstance(content, str) and content.endswith(context):
                 return messages
             if isinstance(content, list) and any(
                 isinstance(block, dict)
                 and block.get("type") == "text"
                 and isinstance(block.get("text"), str)
-                and self._INVESTIGATION_CONTEXT_MARKER in block["text"]
+                and block["text"] == context
                 for block in content
             ):
                 return messages

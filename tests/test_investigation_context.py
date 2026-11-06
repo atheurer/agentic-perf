@@ -41,7 +41,11 @@ class _Agent(AgentBase):
         pass
 
 
-async def _run(ticket: dict[str, Any], name: str = "review-agent"):
+async def _run(
+    ticket: dict[str, Any],
+    name: str = "review-agent",
+    messages: list[dict[str, Any]] | None = None,
+):
     llm = _CaptureLLM()
     agent = _Agent(
         agent_name=name,
@@ -50,6 +54,8 @@ async def _run(ticket: dict[str, Any], name: str = "review-agent"):
         max_iterations=0,
     )
     agent._get_ticket = AsyncMock(return_value=ticket)
+    if messages is not None:
+        agent._build_messages = MagicMock(return_value=copy.deepcopy(messages))
     agent._check_interject = AsyncMock(return_value=None)
     agent._check_drift = MagicMock()
     agent._get_previous_iteration_counts = MagicMock(return_value=(0, 0))
@@ -233,6 +239,29 @@ async def test_old_resumed_history_adds_context_without_altering_tool_pair():
     assert resumed[1:] == original[1:]
     assert previous == original
     assert _context(resumed)[1]["anomaly_context"]["metric"] == "latency"
+
+
+async def test_user_marker_does_not_suppress_generated_context():
+    marker = AgentBase._INVESTIGATION_CONTEXT_MARKER
+    original = f"User directive includes this literal: {marker}"
+    ticket = {
+        "status": "triage_pending",
+        "custom_fields": {"anomaly_context": {"metric": "latency"}},
+    }
+    _, messages = await _run(
+        ticket,
+        messages=[{"role": "user", "content": original}],
+    )
+
+    content = messages[0]["content"]
+    assert content.startswith(original)
+    assert content.count(marker) == 2
+    context_suffix = content[len(original) :]
+    assert context_suffix.startswith(f"\n\n{marker}\n")
+    assert json.loads(context_suffix.split(marker, 1)[1].strip()) == {
+        "anomaly_context": {"metric": "latency"}
+    }
+    assert content.count(context_suffix) == 1
 
 
 async def test_resumed_text_blocks_preserve_tool_result_pair():
