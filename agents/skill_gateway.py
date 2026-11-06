@@ -29,6 +29,8 @@ _LOCAL_SUBJECT_DIRS = {
     "harness/kube-burner": "kube-burner",
     "harness/k8s-netperf": "k8s-netperf",
     "resource/aws": "resource/aws",
+    "resource/jumpstarter": "jumpstarter",
+    "workflow/investigation": "investigation",
 }
 _UPSTREAM_REPOS = {
     "harness/kube-burner": "kube-burner",

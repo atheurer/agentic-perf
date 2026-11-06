@@ -149,18 +149,32 @@ tickets). For manual tickets, the server is determined by
 
 When a ticket is created by a Horreum webhook, `anomaly_context` may
 contain metadata that conflicts with other ticket fields (e.g.,
-`mode=package` while the test name implies ostree). Resolve using this
-hierarchy — highest priority wins:
+`mode=package` while the test name contains `ostree`). The provisioning
+resolver derives the image type deterministically, so follow the same
+precedence:
 
-1. **Exact mode token in test name**: A dash-delimited token that is
-   exactly `ostree` or `package` (e.g., `boot-time-ostree`,
-   `autosd-package-nightly`). Avoid partial matches — `no-ostree` or
-   `ostree-package-comparison` are ambiguous; move to the next level.
-2. **`anomaly_context.mode` field**: If set to exactly `"ostree"` or
-   `"package"` and the test name was ambiguous, use this.
-3. **Default fallback**: ostree.
+1. **A valid explicit `image_type` directive on the ticket** wins. The
+   resolver accepts only `ostree` or `regular` (case-insensitive) and
+   otherwise falls back to the computed default below.
+2. **`RHIVOS Mode` in `run_metadata` is authoritative** when present:
+   `bootc` or `ostree` selects `ostree`; any other value, including
+   `package`, selects `regular`.
+3. **`anomaly_context.mode` is only a hint** when `run_metadata` is
+   absent (`ostree` suggests `ostree`, `package` suggests `regular`).
+   The resolver does not read that field, so pass the choice as an
+   explicit valid `image_type` directive. It never overrides an
+   authoritative label.
+4. **Do not infer the mode from the test name** when authoritative
+   metadata exists. Tokens such as `no-ostree` or
+   `ostree-package-comparison` are ambiguous, and a name token must not
+   overrule the `RHIVOS Mode` label.
+5. **Fallback**: when no mode evidence exists, match the resolver
+   defaults. If `run_metadata.labels` has a `RHIVOS image name`, use
+   that name with `regular` type. Otherwise, when nonempty labels are
+   present, use image name `qa` with `regular` type; when run metadata
+   is absent or its labels are empty, use `ps` with `regular` type.
 
 When resolving a conflict, add a ticket comment explaining your
-choice — e.g., "Resolved image/mode: selected ostree — test name
-token 'ostree' in 'boot-time-ostree-autosd10' takes precedence over
-metadata mode=package."
+choice and which source won — e.g., "Resolved image/mode: selected
+regular — authoritative `RHIVOS Mode=package` in run_metadata
+overrides the 'ostree' token in the test name."

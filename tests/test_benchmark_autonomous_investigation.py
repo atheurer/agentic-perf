@@ -3,10 +3,10 @@
 Validates that:
 1. Analysis findings from analysis_result are surfaced into _build_messages context.
 2. When anomaly_context is present, _system_prompt() injects skill_context_prompt
-   for "investigation" (provider-agnostic reproduction rules).
+   for "workflow/investigation" (provider-agnostic reproduction rules).
 3. When resource_provider is "jumpstarter", _system_prompt() injects
-   skill_context_prompt for "jumpstarter" (image/mode selection including webhook
-   conflict resolution).
+   skill_context_prompt for "resource/jumpstarter" (image/mode selection
+   including webhook conflict resolution).
 4. The two injections are independent — Jumpstarter skill loads for any Jumpstarter
    ticket, investigation skill loads for any webhook ticket.
 5. No Horreum/webhook-specific content is embedded in core benchmark prompts.
@@ -92,6 +92,33 @@ class TestAnalysisFindingsSurfaced:
         assert "Boot time increased by 15%" not in content
         assert "scheduler: CFS latency increase" not in content
 
+    def test_malformed_analysis_result_does_not_crash(self, mock_agent):
+        """Non-dict analysis_result is ignored rather than raising."""
+        ticket = {
+            "id": "TEST-123",
+            "summary": "Performance investigation",
+            "description": "Investigate regression",
+            "custom_fields": {"analysis_result": '{"conclusive": false}'},
+        }
+        messages = mock_agent._build_messages(ticket)
+        content = messages[0]["content"]
+        assert "## Analysis Findings" not in content
+
+    def test_analysis_finding_is_bounded(self, mock_agent):
+        """Analysis text is truncated so it cannot dominate the prompt."""
+        ticket = {
+            "id": "TEST-123",
+            "summary": "Performance investigation",
+            "description": "Investigate regression",
+            "custom_fields": {
+                "analysis_result": {"conclusive": False, "finding": "x" * 10_000},
+            },
+        }
+        messages = mock_agent._build_messages(ticket)
+        content = messages[0]["content"]
+        assert "x" * 10_000 not in content
+        assert "...[truncated]" in content
+
 
 class TestSkillInjection:
     """Skill context prompts are injected based on ticket properties independently."""
@@ -105,13 +132,13 @@ class TestSkillInjection:
             },
         }
         prompt = mock_agent._system_prompt(ticket)
-        assert skill_context_prompt("investigation") in prompt
+        assert skill_context_prompt("workflow/investigation") in prompt
 
     def test_investigation_skill_absent_for_ordinary_ticket(self, mock_agent):
         """No anomaly_context → investigation skill context not injected."""
         ticket = {"id": "TEST-123", "custom_fields": {}}
         prompt = mock_agent._system_prompt(ticket)
-        assert skill_context_prompt("investigation") not in prompt
+        assert skill_context_prompt("workflow/investigation") not in prompt
 
     def test_jumpstarter_skill_injected_for_jumpstarter_provider(self, mock_agent):
         """resource_provider=jumpstarter → jumpstarter skill context injected."""
@@ -120,13 +147,13 @@ class TestSkillInjection:
             "custom_fields": {"resource_provider": "jumpstarter"},
         }
         prompt = mock_agent._system_prompt(ticket)
-        assert skill_context_prompt("jumpstarter") in prompt
+        assert skill_context_prompt("resource/jumpstarter") in prompt
 
     def test_jumpstarter_skill_absent_without_jumpstarter_provider(self, mock_agent):
         """No jumpstarter provider → jumpstarter skill context not injected."""
         ticket = {"id": "TEST-123", "custom_fields": {}}
         prompt = mock_agent._system_prompt(ticket)
-        assert skill_context_prompt("jumpstarter") not in prompt
+        assert skill_context_prompt("resource/jumpstarter") not in prompt
 
     def test_both_skills_injected_for_jumpstarter_webhook_ticket(self, mock_agent):
         """Jumpstarter webhook ticket gets both investigation and jumpstarter skills."""
@@ -138,8 +165,8 @@ class TestSkillInjection:
             },
         }
         prompt = mock_agent._system_prompt(ticket)
-        assert skill_context_prompt("investigation") in prompt
-        assert skill_context_prompt("jumpstarter") in prompt
+        assert skill_context_prompt("workflow/investigation") in prompt
+        assert skill_context_prompt("resource/jumpstarter") in prompt
 
     def test_base_prompt_contains_no_webhook_specifics(self):
         """Core BENCHMARK_BASE_PROMPT has no Horreum or webhook-specific content."""
