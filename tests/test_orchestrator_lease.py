@@ -944,6 +944,22 @@ def test_release_fsyncs_persistence_directory(tmp_path, monkeypatch):
     assert not (tmp_path / "orchestrator-lease.json").exists()
 
 
+def test_lease_cache_unchanged_when_disk_write_fails(tmp_path, monkeypatch):
+    store = TicketStore(persist_dir=tmp_path)
+    lease = store.acquire_orchestrator_lease(_request())
+
+    def failing_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store._system_filesystem, "write", failing_write)
+    with pytest.raises(OSError):
+        store.renew_orchestrator_lease(lease.session_id, lease.epoch, 30)
+
+    current = store.get_orchestrator_lease()
+    assert current is not None
+    assert current.expires_at == lease.expires_at
+
+
 def test_public_health_does_not_disclose_lease_holder_identity(tmp_path):
     store = TicketStore(persist_dir=tmp_path)
     store.acquire_orchestrator_lease(_request())

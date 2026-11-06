@@ -67,7 +67,7 @@ async def event_stream(
 
             ids_to_poll = ticket_ids
             if ids_to_poll is None:
-                ids_to_poll = _active_ticket_ids(store)
+                ids_to_poll = await asyncio.to_thread(_active_ticket_ids, store)
 
             new_events = await asyncio.to_thread(
                 _poll_events,

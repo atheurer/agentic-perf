@@ -9,9 +9,11 @@ Two endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import secrets
+import threading
 import time
 from typing import Any
 
@@ -28,6 +30,11 @@ router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 # In-memory rate-limit tracker: username -> list of timestamps
 _rate_limit_window: dict[str, list[float]] = {}
+
+# Ticket creation for webhook sources is serialized so the dedup lookup and the
+# insert it guards cannot interleave: without this, two concurrent deliveries of
+# the same event could both miss the lookup and each create a ticket.
+_webhook_create_lock = threading.Lock()
 
 
 def _check_rate_limit(username: str, max_per_hour: int | None) -> None:
@@ -149,6 +156,60 @@ def _find_dedup(
     return None
 
 
+def _dedup_or_create_ticket(
+    store: Any,
+    event_bus: Any,
+    create_req: CreateTicketRequest,
+    *,
+    trigger_source: str,
+    source: str,
+    username: str,
+    dedup_key_value: str | None,
+) -> tuple[str | None, Any | None]:
+    """Deduplicate, then create and queue a ticket, in one worker call.
+
+    The lookup and creation share a worker-thread invocation so concurrent
+    webhooks with the same dedup key cannot both pass the lookup before either
+    creates a ticket.  It also means a cancelled request cannot leave a created
+    ticket that never reaches TRIAGE_PENDING.
+
+    Returns ``(existing_ticket_id, None)`` for a dedup hit or
+    ``(None, new_ticket)`` after creating and queueing one.
+    """
+    with _webhook_create_lock:
+        existing_id = _find_dedup(store, trigger_source, dedup_key_value)
+        if existing_id:
+            if event_bus:
+                event_bus.emit(
+                    existing_id,
+                    "webhook",
+                    "duplicate_suppressed",
+                    {
+                        "source": source,
+                        "dedup_key": dedup_key_value,
+                        "submitted_by": username,
+                    },
+                )
+            return existing_id, None
+
+        ticket = store.create_ticket(create_req, created_by=username)
+        if event_bus:
+            event_bus.emit(
+                ticket.id,
+                "webhook",
+                "ticket_created",
+                {
+                    "source": source,
+                    "created_by": username,
+                    "dedup_key": dedup_key_value,
+                },
+            )
+        store.transition_ticket(
+            ticket.id, TransitionRequest(status=TicketStatus.TRIAGE_PENDING)
+        )
+        return None, ticket
+
+
 @router.get("")
 def list_webhook_sources(request: Request) -> dict[str, list[str]]:
     """List available webhook sources.  Requires normal auth."""
@@ -215,12 +276,32 @@ async def receive_webhook(
     ticket_fields = translator.translate(payload)
     dedup_key_value = translator.dedup_key(payload)
 
-    # Dedup check
+    # Dedup check plus creation and queueing.  Both run inside one worker call
+    # so concurrent duplicate webhooks cannot race between lookup and create.
     store = request.app.state.store
-    existing_id = _find_dedup(
+    trigger_source = ticket_fields.get("custom_fields", {}).get(
+        "trigger_source", source
+    )
+
+    # Inject dedup key into custom_fields
+    custom_fields = ticket_fields.get("custom_fields", {})
+    if dedup_key_value:
+        custom_fields["dedup_key"] = dedup_key_value
+
+    create_req = CreateTicketRequest(
+        summary=ticket_fields["summary"],
+        description=ticket_fields.get("description", ""),
+        custom_fields=custom_fields,
+    )
+    existing_id, ticket = await asyncio.to_thread(
+        _dedup_or_create_ticket,
         store,
-        ticket_fields.get("custom_fields", {}).get("trigger_source", source),
-        dedup_key_value,
+        getattr(request.app.state, "event_bus", None),
+        create_req,
+        trigger_source=trigger_source,
+        source=source,
+        username=username,
+        dedup_key_value=dedup_key_value,
     )
     if existing_id:
         logger.info(
@@ -229,59 +310,13 @@ async def receive_webhook(
             dedup_key_value,
             existing_id,
         )
-        # Record the dedup on the existing ticket so it's
-        # visible in the dashboard timeline.
-        event_bus = getattr(request.app.state, "event_bus", None)
-        if event_bus:
-            event_bus.emit(
-                existing_id,
-                "webhook",
-                "duplicate_suppressed",
-                {
-                    "source": source,
-                    "dedup_key": dedup_key_value,
-                    "submitted_by": username,
-                },
-            )
         return {
             "status": "duplicate",
             "ticket_id": existing_id,
             "dedup_key": dedup_key_value,
         }
 
-    # Inject dedup key into custom_fields
-    custom_fields = ticket_fields.get("custom_fields", {})
-    if dedup_key_value:
-        custom_fields["dedup_key"] = dedup_key_value
-
-    # Create ticket
-    create_req = CreateTicketRequest(
-        summary=ticket_fields["summary"],
-        description=ticket_fields.get("description", ""),
-        custom_fields=custom_fields,
-    )
-    ticket = store.create_ticket(create_req, created_by=username)
-
-    # Emit event so the dashboard timeline shows the trigger.
-    event_bus = getattr(request.app.state, "event_bus", None)
-    if event_bus:
-        event_bus.emit(
-            ticket.id,
-            "webhook",
-            "ticket_created",
-            {
-                "source": source,
-                "created_by": username,
-                "dedup_key": dedup_key_value,
-            },
-        )
-
-    # Transition to triage_pending so the orchestrator picks it up.
-    store.transition_ticket(
-        ticket.id,
-        TransitionRequest(status=TicketStatus.TRIAGE_PENDING),
-    )
-
+    assert ticket is not None
     logger.info(
         "Webhook created ticket %s from source=%s user=%s",
         ticket.id,

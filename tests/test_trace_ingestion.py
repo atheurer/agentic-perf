@@ -240,3 +240,73 @@ async def test_invalid_trace_schema_increments_health_counter() -> None:
     finally:
         await client.aclose()
         app.state.trace_store.close()
+
+
+async def test_ingest_runs_sqlite_write_off_event_loop(tmp_path, monkeypatch) -> None:
+    """_insert() must run in a thread so the event loop stays free for health probes."""
+    import threading
+
+    app = make_app(tmp_path)
+    loop_thread = threading.current_thread()
+    insert_threads: list[threading.Thread] = []
+
+    real_insert = app.state.trace_store.insert_event_result
+
+    def recording_insert(event):
+        insert_threads.append(threading.current_thread())
+        return real_insert(event)
+
+    monkeypatch.setattr(app.state.trace_store, "insert_event_result", recording_insert)
+
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    headers = {"Authorization": "Bearer service"}
+    response = await client.post(
+        "/api/v1/traces/events", json=payload(event()), headers=headers
+    )
+    await client.aclose()
+
+    assert response.status_code == 200
+    assert len(insert_threads) == 1
+    assert insert_threads[0] is not loop_thread, (
+        "SQLite insert ran on the event loop thread — this blocks health probes"
+    )
+
+
+async def test_ingest_batch_runs_sqlite_writes_off_event_loop(
+    tmp_path, monkeypatch
+) -> None:
+    """Each _insert() in ingest_batch must also run in a thread."""
+    import threading
+
+    app = make_app(tmp_path)
+    loop_thread = threading.current_thread()
+    insert_threads: list[threading.Thread] = []
+
+    real_insert = app.state.trace_store.insert_event_result
+
+    def recording_insert(event):
+        insert_threads.append(threading.current_thread())
+        return real_insert(event)
+
+    monkeypatch.setattr(app.state.trace_store, "insert_event_result", recording_insert)
+
+    one, two = event(), event().model_copy(update={"action_id": "2" * 16})
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    headers = {"Authorization": "Bearer service"}
+    response = await client.post(
+        "/api/v1/traces/events/batch",
+        json={"events": [payload(one), payload(two)]},
+        headers=headers,
+    )
+    await client.aclose()
+
+    assert response.status_code == 200
+    assert len(insert_threads) == 2
+    for t in insert_threads:
+        assert t is not loop_thread, (
+            "SQLite insert ran on the event loop thread — this blocks health probes"
+        )

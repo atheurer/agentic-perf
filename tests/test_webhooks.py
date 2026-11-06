@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
+import httpx
 import pytest
 from fastapi import Depends
 from fastapi.testclient import TestClient
@@ -288,6 +292,56 @@ class TestDedupDetection:
         assert r2.status_code == 200
         assert r2.json()["status"] == "duplicate"
         assert r2.json()["ticket_id"] == r1.json()["ticket_id"]
+
+    async def test_concurrent_duplicate_webhooks_create_one_ticket(
+        self, tmp_path, monkeypatch
+    ):
+        app, _store, deploy_token = _make_app(tmp_path)
+        payload = {
+            "testName": "concurrent-dedup",
+            "change": {
+                "id": 1001,
+                "variable": {"name": "x"},
+                "dataset": {"runId": 1},
+            },
+        }
+        import threading
+
+        from state_store.api import webhooks as webhooks_api
+
+        real_find_dedup = webhooks_api._find_dedup
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+
+        def slow_find_dedup(*args, **kwargs):
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                # Widen the window between the dedup lookup and ticket creation.
+                time.sleep(0.1)
+                return real_find_dedup(*args, **kwargs)
+            finally:
+                with active_lock:
+                    active -= 1
+
+        monkeypatch.setattr(webhooks_api, "_find_dedup", slow_find_dedup)
+
+        transport = httpx.ASGITransport(app=app)
+        headers = {"Authorization": f"Bearer {deploy_token}"}
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            responses = await asyncio.gather(
+                client.post("/api/v1/webhooks/horreum", json=payload, headers=headers),
+                client.post("/api/v1/webhooks/horreum", json=payload, headers=headers),
+            )
+
+        assert sorted(r.json()["status"] for r in responses) == ["created", "duplicate"]
+        assert max_active == 1, "dedup lookups ran concurrently despite the create lock"
+        assert len(app.state.store.list_tickets()) == 1
 
 
 # ------------------------------------------------------------------
