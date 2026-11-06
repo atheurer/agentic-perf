@@ -19,7 +19,12 @@ import asyncio
 import logging
 
 from .base import InvestigationRecordProvider
-from .models import BuildHistoryEntry, InvestigationRecord
+from .models import (
+    BuildHistoryEntry,
+    ChangeAttribution,
+    InvestigationRecord,
+    OperationalMetrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +122,25 @@ class CompositeRecordProvider(InvestigationRecordProvider):
     ) -> None:
         """Append to the writer only."""
         await self._writer.append_build_history(investigation_id, entry)
+
+    async def update_findings(
+        self,
+        investigation_id: str,
+        root_cause_summary: str,
+        confidence: float,
+        convergence_outcome: str,
+        operational_metrics: OperationalMetrics | None = None,
+        change_attribution: ChangeAttribution | None = None,
+    ) -> None:
+        """Update findings on the writer only."""
+        await self._writer.update_findings(
+            investigation_id,
+            root_cause_summary,
+            confidence,
+            convergence_outcome,
+            operational_metrics=operational_metrics,
+            change_attribution=change_attribution,
+        )
 
     async def link_jira(
         self,

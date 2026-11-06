@@ -98,7 +98,7 @@ async def enrich_webhook_ticket(
 
     fields: dict[str, Any] = {"run_metadata": run_info}
 
-    # Set canonical dedup_key for deterministic dedup matching.
+    # Set investigation_dedup for deterministic dedup matching.
     # The gathering_context agent compares these fields against
     # open investigation records using exact matching.
     # Source-specific extraction happens here; the dedup logic
@@ -107,7 +107,7 @@ async def enrich_webhook_ticket(
     target = run_info.get("target", "")
     variable_name = anomaly.get("variable_name", "")
     if target and variable_name:
-        fields["dedup_key"] = {
+        fields["investigation_dedup"] = {
             "metric": variable_name,
             "platform": target,
         }

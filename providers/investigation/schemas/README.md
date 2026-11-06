@@ -36,6 +36,6 @@ breaking changes to the record structure.
 For deterministic dedup to work, records must have `metric`
 and `platform` populated in `anomaly_context`. These are
 set automatically by the synthesis agent from the ticket's
-`dedup_key` field (written by webhook enrichment or ticket
+`investigation_dedup` field (written by webhook enrichment or ticket
 creation). Records with empty `metric`/`platform` will not
 match deterministic dedup and fall through to LLM matching.

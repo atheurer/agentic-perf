@@ -4,10 +4,11 @@ Stores each record as a JSON file in a configurable directory.
 This is the default backend for development and testing — no
 external services required.
 
-Records are write-once: the JSON file is created by create()
-and the investigation data within it is never modified. Only
-build history (append-only), Jira linkage (one-time), and
-lifecycle state (OPEN -> RESOLVED) can change.
+Records are created by create() and are largely immutable:
+build history is append-only, Jira linkage is one-time, and
+lifecycle state moves OPEN -> RESOLVED. The one exception is
+update_findings(), which lets an inconclusive record be
+revised with the results of a later reinvestigation.
 
 Records are stored as:
     {persist_dir}/{investigation_id}.json
@@ -25,8 +26,11 @@ from paths import INVESTIGATION_RECORDS_DIR as _DEFAULT_DIR
 from .base import InvestigationRecordProvider
 from .models import (
     BuildHistoryEntry,
+    ChangeAttribution,
     InvestigationRecord,
     InvestigationState,
+    OperationalMetrics,
+    is_inconclusive_outcome,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,6 +147,41 @@ class FileRecordProvider(InvestigationRecordProvider):
             f"[investigation] Appended build history to "
             f"{investigation_id}: {entry.build_id}"
         )
+
+    async def update_findings(
+        self,
+        investigation_id: str,
+        root_cause_summary: str,
+        confidence: float,
+        convergence_outcome: str,
+        operational_metrics: OperationalMetrics | None = None,
+        change_attribution: ChangeAttribution | None = None,
+    ) -> None:
+        """Update findings on an existing inconclusive record."""
+        record = await self.get(investigation_id)
+        if record is None:
+            raise KeyError(f"Record not found: {investigation_id}")
+
+        current_outcome = record.operational_metrics.convergence_outcome
+        if not is_inconclusive_outcome(current_outcome):
+            raise ValueError(
+                f"Record {investigation_id} already has conclusive outcome: "
+                f"{(current_outcome or '').strip().lower()}"
+            )
+
+        record.root_cause_summary = root_cause_summary
+        record.confidence = confidence
+        record.operational_metrics.convergence_outcome = convergence_outcome
+        record.updated_at = datetime.now(timezone.utc)
+        if operational_metrics is not None:
+            # Preserve convergence_outcome we just set
+            saved_outcome = record.operational_metrics.convergence_outcome
+            record.operational_metrics = operational_metrics
+            record.operational_metrics.convergence_outcome = saved_outcome
+        if change_attribution is not None:
+            record.change_attribution = change_attribution
+        self._write(record)
+        logger.info(f"[investigation] Updated findings on {investigation_id}")
 
     async def link_jira(
         self,

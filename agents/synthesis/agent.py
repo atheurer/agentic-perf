@@ -244,15 +244,90 @@ class SynthesisAgent(AgentBase):
         metrics = self._collect_operational_metrics(ticket_id, cf)
 
         # Create the Investigation Record via MCP.
-        # Use dedup_key (set by enrichment) for metric/platform
-        # so future alerts with the same dedup_key match this
+        # Use investigation_dedup (set by enrichment) for metric/platform
+        # so future alerts with the same investigation_dedup match this
         # record deterministically. Fall back to anomaly_context
-        # fields if dedup_key is not set.
+        # fields if investigation_dedup is not set.
         anomaly = cf.get("anomaly_context", {})
-        dedup_key = cf.get("dedup_key", {})
+        # Fall back to the pre-rename ``dedup_key`` field for tickets
+        # enriched before the rename, but ignore non-dict values (old
+        # tickets stored the raw webhook dedup string there).
+        dedup_key = cf.get("investigation_dedup") or cf.get("dedup_key") or {}
+        if not isinstance(dedup_key, dict):
+            dedup_key = {}
         rc = metrics.get("resource_consumption", {})
         record_created = False
-        if self._mcp and anomaly:
+
+        # Check if this is a reinvestigation of an existing record
+        dedup_result = cf.get("dedup_result", {})
+        existing_record_id = dedup_result.get("matched_investigation_id", "")
+
+        if self._mcp and existing_record_id and anomaly:
+            # Update the existing record instead of creating a new one
+            try:
+                record_result = await self._mcp.call_tool(
+                    "update_investigation_record",
+                    {
+                        "investigation_id": existing_record_id,
+                        "root_cause_summary": root_cause,
+                        "confidence": confidence,
+                        "convergence_outcome": outcome,
+                        "provision_cycles": metrics.get("provision_cycles", 0),
+                        "wall_clock_mins": metrics.get("wall_clock_mins", 0.0),
+                        "info_gain_trajectory": json.dumps(
+                            metrics.get("info_gain_trajectory", [])
+                        ),
+                        "stall_events": metrics.get("stall_events", 0),
+                        "llm_tokens_total": rc.get("llm_tokens_total", 0),
+                        "llm_invocations": rc.get("llm_invocations", 0),
+                        "estimated_cost_usd": rc.get("estimated_cost_usd", 0.0),
+                        "hardware_time_mins": metrics.get("hardware_time_mins", 0.0),
+                        "change_classification": change_class,
+                        "causal_commits": ",".join(causal_commits),
+                        "change_summary": change_summary,
+                    },
+                )
+                # MCP tools return errors as JSON, not exceptions
+                parsed = (
+                    json.loads(record_result) if isinstance(record_result, str) else {}
+                )
+                if parsed.get("status") not in ("updated",):
+                    raise RuntimeError(
+                        f"update_investigation_record failed: "
+                        f"{parsed.get('message', parsed.get('status', 'unknown'))}"
+                    )
+                record_created = True
+                logger.info(
+                    "[synthesis-agent] Investigation Record updated: %s",
+                    existing_record_id,
+                )
+                # Append build history entry for reinvestigation
+                try:
+                    await self._mcp.call_tool(
+                        "append_build_history",
+                        {
+                            "investigation_id": existing_record_id,
+                            "build_id": build_id,
+                            "action": "REINVESTIGATION_COMPLETE",
+                            "comment": f"Reinvestigation completed with outcome: {outcome}",
+                            "ticket_id": ticket_id,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "[synthesis-agent] Failed to append reinvestigation history to %s",
+                        existing_record_id,
+                    )
+            except Exception:
+                logger.warning(
+                    "[synthesis-agent] Failed to update record %s, "
+                    "falling back to create",
+                    existing_record_id,
+                    exc_info=True,
+                )
+
+        if not record_created and self._mcp and anomaly:
+            # Original create path
             try:
                 record_result = await self._mcp.call_tool(
                     "create_investigation_record",

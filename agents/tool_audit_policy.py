@@ -167,6 +167,7 @@ TOOL_AUDIT_POLICY = (
     *_side_effecting(
         "providers.investigation.repository",
         "agents/investigation/server.py:create_investigation_record",
+        "agents/investigation/server.py:update_investigation_record",
         "agents/investigation/server.py:append_build_history",
         "agents/investigation/server.py:link_jira_ticket",
         "agents/investigation/server.py:close_investigation_record",

@@ -54,7 +54,7 @@ Returns:
 Or if a duplicate is detected:
 
 ```json
-{"status": "duplicate", "ticket_id": "PERF-EXISTING", "dedup_key": "..."}
+{"status": "duplicate", "ticket_id": "PERF-EXISTING", "webhook_dedup_key": "..."}
 ```
 
 ## Service Accounts
@@ -254,7 +254,7 @@ metadata for a Horreum run or dataset by ID.
 ## Dedup
 
 Before creating a ticket, the endpoint checks all open tickets
-for a matching `trigger_source` + `dedup_key`. If a match is found,
+for a matching `trigger_source` + `webhook_dedup_key`. If a match is found,
 the webhook returns the existing ticket ID with `status: "duplicate"`
 instead of creating a new one.
 
