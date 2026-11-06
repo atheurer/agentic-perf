@@ -1007,17 +1007,22 @@ class TestTopologySafety:
         assert new_plan["steps"][2]["agent_type"] == "provision"
 
     def test_step_between_benchmarks_would_pause(self):
-        """Multiple benchmarks (steps between first and last benchmark)
-        are the ambiguous case: the transform must refuse."""
+        """Non-benchmark steps between the first and last benchmark steps
+        would be silently discarded by the transform — it must refuse."""
         plan = default_plan()
         plan["steps"].append({"id": 5, "agent_type": "provision", "params": {}})
         plan["steps"].append({"id": 6, "agent_type": "benchmark", "params": {}})
         _, err = build_kernel_comparison_plan(plan, dict(GOOD))
-        assert normalized_plan_is_none(err)
+        assert err
+        assert "silently discard" in err
 
 
 def normalized_plan_is_none(err):
-    return err and "does not support" in err
+    return err and (
+        "does not support" in err
+        or "silently discard" in err
+        or "would be ambiguous" in err
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1481,7 +1486,7 @@ class TestTriageEmittedABShape:
         assert new_plan["steps"][1]["agent_type"] == "provision"
         assert new_plan["steps"][-1]["agent_type"] == "teardown"
 
-    def test_two_benchmarks_with_intermediate_step_still_rejected(self):
+    def test_two_benchmarks_with_intermediate_step_rejected(self):
         plan = default_plan()
         plan["steps"].insert(3, {"id": 3, "agent_type": "provision", "params": {}})
         plan["steps"].insert(5, {"id": 5, "agent_type": "benchmark", "params": {}})
@@ -1489,4 +1494,4 @@ class TestTriageEmittedABShape:
             s["id"] = i
         _, err = build_kernel_comparison_plan(plan, dict(GOOD))
         assert err
-        assert "intermediate steps" in err
+        assert "silently discard" in err
