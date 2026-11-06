@@ -10,6 +10,7 @@ import pytest
 
 from orchestrator.dispatcher import Dispatcher
 from providers.tracing import (
+    ActionType,
     LifecycleState,
     TraceRecorder,
     bind_trace_context,
@@ -465,15 +466,26 @@ async def test_repo_cache_refresh_binds_the_claimed_ticket_context() -> None:
 
 async def test_renewal_loss_records_claim_failure() -> None:
     dispatcher, sink = _dispatcher()
-    client = MagicMock()
-    client.__enter__.return_value.post.return_value.status_code = 200
-    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
-        assert dispatcher.try_claim("PERF-1", "triage_pending")
+    # Seed a fake task so the renewal loop can cancel it
+    dummy = asyncio.create_task(asyncio.sleep(60))
+    dispatcher._tasks["PERF-1"] = dummy
+    dispatcher._trace_contexts["PERF-1"] = new_trace_context(
+        ticket_id="PERF-1", agent_id="triage_pending"
+    )
     dispatcher.renew_claim = AsyncMock(return_value=False)
     dispatcher.lease_seconds = 0
     await dispatcher._renewal_loop("PERF-1")
+    # Trace records the renewal failure
     assert sink.events[-1].lifecycle.state == LifecycleState.FAILED
     assert sink.events[-1].action.phase == "claim_renewal"
+    # Only this ticket's task is cancelled — global deposition flag stays False
+    assert dummy.cancelled() or dummy.cancelling()
+    assert not dispatcher.is_deposed()
+    dummy.cancel()
+    try:
+        await dummy
+    except asyncio.CancelledError:
+        pass
 
 
 async def test_introspection_is_a_sibling_child_of_dispatch() -> None:

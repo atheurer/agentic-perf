@@ -288,7 +288,14 @@ class Dispatcher:
                             phase="claim_renewal",
                             duration_ms=0,
                         )
-                    self.mark_deposed()
+                    # Cancel only this ticket's task. mark_deposed() is a
+                    # global one-way latch intended for orchestrator-level
+                    # fence loss; calling it here permanently prevents
+                    # _advance_plan from running for every subsequent ticket
+                    # for the rest of this pod's lifetime.
+                    task = self._tasks.get(ticket_id)
+                    if task is not None and not task.done():
+                        task.cancel()
                     break
         except asyncio.CancelledError:
             pass
