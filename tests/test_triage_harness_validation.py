@@ -744,3 +744,19 @@ class TestSuiteAutoCorrection:
         assert ticket["status"] == "awaiting_hardware"
         assert updated_fields["benchmark_suite"] == "invented-suite"
         assert updated_fields["absent_suite"] is True
+
+    @pytest.mark.asyncio
+    async def test_user_directive_value_survives_llm_alias_renormalization(self):
+        """An LLM alias must not shadow the user's canonical directive value."""
+        _agent, ticket, updated_fields = await _complete_triage_result(
+            {
+                "benchmark_suite": "uperf",
+                "absent_suite": False,
+                "directives": {"harness": "crucible", "delay_seconds": 20},
+            },
+            _make_provider(),
+            custom_fields={"directives": {"power_off_delay": 10}},
+        )
+
+        assert ticket["status"] == "awaiting_hardware"
+        assert updated_fields["directives"]["power_off_delay"] == 10

@@ -1350,6 +1350,21 @@ class TriageAgent(AgentBase):
         from providers.directives import normalize_directives as _norm_dir
 
         directives, _applied, _unrec = _norm_dir(directives)
+        # Normalization keeps the first key it sees for a canonical name, so an
+        # LLM alias (e.g. "delay_seconds") merged in above would otherwise
+        # shadow the user's canonical value.  Re-apply the user's values last
+        # so explicit user intent always wins.  ``harness`` is resolved
+        # separately above (alias mapping plus validation), so leave the
+        # resolved value in place.
+        if isinstance(user_directives, dict) and user_directives:
+            user_normalized, _, _ = _norm_dir(user_directives)
+            directives.update(
+                {
+                    key: value
+                    for key, value in user_normalized.items()
+                    if key != "harness"
+                }
+            )
 
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),

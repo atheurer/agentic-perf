@@ -302,6 +302,10 @@ async def read_artifact_file(
             to the ticket's artifact directory.
         offset: 0-based line number to start reading from.
         limit: Maximum number of lines to return (max 500).
+
+    Returns JSON with the selected lines.  Reads are capped at 256 KiB;
+    when a single line exceeds the cap the content is cut short and
+    ``truncated`` is true, because that line cannot be paged past.
     """
     await _ensure_init()
 

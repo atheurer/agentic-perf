@@ -138,3 +138,67 @@ async def test_read_artifact_tool_initializes_ticket_once(
     ensure_init.assert_awaited_once()
     assert result["content"] == "second\n"
     assert result["has_more"] is True
+
+
+def test_read_artifact_file_truncates_oversized_line(artifact_dir: Path) -> None:
+    """A single oversized line is byte-bounded and reported as truncated."""
+    from agents.server_utils import _ARTIFACT_READ_MAX_BYTES, read_artifact_file_impl
+
+    ticket_dir = artifact_dir / "PERF-A"
+    ticket_dir.mkdir()
+    (ticket_dir / "huge.log").write_text("A" * (_ARTIFACT_READ_MAX_BYTES * 2))
+
+    result = json.loads(read_artifact_file_impl("huge.log", ticket_id="PERF-A"))
+
+    assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert len(result["content"].encode("utf-8")) <= _ARTIFACT_READ_MAX_BYTES
+
+
+def test_read_artifact_file_normal_read_not_truncated(artifact_dir: Path) -> None:
+    from agents.server_utils import read_artifact_file_impl
+
+    ticket_dir = artifact_dir / "PERF-A"
+    ticket_dir.mkdir()
+    (ticket_dir / "small.log").write_text("a\nb\n")
+
+    result = json.loads(read_artifact_file_impl("small.log", ticket_id="PERF-A"))
+
+    assert result["truncated"] is False
+    assert result["has_more"] is False
+    assert result["content"] == "a\nb\n"
+
+
+def test_read_artifact_file_clamps_negative_offset_and_limit(
+    artifact_dir: Path,
+) -> None:
+    from agents.server_utils import read_artifact_file_impl
+
+    ticket_dir = artifact_dir / "PERF-A"
+    ticket_dir.mkdir()
+    (ticket_dir / "data.log").write_text("one\ntwo\n")
+
+    result = json.loads(
+        read_artifact_file_impl("data.log", offset=-3, limit=-5, ticket_id="PERF-A")
+    )
+
+    assert result["offset"] == 0
+    assert result["limit"] == 0
+    assert result["lines_returned"] == 0
+
+
+def test_read_artifact_file_offset_skips_oversized_first_line(
+    artifact_dir: Path,
+) -> None:
+    from agents.server_utils import _ARTIFACT_READ_MAX_BYTES, read_artifact_file_impl
+
+    ticket_dir = artifact_dir / "PERF-A"
+    ticket_dir.mkdir()
+    (ticket_dir / "long.log").write_text("A" * (_ARTIFACT_READ_MAX_BYTES * 3) + "\nb\n")
+
+    result = json.loads(
+        read_artifact_file_impl("long.log", offset=1, ticket_id="PERF-A")
+    )
+
+    assert result["truncated"] is False
+    assert result["content"] == "b\n"

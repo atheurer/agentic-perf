@@ -6820,9 +6820,14 @@ async def read_artifact_file(
 
     Args:
         path: Absolute path to the artifact file, or a path relative
-            to the current run's output_dir.
+            to the ticket's artifact directory (for example
+            ``<run_uuid>/harness-output.log``).
         offset: 0-based line number to start reading from.
         limit: Maximum number of lines to return (max 500).
+
+    Returns JSON with the selected lines.  Reads are capped at 256 KiB;
+    when a single line exceeds the cap the content is cut short and
+    ``truncated`` is true, because that line cannot be paged past.
     """
     await _ensure_init()
 

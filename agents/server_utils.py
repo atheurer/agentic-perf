@@ -2807,6 +2807,15 @@ def extract_ticket_references(text: str) -> list[str]:
     return ids
 
 
+# Hard cap on how many bytes read_artifact_file_impl will return, so a
+# single oversized line (or a file with no newlines) cannot blow up the
+# agent process or produce a multi-gigabyte tool response.
+_ARTIFACT_READ_MAX_BYTES = 256 * 1024
+# Chunk size used while advancing to ``offset``; keeps the skip loop from
+# reading an entire oversized line into memory just to count it.
+_ARTIFACT_SKIP_CHUNK = 8 * 1024
+
+
 def read_artifact_file_impl(
     path: str,
     offset: int = 0,
@@ -2860,19 +2869,42 @@ def read_artifact_file_impl(
         return json.dumps({"error": f"File not found: {path}"})
 
     try:
-        from itertools import islice
-
         limit = max(0, min(limit, 500))
         offset = max(0, offset)
         size = resolved.stat().st_size
         with open(resolved, encoding="utf-8", errors="replace") as f:
-            # Skip to offset
-            for _ in range(offset):
-                if f.readline() == "":
+            # Skip to offset, consuming long lines in bounded chunks so a
+            # single oversized line cannot be materialized in memory.
+            skipped = 0
+            while skipped < offset:
+                chunk = f.readline(_ARTIFACT_SKIP_CHUNK)
+                if chunk == "":
                     break
-            selected = list(islice(f, limit))
-            # Count remaining to determine has_more
-            has_more = f.readline() != ""
+                if chunk.endswith("\n"):
+                    skipped += 1
+            # Read up to ``limit`` lines while enforcing a byte budget
+            # so a single oversized line (or a file with no newlines)
+            # cannot exhaust the agent process or return a huge payload.
+            selected: list[str] = []
+            used_bytes = 0
+            truncated = False
+            for _ in range(limit):
+                remaining = _ARTIFACT_READ_MAX_BYTES - used_bytes
+                # Bound the read itself: a plain readline() would
+                # materialize a multi-gigabyte line in memory before the
+                # byte budget below could reject it.
+                line = f.readline(remaining + 1)
+                if line == "":
+                    break
+                encoded = line.encode("utf-8", "replace")
+                if len(encoded) > remaining:
+                    if remaining > 0:
+                        selected.append(encoded[:remaining].decode("utf-8", "replace"))
+                    truncated = True
+                    break
+                selected.append(line)
+                used_bytes += len(encoded)
+            has_more = truncated or f.read(1) != ""
         return json.dumps(
             {
                 "file": str(resolved),
@@ -2882,6 +2914,7 @@ def read_artifact_file_impl(
                 "lines_returned": len(selected),
                 "content": "".join(selected),
                 "has_more": has_more,
+                "truncated": truncated,
             }
         )
     except Exception as exc:
