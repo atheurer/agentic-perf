@@ -36,6 +36,7 @@ from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
 from providers.tracing import (
     TraceContext,
+    TraceDeliveryError,
     bind_trace_context,
     current_trace_context,
     new_trace_context,
@@ -616,7 +617,12 @@ PLAN_AGENT_STATUS = {
     "analyze": "analyzing",
     "synthesis": "synthesizing_results",
     "build_image": "building_image",
+    "gathering_context": "gathering_context",
+    "evaluate": "evaluating_convergence",
 }
+# Gathering-context and evaluation choose their own next status, so the plan
+# cursor must follow that choice instead of transitioning to the next step.
+AGENT_ROUTED_PLAN_STATUSES = frozenset({"gathering_context", "evaluating_convergence"})
 # Triage advances the ticket itself instead of using the execution-plan loop,
 # but it needs the same no-progress retry protection as plan-managed stages.
 DISPATCH_RETRY_STATUSES = frozenset({*PLAN_AGENT_STATUS.values(), "triage_pending"})
@@ -919,7 +925,8 @@ async def _advance_plan(
     Snapshots step results, applies per-step param overrides for the
     next step, and transitions the ticket to the next step's status.
     Only advances if the completed agent matches the current step's
-    agent_type.
+    agent_type. Gathering-context and evaluation routes remain agent-owned;
+    their plan cursor follows the chosen route without another transition.
     """
     context = current_trace_context() or new_trace_context(
         ticket_id=ticket_id, agent_id="orchestrator"
@@ -965,6 +972,9 @@ async def _advance_plan(
             return
 
         ticket_status = ticket.get("status", "")
+        agent_routed = completed_status in AGENT_ROUTED_PLAN_STATUSES
+        if agent_routed and ticket_status == completed_status:
+            return
         if ticket_status == "awaiting_customer_guidance":
             logger.debug(
                 f"[advance-plan] {ticket_id}: ticket is at guidance, deferring"
@@ -1202,6 +1212,33 @@ async def _advance_plan(
 
         next_idx = current + 1
 
+        if agent_routed:
+            decision = (
+                cf.get("evaluation_result", {}).get("decision", "")
+                if completed_status == "evaluating_convergence"
+                else ""
+            )
+            route_status = ticket_status
+            if decision == "loop_plan" and ticket_status == "planning_investigation":
+                route_status = "executing_benchmark"
+            candidates = [
+                index
+                for index in range(next_idx, len(steps))
+                if PLAN_AGENT_STATUS.get(steps[index].get("agent_type")) == route_status
+                and steps[index].get("status") in {"pending", "in_progress"}
+            ]
+            if candidates:
+                next_idx = (
+                    candidates[-1]
+                    if decision in {"loop_analyze", "loop_plan"}
+                    else candidates[0]
+                )
+            else:
+                next_idx = len(steps)
+            for skipped_step in steps[current + 1 : next_idx]:
+                if skipped_step.get("status") in {"pending", "in_progress"}:
+                    skipped_step["status"] = "skipped"
+
         # Inject provision step when the resource agent
         # completed but the LLM-generated plan omitted
         # the provision step.  Provisioning is part of
@@ -1297,6 +1334,9 @@ async def _advance_plan(
                     },
                 )
                 response.raise_for_status()
+
+                if agent_routed:
+                    return
 
                 comment = (
                     f"Plan advancing to step {next_idx}: {next_step['agent_type']}"
@@ -1569,6 +1609,8 @@ async def run_agent_task(
 ):
     agent = None
     success = False
+    trace_delivery_failed = False
+    custom_fields_snapshot: dict[str, Any] | None = None
     raw_claim_id = dispatcher._claim_ids.get(ticket_id)
     claim_id = raw_claim_id if isinstance(raw_claim_id, str) and raw_claim_id else None
     mutation_headers = _mutation_headers(claim_id)
@@ -1640,7 +1682,7 @@ async def run_agent_task(
             agent.set_fence_context(
                 dispatcher._session_id,
                 dispatcher._fencing_epoch,
-                dispatcher._claim_ids.get(ticket_id),
+                claim_id,
             )
 
         if getattr(agent, "trace_context", None) is None:
@@ -1670,7 +1712,15 @@ async def run_agent_task(
                     f"{dispatcher.store_url}/api/v1/tickets/{ticket_id}"
                 )
                 if r.status_code == 200:
-                    cf = r.json().get("custom_fields", {})
+                    cf = r.json().get("custom_fields")
+                    if isinstance(cf, dict):
+                        # Agents can commit results or external-operation IDs
+                        # without changing status or advancing the plan.
+                        custom_fields_snapshot = copy.deepcopy(
+                            _agent_progress_fields(cf)
+                        )
+                    else:
+                        cf = {}
                     if cf.get("investigation_ledger") or cf.get("anomaly_context"):
                         agent.max_iterations = 0
                     if (
@@ -1967,6 +2017,16 @@ async def run_agent_task(
             f"Agent cleanly unwound after ticket drift on "
             f"{ticket_id} (status={status}) — no transition needed"
         )
+    except TraceDeliveryError as exc:
+        success = False
+        trace_delivery_failed = True
+        logger.warning(
+            "Trace delivery failed for %s (status=%s); checking committed progress "
+            "before retry: %s",
+            ticket_id,
+            status,
+            exc,
+        )
     except Exception as e:
         logger.exception(f"Agent failed on ticket {ticket_id} (status={status})")
         err_msg = str(e).lower()
@@ -2013,7 +2073,9 @@ async def run_agent_task(
                         event_bus=dispatcher.events,
                         claim_id=dispatcher._claim_ids.get(ticket_id),
                     )
-                except Exception:
+                except Exception as plan_exc:
+                    if isinstance(plan_exc, TraceDeliveryError):
+                        trace_delivery_failed = True
                     logger.exception(f"_advance_plan failed for {ticket_id}")
 
             # Debug halt for triage: triage_pending is not in
@@ -2062,6 +2124,8 @@ async def run_agent_task(
                     ticket_id,
                     status,
                     claim_id=claim_id,
+                    trace_delivery_failed=trace_delivery_failed,
+                    custom_fields_snapshot=custom_fields_snapshot,
                 )
             except Exception:
                 logger.exception(
@@ -2831,18 +2895,50 @@ async def _prune_stale_retry_state(
         logger.exception("Could not clear stale retry state for %s", ticket_id)
 
 
+# Ticket custom fields that the orchestrator or state store rewrite on their own
+# during a dispatch: claim renewal, pre-run image resolution, iteration grants,
+# retry bookkeeping, and the introspection observer.  They must not be mistaken
+# for agent progress when the pre-dispatch snapshot is compared after a
+# trace-delivery failure.
+_ORCHESTRATOR_MANAGED_FIELDS = frozenset(
+    {
+        "claim",
+        "jumpstarter_flash",
+        "iteration_budget",
+        RETRY_STATE_FIELD,
+        "introspection",
+    }
+)
+
+
+def _agent_progress_fields(custom_fields: Any) -> dict[str, Any]:
+    """Return only the ticket fields an agent may change during its dispatch."""
+    if not isinstance(custom_fields, dict):
+        return {}
+    return {
+        key: value
+        for key, value in custom_fields.items()
+        if key not in _ORCHESTRATOR_MANAGED_FIELDS
+    }
+
+
 async def _record_dispatch_retry_outcome(
     dispatcher: Dispatcher,
     ticket_id: str,
     dispatched_status: str,
     *,
     claim_id: str | None,
+    trace_delivery_failed: bool = False,
+    custom_fields_snapshot: dict[str, Any] | None = None,
 ) -> None:
-    """Back off repeated no-progress dispatches and stop after the cap."""
+    """Back off no-progress attempts and block ambiguous progress after trace loss."""
     if (
         dispatcher.is_deposed()
         or not claim_id
-        or dispatched_status not in DISPATCH_RETRY_STATUSES
+        or (
+            dispatched_status not in DISPATCH_RETRY_STATUSES
+            and not trace_delivery_failed
+        )
     ):
         return
 
@@ -2859,9 +2955,53 @@ async def _record_dispatch_retry_outcome(
             return
         ticket = response.json()
         ticket.setdefault("id", ticket_id)
+        # Compare against the fields as stored, before a locally pending retry
+        # write is overlaid, so retry bookkeeping is not mistaken for agent
+        # progress.
+        observed_fields = copy.deepcopy(ticket.get("custom_fields", {}))
         _overlay_pending_retry_state(ticket)
         custom_fields = ticket.get("custom_fields", {})
         current_status = ticket.get("status", "")
+
+        if trace_delivery_failed and (
+            current_status != dispatched_status
+            or custom_fields_snapshot is None
+            or _agent_progress_fields(observed_fields) != custom_fields_snapshot
+        ):
+            # The stage may have committed work before delivery failed.  Stop
+            # dispatching it (and whatever status it moved to) instead of
+            # replaying an unaudited mutation, then ask for guidance.  The
+            # guard is written first so a rejected guidance transition cannot
+            # let the stage be dispatched again.
+            if current_status in {"closed", "awaiting_customer_guidance"}:
+                return
+            retry_state, _, _ = record_retry_failure(
+                custom_fields,
+                "dispatch",
+                current_status,
+                now=time.time(),
+                retry_limit=1,
+                base_seconds=DISPATCH_RETRY_BASE_SECONDS,
+                max_seconds=DISPATCH_RETRY_MAX_SECONDS,
+            )
+            await _persist_retry_state(
+                dispatcher.store_url,
+                ticket_id,
+                retry_state,
+                claim_id=claim_id,
+                trace_context=context,
+            )
+            await _transition_to_guidance(
+                dispatcher.store_url,
+                ticket_id,
+                "Trace delivery failed and unchanged ticket status and custom "
+                "fields could not be confirmed. Automatic dispatch is blocked "
+                "because stage completion cannot be confirmed. Review the committed "
+                "changes and reconcile the execution plan before resuming.",
+                event_bus=dispatcher.events,
+                claim_id=claim_id,
+            )
+            return
 
         if current_status != dispatched_status:
             retry_state = clear_retry_entry(custom_fields, "dispatch")

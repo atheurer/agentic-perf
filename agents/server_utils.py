@@ -2805,3 +2805,117 @@ def extract_ticket_references(text: str) -> list[str]:
             seen.add(tid)
             ids.append(tid)
     return ids
+
+
+# Hard cap on how many bytes read_artifact_file_impl will return, so a
+# single oversized line (or a file with no newlines) cannot blow up the
+# agent process or produce a multi-gigabyte tool response.
+_ARTIFACT_READ_MAX_BYTES = 256 * 1024
+# Chunk size used while advancing to ``offset``; keeps the skip loop from
+# reading an entire oversized line into memory just to count it.
+_ARTIFACT_SKIP_CHUNK = 8 * 1024
+
+
+def read_artifact_file_impl(
+    path: str,
+    offset: int = 0,
+    limit: int = 200,
+    ticket_id: str = "",
+) -> str:
+    """Read lines from a local artifact file with bounds checking.
+
+    Shared implementation for the read_artifact_file MCP tool
+    exposed by benchmark and platform servers.
+
+    Args:
+        path: Absolute path or path relative to the ticket's
+            artifact directory.
+        offset: 0-based line number to start reading from.
+        limit: Maximum number of lines to return (max 500).
+        ticket_id: Required ticket ID for scoping all artifact reads.
+
+    Returns:
+        JSON string with file content, metadata, and pagination info.
+    """
+    import json
+    from pathlib import Path
+
+    from paths import ARTIFACT_DIR
+
+    if not ticket_id:
+        return json.dumps({"error": f"File not found: {path}"})
+
+    limit = min(limit, 500)
+
+    resolved = Path(path)
+    if not resolved.is_absolute():
+        resolved = ARTIFACT_DIR / ticket_id / path
+    resolved = resolved.resolve()
+
+    # Containment check BEFORE existence check to avoid leaking
+    # filesystem information (an out-of-scope existing path must
+    # return the same error as a missing one).
+    try:
+        scoped_dir = (ARTIFACT_DIR / ticket_id).resolve()
+        # Use is_relative_to for proper path-component containment.
+        # String prefix matching would allow sibling directories
+        # like "artifacts-archive/" to pass.
+        if not resolved.is_relative_to(scoped_dir):
+            return json.dumps({"error": f"File not found: {path}"})
+    except (OSError, ValueError):
+        return json.dumps({"error": f"File not found: {path}"})
+
+    if not resolved.exists():
+        return json.dumps({"error": f"File not found: {path}"})
+
+    try:
+        limit = max(0, min(limit, 500))
+        offset = max(0, offset)
+        size = resolved.stat().st_size
+        with open(resolved, encoding="utf-8", errors="replace") as f:
+            # Skip to offset, consuming long lines in bounded chunks so a
+            # single oversized line cannot be materialized in memory.
+            skipped = 0
+            while skipped < offset:
+                chunk = f.readline(_ARTIFACT_SKIP_CHUNK)
+                if chunk == "":
+                    break
+                if chunk.endswith("\n"):
+                    skipped += 1
+            # Read up to ``limit`` lines while enforcing a byte budget
+            # so a single oversized line (or a file with no newlines)
+            # cannot exhaust the agent process or return a huge payload.
+            selected: list[str] = []
+            used_bytes = 0
+            truncated = False
+            for _ in range(limit):
+                remaining = _ARTIFACT_READ_MAX_BYTES - used_bytes
+                # Bound the read itself: a plain readline() would
+                # materialize a multi-gigabyte line in memory before the
+                # byte budget below could reject it.
+                line = f.readline(remaining + 1)
+                if line == "":
+                    break
+                encoded = line.encode("utf-8", "replace")
+                if len(encoded) > remaining:
+                    if remaining > 0:
+                        selected.append(encoded[:remaining].decode("utf-8", "replace"))
+                    truncated = True
+                    break
+                selected.append(line)
+                used_bytes += len(encoded)
+            has_more = truncated or f.read(1) != ""
+        return json.dumps(
+            {
+                "file": str(resolved),
+                "total_bytes": size,
+                "offset": offset,
+                "limit": limit,
+                "lines_returned": len(selected),
+                "content": "".join(selected),
+                "has_more": has_more,
+                "truncated": truncated,
+            }
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"Failed to read file: {exc}"})

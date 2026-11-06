@@ -532,12 +532,31 @@ step. If so, it:
 3. Advances `current_step` to the next step
 4. Transitions the ticket to the next step's target status
 
+Gathering-context and evaluation agents own their routing decisions. For
+these stages, plan advancement records completion and follows the status
+chosen by the agent without issuing another transition. Intervening steps
+are skipped when the agent chooses a later stage, such as synthesis or
+retrospective. Evaluation loop-backs activate the newly appended analysis
+or benchmark step; planning remains an intermediate status before a new
+benchmark. If the chosen route has no remaining matching plan step, the
+explicit plan is retired and the agent's normal workflow continues.
+
 If the agent paused for HITL (pre-run approval, clarification), the
 plan is not advanced — the step stays in_progress until the agent
 actually finishes its work after the user replies.
 
 If the completed agent is not part of the plan (resource, provisioning),
 the plan is not touched.
+
+A trace-delivery failure does not establish agent success. An unchanged
+status and independently copied custom-fields snapshot use the dispatch retry
+backoff. If status or any custom field changed before the failure, including
+benchmark results or external run IDs, automatic dispatch is blocked and the
+ticket is paused for guidance. A missing snapshot also blocks automatic retry.
+The exhausted dispatch guard is recorded before requesting guidance, so failed
+guidance delivery cannot replay the stage. Reconcile the committed work and
+plan before resuming; the orchestrator does not replay or assume completion of
+the mutation.
 
 ## Agents
 

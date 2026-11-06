@@ -7,6 +7,7 @@ from datetime import timedelta
 from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from agents.platform.agent import PlatformAgent
@@ -284,6 +285,62 @@ class TestPlatformAgent:
             await agent._handle_completion("T-1", response)
             assert agent._transition_ticket.call_args[0][1] == "coordinating_fleet"
 
+    async def test_fleet_transition_rejection_reaches_orchestrator_guidance(self):
+        """A rejected fleet transition must not strand the ticket at the board.
+
+        The platform agent does not fall back to HITL itself: the error
+        propagates so ``run_agent_task`` routes the crash through
+        ``_transition_to_guidance`` with the captured claim.
+        """
+        agent = self._make_agent()
+        response = AsyncMock()
+        response.text = ""
+        response.tool_calls = [
+            MagicMock(
+                name="submit_platform_result",
+                input={
+                    "platform_ready": False,
+                    "diagnostics": "Flash failed",
+                    "board_name": "board-03",
+                },
+            )
+        ]
+        rejection = httpx.HTTPStatusError(
+            "coordinating_fleet rejected",
+            request=httpx.Request("POST", "http://localhost:8090/transition"),
+            response=httpx.Response(503),
+        )
+
+        with (
+            patch.object(agent, "_update_fields", new_callable=AsyncMock),
+            patch.object(agent, "_add_comment", new_callable=AsyncMock),
+            patch.object(
+                agent,
+                "_transition_ticket",
+                new_callable=AsyncMock,
+                side_effect=rejection,
+            ) as transition,
+            patch.object(
+                agent,
+                "_get_ticket",
+                new_callable=AsyncMock,
+                return_value={
+                    "custom_fields": {
+                        "fleet_investigation": {
+                            "enabled": True,
+                            "tested_hosts": [],
+                        },
+                    },
+                },
+            ),
+        ):
+            with pytest.raises(httpx.HTTPStatusError):
+                await agent._handle_completion("T-1", response)
+
+        # No second attempt to route the failure locally.
+        assert transition.await_count == 1
+        assert transition.call_args[0][1] == "coordinating_fleet"
+
     @pytest.mark.parametrize(
         "board_fields",
         [
@@ -518,8 +575,9 @@ class TestProvisionJumpstarterSDK:
         assert r.ip == "10.0.0.1"
         assert any("SSH port 22 reachable" in d for d in r.diagnostics)
         client.storage.flash.assert_called_once_with("https://image.xz")
-        # Called twice: pre-flash power cycle + Step 2 power on
-        assert client.power.on.call_count == 2
+        # Called once: Step 2 power on (pre-flash cycle removed —
+        # flash tool does its own internal power cycle)
+        assert client.power.on.call_count == 1
         assert client.ssh.run.call_count == 2  # inject + verify
 
     @pytest.mark.asyncio

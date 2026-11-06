@@ -1094,7 +1094,7 @@ def test_per_step_results_survive_teardown():
 
 
 def test_plan_agent_status_includes_all_step_types():
-    """PLAN_AGENT_STATUS maps all five step types."""
+    """PLAN_AGENT_STATUS includes infrastructure and data-only step types."""
     from orchestrator.main import PLAN_AGENT_STATUS
 
     assert PLAN_AGENT_STATUS["teardown"] == "awaiting_teardown"
@@ -1102,6 +1102,41 @@ def test_plan_agent_status_includes_all_step_types():
     assert PLAN_AGENT_STATUS["provision"] == "awaiting_provision"
     assert PLAN_AGENT_STATUS["benchmark"] == "executing_benchmark"
     assert PLAN_AGENT_STATUS["review"] == "awaiting_review"
+    assert PLAN_AGENT_STATUS["gathering_context"] == "gathering_context"
+    assert PLAN_AGENT_STATUS["evaluate"] == "evaluating_convergence"
+
+
+def test_advance_plan_routes_to_evaluate() -> None:
+    from orchestrator.main import _advance_plan
+
+    plan = {
+        "current_step": 0,
+        "steps": [
+            {"id": 0, "agent_type": "benchmark", "status": "in_progress"},
+            {"id": 1, "agent_type": "evaluate", "status": "pending"},
+        ],
+    }
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "status": "executing_benchmark",
+        "custom_fields": {"execution_plan": plan},
+    }
+    client = _async_client()
+    client.get.return_value = response
+    client.patch.return_value = MagicMock(status_code=200)
+    client.post.return_value = MagicMock(status_code=200)
+    with patch("orchestrator.main.AuditedAsyncHTTPClient") as factory:
+        factory.return_value.__aenter__ = AsyncMock(return_value=client)
+        factory.return_value.__aexit__ = AsyncMock(return_value=None)
+        asyncio.run(
+            _advance_plan("http://store", "PERF-evaluate", "executing_benchmark")
+        )
+
+    assert plan["current_step"] == 1
+    assert plan["steps"][1]["status"] == "in_progress"
+    transition = client.post.call_args
+    assert transition.args[0].endswith("/transition")
+    assert transition.kwargs["json"]["status"] == "evaluating_convergence"
 
 
 # --- Triage plan creation with infrastructure steps ---
