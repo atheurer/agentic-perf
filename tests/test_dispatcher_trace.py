@@ -311,7 +311,7 @@ async def test_stale_closed_ticket_stops_agent_before_one_fenced_release() -> No
     main_client.__aexit__ = AsyncMock(return_value=None)
     main_client.get = AsyncMock(return_value=response)
     events = MagicMock()
-    events.last_event_time.return_value = 1.0
+    events.latest_trace_event_time.return_value = 1.0
     control = new_trace_context(ticket_id="control", agent_id="orchestrator")
     token = bind_trace_context(control)
     try:
@@ -390,7 +390,7 @@ async def test_stale_watchdog_handles_task_finishing_during_ticket_read(
 
     client.get = AsyncMock(side_effect=get)
     events = MagicMock()
-    events.last_event_time.return_value = 1.0
+    events.latest_trace_event_time.return_value = 1.0
     with patch("orchestrator.main.AuditedAsyncHTTPClient", return_value=client):
         watchdog = asyncio.create_task(
             _check_stale_tasks(dispatcher, events, 1, dispatcher.store_url)
@@ -1069,3 +1069,20 @@ def test_constructed_agent_is_a_distinct_child_of_dispatch() -> None:
     agent = dispatcher.create_agent("triage_pending", {"id": "PERF-1"})
     assert agent.trace_context.parent_action_id == dispatch.action_id
     assert agent.trace_context.action_id != dispatch.action_id
+
+
+async def test_task_started_at_tracks_dispatch_and_prunes_finished() -> None:
+    dispatcher, _ = _dispatcher()
+    task = asyncio.create_task(asyncio.sleep(0))
+
+    assert dispatcher.task_started_at("PERF-1") is None
+    dispatcher.set_task("PERF-1", task, status="running")
+    started = dispatcher.task_started_at("PERF-1")
+    assert started is not None
+    assert dispatcher.task_started_at("PERF-2") is None
+    assert "PERF-1" in dispatcher.active_tasks()
+
+    await task
+
+    assert dispatcher.active_tasks() == {}
+    assert dispatcher.task_started_at("PERF-1") is None

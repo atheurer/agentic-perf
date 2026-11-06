@@ -31,6 +31,7 @@ from providers.execution import (
     AuditedAsyncHTTPClient,
     AuditedSubprocessRunner,
 )
+from providers.kill_reason import format_kill_reason
 from providers.llm.factory import create_llm_provider
 from providers.secrets.local import LocalSecretsProvider
 from providers.skills.repo_cache import RepoCache
@@ -2180,6 +2181,10 @@ def _build_cancellation_guidance_summary(
     Only comments authored by the running agent are included. If its identity
     is unavailable, omit comment context rather than risk attributing a
     multi-user comment to the agent.
+
+    A recorded ``last_subprocess_kill_reason`` is surfaced here because a
+    stale-task cancellation ends the agent before it can report the reason
+    itself.
     """
     agent = STATUS_AGENT_MAP.get(status, "unknown")
 
@@ -2202,11 +2207,19 @@ def _build_cancellation_guidance_summary(
     if benchmark_results:
         partial_context = " Partial benchmark results are available in the ticket."
 
+    kill_context = ""
+    if isinstance(custom_fields, dict):
+        kill_reason = custom_fields.get("last_subprocess_kill_reason")
+        formatted = format_kill_reason(kill_reason)
+        if formatted:
+            kill_context = f" {formatted}"
+
     details = f"The {agent} agent was interrupted before it could complete."
     if last_agent_message:
         # Truncate to keep the summary concise
         snippet = last_agent_message[:500]
         details += f" Last agent activity: {snippet}"
+    details += kill_context
     if partial_context:
         details += partial_context
 
@@ -2269,10 +2282,14 @@ async def _check_stale_tasks(
     Detects agents stuck on unresponsive LLM calls, hung SSH
     connections, or infinite loops that don't emit events.
 
-    Checks two staleness signals and uses the most recent:
-    1. EventBus last-event timestamp (in-process agent events)
-    2. Ticket updated_at from the state store (covers progress
-       comments posted by MCP subprocess tools like run_with_progress)
+    Uses the trace store latest event time as the staleness
+    signal.  The trace store is a shared SQLite DB that sees
+    events from both the orchestrator and MCP child processes
+    (heartbeats, tool calls, tool results).  Store-side ``state``
+    events are ignored: claim renewal writes one every lease
+    interval and would otherwise mask a stuck agent.  When a
+    dispatch has no such events yet, the dispatch start time is
+    used so a task that never reports is still evaluated.
 
     Always skips tickets in awaiting_customer_guidance — the
     agent is waiting for user input which can take arbitrarily
@@ -2281,16 +2298,29 @@ async def _check_stale_tasks(
     Cleans up leaked active_tasks entries for closed tickets
     (e.g. after force_close while an agent was running).
     """
-    from datetime import datetime
 
     now = time.time()
+    # Claim renewal is a timer-driven store mutation, not agent
+    # activity; counting it as activity would mask a stuck agent.
+    excluded_state_targets = ("renew_claim", "claim_fence")
     async with AuditedAsyncHTTPClient(timeout=5.0, headers=_auth_headers()) as client:
         for tid, task in list(dispatcher.active_tasks().items()):
-            last_event_time = event_bus.last_event_time(tid)
-            if last_event_time is None:
+            # Trace store: shared SQLite DB sees events from
+            # both parent and child processes.
+            try:
+                trace_ts = await asyncio.to_thread(
+                    event_bus.latest_trace_event_time,
+                    tid,
+                    exclude_state_targets=excluded_state_targets,
+                )
+            except Exception:
+                trace_ts = None
+            if trace_ts is None:
+                trace_ts = dispatcher.task_started_at(tid)
+            if not isinstance(trace_ts, (int, float)):
                 continue
 
-            last_activity = last_event_time
+            last_activity = trace_ts
             ticket_status = None
             try:
                 r = await client.get(f"{store_url}/api/v1/tickets/{tid}")
@@ -2311,12 +2341,6 @@ async def _check_stale_tasks(
                             # stopped the agent and its finalizer has completed.
                             task.cancel()
                         continue
-                    updated_at = ticket_data.get("updated_at", "")
-                    if updated_at:
-                        ticket_time = datetime.fromisoformat(updated_at)
-                        ticket_ts = ticket_time.timestamp()
-                        if ticket_ts > last_activity:
-                            last_activity = ticket_ts
             except Exception:
                 pass
 
@@ -2332,8 +2356,41 @@ async def _check_stale_tasks(
                     f"Stale task detected for {tid}:"
                     f" no events for {idle_seconds:.0f}s"
                     f" (threshold: {stale_timeout:.0f}s)"
-                    f" — cancelling task"
+                    f" — recording kill reason and cancelling task"
                 )
+
+                # Record kill reason to custom_fields before cancelling the
+                # task.  We deliberately await this PATCH so the state store
+                # commits the reason before t.cancel() is called — the agent
+                # reads custom_fields after the subprocess exits, so there is
+                # no race as long as the write precedes the signal.
+                claim_id = dispatcher._claim_ids.get(tid)
+                try:
+                    async with AuditedAsyncHTTPClient(
+                        timeout=2.0, headers=_mutation_headers(claim_id)
+                    ) as kill_client:
+                        resp = await kill_client.patch(
+                            f"{store_url}/api/v1/tickets/{tid}/fields",
+                            json={
+                                "fields": {
+                                    "last_subprocess_kill_reason": {
+                                        "code": "stale_task_timeout",
+                                        "timestamp": round(now),
+                                        "idle_seconds": round(idle_seconds),
+                                        "threshold_seconds": round(stale_timeout),
+                                        "mechanism": "orchestrator_stale_task_detector",
+                                    }
+                                }
+                            },
+                        )
+                        resp.raise_for_status()
+                except Exception:
+                    logger.warning(
+                        f"Failed to record kill reason for {tid} "
+                        f"(proceeding with cancellation)",
+                        exc_info=True,
+                    )
+
                 event_bus.emit(
                     tid,
                     "orchestrator",

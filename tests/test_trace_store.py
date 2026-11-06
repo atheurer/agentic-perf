@@ -234,3 +234,82 @@ def test_startup_configuration_and_close(tmp_path: Path) -> None:
     assert store._connection.execute("PRAGMA busy_timeout").fetchone()[0] == 123
     store.close()
     assert store._connection is None
+
+
+def test_latest_event_time_returns_none_for_empty_store(tmp_path: Path) -> None:
+    path = tmp_path / "trace.db"
+    with TraceStore(path) as store:
+        assert store.latest_event_time("PERF-NONE") is None
+
+
+def test_latest_event_time_returns_timestamp_after_insert(tmp_path: Path) -> None:
+    path = tmp_path / "trace.db"
+    with TraceStore(path) as store:
+        store.insert_event(event(ticket_id="PERF-T1"))
+        ts = store.latest_event_time("PERF-T1")
+        assert ts is not None
+        assert isinstance(ts, float)
+        # Should be recent (within last 5 seconds)
+        import time
+
+        assert abs(time.time() - ts) < 5.0
+
+
+def test_latest_event_time_tracks_most_recent(tmp_path: Path) -> None:
+    path = tmp_path / "trace.db"
+    with TraceStore(path) as store:
+        store.insert_event(event(ticket_id="PERF-T2"))
+        ts1 = store.latest_event_time("PERF-T2")
+
+        import time
+
+        time.sleep(0.05)
+        store.insert_event(event(ticket_id="PERF-T2"))
+        ts2 = store.latest_event_time("PERF-T2")
+
+        assert ts2 is not None
+        assert ts1 is not None
+        assert ts2 >= ts1
+
+
+def test_latest_event_time_scoped_to_ticket(tmp_path: Path) -> None:
+    path = tmp_path / "trace.db"
+    with TraceStore(path) as store:
+        store.insert_event(event(ticket_id="PERF-A"))
+        store.insert_event(event(ticket_id="PERF-B"))
+        assert store.latest_event_time("PERF-A") is not None
+        assert store.latest_event_time("PERF-B") is not None
+        assert store.latest_event_time("PERF-C") is None
+
+
+def test_latest_event_time_skips_excluded_state_targets(tmp_path: Path) -> None:
+    """Timer-driven store bookkeeping must not count as activity."""
+    import time
+    from datetime import datetime, timedelta, timezone
+
+    path = tmp_path / "trace.db"
+    old = datetime.now(timezone.utc) - timedelta(hours=2)
+    with TraceStore(path) as store:
+        store.insert_event(
+            event(
+                ticket_id="PERF-T3",
+                occurred_at=old,
+                action=ActionDescriptor(type=ActionType.STATE, target="add_comment"),
+            )
+        )
+        store.insert_event(
+            event(
+                ticket_id="PERF-T3",
+                action=ActionDescriptor(type=ActionType.STATE, target="renew_claim"),
+            )
+        )
+
+        unfiltered = store.latest_event_time("PERF-T3")
+        filtered = store.latest_event_time(
+            "PERF-T3", exclude_state_targets=("renew_claim",)
+        )
+
+    assert unfiltered is not None
+    assert filtered is not None
+    assert abs(time.time() - unfiltered) < 5.0
+    assert abs(filtered - old.timestamp()) < 1.0

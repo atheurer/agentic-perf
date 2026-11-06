@@ -591,6 +591,58 @@ class TraceStore:
             except (sqlite3.Error, OSError):
                 return 0
 
+    def latest_event_time(
+        self,
+        ticket_id: str,
+        *,
+        exclude_state_targets: tuple[str, ...] = (),
+        scan_limit: int = 500,
+    ) -> float | None:
+        """Return the wall-clock time of the most recent trace event.
+
+        Queries the shared SQLite DB directly, so events written
+        by MCP child processes are visible to the parent.
+        Returns a Unix timestamp, or None if no events exist.
+
+        ``exclude_state_targets`` skips store-side ``state``
+        mutations with those targets.  Claim renewal writes one
+        every lease interval regardless of agent progress, so a
+        staleness check must not treat it as activity.
+        """
+        with self._lock:
+            try:
+                rows = (
+                    self._open_connection()
+                    .execute(
+                        "SELECT occurred_at, action_type, event_json "
+                        "FROM trace_events WHERE ticket_id = ? "
+                        "ORDER BY occurred_at DESC LIMIT ?",
+                        (ticket_id, scan_limit),
+                    )
+                    .fetchall()
+                )
+            except Exception:
+                return None
+
+        for occurred_at, action_type, event_json in rows:
+            if exclude_state_targets and action_type == "state":
+                try:
+                    action = (json.loads(event_json) or {}).get("action") or {}
+                except (TypeError, ValueError):
+                    action = {}
+                if action.get("target") in exclude_state_targets:
+                    continue
+            if not occurred_at:
+                continue
+            try:
+                dt = datetime.fromisoformat(occurred_at)
+            except ValueError:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        return None
+
     def latest_ticket_seq(self, ticket_id: str) -> int:
         """Return the highest ticket_seq for a ticket.
 

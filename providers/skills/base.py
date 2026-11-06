@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,26 @@ EXECUTION_MODEL_DIRECT = "direct"
 # so both AgentBase._effective_harness and catalog resolution
 # reference the same constant rather than hardcoding the name.
 WORKFLOW_HARNESS = "arcaflow-workflows"
+
+# Subprocess progress parsing for benchmark heartbeats.
+# Harnesses register a parser via register_progress_parser().
+# The parser receives accumulated stdout chunks and returns
+# a dict of progress info (e.g., {"samples_collected": 42}).
+# Unknown harnesses get an empty dict (generic fallback).
+SubprocessProgressParser = Callable[[list[bytes]], dict[str, Any]]
+
+_progress_parsers: dict[str, SubprocessProgressParser] = {}
+
+
+def register_progress_parser(harness: str, parser: SubprocessProgressParser) -> None:
+    """Register a subprocess progress parser for a harness."""
+    _progress_parsers[harness] = parser
+
+
+def get_progress_parser(harness: str) -> SubprocessProgressParser | None:
+    """Return the progress parser for a harness, or None."""
+    return _progress_parsers.get(harness)
+
 
 # User-facing harness names that map to canonical provider
 # registry names.  Defined in the skills layer (not agents)

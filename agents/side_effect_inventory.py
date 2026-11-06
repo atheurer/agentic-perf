@@ -32,6 +32,12 @@ INVENTORIED_SIDE_EFFECTS = (
     ),
     ("agents/benchmark/server.py", "_add_execution_note", "mutating_http_state"),
     ("agents/benchmark/server.py", "_append_output_dir", "mutating_http_state"),
+    ("agents/benchmark/server.py", "_post_progress_comment", "mutating_http_state"),
+    (
+        "agents/benchmark/server.py",
+        "_record_subprocess_kill_reason",
+        "mutating_http_state",
+    ),
     ("agents/benchmark/server.py", "_read_controller_file", "ssh"),
     ("agents/benchmark/server.py", "_refresh_controller_context", "ssh"),
     ("agents/benchmark/server.py", "execute_benchmark", "filesystem"),
@@ -338,6 +344,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("orchestrator/main.py", "persist_plan_fields", "mutating_http_state"),
     ("orchestrator/main.py", "_block_absent_suite", "mutating_http_state"),
     ("orchestrator/main.py", "_block_handoff_failed", "mutating_http_state"),
+    ("orchestrator/main.py", "_check_stale_tasks", "mutating_http_state"),
     ("orchestrator/main.py", "_normalize_ticket_directives", "mutating_http_state"),
     ("orchestrator/main.py", "_persist_retry_state", "mutating_http_state"),
     ("orchestrator/main.py", "_process_stop_requests", "mutating_http_state"),
@@ -880,6 +887,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/store.py", "archive_ticket", "filesystem"),
     ("state_store/store.py", "create_approval_request", "filesystem"),
     ("state_store/trace_store.py", "__init__", "filesystem"),
+    ("state_store/trace_store.py", "latest_event_time", "filesystem"),
 )
 
 # Exact review disposition for every checked-in boundary.
@@ -1040,6 +1048,26 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/benchmark/server.py:_append_output_dir",
+        "2027-12-31",
+    ),
+    (
+        "agents/benchmark/server.py",
+        "_post_progress_comment",
+        "mutating_http_state",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/server.py:_post_progress_comment",
+        "2027-12-31",
+    ),
+    (
+        "agents/benchmark/server.py",
+        "_record_subprocess_kill_reason",
+        "mutating_http_state",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/server.py:_record_subprocess_kill_reason",
         "2027-12-31",
     ),
     ("agents/benchmark/server.py", "_read_controller_file", "ssh"): (
@@ -2590,6 +2618,12 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "orchestration-maintainers",
         "orchestrator/main.py:_block_handoff_failed",
+        "2027-12-31",
+    ),
+    ("orchestrator/main.py", "_check_stale_tasks", "mutating_http_state"): (
+        "system_only",
+        "orchestration-maintainers",
+        "orchestrator/main.py:_check_stale_tasks",
         "2027-12-31",
     ),
     ("orchestrator/main.py", "_persist_retry_state", "mutating_http_state"): (
@@ -4854,6 +4888,12 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/trace_store.py:__init__",
+        "2027-12-31",
+    ),
+    ("state_store/trace_store.py", "latest_event_time", "filesystem"): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/trace_store.py:latest_event_time",
         "2027-12-31",
     ),
 }

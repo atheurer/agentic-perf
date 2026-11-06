@@ -113,6 +113,59 @@ The `user_pre_run_approval` directive provides user-level control:
 - **`false`** — skip approval (auto-approve when validation exists)
 - **unset** — pause if validation tools exist, skip otherwise
 
+## Subprocess progress reporting
+
+If the harness runs long-lived subprocesses during benchmark execution,
+register a progress parser so the benchmark server can report how far a
+run has progressed while the subprocess is still going. Without a parser,
+heartbeats report only the harness name, elapsed time, and requested
+sample count.
+
+```python
+# In providers/skills/my_harness.py
+import re
+from providers.skills.base import register_progress_parser
+
+_ITERATION_RE = re.compile(rb"^Iteration (\d+)/\d+", re.MULTILINE)
+_PROGRESS_TAIL_BYTES = 64 * 1024
+
+def _parse_progress(chunks: list[bytes]) -> dict[str, Any]:
+    tail = b"".join(chunks)[-_PROGRESS_TAIL_BYTES:]
+    matches = _ITERATION_RE.findall(tail)
+    if not matches:
+        return {}
+    return {"iterations_completed": int(matches[-1])}
+
+register_progress_parser("my-harness", _parse_progress)
+```
+
+The parser receives the accumulated stdout byte chunks from the
+subprocess and returns a dict. Any keys present are included in the
+heartbeat payload. Work on the tail of the joined output so a line split
+across chunk boundaries is still recognized, and return an empty dict
+when no progress can be extracted.
+
+Registration happens when the skill module is imported, so the module
+must be imported somewhere in the benchmark server's import path (for the
+built-in harnesses, `agents/benchmark/server.py` imports the module that
+registers the parser). Without that import, `get_progress_parser`
+returns `None` and heartbeats carry no harness-specific progress.
+
+Registering a parser only supplies the progress payload; the harness must
+also publish it. The boot-time wait loop in
+`agents/benchmark/server.py` calls `_publish_progress_heartbeat()` while
+its subprocess runs, and that is currently the only caller. A new harness
+with a long-lived subprocess needs the same call from its own wait loop.
+
+The boot-time loop publishes two signals:
+
+- every five minutes, a `benchmark_progress` trace event carrying the
+  parsed progress; this is what keeps the orchestrator's stale-task
+  detector from killing a long-running benchmark
+- every thirty minutes, a ticket comment summarizing progress for humans
+
+Trace and comment failures are logged and never fail the benchmark.
+
 ## A current provider shape
 
 `providers/skills/k8s_netperf.py` is a useful reference because it supplies
