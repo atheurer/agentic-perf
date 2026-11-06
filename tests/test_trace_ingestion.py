@@ -247,7 +247,7 @@ async def test_ingest_runs_sqlite_write_off_event_loop(tmp_path, monkeypatch) ->
     import threading
 
     app = make_app(tmp_path)
-    main_thread = threading.main_thread()
+    loop_thread = threading.current_thread()
     insert_threads: list[threading.Thread] = []
 
     real_insert = app.state.trace_store.insert_event_result
@@ -269,7 +269,7 @@ async def test_ingest_runs_sqlite_write_off_event_loop(tmp_path, monkeypatch) ->
 
     assert response.status_code == 200
     assert len(insert_threads) == 1
-    assert insert_threads[0] is not main_thread, (
+    assert insert_threads[0] is not loop_thread, (
         "SQLite insert ran on the event loop thread — this blocks health probes"
     )
 
@@ -281,7 +281,7 @@ async def test_ingest_batch_runs_sqlite_writes_off_event_loop(
     import threading
 
     app = make_app(tmp_path)
-    main_thread = threading.main_thread()
+    loop_thread = threading.current_thread()
     insert_threads: list[threading.Thread] = []
 
     real_insert = app.state.trace_store.insert_event_result
@@ -307,6 +307,6 @@ async def test_ingest_batch_runs_sqlite_writes_off_event_loop(
     assert response.status_code == 200
     assert len(insert_threads) == 2
     for t in insert_threads:
-        assert t is not main_thread, (
+        assert t is not loop_thread, (
             "SQLite insert ran on the event loop thread — this blocks health probes"
         )

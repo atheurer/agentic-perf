@@ -162,19 +162,24 @@ class TicketStore:
         return self._lease_cache
 
     def _write_orchestrator_lease(self, lease: OrchestratorLease | None) -> None:
-        # Update the in-memory cache first so all subsequent reads are
-        # immediately consistent, even before the disk write completes.
-        self._lease_cache = lease
+        # Publish to the in-memory cache only after the durable write or unlink
+        # succeeds, so a filesystem failure cannot leave callers trusting a
+        # lease that was never persisted (or treating a persisted lease as
+        # released).  Every caller already holds self._lock, so updating the
+        # cache after the write does not change when other threads see it.
         if lease is None:
             try:
                 self._system_filesystem.unlink(self._lease_path.name)
             except FileNotFoundError:
+                self._lease_cache = None
                 return
             self._fsync_lease_directory()
+            self._lease_cache = None
             return
         payload = json.dumps(lease.model_dump(mode="json"), sort_keys=True) + "\n"
         self._system_filesystem.write(self._lease_path.name, payload, mode=0o600)
         self._fsync_lease_directory()
+        self._lease_cache = lease
 
     def _fsync_lease_directory(self) -> None:
         """Make lease creation and deletion survive a host crash."""

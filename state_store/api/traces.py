@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -494,6 +495,15 @@ async def _service_principal(request: Request) -> Principal:
     return principal
 
 
+_trace_health_lock = threading.Lock()
+
+
+def _bump_trace_health(request: Request, key: str) -> None:
+    """Increment a trace health counter from any thread without racing."""
+    with _trace_health_lock:
+        request.app.state.trace_health[key] += 1
+
+
 def _bound(event: TraceEventV1, principal: Principal, request: Request) -> TraceEventV1:
     # Producer identity is authority data.  Never trust an envelope supplied by
     # a client, even one that accidentally copied identity from another process.
@@ -517,7 +527,7 @@ def _insert(
         stored, duplicate = request.app.state.trace_store.insert_event_result(
             _bound(event, principal, request)
         )
-        request.app.state.trace_health["ingested"] += 1
+        _bump_trace_health(request, "ingested")
         legacy_event = (stored.attributes or {}).get("legacy_event", {})
         if (
             not duplicate
@@ -528,10 +538,10 @@ def _insert(
             invalidate_closed_ticket_usage_cache(stored.ticket_id)
         return stored, duplicate
     except TraceEventConflictError as exc:
-        request.app.state.trace_health["ingestion_failures"] += 1
+        _bump_trace_health(request, "ingestion_failures")
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except TraceStoreWriteError as exc:
-        request.app.state.trace_health["ingestion_failures"] += 1
+        _bump_trace_health(request, "ingestion_failures")
         raise HTTPException(status_code=503, detail="trace store unavailable") from exc
 
 
