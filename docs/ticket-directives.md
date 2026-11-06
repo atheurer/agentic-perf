@@ -139,7 +139,7 @@ To target a specific board instance:
 changed host key for an assigned endpoint without a separate confirmation.
 The tool trusts the key presented through the network path to that hostname;
 the ticket owner is responsible for trusting the supplied host identity. It
-records the fingerprint and changes only the affected host's record on the
+records the fingerprint and targets the affected host's record on the
 controller. With `ask`, the user confirms the presented fingerprint for each
 replacement. This policy does not update the orchestrator's host records.
 

@@ -371,6 +371,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/execution/subprocess.py", "run", "subprocess"),
     ("providers/execution/subprocess.py", "run_sync", "subprocess"),
     ("providers/execution/subprocess.py", "start", "subprocess"),
+    ("providers/host_trust.py", "inspect_controller_host_key", "ssh"),
+    ("providers/host_trust.py", "replace_controller_host_key", "ssh"),
     ("providers/image_build/base.py", "BuildResult", "image"),
     ("providers/image_build/base.py", "BuildSpec", "image"),
     ("providers/image_build/caib.py", "<module>", "image"),
@@ -2749,6 +2751,18 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/execution/subprocess.py:start",
+        "2027-12-31",
+    ),
+    ("providers/host_trust.py", "inspect_controller_host_key", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "providers/host_trust.py:inspect_controller_host_key",
+        "2027-12-31",
+    ),
+    ("providers/host_trust.py", "replace_controller_host_key", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "providers/host_trust.py:replace_controller_host_key",
         "2027-12-31",
     ),
     ("providers/image_build/base.py", "BuildResult", "image"): (

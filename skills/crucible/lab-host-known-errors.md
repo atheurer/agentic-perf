@@ -17,8 +17,8 @@ The tool displays the presented fingerprint and asks the user to approve
 replacement. If the ticket explicitly sets `ssh_host_key_policy: replace`,
 the tool replaces the changed record without a separate pause. Trusting the
 user-provided hostname under this policy also trusts the key presented via
-the network path to that hostname. The tool updates only that target's entry
-and refuses a key that changes between inspection and replacement.
+the network path to that hostname. The tool targets that host's entry and
+refuses a key that changes between inspection and replacement.
 
 **Orchestrator to controller:** this tool does not update the orchestrator's
 host records. Ask the operator for help if that connection has a changed key.

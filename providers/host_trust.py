@@ -8,6 +8,7 @@ import ipaddress
 import re
 import shlex
 import struct
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -105,6 +106,18 @@ def preferred_host_key(output: str) -> HostKey | None:
     return None
 
 
+def has_shared_host_records(output: str) -> bool:
+    """Detect matching records whose removal could affect other host identities."""
+    for line in output.splitlines():
+        parts = line.split()
+        if not parts or parts[0].startswith("#"):
+            continue
+        host_patterns = parts[0]
+        if host_patterns.startswith("@") or any(c in host_patterns for c in ",*?!"):
+            return True
+    return False
+
+
 async def inspect_controller_host_key(
     ssh: Any, controller: str, target: str, observed_fingerprint: str | None = None
 ) -> dict[str, Any]:
@@ -133,6 +146,11 @@ async def inspect_controller_host_key(
             "status": "not_found",
             "message": "No stored entry for this host; use normal first-contact handling.",
         }
+    if has_shared_host_records(existing.stdout):
+        return {
+            "status": "rejected",
+            "message": "A matching host record has a shared pattern or marker; operator assistance is required.",
+        }
     scanned = await ssh.run(
         controller,
         f"ssh-keyscan -T 5 -t ed25519,ecdsa,rsa {quoted}",
@@ -140,6 +158,7 @@ async def inspect_controller_host_key(
         mutating=False,
     )
     scanned_keys = parse_host_keys(scanned.stdout)
+    existing_keys = parse_host_keys(existing.stdout)
     if observed_fingerprint:
         matches = [
             key for key in scanned_keys if key.fingerprint == observed_fingerprint
@@ -151,13 +170,45 @@ async def inspect_controller_host_key(
         ):
             candidate = None
     else:
-        candidate = preferred_host_key(scanned.stdout)
+        known_algorithms = {key.algorithm for key in existing_keys}
+        missing_algorithms = known_algorithms - {key.algorithm for key in scanned_keys}
+        if missing_algorithms:
+            return {
+                "status": "error",
+                "message": "Host key scan omitted previously recorded algorithms; inspect again or supply the observed fingerprint.",
+            }
+        changed_keys = [
+            key
+            for key in scanned_keys
+            if key.algorithm in known_algorithms and key not in existing_keys
+        ]
+        if changed_keys:
+            candidate = preferred_host_key(
+                "\n".join(
+                    f"{target} {key.algorithm} {key.encoded}" for key in changed_keys
+                )
+            )
+            if (
+                candidate
+                and sum(key.algorithm == candidate.algorithm for key in scanned_keys)
+                != 1
+            ):
+                candidate = None
+        elif any(key in existing_keys for key in scanned_keys):
+            candidate = preferred_host_key(
+                "\n".join(
+                    f"{target} {key.algorithm} {key.encoded}"
+                    for key in scanned_keys
+                    if key in existing_keys
+                )
+            )
+        else:
+            candidate = preferred_host_key(scanned.stdout)
     if scanned.exit_code != 0 or candidate is None:
         return {
             "status": "error",
             "message": "Could not obtain one unambiguous supported host key from the target.",
         }
-    existing_keys = parse_host_keys(existing.stdout)
     if candidate in existing_keys:
         return {"status": "already_trusted", "fingerprint": candidate.fingerprint}
     return {
@@ -169,7 +220,12 @@ async def inspect_controller_host_key(
 
 
 async def replace_controller_host_key(
-    ssh: Any, controller: str, target: str, approved_key: HostKey
+    ssh: Any,
+    controller: str,
+    target: str,
+    approved_key: HostKey,
+    *,
+    authorize: Callable[[], Awaitable[dict[str, Any] | None]],
 ) -> dict[str, Any]:
     """Replace only target's controller record after checking the presented key again."""
     validate_host(controller)
@@ -187,24 +243,50 @@ async def replace_controller_host_key(
             "status": "rejected",
             "message": "The presented host key changed since approval; inspect it again.",
         }
+    rejected = await authorize()
+    if rejected is not None:
+        return rejected
     entry = shlex.quote(f"{target} {approved_key.algorithm} {approved_key.encoded}")
     target_arg = shlex.quote(target)
-    # Lock cooperating writers and replace atomically, preserving other hosts.
+    # The lock serializes cooperating writers; detect other changes before the
+    # rename. Non-cooperating writers can still race after that final check.
     command = (
         "( "
-        "flock -x 9 || exit 1; "
+        "flock -n -x 9 || exit 4; "
         "[ ! -L /root/.ssh/known_hosts ] || exit 1; "
+        "[ -f /root/.ssh/known_hosts ] || exit 2; "
         "tmp=$(mktemp /root/.ssh/.known-hosts.XXXXXX) || exit 1; "
-        'trap \'rm -f "$tmp" "$tmp.old"\' EXIT; '
-        "if [ -f /root/.ssh/known_hosts ]; then "
-        'cp /root/.ssh/known_hosts "$tmp" || exit 1; '
-        f'ssh-keygen -R {target_arg} -f "$tmp" >/dev/null || exit 1; fi; '
-        f"printf '%s\\n' {entry} >> \"$tmp\" && "
-        'chmod 600 "$tmp" && mv -f "$tmp" /root/.ssh/known_hosts '
+        'baseline="$tmp.baseline"; matches="$tmp.matches"; '
+        'trap \'rm -f "$tmp" "$tmp.old" "$baseline" "$matches"\' EXIT; '
+        'cp /root/.ssh/known_hosts "$baseline" || exit 1; '
+        'cp "$baseline" "$tmp" || exit 1; '
+        f'ssh-keygen -F {target_arg} -f "$baseline" > "$matches" || exit 2; '
+        "awk '/^#/ { next } NF && ($1 ~ /^@/ || $1 ~ /[,*?!]/) { exit 1 }' \"$matches\" || exit 3; "
+        f'ssh-keygen -R {target_arg} -f "$tmp" >/dev/null || exit 1; '
+        f"printf '%s\\n' {entry} >> \"$tmp\" || exit 1; "
+        'chmod 600 "$tmp" || exit 1; '
+        "[ ! -L /root/.ssh/known_hosts ] || exit 1; "
+        'cmp -s "$baseline" /root/.ssh/known_hosts || exit 2; '
+        'mv -f "$tmp" /root/.ssh/known_hosts '
         ") 9>/root/.ssh/.agentic-perf-hostkeys.lock"
     )
     result = await ssh.run(controller, command, timeout=30, mutating=True)
     if result.exit_code != 0:
+        if result.exit_code == 4:
+            return {
+                "status": "busy",
+                "message": "Another host-key update is in progress; retry.",
+            }
+        if result.exit_code == 3:
+            return {
+                "status": "rejected",
+                "message": "A matching host record has a shared pattern or marker; operator assistance is required.",
+            }
+        if result.exit_code == 2:
+            return {
+                "status": "rejected",
+                "message": "Controller host records changed during replacement; inspect again.",
+            }
         return {
             "status": "error",
             "message": "Could not update the controller host record.",

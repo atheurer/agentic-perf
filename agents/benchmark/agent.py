@@ -359,25 +359,56 @@ class BenchmarkAgent(AgentBase):
         except ValueError as exc:
             return json.dumps({"status": "rejected", "message": str(exc)})
 
-        def authorized_hosts(ticket: dict[str, Any]) -> bool:
+        def authorized_binding(
+            ticket: dict[str, Any],
+        ) -> tuple[str, str | None, int, str, str | None] | None:
             fields = ticket.get("custom_fields") or {}
+            if not isinstance(fields, dict):
+                return None
             assigned = fields.get("assigned_hardware_ips") or {}
-            if (
-                not isinstance(assigned, dict)
-                or assigned.get("controller") != controller
-            ):
-                return False
-            targets = assigned.get("targets") or []
-            if not isinstance(targets, list):
-                return False
-            return target_host != controller and target_host in targets
+            if not isinstance(assigned, dict):
+                return None
+            assigned_controller = assigned.get("controller")
+            assigned_targets = assigned.get("targets")
+            if not isinstance(assigned_controller, str) or not assigned_controller:
+                return None
+            if not isinstance(assigned_targets, list) or not assigned_targets:
+                return None
+            controllers = {assigned_controller}
+            ssh_controller = None
+            ssh_targets: list[Any] = []
+            ssh_addresses = fields.get("ssh_hardware_ips")
+            if isinstance(ssh_addresses, dict):
+                candidate = ssh_addresses.get("controller")
+                if isinstance(candidate, str) and candidate:
+                    ssh_controller = candidate
+                    controllers.add(candidate)
+                candidates = ssh_addresses.get("targets")
+                if isinstance(candidates, list):
+                    ssh_targets = candidates
+            if controller not in controllers or target_host in controllers:
+                return None
+            matches = []
+            for index, assigned_target in enumerate(assigned_targets):
+                if not isinstance(assigned_target, str) or not assigned_target:
+                    continue
+                alias = ssh_targets[index] if index < len(ssh_targets) else None
+                if not isinstance(alias, str) or not alias:
+                    alias = None
+                if target_host == assigned_target or target_host == alias:
+                    matches.append((index, assigned_target, alias))
+            if len(matches) != 1:
+                return None
+            index, assigned_target, alias = matches[0]
+            return assigned_controller, ssh_controller, index, assigned_target, alias
 
         ticket = await assert_ticket_active(
             self._ticket_id, self.store_url, "executing_benchmark"
         )
         if ticket.get("status") == "rejected":
             return json.dumps(ticket)
-        if not authorized_hosts(ticket):
+        binding = authorized_binding(ticket)
+        if binding is None:
             return json.dumps(
                 {
                     "status": "rejected",
@@ -431,33 +462,49 @@ class BenchmarkAgent(AgentBase):
         else:
             authorization = "ticket policy"
 
-        current = await assert_ticket_active(
-            self._ticket_id, self.store_url, "executing_benchmark"
-        )
-        if current.get("status") == "rejected":
-            return json.dumps(current)
-        if not authorized_hosts(current):
-            return json.dumps(
-                {"status": "rejected", "message": "Ticket host assignment changed."}
+        async def recheck_authorization() -> dict[str, Any] | None:
+            current = await assert_ticket_active(
+                self._ticket_id, self.store_url, "executing_benchmark"
             )
-        current_directives = (current.get("custom_fields") or {}).get(
-            "directives"
-        ) or {}
-        if not isinstance(current_directives, dict):
-            return json.dumps(
-                {"status": "rejected", "message": "Ticket directives are malformed."}
-            )
-        current_policy = current_directives.get("ssh_host_key_policy", "ask")
-        if policy == "replace" and current_policy != "replace":
-            return json.dumps(
-                {"status": "rejected", "message": "Ticket replacement policy changed."}
-            )
+            if current.get("status") == "rejected":
+                return current
+            if authorized_binding(current) != binding:
+                return {
+                    "status": "rejected",
+                    "message": "Ticket host assignment changed.",
+                }
+            current_directives = (current.get("custom_fields") or {}).get(
+                "directives"
+            ) or {}
+            if not isinstance(current_directives, dict):
+                return {
+                    "status": "rejected",
+                    "message": "Ticket directives are malformed.",
+                }
+            current_policy = current_directives.get("ssh_host_key_policy", "ask")
+            if current_policy not in ("ask", "replace"):
+                return {
+                    "status": "rejected",
+                    "message": "Ticket replacement policy is invalid.",
+                }
+            if policy == "replace" and current_policy != "replace":
+                return {
+                    "status": "rejected",
+                    "message": "Ticket replacement policy changed.",
+                }
+            return None
+
+        rejection = await recheck_authorization()
+        if rejection is not None:
+            return json.dumps(rejection)
         await self._add_comment(
             self._ticket_id,
             f"Replacing the host key for {target_host} on {controller}; "
             f"fingerprint {fingerprint}; authorization: {authorization}.",
         )
-        result = await replace_controller_host_key(ssh, controller, target_host, key)
+        result = await replace_controller_host_key(
+            ssh, controller, target_host, key, authorize=recheck_authorization
+        )
         await self._add_comment(
             self._ticket_id,
             f"Host-key replacement for {target_host} on {controller}: {result['status']}; "
