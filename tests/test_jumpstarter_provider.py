@@ -402,12 +402,125 @@ class TestTerminate:
         )
 
         mock_svc = AsyncMock()
-        mock_svc.DeleteLease = AsyncMock(side_effect=Exception("not found"))
+        mock_svc.DeleteLease = AsyncMock(
+            side_effect=Exception("lease bad-lease not found")
+        )
         provider._service = mock_svc
 
         result = await provider.terminate("bad-lease")
         assert result["status"] == "error"
         assert "not found" in result["error"]
+        assert result["already_released"] is False
+
+    @pytest.mark.asyncio
+    async def test_unrelated_not_found_error_is_not_already_released(self):
+        provider = JumpstarterResourceProvider(
+            client_name="test",
+        )
+
+        mock_svc = AsyncMock()
+        mock_svc.DeleteLease = AsyncMock(
+            side_effect=Exception("provider endpoint not found")
+        )
+        provider._service = mock_svc
+
+        result = await provider.terminate("lease-abc123")
+        assert result["already_released"] is False
+
+    @pytest.mark.asyncio
+    async def test_not_found_grpc_code_is_already_released(self):
+        class _Status:
+            name = "NOT_FOUND"
+
+        class _RpcError(Exception):
+            def code(self):
+                return _Status()
+
+        provider = JumpstarterResourceProvider(
+            client_name="test",
+        )
+
+        mock_svc = AsyncMock()
+        mock_svc.DeleteLease = AsyncMock(
+            side_effect=_RpcError("rpc error: code = NotFound")
+        )
+        provider._service = mock_svc
+
+        result = await provider.terminate("lease-abc123")
+        assert result["already_released"] is True
+
+    @pytest.mark.asyncio
+    async def test_failed_precondition_without_release_wording_is_not_success(self):
+        class _Status:
+            name = "FAILED_PRECONDITION"
+
+        class _RpcError(Exception):
+            def code(self):
+                return _Status()
+
+        provider = JumpstarterResourceProvider(
+            client_name="test",
+        )
+
+        mock_svc = AsyncMock()
+        mock_svc.DeleteLease = AsyncMock(
+            side_effect=_RpcError("failed precondition: lease has active clients")
+        )
+        provider._service = mock_svc
+
+        result = await provider.terminate("lease-abc123")
+        assert result["already_released"] is False
+
+    @pytest.mark.asyncio
+    async def test_non_lease_release_wording_is_not_success(self):
+        provider = JumpstarterResourceProvider(
+            client_name="test",
+        )
+
+        mock_svc = AsyncMock()
+        mock_svc.DeleteLease = AsyncMock(
+            side_effect=Exception("provider endpoint has already been released")
+        )
+        provider._service = mock_svc
+
+        result = await provider.terminate("lease-abc123")
+        assert result["already_released"] is False
+
+    @pytest.mark.asyncio
+    async def test_marks_already_been_released(self):
+        class _Status:
+            name = "FAILED_PRECONDITION"
+
+        class _RpcError(Exception):
+            def code(self):
+                return _Status()
+
+        provider = JumpstarterResourceProvider(
+            client_name="test",
+        )
+
+        mock_svc = AsyncMock()
+        mock_svc.DeleteLease = AsyncMock(
+            side_effect=_RpcError("lease has already been released")
+        )
+        provider._service = mock_svc
+
+        result = await provider.terminate("lease-gone")
+        assert result["already_released"] is True
+
+    @pytest.mark.asyncio
+    async def test_genuine_error_is_not_already_released(self):
+        provider = JumpstarterResourceProvider(
+            client_name="test",
+        )
+
+        mock_svc = AsyncMock()
+        mock_svc.DeleteLease = AsyncMock(side_effect=Exception("connection refused"))
+        provider._service = mock_svc
+
+        result = await provider.terminate("lease-abc123")
+        assert result["status"] == "error"
+        assert result["already_released"] is False
 
 
 # --- Registry ---

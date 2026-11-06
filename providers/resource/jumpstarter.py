@@ -67,6 +67,30 @@ _NAME_SELECTOR_KEY = "name"
 _DEVICE_SELECTOR_KEY = "device"
 
 
+def _lease_already_released(exc: BaseException) -> bool:
+    """Return True when a DeleteLease failure means the lease is already gone.
+
+    Only a structured gRPC status counts.  The optional Jumpstarter/gRPC
+    packages are not imported here, so the status code is duck-typed.  Error
+    text is deliberately ignored: a message mentioning "not found" could
+    describe something other than the target lease.
+    """
+    code = getattr(exc, "code", None)
+    if not callable(code):
+        return False
+    try:
+        status = code()
+    except Exception:
+        return False
+    name = getattr(status, "name", "")
+    # DeleteLease targets one lease, so NOT_FOUND means that lease is gone.
+    # FAILED_PRECONDITION is generic, so require the controller's released
+    # wording before treating it as a completed release.
+    if name == "NOT_FOUND":
+        return True
+    return name == "FAILED_PRECONDITION" and "already been released" in str(exc).lower()
+
+
 def _get_board_type(labels: dict[str, str]) -> str:
     """Extract the board type from exporter labels.
 
@@ -780,12 +804,23 @@ class JumpstarterResourceProvider(ResourceProvider):
                 "status": "terminated",
             }
         except Exception as e:
-            logger.exception(f"[jumpstarter] Failed to delete lease {reservation_id}")
+            err = str(e)
+            # DeleteLease reports a lease that is already gone as NOT_FOUND or
+            # FAILED_PRECONDITION ("already been released").  Surface that as a
+            # structured flag instead of making callers parse provider text.
+            already_released = _lease_already_released(e)
+            if already_released:
+                logger.info(f"[jumpstarter] Lease already released: {reservation_id}")
+            else:
+                logger.exception(
+                    f"[jumpstarter] Failed to delete lease {reservation_id}"
+                )
             return {
                 "provider": "jumpstarter",
                 "lease_id": reservation_id,
                 "status": "error",
-                "error": str(e),
+                "error": err,
+                "already_released": already_released,
             }
 
     async def setup_ssh(
