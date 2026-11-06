@@ -153,6 +153,47 @@ class TestUpdateFindings:
                 convergence_outcome="ISOLATION",
             )
 
+    @pytest.mark.asyncio
+    async def test_update_with_operational_metrics_preserves_outcome(self, provider):
+        """Passing operational_metrics replaces metrics but keeps the new outcome."""
+        from providers.investigation.models import (
+            ChangeAttribution,
+            OperationalMetrics,
+        )
+
+        record = InvestigationRecord(
+            anomaly_context=AnomalyContext(subsystem="cpu", metric="throughput"),
+        )
+        record.operational_metrics.convergence_outcome = "ENTROPY_STALL"
+        rid = await provider.create(record)
+
+        await provider.update_findings(
+            investigation_id=rid,
+            root_cause_summary="resolved",
+            confidence=0.9,
+            convergence_outcome="ISOLATION",
+            operational_metrics=OperationalMetrics(
+                provision_cycles=7,
+                wall_clock_mins=42.5,
+                convergence_outcome="SHOULD_BE_OVERWRITTEN",
+                stall_events=2,
+            ),
+            change_attribution=ChangeAttribution(
+                classification="ISOLATION",
+                causal_commits=["abc123"],
+                change_summary="driver fix",
+            ),
+        )
+
+        updated = await provider.get(rid)
+        assert updated is not None
+        assert updated.operational_metrics.provision_cycles == 7
+        assert updated.operational_metrics.stall_events == 2
+        # The explicit convergence_outcome arg wins over the metrics object.
+        assert updated.operational_metrics.convergence_outcome == "ISOLATION"
+        assert updated.change_attribution.classification == "ISOLATION"
+        assert updated.change_attribution.causal_commits == ["abc123"]
+
 
 # --- Synthesis agent: update vs create ---
 

@@ -943,11 +943,26 @@ class TestDedupTemporalDecay:
     @pytest.mark.asyncio
     async def test_record_without_timestamp_treated_as_fresh(self):
         """Records missing timestamps are treated as fresh."""
-        from unittest.mock import AsyncMock, MagicMock, patch
+        from unittest.mock import AsyncMock, patch
+
+        from providers.investigation.models import (
+            AnomalyContext,
+            InvestigationRecord,
+            OperationalMetrics,
+        )
 
         agent = self._make_agent()
-        record = MagicMock()
-        record.investigation_id = "RCA-NODATE"
+        record = InvestigationRecord(
+            investigation_id="RCA-NODATE",
+            anomaly_context=AnomalyContext(
+                subsystem="test",
+                metric="CoV - BOOT2 - Kernel Duration",
+                platform="qc8775",
+            ),
+            operational_metrics=OperationalMetrics(
+                convergence_outcome="ISOLATION",
+            ),
+        )
         record.created_at = None
         record.updated_at = None
 
@@ -1143,6 +1158,60 @@ class TestDedupInconclusiveOutcome:
             assert result is True, f"outcome '{outcome}' should block (proceed=False)"
 
     @pytest.mark.asyncio
+    async def test_newest_inconclusive_wins_over_older_conclusive(self):
+        """The newest matching record decides dedup, not an older one."""
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        old_conclusive = self._make_record(outcome="ISOLATION", age_days=40)
+        old_conclusive.investigation_id = "RCA-OLD-CONCLUSIVE"
+        new_inconclusive = self._make_record(outcome="ENTROPY_STALL", age_days=5)
+        new_inconclusive.investigation_id = "RCA-NEW-INCONCLUSIVE"
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(
+                return_value=[old_conclusive, new_inconclusive]
+            )
+            mock_provider.append_build_history = AsyncMock()
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-MULTI", self._make_ticket())
+
+        assert result is False
+        fields = agent._update_fields.call_args[0][1]
+        assert (
+            fields["dedup_advisory"]["matched_investigation_id"]
+            == "RCA-NEW-INCONCLUSIVE"
+        )
+        assert fields["dedup_advisory"]["prior_outcome"] == "entropy_stall"
+
+    @pytest.mark.asyncio
+    async def test_none_outcome_does_not_block(self):
+        """A None convergence_outcome is treated as inconclusive."""
+        from unittest.mock import AsyncMock, patch
+
+        agent = self._make_agent()
+        record = self._make_record()
+        record.operational_metrics.convergence_outcome = None
+
+        with patch(
+            "providers.investigation.registry.create_record_provider",
+        ) as mock_create:
+            mock_provider = AsyncMock()
+            mock_provider.query = AsyncMock(return_value=[record])
+            mock_provider.append_build_history = AsyncMock()
+            mock_create.return_value = mock_provider
+
+            result = await agent._deterministic_dedup("PERF-NONE", self._make_ticket())
+
+        assert result is False
+        fields = agent._update_fields.call_args[0][1]
+        assert fields["dedup_advisory"]["prior_outcome"] == "none"
+
+    @pytest.mark.asyncio
     async def test_llm_match_overridden_by_advisory(self):
         """When dedup_advisory is set and LLM returns MATCH_FOUND,
         the agent reinvestigates (transitions to analyzing) while
@@ -1181,6 +1250,7 @@ class TestDedupInconclusiveOutcome:
                     "dedup_advisory": {
                         "matched_investigation_id": "RCA-INCONC",
                         "prior_outcome": "none",
+                        "history_appended": True,
                     },
                 },
             }
@@ -1222,12 +1292,18 @@ class TestDedupInconclusiveOutcome:
         assert has_reinvestigating_comment, "Should post a Reinvestigating comment"
 
         # Verify dedup_result preserves MATCH_FOUND and matched_investigation_id
+        dedup_results = []
         for call in agent._client.patch.call_args_list:
             body = call.kwargs.get("json", {})
-            dedup_result = body.get("custom_fields", {}).get("dedup_result")
+            dedup_result = body.get("fields", {}).get("dedup_result")
             if dedup_result:
-                assert dedup_result["decision"] == "MATCH_FOUND"
-                assert dedup_result["matched_investigation_id"] == "RCA-INCONC"
+                dedup_results.append(dedup_result)
+        assert dedup_results, "dedup_result should have been persisted"
+        assert any(
+            result["decision"] == "MATCH_FOUND"
+            and result["matched_investigation_id"] == "RCA-INCONC"
+            for result in dedup_results
+        )
 
 
 class TestLLMInconclusiveOutcomeCheck:
@@ -1379,6 +1455,7 @@ class TestStateLeak:
                     "dedup_advisory": {
                         "matched_investigation_id": "RCA-A",
                         "prior_outcome": "inconclusive",
+                        "history_appended": True,
                     },
                 },
             }
@@ -1444,3 +1521,264 @@ class TestStateLeak:
         entry = call_args[0][1]
         assert entry.action == "REINVESTIGATION_CANCELLED"
         assert "RCA-B" in entry.comment
+
+    @pytest.mark.asyncio
+    async def test_cancels_advisory_entry_when_reinvestigating_other_record(self):
+        """When deterministic dedup flagged Record A but the LLM matches a
+        different inconclusive Record C, A's REINVESTIGATING entry is
+        cancelled even though Record C is still reinvestigated."""
+        from unittest.mock import AsyncMock, patch
+
+        from agents.gathering_context.agent import GatheringContextAgent
+        from providers.investigation.models import (
+            AnomalyContext,
+            InvestigationRecord,
+            OperationalMetrics,
+        )
+        from providers.llm.base import LLMResponse, ToolCall
+        from providers.llm.mock import MockLLMProvider
+
+        agent = GatheringContextAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._client = AsyncMock()
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
+        # Deterministic dedup flagged Record A (inconclusive).
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "custom_fields": {
+                    "dedup_advisory": {
+                        "matched_investigation_id": "RCA-A",
+                        "prior_outcome": "entropy_stall",
+                        "history_appended": True,
+                    },
+                },
+            }
+        )
+
+        # LLM matches a different inconclusive Record C.
+        other_inconclusive = InvestigationRecord(
+            investigation_id="RCA-C",
+            anomaly_context=AnomalyContext(subsystem="cpu", metric="throughput"),
+            operational_metrics=OperationalMetrics(
+                convergence_outcome="MAX_ITERATIONS",
+            ),
+        )
+        other_inconclusive.record_url = ""
+
+        mock_provider = AsyncMock()
+
+        async def _get(investigation_id):
+            return other_inconclusive
+
+        mock_provider.get = AsyncMock(side_effect=_get)
+        mock_provider.append_build_history = AsyncMock()
+
+        with (
+            patch(
+                "agents.gathering_context.agent.create_record_provider",
+                return_value=mock_provider,
+                create=True,
+            ),
+            patch(
+                "providers.investigation.registry.create_record_provider",
+                return_value=mock_provider,
+            ),
+        ):
+            response = LLMResponse(
+                text=None,
+                tool_calls=[
+                    ToolCall(
+                        id="tc_1",
+                        name="submit_gathering_context_result",
+                        input={
+                            "decision": "MATCH_FOUND",
+                            "matched_investigation_id": "RCA-C",
+                            "match_confidence": 0.9,
+                            "match_rationale": "Same anomaly",
+                        },
+                    ),
+                ],
+            )
+            await agent._handle_completion("PERF-LEAK2", response)
+
+        # Still reinvestigates Record C.
+        transitioned_to_analyzing = False
+        for call in agent._client.post.call_args_list:
+            url = call.args[0] if call.args else ""
+            if "transition" in str(url):
+                body = call.kwargs.get("json", {})
+                if body.get("status") == "analyzing":
+                    transitioned_to_analyzing = True
+        assert transitioned_to_analyzing
+
+        # The orphaned advisory entry on Record A is cancelled.
+        mock_provider.append_build_history.assert_called_once()
+        call_args = mock_provider.append_build_history.call_args
+        assert call_args[0][0] == "RCA-A"
+        assert call_args[0][1].action == "REINVESTIGATION_CANCELLED"
+        assert "RCA-C" in call_args[0][1].comment
+
+    @pytest.mark.asyncio
+    async def test_age_advisory_does_not_emit_spurious_cancellation(self):
+        """A >90-day advisory never appended REINVESTIGATING, so consuming
+        it must not emit a REINVESTIGATION_CANCELLED entry."""
+        from unittest.mock import AsyncMock, patch
+
+        from agents.gathering_context.agent import GatheringContextAgent
+        from providers.llm.base import LLMResponse, ToolCall
+        from providers.llm.mock import MockLLMProvider
+
+        agent = GatheringContextAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._client = AsyncMock()
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
+        # Advisory-only (stale) entry: no prior_outcome, no history_appended.
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "custom_fields": {
+                    "dedup_advisory": {
+                        "matched_investigation_id": "RCA-OLD",
+                        "age_days": 120,
+                    },
+                },
+            }
+        )
+
+        mock_provider = AsyncMock()
+        mock_provider.append_build_history = AsyncMock()
+
+        with (
+            patch(
+                "agents.gathering_context.agent.create_record_provider",
+                return_value=mock_provider,
+                create=True,
+            ),
+            patch(
+                "providers.investigation.registry.create_record_provider",
+                return_value=mock_provider,
+            ),
+        ):
+            response = LLMResponse(
+                text=None,
+                tool_calls=[
+                    ToolCall(
+                        id="tc_1",
+                        name="submit_gathering_context_result",
+                        input={"decision": "NO_MATCH"},
+                    ),
+                ],
+            )
+            await agent._handle_completion("PERF-OLD", response)
+
+        mock_provider.append_build_history.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_match_cancels_advisory_entry_once(self):
+        """A NO_MATCH decision cancels the speculative REINVESTIGATING
+        entry exactly once (no double cancellation)."""
+        from unittest.mock import AsyncMock, patch
+
+        from agents.gathering_context.agent import GatheringContextAgent
+        from providers.llm.base import LLMResponse, ToolCall
+        from providers.llm.mock import MockLLMProvider
+
+        agent = GatheringContextAgent(
+            llm_provider=MockLLMProvider(),
+            state_store_url="http://localhost:8090",
+        )
+        agent._client = AsyncMock()
+        agent._client.patch = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.post = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200, json=lambda: {}, raise_for_status=lambda: None
+            ),
+        )
+        agent._client.get = AsyncMock(
+            return_value=AsyncMock(
+                status_code=200,
+                json=lambda: {"custom_fields": {}},
+                raise_for_status=lambda: None,
+            ),
+        )
+        agent._get_ticket = AsyncMock(
+            return_value={
+                "custom_fields": {
+                    "dedup_advisory": {
+                        "matched_investigation_id": "RCA-A",
+                        "prior_outcome": "inconclusive",
+                        "history_appended": True,
+                    },
+                },
+            }
+        )
+
+        mock_provider = AsyncMock()
+        mock_provider.append_build_history = AsyncMock()
+
+        with (
+            patch(
+                "agents.gathering_context.agent.create_record_provider",
+                return_value=mock_provider,
+                create=True,
+            ),
+            patch(
+                "providers.investigation.registry.create_record_provider",
+                return_value=mock_provider,
+            ),
+        ):
+            response = LLMResponse(
+                text=None,
+                tool_calls=[
+                    ToolCall(
+                        id="tc_1",
+                        name="submit_gathering_context_result",
+                        input={"decision": "NO_MATCH"},
+                    ),
+                ],
+            )
+            await agent._handle_completion("PERF-NOMATCH", response)
+
+        mock_provider.append_build_history.assert_called_once()
+        call_args = mock_provider.append_build_history.call_args
+        assert call_args[0][0] == "RCA-A"
+        assert call_args[0][1].action == "REINVESTIGATION_CANCELLED"

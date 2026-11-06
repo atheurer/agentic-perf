@@ -20,6 +20,28 @@ from pydantic import BaseModel, Field
 SCHEMA_URI = "urn:agentic-perf:investigation-record:v1"
 SCHEMA_VERSION = "v1"
 
+# Convergence outcomes that mean the investigation did not reach a
+# conclusion. Records with these outcomes (or an empty outcome) must
+# not block a new investigation of the same anomaly. Anything else
+# (e.g. ISOLATION, EXPECTED_REGRESSION, EXPECTED_BEHAVIOR) is
+# conclusive and blocks dedup. Comparisons are performed on the
+# lowercased, stripped outcome.
+INCONCLUSIVE_OUTCOMES: frozenset[str] = frozenset(
+    {
+        "inconclusive",
+        "entropy_stall",
+        "max_iterations",
+        "manual_interruption",
+        "undetermined",
+    }
+)
+
+
+def is_inconclusive_outcome(outcome: str | None) -> bool:
+    """Return True when a convergence outcome should not block dedup."""
+    normalized = (outcome or "").strip().lower()
+    return not normalized or normalized in INCONCLUSIVE_OUTCOMES
+
 
 class InvestigationState(str, Enum):
     """Lifecycle state of an investigation."""

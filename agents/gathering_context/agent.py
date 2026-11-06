@@ -18,6 +18,7 @@ from typing import Any
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from providers.events import EventBus
+from providers.investigation.models import is_inconclusive_outcome
 from providers.llm.base import LLMProvider, LLMResponse
 
 from .prompts import (
@@ -27,17 +28,6 @@ from .prompts import (
 )
 
 logger = logging.getLogger(__name__)
-
-_INCONCLUSIVE_OUTCOMES = frozenset(
-    {
-        "",
-        "inconclusive",
-        "entropy_stall",
-        "max_iterations",
-        "manual_interruption",
-        "undetermined",
-    }
-)
 
 
 class GatheringContextAgent(AgentBase):
@@ -122,7 +112,9 @@ class GatheringContextAgent(AgentBase):
         transitioned.
         """
         cf = ticket.get("custom_fields", {})
-        dedup_key = cf.get("investigation_dedup", {})
+        # Fall back to the pre-rename ``dedup_key`` field for tickets
+        # enriched before the rename.
+        dedup_key = cf.get("investigation_dedup") or cf.get("dedup_key") or {}
         if not isinstance(dedup_key, dict):
             return False
 
@@ -227,7 +219,7 @@ class GatheringContextAgent(AgentBase):
         # The record stays open and accumulates build history.
         metrics = getattr(matched, "operational_metrics", None)
         outcome = (getattr(metrics, "convergence_outcome", "") or "").strip().lower()
-        if outcome in _INCONCLUSIVE_OUTCOMES:
+        if is_inconclusive_outcome(outcome):
             logger.info(
                 "[gathering-context] Deterministic dedup "
                 "match %s has outcome '%s' — proceeding "
@@ -235,6 +227,40 @@ class GatheringContextAgent(AgentBase):
                 matched_id,
                 outcome or "none",
             )
+            # Append build history so the record tracks this alert even
+            # though we're not blocking. The advisory records whether
+            # that append succeeded so _handle_completion only cancels
+            # entries that actually exist.
+            run_meta = cf.get("run_metadata", {})
+            anomaly_ctx = cf.get("anomaly_context", {})
+            build_id = run_meta.get(
+                "build",
+                str(anomaly_ctx.get("run_id", "unknown")),
+            )
+            from providers.investigation.models import BuildHistoryEntry
+
+            history_appended = False
+            try:
+                await provider.append_build_history(
+                    matched_id,
+                    BuildHistoryEntry(
+                        build_id=str(build_id),
+                        ticket_id=ticket_id,
+                        action="REINVESTIGATING",
+                        comment=(
+                            f"Prior outcome was '{outcome or 'none'}'; "
+                            f"proceeding with fresh investigation from "
+                            f"ticket {ticket_id}"
+                        ),
+                    ),
+                )
+                history_appended = True
+            except Exception:
+                logger.warning(
+                    "[gathering-context] Failed to append build history "
+                    "for inconclusive match",
+                    exc_info=True,
+                )
             await self._update_fields(
                 ticket_id,
                 {
@@ -242,6 +268,7 @@ class GatheringContextAgent(AgentBase):
                         "matched_investigation_id": matched_id,
                         "prior_outcome": outcome or "none",
                         "age_days": age_days,
+                        "history_appended": history_appended,
                         "rationale": (
                             f"Record {matched_id} matches on "
                             f"metric/platform but its outcome "
@@ -252,41 +279,6 @@ class GatheringContextAgent(AgentBase):
                     },
                 },
             )
-            # Append build history so the record tracks this
-            # alert even though we're not blocking.
-            run_meta = cf.get("run_metadata", {})
-            anomaly_ctx = cf.get("anomaly_context", {})
-            build_id = run_meta.get(
-                "build",
-                str(anomaly_ctx.get("run_id", "unknown")),
-            )
-            from providers.investigation.models import (
-                BuildHistoryEntry,
-            )
-
-            try:
-                entry = BuildHistoryEntry(
-                    build_id=str(build_id),
-                    ticket_id=ticket_id,
-                    action="REINVESTIGATING",
-                    comment=(
-                        f"Prior outcome was "
-                        f"'{outcome or 'none'}'; "
-                        f"proceeding with fresh "
-                        f"investigation from ticket "
-                        f"{ticket_id}"
-                    ),
-                )
-                await provider.append_build_history(
-                    matched_id,
-                    entry,
-                )
-            except Exception:
-                logger.debug(
-                    "[gathering-context] Failed to append "
-                    "build history for inconclusive match",
-                    exc_info=True,
-                )
             return False
 
         match_confidence = 1.0
@@ -440,6 +432,39 @@ class GatheringContextAgent(AgentBase):
             await mcp.disconnect()
             self._mcp = None
 
+    async def _cancel_reinvestigation(
+        self,
+        investigation_id: str,
+        ticket_id: str,
+        comment: str,
+    ) -> None:
+        """Append a REINVESTIGATION_CANCELLED entry to a record.
+
+        Used when deterministic dedup speculatively appended a
+        REINVESTIGATING entry but the ticket did not ultimately
+        reinvestigate that record.
+        """
+        from providers.investigation.models import BuildHistoryEntry
+        from providers.investigation.registry import create_record_provider
+
+        try:
+            provider = create_record_provider()
+            await provider.append_build_history(
+                investigation_id,
+                BuildHistoryEntry(
+                    build_id="",
+                    ticket_id=ticket_id,
+                    action="REINVESTIGATION_CANCELLED",
+                    comment=comment,
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "[gathering-context] Failed to cancel reinvestigation entry for %s",
+                investigation_id,
+                exc_info=True,
+            )
+
     async def _handle_completion(
         self,
         ticket_id: str,
@@ -455,15 +480,27 @@ class GatheringContextAgent(AgentBase):
         rationale = result.get("match_rationale", "")
         notes = result.get("notes", "")
 
-        # If the deterministic dedup already determined the matched
-        # record is inconclusive, flag for reinvestigation while
-        # keeping the record link intact.
-        ticket = await self._get_ticket(ticket_id)
-        advisory = (ticket.get("custom_fields") or {}).get("dedup_advisory")
-        reinvestigate = (
-            decision == "MATCH_FOUND"
-            and isinstance(advisory, dict)
-            and advisory.get("matched_investigation_id") == matched_id
+        # The deterministic dedup step may have written a
+        # dedup_advisory naming a record it matched on but did not
+        # block on (inconclusive or too old). The advisory is only
+        # authoritative for the record it names.
+        advisory: Any = None
+        try:
+            ticket = await self._get_ticket(ticket_id)
+            advisory = (ticket.get("custom_fields") or {}).get("dedup_advisory")
+        except Exception:
+            logger.warning(
+                "[gathering-context] Could not load ticket %s for dedup advisory",
+                ticket_id,
+                exc_info=True,
+            )
+        advisory_id = (
+            advisory.get("matched_investigation_id")
+            if isinstance(advisory, dict)
+            else None
+        )
+        advisory_history_appended = bool(
+            isinstance(advisory, dict) and advisory.get("history_appended")
         )
 
         # Persist the decision on the ticket
@@ -479,42 +516,12 @@ class GatheringContextAgent(AgentBase):
 
         await self._update_fields(ticket_id, fields)
 
-        if decision == "MATCH_FOUND" and matched_id and not reinvestigate:
-            # Check if the matched record is inconclusive — the LLM
-            # doesn't know about outcome awareness.
-            try:
-                from providers.investigation.registry import (
-                    create_record_provider,
-                )
-
-                provider = create_record_provider()
-                matched_record = await provider.get(matched_id)
-                if matched_record:
-                    metrics = getattr(matched_record, "operational_metrics", None)
-                    record_outcome = (
-                        (getattr(metrics, "convergence_outcome", "") or "")
-                        .strip()
-                        .lower()
-                    )
-                    if record_outcome in _INCONCLUSIVE_OUTCOMES:
-                        reinvestigate = True
-                        logger.info(
-                            "[gathering-context] LLM matched inconclusive "
-                            "record %s (outcome='%s') — reinvestigating",
-                            matched_id,
-                            record_outcome,
-                        )
-            except Exception:
-                logger.debug(
-                    "[gathering-context] Could not check record outcome for %s",
-                    matched_id,
-                    exc_info=True,
-                )
-
+        # Resolve the matched record from the provider rather than
+        # trusting LLM output — this gives us the canonical URL and
+        # the persisted convergence outcome the LLM is unaware of.
+        record = None
+        record_outcome = ""
         if decision == "MATCH_FOUND" and matched_id:
-            # Resolve the record URL from the provider
-            # rather than trusting LLM output.
-            record_url = ""
             try:
                 from providers.investigation.registry import (
                     create_record_provider,
@@ -523,23 +530,55 @@ class GatheringContextAgent(AgentBase):
                 provider = create_record_provider()
                 record = await provider.get(matched_id)
                 if record:
-                    record_url = record.record_url
-                    fields["dedup_result"]["record_url"] = record_url
+                    metrics = getattr(record, "operational_metrics", None)
+                    record_outcome = (
+                        (getattr(metrics, "convergence_outcome", "") or "")
+                        .strip()
+                        .lower()
+                    )
+                    fields["dedup_result"]["record_url"] = record.record_url
                     await self._update_fields(ticket_id, fields)
             except Exception:
-                logger.debug(
-                    "[gathering-context] Could not resolve record URL for %s",
+                logger.warning(
+                    "[gathering-context] Could not resolve record %s",
                     matched_id,
+                    exc_info=True,
                 )
 
+        # Reinvestigate when the deterministic advisory named this
+        # record, or the matched record itself is inconclusive. If the
+        # advisory named a different record, its REINVESTIGATING entry
+        # is orphaned and must be cancelled regardless of the outcome.
+        reinvestigate = bool(
+            decision == "MATCH_FOUND"
+            and matched_id
+            and (
+                advisory_id == matched_id
+                or (record is not None and is_inconclusive_outcome(record_outcome))
+            )
+        )
+        if (
+            decision == "MATCH_FOUND"
+            and matched_id
+            and advisory_id
+            and advisory_id != matched_id
+            and advisory_history_appended
+        ):
+            await self._cancel_reinvestigation(
+                advisory_id,
+                ticket_id,
+                comment=f"LLM matched different record {matched_id}",
+            )
+
+        if decision == "MATCH_FOUND" and matched_id:
+            record_url = record.record_url if record is not None else ""
             record_label = f"[{matched_id}]({record_url})" if record_url else matched_id
 
             if reinvestigate:
-                prior_outcome = (
-                    advisory.get("prior_outcome", "none")
-                    if isinstance(advisory, dict)
-                    else "none"
-                )
+                if advisory_id == matched_id and isinstance(advisory, dict):
+                    prior_outcome = advisory.get("prior_outcome", "none")
+                else:
+                    prior_outcome = record_outcome or "none"
                 summary = (
                     f"**Reinvestigating**\n\n"
                     f"- **Matched Record:** {record_label}\n"
@@ -575,64 +614,15 @@ class GatheringContextAgent(AgentBase):
                     "retrospective_pending",
                     comment=(f"Dedup match: {matched_id}. Skipping investigation."),
                 )
-                # If deterministic dedup matched a different record,
-                # clean up the orphaned REINVESTIGATING entry.
-                if (
-                    isinstance(advisory, dict)
-                    and advisory.get("matched_investigation_id") != matched_id
-                ):
-                    try:
-                        from providers.investigation.models import (
-                            BuildHistoryEntry,
-                        )
-                        from providers.investigation.registry import (
-                            create_record_provider,
-                        )
-
-                        cleanup_provider = create_record_provider()
-                        await cleanup_provider.append_build_history(
-                            advisory["matched_investigation_id"],
-                            BuildHistoryEntry(
-                                build_id="",
-                                ticket_id=ticket_id,
-                                action="REINVESTIGATION_CANCELLED",
-                                comment=(f"LLM matched different record {matched_id}"),
-                            ),
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Failed to cancel reinvestigation entry",
-                            exc_info=True,
-                        )
         else:
             # LLM decided NO_MATCH. If deterministic dedup had
             # appended a REINVESTIGATING entry, clean it up.
-            if isinstance(advisory, dict) and advisory.get("matched_investigation_id"):
-                try:
-                    from providers.investigation.models import (
-                        BuildHistoryEntry,
-                    )
-                    from providers.investigation.registry import (
-                        create_record_provider,
-                    )
-
-                    cancel_provider = create_record_provider()
-                    await cancel_provider.append_build_history(
-                        advisory["matched_investigation_id"],
-                        BuildHistoryEntry(
-                            build_id="",
-                            ticket_id=ticket_id,
-                            action="REINVESTIGATION_CANCELLED",
-                            comment=(
-                                "LLM dedup determined this is a different anomaly"
-                            ),
-                        ),
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to cancel reinvestigation entry",
-                        exc_info=True,
-                    )
+            if advisory_id and advisory_history_appended:
+                await self._cancel_reinvestigation(
+                    advisory_id,
+                    ticket_id,
+                    comment="LLM dedup determined this is a different anomaly",
+                )
 
             summary = (
                 "**No Dedup Match**\n\n"

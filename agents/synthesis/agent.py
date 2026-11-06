@@ -249,7 +249,12 @@ class SynthesisAgent(AgentBase):
         # record deterministically. Fall back to anomaly_context
         # fields if investigation_dedup is not set.
         anomaly = cf.get("anomaly_context", {})
-        dedup_key = cf.get("investigation_dedup", {})
+        # Fall back to the pre-rename ``dedup_key`` field for tickets
+        # enriched before the rename, but ignore non-dict values (old
+        # tickets stored the raw webhook dedup string there).
+        dedup_key = cf.get("investigation_dedup") or cf.get("dedup_key") or {}
+        if not isinstance(dedup_key, dict):
+            dedup_key = {}
         rc = metrics.get("resource_consumption", {})
         record_created = False
 
@@ -283,10 +288,8 @@ class SynthesisAgent(AgentBase):
                     },
                 )
                 # MCP tools return errors as JSON, not exceptions
-                import json as _json
-
                 parsed = (
-                    _json.loads(record_result) if isinstance(record_result, str) else {}
+                    json.loads(record_result) if isinstance(record_result, str) else {}
                 )
                 if parsed.get("status") not in ("updated",):
                     raise RuntimeError(

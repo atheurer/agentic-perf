@@ -293,8 +293,12 @@ async def update_investigation_record(
     )
     if info_gain_trajectory:
         try:
-            om.info_gain_trajectory = json.loads(info_gain_trajectory)
-        except (json.JSONDecodeError, TypeError):
+            parsed_trajectory = [float(x) for x in json.loads(info_gain_trajectory)]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            parsed_trajectory = None
+        if parsed_trajectory is not None:
+            om.info_gain_trajectory = parsed_trajectory
+        else:
             logger.warning(
                 "Malformed info_gain_trajectory for update — data dropped: %r",
                 info_gain_trajectory,
@@ -352,9 +356,11 @@ async def append_build_history(
 
     Call this when a known regression is detected in a new build
     — the agent skips the full investigation and records that the
-    regression is still present. Action should be
-    FULL_INVESTIGATION or SKIP_MATCHED. Include ticket_id to
-    link the history entry to the originating ticket.
+    regression is still present. Action should be one of
+    FULL_INVESTIGATION, SKIP_MATCHED, REINVESTIGATING,
+    REINVESTIGATION_COMPLETE, or REINVESTIGATION_CANCELLED.
+    Include ticket_id to link the history entry to the
+    originating ticket.
     """
     # Fallback to env var set by mcp_client for ticket-bound servers
     ticket_id = ticket_id or os.environ.get("TICKET_ID", "")

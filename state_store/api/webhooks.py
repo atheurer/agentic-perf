@@ -151,7 +151,10 @@ def _find_dedup(
         cf = ticket.custom_fields
         if cf.get("trigger_source") != trigger_source:
             continue
-        if cf.get("webhook_dedup_key") == dedup_key_value:
+        # Fall back to the pre-rename ``dedup_key`` field so tickets
+        # created before this field was renamed still dedup correctly.
+        stored_key = cf.get("webhook_dedup_key") or cf.get("dedup_key")
+        if stored_key == dedup_key_value:
             return ticket.id
     return None
 
