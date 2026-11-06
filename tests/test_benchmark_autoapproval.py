@@ -475,6 +475,7 @@ async def test_malformed_2xx_create_without_readback_stays_reclaimable(
         seed_unrelated=True,
         **{readback_option: True},
     )
+    lease_ttl_seconds = benchmark_server._BENCHMARK_OPERATION_LEASE_TTL_SECONDS
     monkeypatch.setattr(benchmark_server, "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS", 0.3)
 
     first = json.loads(
@@ -493,6 +494,11 @@ async def test_malformed_2xx_create_without_readback_stays_reclaimable(
     api.fail_list_after_create = False
     await asyncio.sleep(
         max(0.0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.05
+    )
+    monkeypatch.setattr(
+        benchmark_server,
+        "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS",
+        lease_ttl_seconds,
     )
 
     replay = json.loads(
@@ -625,6 +631,7 @@ async def test_cancel_after_consumed_approval_replays_without_second_consume(
         directives={"user_pre_run_approval": False},
         consume_cancel=True,
     )
+    lease_ttl_seconds = benchmark_server._BENCHMARK_OPERATION_LEASE_TTL_SECONDS
     monkeypatch.setattr(benchmark_server, "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS", 0.3)
 
     first_task = asyncio.create_task(
@@ -643,6 +650,11 @@ async def test_cancel_after_consumed_approval_replays_without_second_consume(
         store.close()
     await asyncio.sleep(
         max(0.0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.05
+    )
+    monkeypatch.setattr(
+        benchmark_server,
+        "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS",
+        lease_ttl_seconds,
     )
     api.consume_cancel = False
 
@@ -667,6 +679,7 @@ async def test_uncertain_consume_readback_leaves_prepared_operation_reclaimable(
         fail_list_after_consume=True,
         **{consume_response: True},
     )
+    lease_ttl_seconds = benchmark_server._BENCHMARK_OPERATION_LEASE_TTL_SECONDS
     monkeypatch.setattr(benchmark_server, "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS", 0.3)
 
     first = json.loads(
@@ -683,6 +696,13 @@ async def test_uncertain_consume_readback_leaves_prepared_operation_reclaimable(
         store.close()
     await asyncio.sleep(
         max(0.0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.05
+    )
+    # Keep the short TTL only for proving the original lease expires. Replay
+    # needs the normal lease window to finish its readback and consume checks.
+    monkeypatch.setattr(
+        benchmark_server,
+        "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS",
+        lease_ttl_seconds,
     )
     api.fail_list_after_consume = False
 
@@ -808,6 +828,7 @@ async def test_cancel_after_resolve_reuses_approval_after_prepared_lease_expires
     _, calls, api = _wire(
         monkeypatch, tmp_path, directives={"user_pre_run_approval": False}
     )
+    lease_ttl_seconds = benchmark_server._BENCHMARK_OPERATION_LEASE_TTL_SECONDS
     monkeypatch.setattr(benchmark_server, "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS", 0.3)
     note_entered = asyncio.Event()
     original_note = benchmark_server._add_execution_note
@@ -839,6 +860,11 @@ async def test_cancel_after_resolve_reuses_approval_after_prepared_lease_expires
         store.close()
     await asyncio.sleep(
         max(0.0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.05
+    )
+    monkeypatch.setattr(
+        benchmark_server,
+        "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS",
+        lease_ttl_seconds,
     )
 
     replay = json.loads(
