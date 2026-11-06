@@ -171,14 +171,27 @@ async def get_ticket_results(ticket_id: str) -> str:
 
     # Always provide the artifact base path — even when output_dir
     # wasn't persisted, artifacts may exist on disk at the standard
-    # location.
+    # location. Resolve and confine it beneath ARTIFACT_DIR so a
+    # crafted ticket id cannot point outside the artifact tree.
     from paths import ARTIFACT_DIR
 
-    artifact_base = ARTIFACT_DIR / ticket_id
-    if artifact_base.exists():
+    try:
+        artifact_root = Path(ARTIFACT_DIR).resolve()
+        artifact_base = (artifact_root / ticket_id).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        artifact_root = artifact_base = None
+    if (
+        artifact_root is not None
+        and artifact_base is not None
+        and artifact_base.is_relative_to(artifact_root)
+        and artifact_base.is_dir()
+    ):
         result["artifact_base_path"] = str(artifact_base)
         # List run directories so the caller knows what's available
-        run_dirs = sorted([str(d) for d in artifact_base.iterdir() if d.is_dir()])
+        try:
+            run_dirs = sorted(str(d) for d in artifact_base.iterdir() if d.is_dir())
+        except OSError:
+            run_dirs = []
         if run_dirs:
             result["artifact_run_dirs"] = run_dirs
 
@@ -255,18 +268,41 @@ async def search_tickets(
     )
 
 
+def _resolve_confined_artifact_dir(output_dir: str) -> Path | None:
+    """Resolve ``output_dir`` and confine it beneath ``ARTIFACT_DIR``.
+
+    ``list_benchmark_artifacts`` and ``read_benchmark_artifact`` are
+    handed paths discovered from tickets, which must stay inside the
+    artifact tree. Returns ``None`` when the path is outside the root.
+    """
+    from paths import ARTIFACT_DIR
+
+    try:
+        root = Path(ARTIFACT_DIR).resolve()
+        resolved = Path(output_dir).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not resolved.is_relative_to(root):
+        return None
+    return resolved
+
+
 @mcp.tool()
 async def list_benchmark_artifacts(output_dir: str) -> str:
     """List available artifacts in a benchmark output directory.
 
     Use get_ticket_results to discover artifact paths for a ticket,
     then pass output_dir or artifact_run_dirs entries to this tool
-    to list available files.
+    to list available files. Paths must be inside the artifact
+    directory tree; other locations are rejected.
 
     Args:
-        output_dir: Path to the benchmark output directory.
+        output_dir: Path to the benchmark output directory (must be
+            inside the artifact tree).
     """
-    path = Path(output_dir)
+    path = _resolve_confined_artifact_dir(output_dir)
+    if path is None:
+        return json.dumps({"error": f"Directory not allowed: {output_dir}"})
     if not path.exists():
         return json.dumps({"error": f"Directory not found: {output_dir}"})
 
@@ -306,10 +342,13 @@ async def read_benchmark_artifact(
         offset: Line number to start reading from (0-based).
         limit: Maximum number of lines to return (default 200).
     """
-    path = Path(output_dir) / filename
+    base = _resolve_confined_artifact_dir(output_dir)
+    if base is None:
+        return json.dumps({"error": "Path traversal not allowed"})
+    path = base / filename
 
     try:
-        path.resolve().relative_to(Path(output_dir).resolve())
+        path.resolve().relative_to(base)
     except ValueError:
         return json.dumps({"error": "Path traversal not allowed"})
 
