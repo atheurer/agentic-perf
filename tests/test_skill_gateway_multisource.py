@@ -1802,3 +1802,35 @@ async def test_resource_service_config_is_gateway_only_and_not_model_readable(
     assert result["context_conflicts"]["runtime_configuration_conflict"] is False
     assert "quads-internal.example.test" not in json.dumps(result)
     assert resolver.get_runtime_config("resource/quads") == config
+
+
+@pytest.mark.asyncio
+async def test_benchmark_gateway_serves_investigation_and_jumpstarter_local_docs():
+    """The benchmark prompt's subjects resolve to the repo's bundled skill docs."""
+    skills = Path(__file__).resolve().parent.parent / "skills"
+    provider = MultiHarnessSkillProvider(
+        {},
+        private=PrivateSkillProvider(resolver=OrganizationSkillResolver({})),
+        project_context_source=None,
+    )
+
+    for subject, expected_document in (
+        ("resource/jumpstarter", "image-selection.md"),
+        ("workflow/investigation", "webhook-autonomy.md"),
+    ):
+        result = json.loads(
+            await skill_context_gateway(
+                provider,
+                ticket_id="TEST-LOCAL-BENCHMARK-SUBJECTS",
+                agent_name="benchmark-agent",
+                phase="benchmark",
+                subject=subject,
+                operation="bootstrap",
+                local_skills_dir=skills,
+            )
+        )
+
+        assert result["found"] is True, (subject, result)
+        assert any(
+            item["path"].endswith(expected_document) for item in result["documents"]
+        ), (subject, result["documents"])
