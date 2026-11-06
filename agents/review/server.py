@@ -9,6 +9,7 @@ Run directly:  python agents/review/server.py
 Connected via: AgentMCPClient (agents/mcp_client.py)
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -16,6 +17,8 @@ import shlex
 import sys
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
@@ -31,6 +34,7 @@ from agents.server_utils import (
     crucible_context_gateway,
     read_skill_documents,
     ticket_controller_host,
+    ticket_state_headers,
 )
 from agents.skill_gateway import (
     SKILL_GATEWAY_TOOL_DESCRIPTION,
@@ -38,6 +42,7 @@ from agents.skill_gateway import (
     skill_config_view,
     skill_context_gateway,
 )
+from providers.execution import AuditedAsyncHTTPClient
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +52,8 @@ SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 
 # Module-level globals — lazily initialized by _ensure_init()
 _initialized = False
+_cdm_initialized = False
+_cdm_init_lock = asyncio.Lock()
 _ssh = None
 _skill_provider = None
 _crucible_context = None
@@ -59,14 +66,49 @@ async def _ensure_init():
     global _initialized, _ssh, _skill_provider, _crucible_context, _repo_cache, _ticket
     if _initialized:
         return
-    _ssh, _ticket = await build_ssh_from_ticket()
-    _skill_provider = await build_skill_provider_async(skill_phase="review")
-    _crucible_context = build_crucible_context_gateway(catalog_only=False)
-    try:
-        _repo_cache = await build_repo_cache()
-    except Exception:
-        _repo_cache = None
-    _initialized = True
+    async with _cdm_init_lock:
+        if _initialized:
+            return
+        ssh, ticket = await build_ssh_from_ticket()
+        provider = await build_skill_provider_async(skill_phase="review")
+        context = build_crucible_context_gateway(catalog_only=False)
+        try:
+            repo_cache = await build_repo_cache()
+        except Exception:
+            repo_cache = None
+        _ssh, _ticket, _skill_provider, _crucible_context, _repo_cache = (
+            ssh,
+            ticket,
+            provider,
+            context,
+            repo_cache,
+        )
+        _initialized = True
+
+
+async def _ensure_cdm_init():
+    """Load ticket and review configuration without resolving SSH credentials."""
+    global _cdm_initialized, _ticket, _skill_provider
+    if _initialized or _cdm_initialized:
+        return
+    async with _cdm_init_lock:
+        if _initialized or _cdm_initialized:
+            return
+        ticket_id = os.environ.get("TICKET_ID", "")
+        if ticket_id:
+            store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+            async with AuditedAsyncHTTPClient(
+                timeout=15.0, headers=ticket_state_headers()
+            ) as client:
+                response = await client.get(f"{store_url}/api/v1/tickets/{ticket_id}")
+                response.raise_for_status()
+                ticket = response.json()
+        else:
+            ticket = {}
+        provider = await build_skill_provider_async(skill_phase="review")
+        _ticket = ticket
+        _skill_provider = provider
+        _cdm_initialized = True
 
 
 # ---------------------------------------------------------------------------
@@ -571,43 +613,124 @@ async def cdm_api_request(
     port: int = 3000,
 ) -> str:
     """Internal helper — use cdm_api_requests (plural) to make CDM queries."""
-    await _ensure_init()
+    await _ensure_cdm_init()
 
-    if method == "GET":
-        cmd = f"curl --silent --show-error --fail -X GET http://localhost:{port}{path}"
-    else:
-        body_json = json.dumps(body or {})
-        cmd = (
-            f"curl --silent --show-error --fail "
-            f"-X POST http://localhost:{port}{path} "
-            f"-H 'Content-Type: application/json' "
-            f"-d '{body_json}'"
-        )
-
-    result = await _ssh.run(controller, cmd, timeout=60)
-    if result.exit_code != 0:
+    method = method.upper()
+    fields = _ticket.get("custom_fields", {}) if isinstance(_ticket, dict) else {}
+    if not isinstance(fields, dict):
+        fields = {}
+    controllers = [ticket_controller_host(_ticket)]
+    for key in ("ssh_hardware_ips", "assigned_hardware_ips"):
+        addresses = fields.get(key)
+        if isinstance(addresses, dict):
+            controllers.append(addresses.get("controller"))
+    context = fields.get("crucible_controller_context")
+    if isinstance(context, dict):
+        controllers.extend((context.get("host"), context.get("controller")))
+    allowed_hosts = {
+        host.strip().rstrip(".").casefold()
+        for host in controllers
+        if isinstance(host, str) and host.strip()
+    }
+    configured_port = 3000
+    if _skill_provider is not None:
+        try:
+            config = await skill_config_view(
+                _skill_provider, "crucible", "review", "review"
+            )
+            configured_port = config.get("cdm_port", 3000)
+        except Exception:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "method": method,
+                    "path": path,
+                    "error": "Unable to verify the configured CDM port",
+                }
+            )
+    if (
+        controller.rstrip(".").casefold() not in allowed_hosts
+        or port != configured_port
+    ):
         return json.dumps(
             {
                 "status": "error",
                 "method": method,
                 "path": path,
-                "exit_code": result.exit_code,
-                "error": result.stderr or "",
+                "error": "CDM requests require a recorded controller and configured CDM port",
+            }
+        )
+    if (
+        method not in {"GET", "POST"}
+        or not path.startswith("/")
+        or path.startswith("//")
+        or "%" in path.split("?", 1)[0]
+        or "\\" in path.split("?", 1)[0]
+    ):
+        return json.dumps(
+            {
+                "status": "error",
+                "method": method,
+                "path": path,
+                "error": "Expected GET or POST and an absolute API path",
+            }
+        )
+    try:
+        url = httpx.URL(scheme="http", host=controller, port=port).join(path)
+        if not (url.path in {"/api/v1", "/health"} or url.path.startswith("/api/v1/")):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "method": method,
+                    "path": path,
+                    "error": "Expected a CDM API or health path",
+                }
+            )
+        async with AuditedAsyncHTTPClient(timeout=60.0, trust_env=False) as client:
+            if method == "GET":
+                response = await client.get(url)
+            else:
+                response = await client.post(url, json=body or {})
+    except (httpx.RequestError, httpx.InvalidURL, ValueError) as exc:
+        return json.dumps(
+            {
+                "status": "error",
+                "method": method,
+                "path": path,
+                "error": f"CDM request failed: {type(exc).__name__}: {exc}",
             }
         )
 
     try:
-        return json.dumps(json.loads(result.stdout))
-    except json.JSONDecodeError:
+        response_body = response.json()
+        valid_json = True
+    except ValueError:
+        response_body = response.text
+        valid_json = False
+    if not response.is_success:
+        error = response_body.get("error") if isinstance(response_body, dict) else None
         return json.dumps(
             {
                 "status": "error",
                 "method": method,
                 "path": path,
-                "raw_output": result.stdout or "",
+                "status_code": response.status_code,
+                "error": error or f"CDM returned HTTP {response.status_code}",
+                "response_body": response_body,
+            }
+        )
+    if not valid_json:
+        return json.dumps(
+            {
+                "status": "error",
+                "method": method,
+                "path": path,
+                "status_code": response.status_code,
+                "raw_output": response_body,
                 "error": "Response is not valid JSON",
             }
         )
+    return json.dumps(response_body)
 
 
 @mcp.tool()
@@ -616,36 +739,30 @@ async def cdm_api_requests(
     requests: list[dict],
     port: int = 3000,
 ) -> str:
-    """Make multiple CDM API requests concurrently in one call. Each entry needs 'label', 'method', and 'path'; optionally 'body' for POST. Use this instead of calling cdm_api_request repeatedly to save iterations — e.g. fetch uperf Gbps, mpstat CPU, and tcp-window cwnd for all samples in one call."""
-    import asyncio as _asyncio
+    """Query CDM directly on a recorded controller (default HTTP port 3000).
 
-    await _ensure_init()
+    Each request needs 'label', 'method', and 'path'; POST may include 'body'.
+    Requests run concurrently. HTTP errors include the status and response body;
+    large outputs are available through the ticket workspace.
+    """
+    await _ensure_cdm_init()
 
     async def _one(req: dict) -> tuple[str, dict]:
         label = req.get("label", req.get("path", "?"))
-        raw = await cdm_api_request(
-            controller=controller,
-            path=req.get("path", ""),
-            method=req.get("method", "POST"),
-            body=req.get("body"),
-            port=port,
-        )
         try:
+            raw = await cdm_api_request(
+                controller=controller,
+                path=req.get("path", ""),
+                method=req.get("method", "POST"),
+                body=req.get("body"),
+                port=port,
+            )
             return label, json.loads(raw)
-        except Exception:
-            return label, {"raw": raw}
+        except Exception as exc:
+            return label, {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
-    results = await _asyncio.gather(
-        *[_one(r) for r in requests], return_exceptions=True
-    )
-    out = {}
-    for item in results:
-        if isinstance(item, Exception):
-            out["error"] = {"status": "error", "error": str(item)}
-        else:
-            label, data = item
-            out[label] = data
-    return json.dumps(out)
+    results = await asyncio.gather(*[_one(r) for r in requests])
+    return json.dumps(dict(results))
 
 
 @mcp.tool()
@@ -656,34 +773,18 @@ async def compare_results(
     port: int = 3000,
 ) -> str:
     """Compare metrics between two or more benchmark runs via the CDM API. Only applicable for crucible runs."""
-    await _ensure_init()
+    await _ensure_cdm_init()
 
     results = {}
     for rid in run_ids:
-        body_json = json.dumps({"runIds": [rid]})
-        api_result = await _ssh.run(
+        api_result = await cdm_api_request(
             controller,
-            f"curl --silent --show-error --fail "
-            f"-X POST http://localhost:{port}/api/v1/iterations/metric-values "
-            f"-H 'Content-Type: application/json' "
-            f"-d '{body_json}'",
-            timeout=60,
+            "/api/v1/iterations/metric-values",
+            method="POST",
+            body={"runIds": [rid]},
+            port=port,
         )
-        if api_result.exit_code != 0:
-            results[rid] = {
-                "status": "error",
-                "exit_code": api_result.exit_code,
-                "error": api_result.stderr or "",
-            }
-        else:
-            try:
-                results[rid] = json.loads(api_result.stdout)
-            except json.JSONDecodeError:
-                results[rid] = {
-                    "status": "error",
-                    "error": "Response is not valid JSON",
-                    "raw_output": api_result.stdout[:2000] if api_result.stdout else "",
-                }
+        results[rid] = json.loads(api_result)
 
     return json.dumps(
         {
@@ -703,7 +804,7 @@ async def compare_results(
 @mcp.tool()
 async def get_review_config(harness_name: str) -> str:
     """Get review/results-retrieval settings for the benchmark harness. Crucible returns approved method, port, and result-location fields; read interpretation guidance through get_skill_context. Check ticket artifacts before retrieving remote results."""
-    await _ensure_init()
+    await _ensure_cdm_init()
 
     if harness_name == "crucible" or organization_manages_harness(
         _skill_provider, harness_name

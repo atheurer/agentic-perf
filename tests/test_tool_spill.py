@@ -104,6 +104,112 @@ async def test_tool_output_over_threshold_spilled_and_queryable(agent):
     assert parsed_jq["result"] == [0.0, 1.5, 3.0]
 
 
+@pytest.mark.parametrize("status_code", [200, 400])
+async def test_cdm_response_uses_workspace_for_large_success_and_error(
+    agent, monkeypatch, tmp_path, status_code
+):
+    import asyncio
+
+    import httpx
+    from fastmcp import Client
+
+    import agents.review.server as review
+    from providers.execution import AuditedAsyncHTTPClient
+
+    details = "full response " * 600
+
+    async def emit(_event):
+        pass
+
+    def client_factory(**kwargs):
+        def handle(request):
+            if request.url.host == "store.example":
+                return httpx.Response(
+                    200,
+                    json={
+                        "custom_fields": {
+                            "assigned_hardware_ips": {
+                                "controller": "controller.example"
+                            }
+                        }
+                    },
+                )
+            return httpx.Response(
+                status_code, json={"error": "bad field", "details": details}
+            )
+
+        transport = httpx.MockTransport(handle)
+        return AuditedAsyncHTTPClient(
+            client=httpx.AsyncClient(transport=transport, **kwargs), emit=emit
+        )
+
+    monkeypatch.setattr(review, "_initialized", False)
+    monkeypatch.setattr(review, "_cdm_initialized", False)
+    monkeypatch.setattr(review, "_cdm_init_lock", asyncio.Lock())
+    monkeypatch.setattr(review, "_skill_provider", None)
+    monkeypatch.setattr(review, "_ticket", {})
+    monkeypatch.setenv("TICKET_ID", "PERF-SPILL-1")
+    monkeypatch.setenv("STATE_STORE_URL", "http://store.example")
+    monkeypatch.setattr(review, "ticket_state_headers", lambda: {})
+    ssh_init = AsyncMock(side_effect=AssertionError("CDM must not resolve SSH"))
+    monkeypatch.setattr(review, "build_ssh_from_ticket", ssh_init)
+    monkeypatch.setattr(
+        review, "build_skill_provider_async", AsyncMock(return_value=object())
+    )
+    monkeypatch.setattr(
+        review, "skill_config_view", AsyncMock(return_value={"cdm_port": 3000})
+    )
+    monkeypatch.setattr(review, "AuditedAsyncHTTPClient", client_factory)
+    _register_visible_test_tool(agent, "cdm_api_requests")
+    async with Client(review.mcp) as client:
+
+        async def call_tool(name, args, trace_context=None):
+            response = await client.call_tool(name, args)
+            return response.content[0].text
+
+        agent._mcp = MagicMock()
+        agent._mcp.call_tool = call_tool
+        result = await agent._execute_tool(
+            ToolCall(
+                id="call_cdm",
+                name="cdm_api_requests",
+                input={
+                    "controller": "controller.example",
+                    "requests": [
+                        {
+                            "label": "query",
+                            "method": "POST",
+                            "path": "/api/v1/metric-data",
+                            "body": {"source": "mpstat"},
+                        }
+                    ],
+                },
+            )
+        )
+    assert not result.is_error
+    ssh_init.assert_not_awaited()
+    descriptor = json.loads(result.content)
+    assert descriptor["status"] == "spilled_to_workspace"
+    assert descriptor["file_ref"].startswith("workspace://cdm_api_requests_")
+    files = list(tmp_path.rglob("cdm_api_requests_*.json"))
+    assert len(files) == 1
+    stored = json.loads(files[0].read_text())["query"]
+    if status_code == 400:
+        assert stored["status_code"] == 400
+        stored = stored["response_body"]
+    assert stored["details"] == details
+
+    jq = await agent._execute_tool(
+        ToolCall(
+            id="call_jq",
+            name="jq_file_from_workspace",
+            input={"file_ref": descriptor["file_ref"], "filter": ".query | keys"},
+        )
+    )
+    assert not jq.is_error
+    assert json.loads(jq.content)["status"] == "ok"
+
+
 async def test_exempt_tools_not_spilled(agent, monkeypatch):
     monkeypatch.setenv("TOOL_SPILL_THRESHOLD", "10")
     agent._spill_threshold = 10
