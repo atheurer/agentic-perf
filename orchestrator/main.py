@@ -4043,7 +4043,7 @@ async def _poll_loop_after_lease(
                     if retry_is_suppressed(cf, "dispatch", status, now=time.time()):
                         continue
 
-                    if not dispatcher.try_claim(tid, status):
+                    if not await dispatcher.try_claim(tid, status):
                         logger.info(f"Skipping {tid} at {status}: claim held")
                         continue
                     dispatcher.start_renewal(tid)

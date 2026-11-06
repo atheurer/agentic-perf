@@ -610,7 +610,7 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
     dispatcher.active_tasks.return_value = []
     dispatcher.is_active.return_value = False
     dispatcher.is_handoff_blocked.return_value = False
-    dispatcher.try_claim.return_value = False
+    dispatcher.try_claim = AsyncMock(return_value=False)
     dispatcher.shutdown = AsyncMock()
     dispatcher._trace_contexts = {}
     monkeypatch.setattr(main, "Dispatcher", lambda *_args, **_kwargs: dispatcher)
@@ -807,7 +807,7 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     dispatcher = MagicMock()
     dispatcher.active_tasks.return_value = []
     dispatcher.is_active.return_value = False
-    dispatcher.try_claim.return_value = False
+    dispatcher.try_claim = AsyncMock(return_value=False)
     dispatcher.shutdown = AsyncMock()
     events = MagicMock()
     if failure_path == "event":

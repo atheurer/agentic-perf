@@ -416,6 +416,30 @@ def test_claim_rejection_is_a_durable_dispatch_outcome() -> None:
     assert sink.events[-1].lifecycle.state == LifecycleState.REJECTED
 
 
+async def test_claim_cancellation_is_recorded_and_still_propagates() -> None:
+    dispatcher, sink = _dispatcher()
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.post = AsyncMock(side_effect=asyncio.CancelledError())
+    outer = new_trace_context(ticket_id="control", agent_id="orchestrator")
+    token = bind_trace_context(outer)
+    try:
+        with patch("providers.execution.AuditedAsyncHTTPClient", return_value=client):
+            with pytest.raises(asyncio.CancelledError):
+                await dispatcher.try_claim("PERF-1", "triage_pending")
+        restored = current_trace_context()
+        assert restored is not None
+        assert restored.ticket_id == "control"
+    finally:
+        reset_trace_context(token)
+    assert [
+        event.lifecycle.state
+        for event in sink.events
+        if event.ticket_id == "PERF-1" and event.action.type == ActionType.DISPATCH
+    ] == [LifecycleState.CANCELLED]
+
+
 async def test_repo_cache_refresh_binds_the_claimed_ticket_context() -> None:
     """Cache mutations are attributed to the ticket that triggered them."""
     from orchestrator.main import _refresh_harness_repos

@@ -153,13 +153,25 @@ class Dispatcher:
             )
         return headers
 
-    def try_claim(self, ticket_id: str, status: str) -> bool:
+    async def try_claim(self, ticket_id: str, status: str) -> bool:
         """Attempt to claim a ticket via the state store. Returns True on success."""
         if getattr(self, "_cleanup_counts", {}).get(ticket_id, 0):
             return False
+        context = new_trace_context(ticket_id=ticket_id, agent_id=status)
+        previous = self._previous_invocations.get(ticket_id)
+        attributes = {}
+        if previous is not None:
+            # A resumed dispatch must not reuse the old invocation,
+            # while its causal tree remains navigable.
+            context = context.model_copy(
+                update={"parent_action_id": previous.action_id}
+            )
+            attributes["prior_invocation_id"] = str(previous.invocation_id)
         try:
-            with httpx.Client(timeout=10.0, headers=self._auth_headers()) as client:
-                r = client.post(
+            async with httpx.AsyncClient(
+                timeout=10.0, headers=self._auth_headers()
+            ) as client:
+                r = await client.post(
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim",
                     json={
                         "owner": self._instance_name,
@@ -171,16 +183,6 @@ class Dispatcher:
                 )
                 if r.status_code == 200:
                     self._claim_ids[ticket_id] = r.json().get("claim_id", "")
-                    context = new_trace_context(ticket_id=ticket_id, agent_id=status)
-                    previous = self._previous_invocations.get(ticket_id)
-                    attributes = {}
-                    if previous is not None:
-                        # A resumed dispatch must not reuse the old invocation,
-                        # while its causal tree remains navigable.
-                        context = context.model_copy(
-                            update={"parent_action_id": previous.action_id}
-                        )
-                        attributes["prior_invocation_id"] = str(previous.invocation_id)
                     self._trace_contexts[ticket_id] = context
                     self._trace.record(
                         context,
@@ -190,9 +192,8 @@ class Dispatcher:
                         attributes=attributes or None,
                     )
                     return True
-                rejected = new_trace_context(ticket_id=ticket_id, agent_id=status)
                 self._trace.record(
-                    rejected,
+                    context,
                     ActionType.DISPATCH,
                     LifecycleState.REJECTED,
                     phase=status,
