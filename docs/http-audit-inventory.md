@@ -14,6 +14,7 @@ below.  These exclusions are deliberately per-file, not directory-wide:
 | `orchestrator/poller.py` | Process-control polling before a ticket claim creates causal context. |
 | `providers/skills/arcaflow_plugins.py` | Provider discovery/bootstrap compatibility path without a ticket argument. |
 | `providers/skills/crucible.py` | No-ticket catalog compatibility uses bounded direct HTTP reads. Ticket-bound catalog and child-repository reads use the source epoch's exact Git commit captures instead. |
+| `orchestrator/dispatcher.py:147` | Claim POST runs before a ticket trace context exists; infrastructure-level traffic intentionally outside audit scope. |
 | `providers/tracing/client.py` | The trace delivery transport itself; wrapping it would recursively audit its own persistence call. |
 | `providers/execution/http.py` | The audited boundary implementation. |
 | `providers/secrets/git_reference.py` | Anonymous, host-pinned GitLab HTTPS fetch for explicitly configured secret-file pointers; no credentials, redirects, proxy environment, or ticket-bound HTTP client are involved. |
