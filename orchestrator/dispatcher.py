@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -306,6 +307,10 @@ class Dispatcher:
 
     def set_task(self, ticket_id: str, task: asyncio.Task, status: str = "") -> None:
         self._tasks[ticket_id] = task
+        started = getattr(self, "_task_started_at", None)
+        if started is None:
+            started = self._task_started_at = {}
+        started[ticket_id] = time.time()
         statuses = getattr(self, "_task_statuses", None)
         if statuses is None:
             statuses = self._task_statuses = {}
@@ -495,11 +500,19 @@ class Dispatcher:
         # Clean up finished tasks while iterating.
         done = [tid for tid, task in self._tasks.items() if task.done()]
         statuses = getattr(self, "_task_statuses", None)
+        started = getattr(self, "_task_started_at", None)
         for tid in done:
             self._tasks.pop(tid, None)
             if statuses is not None:
                 statuses.pop(tid, None)
+            if started is not None:
+                started.pop(tid, None)
         return dict(self._tasks)
+
+    def task_started_at(self, ticket_id: str) -> float | None:
+        """Return when the current dispatch task for a ticket started."""
+        started = getattr(self, "_task_started_at", {})
+        return started.get(ticket_id)
 
     def active_tasks_for_status(self, status: str) -> int:
         """Return the count of non-done tasks currently running for a specific status."""

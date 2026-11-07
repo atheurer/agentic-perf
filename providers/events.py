@@ -360,6 +360,21 @@ class EventBus:
         """
         return self._last_event_time.get(ticket_id)
 
+    def latest_trace_event_time(
+        self,
+        ticket_id: str,
+        *,
+        exclude_state_targets: tuple[str, ...] = (),
+    ) -> float | None:
+        """Return the last durable trace event time for a ticket.
+
+        Unlike :meth:`last_event_time`, this reads the shared trace
+        store, so activity from MCP child processes is included.
+        """
+        return self._trace_store.latest_event_time(
+            ticket_id, exclude_state_targets=exclude_state_targets
+        )
+
     def register_ticket_owner(
         self,
         ticket_id: str,

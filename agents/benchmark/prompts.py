@@ -95,6 +95,50 @@ for the observed symptoms before attributing to any specific cause.
 For each explanation, note what evidence supports or contradicts it.
 Do not assume the ticket's hypothesis is correct — evaluate it
 against alternatives with equal rigor.
+
+## External Termination (Exit Code -9)
+
+Exit code -9 means the benchmark subprocess was terminated externally
+by the operating system (SIGKILL). The orchestrator may do this if:
+
+- **Stale task detector fired**: The agent posted no activity events for
+  longer than the configured timeout. This indicates the harness hung,
+  the board became unresponsive, or the agent failed to emit heartbeats.
+
+- **Other external kill**: OOM kill, external script, or manual
+  termination. Check orchestrator and system logs for context.
+
+When a benchmark exits with -9, check the ticket's `last_subprocess_kill_reason`
+field in custom_fields. If present, this is the authoritative cause recorded
+either by the orchestrator before it cancels the task or by the harness before
+it kills its own subprocess. The format is:
+
+```json
+{
+  "code": "stale_task_timeout",
+  "idle_seconds": <actual_idle_duration>,
+  "threshold_seconds": <configured_threshold>,
+  "mechanism": "orchestrator_stale_task_detector"
+}
+```
+
+Harness kills use `"code": "harness_timeout"` with `timeout_seconds`, or
+`"code": "harness_stall"` with `stall_seconds`, and
+`"mechanism": "benchmark_harness"`.
+
+Based on the code, report the appropriate recovery action to the user:
+- **stale_task_timeout**: The harness or board likely hung during execution.
+  Suggest increasing the benchmark heartbeat interval, verifying board
+  connectivity, or splitting the benchmark into smaller runs.
+- **harness_timeout**: The harness's own deadline fired. Suggest raising the
+  power-off delay budget or reducing the sample count.
+- **harness_stall**: No new artifacts appeared for the stall window. Check
+  board responsiveness and the serial connection.
+- **Unknown code**: Check orchestrator logs for the kill reason details.
+
+If `last_subprocess_kill_reason` is absent and exit code is -9,
+the cause is unknown — OOM kill or external termination. Recommend
+increasing available memory or running with fewer samples.
 """
 
 APPROVAL_STEP_PAUSE = """\

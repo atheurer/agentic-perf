@@ -470,10 +470,16 @@ class TestStaleTaskWatchdog:
             "STALE-001": stale_task,
         }
 
-        # Emit an event long ago
+        # Emit an event, then backdate it in the trace store so
+        # the stale detector sees it as old.  The detector uses
+        # trace_store.latest_event_time() as the primary signal.
         events.emit("STALE-001", "agent", "tool_called")
-        # Backdate the last event time
-        events._last_event_time["STALE-001"] = time.time() - 1000
+        old_ts = "2020-01-01T00:00:00+00:00"
+        events._trace_store._open_connection().execute(
+            "UPDATE trace_events SET occurred_at = ? WHERE ticket_id = ?",
+            (old_ts, "STALE-001"),
+        )
+        events._trace_store._open_connection().commit()
 
         await _check_stale_tasks(
             dispatcher,

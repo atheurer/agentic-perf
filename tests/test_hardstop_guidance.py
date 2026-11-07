@@ -28,6 +28,50 @@ class TestBuildCancellationGuidanceSummary:
         assert "interrupted" in summary["details"]
         assert len(summary["suggested_actions"]) == 3
 
+    def test_surfaces_recorded_stale_task_kill_reason(self):
+        ticket: dict[str, Any] = {
+            "comments": [],
+            "custom_fields": {
+                "last_subprocess_kill_reason": {
+                    "code": "stale_task_timeout",
+                    "idle_seconds": 3700,
+                    "threshold_seconds": 3600,
+                    "mechanism": "orchestrator_stale_task_detector",
+                }
+            },
+        }
+        summary = _build_cancellation_guidance_summary(
+            ticket, "executing_benchmark", "hard_stop"
+        )
+        assert "no heartbeat activity for 3700s" in summary["details"]
+        assert "threshold: 3600s" in summary["details"]
+
+    def test_surfaces_recorded_harness_kill_reason(self):
+        ticket: dict[str, Any] = {
+            "comments": [],
+            "custom_fields": {
+                "last_subprocess_kill_reason": {
+                    "code": "harness_stall",
+                    "stall_seconds": 300,
+                    "mechanism": "benchmark_harness",
+                }
+            },
+        }
+        summary = _build_cancellation_guidance_summary(
+            ticket, "executing_benchmark", "hard_stop"
+        )
+        assert "without new artifact files" in summary["details"]
+
+    def test_ignores_malformed_kill_reason(self):
+        ticket: dict[str, Any] = {
+            "comments": [],
+            "custom_fields": {"last_subprocess_kill_reason": "not-a-dict"},
+        }
+        summary = _build_cancellation_guidance_summary(
+            ticket, "executing_benchmark", "hard_stop"
+        )
+        assert "Benchmark" not in summary["details"].split("interrupted")[1]
+
     def test_includes_last_agent_message(self):
         ticket: dict[str, Any] = {
             "comments": [

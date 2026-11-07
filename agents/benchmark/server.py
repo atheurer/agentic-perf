@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -6114,7 +6115,22 @@ async def execute_boot_time_test(
         # Prevents orphaned jmp shell subprocesses from keeping
         # the pipe open indefinitely (observed: 4hr hang when
         # capture-boot timed out but jmp shell child lingered).
-        benchmark_timeout = (samples * 90) + 900
+        # Timeout: samples × per-sample estimate + 15 min overhead.
+        # Per-sample time = boot duration (~18s) + power-off delay + SSH
+        # reconnect overhead.  Cold reboots with a 45s power-off need ~70s
+        # of infrastructure time per sample on top of the boot itself.
+        # Default to 90s/sample when no power-off delay is configured (warm
+        # reboots); add the full power-off delay when it is set.
+        try:
+            _power_off_s = max(0.0, float(power_off_delay or 0))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[boot-time] Ignoring non-numeric power_off_delay %r for timeout",
+                power_off_delay,
+            )
+            _power_off_s = 0.0
+        _per_sample_s = 90 + _power_off_s
+        benchmark_timeout = int(round(samples * _per_sample_s)) + 900
 
         # Capture full subprocess output to an artifact log file.
         # The tool result truncates stdout to the last 3000 bytes,
@@ -6213,6 +6229,8 @@ async def execute_boot_time_test(
         except OSError:
             last_file_count = 0
         last_progress_time = start_time
+        last_heartbeat = start_time
+        last_progress_comment = start_time
         _last_chunk_count = 0
         stall_killed = False
         timed_out = False
@@ -6241,6 +6259,21 @@ async def execute_boot_time_test(
                     break
                 except _asyncio.TimeoutError:
                     now = loop.time()
+                    if now - last_heartbeat >= _PROGRESS_HEARTBEAT_INTERVAL_S:
+                        last_heartbeat = now
+                        post_comment = (
+                            now - last_progress_comment >= _PROGRESS_COMMENT_INTERVAL_S
+                        )
+                        if post_comment:
+                            last_progress_comment = now
+                        await _publish_progress_heartbeat(
+                            _ticket_id,
+                            _stdout_chunks,
+                            harness="boot-time",
+                            elapsed_seconds=now - start_time,
+                            samples_requested=samples,
+                            post_comment=post_comment,
+                        )
                     try:
                         file_count = sum(
                             1 for path in output_dir.rglob("*") if path.is_file()
@@ -6336,6 +6369,30 @@ async def execute_boot_time_test(
                 "minutes (stall detected). This may indicate the board is "
                 "unresponsive after a cold reboot or the serial connection is dead."
             )
+        if timed_out:
+            stderr_str += (
+                f"\n[agentic-perf] Benchmark killed: subprocess timeout after "
+                f"{benchmark_timeout}s ({benchmark_timeout // 60} min). "
+                f"Consider increasing the power_off_delay budget or reducing "
+                f"the requested sample count."
+            )
+
+        if stall_killed or timed_out:
+            kill_reason: dict[str, Any] = {
+                "code": "harness_stall" if stall_killed else "harness_timeout",
+                "timestamp": round(time.time()),
+                "mechanism": "benchmark_harness",
+            }
+            if timed_out:
+                kill_reason["timeout_seconds"] = benchmark_timeout
+            if stall_killed:
+                kill_reason["stall_seconds"] = _STALL_TIMEOUT
+            try:
+                await _record_subprocess_kill_reason(_ticket_id, kill_reason)
+            except Exception:
+                logger.warning(
+                    "[boot-time] Could not record harness kill reason", exc_info=True
+                )
 
         # ── Parse reboot method from script output ───────
         reboot_method = ""
@@ -6802,10 +6859,146 @@ async def _append_output_dir(ticket_id: str, output_dir_path: str) -> None:
                 "fields": {
                     "output_dir": output_dir_path,
                     "output_dirs": existing_dirs,
+                    # A new run invalidates any kill reason from a previous
+                    # attempt, so a later failure cannot inherit it.
+                    **(
+                        {"last_subprocess_kill_reason": None}
+                        if ticket["custom_fields"].get("last_subprocess_kill_reason")
+                        is not None
+                        else {}
+                    ),
                 }
             },
         )
         patch_resp.raise_for_status()
+
+
+async def _record_subprocess_kill_reason(
+    ticket_id: str, reason: dict[str, Any]
+) -> None:
+    """Persist why the harness killed its subprocess (best effort).
+
+    The benchmark agent reads the same field the orchestrator writes so
+    both kill sources are reported identically instead of leaving a bare
+    ``exit code -9``.
+    """
+    if not ticket_id:
+        return
+    from agents.server_utils import ticket_state_headers
+    from providers.execution import AuditedAsyncHTTPClient
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    async with AuditedAsyncHTTPClient(
+        timeout=10.0, headers=ticket_state_headers()
+    ) as client:
+        response = await client.patch(
+            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+            json={"fields": {"last_subprocess_kill_reason": reason}},
+        )
+        response.raise_for_status()
+
+
+# Progress heartbeat cadence for long subprocess runs.  Trace events are
+# cheap and keep the orchestrator's stale-task detector informed; ticket
+# comments also land in later agent context, so they are far less frequent.
+_PROGRESS_HEARTBEAT_INTERVAL_S = 300.0
+_PROGRESS_COMMENT_INTERVAL_S = 1800.0
+
+
+def _publish_progress_trace(progress: dict[str, Any]) -> None:
+    """Record one progress trace event.  Runs in a worker thread."""
+    from providers.tracing import ActionType, LifecycleState, current_trace_context
+    from providers.tracing.client import TraceClient
+    from providers.tracing.runtime import TraceRecorder
+
+    context = current_trace_context()
+    token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+    if context is None or not token:
+        return
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    client = TraceClient(store_url, token)
+    try:
+        TraceRecorder(context, client).record(
+            context,
+            ActionType.SUBPROCESS,
+            LifecycleState.STARTED,
+            phase="progress",
+            target="benchmark_progress",
+            attributes=progress,
+        )
+        client.flush()
+    finally:
+        client.close()
+
+
+async def _post_progress_comment(ticket_id: str, body: str) -> None:
+    from agents.server_utils import ticket_state_headers
+    from providers.execution import AuditedAsyncHTTPClient
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    async with AuditedAsyncHTTPClient(
+        timeout=10.0, headers=ticket_state_headers()
+    ) as client:
+        response = await client.post(
+            f"{store_url}/api/v1/tickets/{ticket_id}/comments",
+            json={"author": "benchmark", "body": body},
+        )
+        response.raise_for_status()
+
+
+async def _publish_progress_heartbeat(
+    ticket_id: str,
+    stdout_chunks: list[bytes],
+    *,
+    harness: str,
+    elapsed_seconds: float,
+    samples_requested: int,
+    post_comment: bool,
+) -> dict[str, Any]:
+    """Report subprocess progress to the trace store and ticket.
+
+    The stale-task detector only sees durable trace events, so a long
+    subprocess must publish some.  Failures here are never fatal to the
+    benchmark.
+    """
+    import providers.skills.boot_time  # noqa: F401  # registers the parser
+    from providers.skills.base import get_progress_parser
+
+    progress: dict[str, Any] = {}
+    parser = get_progress_parser(harness)
+    if parser is not None:
+        try:
+            progress = parser(list(stdout_chunks)) or {}
+        except Exception:
+            logger.warning("[boot-time] Progress parser failed", exc_info=True)
+    attributes = {
+        "harness": harness,
+        "elapsed_seconds": round(elapsed_seconds),
+        "samples_requested": samples_requested,
+        **progress,
+    }
+    if not ticket_id:
+        return attributes
+    try:
+        await asyncio.to_thread(_publish_progress_trace, attributes)
+    except Exception:
+        logger.warning("[boot-time] Could not publish progress trace", exc_info=True)
+    if post_comment:
+        collected = attributes.get("samples_collected")
+        detail = (
+            f"{collected}/{samples_requested} samples"
+            if collected is not None
+            else "subprocess still running"
+        )
+        body = (
+            f"**Benchmark progress:** {detail} after "
+            f"{round(elapsed_seconds / 60)} min ({harness})."
+        )
+        try:
+            await _post_progress_comment(ticket_id, body)
+        except Exception:
+            logger.warning("[boot-time] Could not post progress comment", exc_info=True)
+    return attributes
 
 
 @mcp.tool()

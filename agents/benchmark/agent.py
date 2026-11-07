@@ -14,6 +14,7 @@ from agents.prompt_context import bounded_prompt_value
 from agents.skill_context import skill_context_prompt
 from agents.tool_ownership import selected_harness_from_ticket
 from providers.events import EventBus
+from providers.kill_reason import format_kill_reason
 from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
 from providers.skills.arcaflow_mcp import (
     WORKFLOW_EXECUTE,
@@ -1586,6 +1587,39 @@ class BenchmarkAgent(AgentBase):
             "benchmark_duration": result.get("benchmark_duration"),
             "benchmark_notes": _bounded_benchmark_notes(result.get("notes")),
         }
+
+        # A failed benchmark may have been killed for us: the orchestrator
+        # records why before it cancels the task, and the harness records why
+        # before it kills its own subprocess.  Both write the same field, and
+        # the harness clears it when it starts a run, so anything present here
+        # describes this run.  Clear it after reading so it cannot leak into a
+        # later attempt.
+        status = result.get("benchmark_status")
+        notes_text = fields.get("benchmark_notes") or ""
+        if status == "failed":
+            ticket = await self._get_ticket(ticket_id)
+            cf = ticket.get("custom_fields", {})
+            kill_reason = cf.get("last_subprocess_kill_reason")
+            formatted_kill_reason = format_kill_reason(kill_reason)
+            if formatted_kill_reason:
+                fields["benchmark_notes"] = (
+                    f"{notes_text}\n\n**Kill Reason:** {formatted_kill_reason}"
+                    if notes_text
+                    else f"**Kill Reason:** {formatted_kill_reason}"
+                )
+                if kill_reason is not None:
+                    logger.info(
+                        "Benchmark %s killed (recorded reason: %s)",
+                        ticket_id,
+                        kill_reason.get("code"),
+                    )
+            # Always clear the field after reading to prevent state leakage
+            # across run attempts on the same ticket.
+            if kill_reason is not None:
+                await self._update_fields(
+                    ticket_id, {"last_subprocess_kill_reason": None}
+                )
+
         validation_id = result.get("validation_id") or self._active_validation_id
         fields["benchmark_execution_validation_id"] = validation_id or ""
         run_file_used = result.get("run_file_used", {})
