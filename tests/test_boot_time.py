@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from agents.benchmark.harnesses import boot_time as harness
 from providers.execution import AuditedSubprocessRunner
 from providers.tracing import bind_trace_context, new_trace_context, reset_trace_context
 
@@ -56,10 +57,10 @@ async def _run_mock_benchmark(tmp_path: Path, process: MagicMock) -> dict:
         patch.object(server, "_initialized", True),
         patch.object(server, "_repo_cache", cache),
         patch.object(server, "_ticket", _boot_time_ticket()),
-        patch.object(server, "_BOOT_TIME_DRAIN_TIMEOUT", 0.05),
+        patch.object(harness, "_BOOT_TIME_DRAIN_TIMEOUT", 0.05),
         patch("paths.create_artifact_dir", return_value=tmp_path),
         patch("socket.create_connection", return_value=MagicMock()),
-        patch.object(server, "AuditedSubprocessRunner", return_value=runner),
+        patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
     ):
         return json.loads(
             await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
@@ -165,8 +166,6 @@ class TestBootTimeOutputDrain:
         )
 
     async def test_reader_failure_cancels_sibling_before_log_close(self, tmp_path):
-        from agents.benchmark import server
-
         sibling_started = asyncio.Event()
         sibling_cancelled = asyncio.Event()
 
@@ -191,7 +190,7 @@ class TestBootTimeOutputDrain:
             sibling_cancelled.is_set()
         )
 
-        with patch.object(server.AuditedFilesystem, "open_stream", return_value=log):
+        with patch.object(harness.AuditedFilesystem, "open_stream", return_value=log):
             result = await _run_mock_benchmark(tmp_path, process)
 
         assert result["status"] == "failed"
@@ -200,11 +199,9 @@ class TestBootTimeOutputDrain:
         assert cancelled_at_close == [True]
 
     async def test_log_open_failure_keeps_benchmark_result(self, tmp_path, caplog):
-        from agents.benchmark import server
-
         process = _make_mock_process(stdout_data=b"success")
         with patch.object(
-            server.AuditedFilesystem,
+            harness.AuditedFilesystem,
             "open_stream",
             side_effect=OSError("disk unavailable"),
         ):
@@ -216,13 +213,11 @@ class TestBootTimeOutputDrain:
     async def test_log_write_and_close_failures_keep_benchmark_result(
         self, tmp_path, caplog
     ):
-        from agents.benchmark import server
-
         log = MagicMock()
         log.write.side_effect = OSError("write failed")
         log.close.side_effect = OSError("close failed")
         process = _make_mock_process(stdout_data=b"success")
-        with patch.object(server.AuditedFilesystem, "open_stream", return_value=log):
+        with patch.object(harness.AuditedFilesystem, "open_stream", return_value=log):
             result = await _run_mock_benchmark(tmp_path, process)
 
         assert result["status"] == "completed"
@@ -233,12 +228,13 @@ class TestBootTimeOutputDrain:
 @pytest.fixture(autouse=True)
 def _reset_boot_time_guard(monkeypatch):
     """Reset the one-execution-per-session guard between tests."""
+    import agents.benchmark.harnesses.boot_time as harness_mod
     import agents.benchmark.server as srv
 
-    srv._boot_time_executed = False
+    harness_mod._boot_time_executed = False
     monkeypatch.setattr(srv, "_ticket", _boot_time_ticket())
     yield
-    srv._boot_time_executed = False
+    harness_mod._boot_time_executed = False
 
 
 class TestSelfHostGuard:
@@ -404,7 +400,7 @@ class TestBootTimeJumpstarterRecovery:
             patch.object(server, "_ticket", ticket),
             patch("socket.create_connection", side_effect=OSError("not ready")) as ssh,
             patch("asyncio.sleep", new_callable=AsyncMock),
-            patch.object(server, "AuditedSubprocessRunner", return_value=mock_runner),
+            patch.object(harness, "AuditedSubprocessRunner", return_value=mock_runner),
         ):
             result = json.loads(
                 await server.execute_boot_time_test(
@@ -483,7 +479,7 @@ class TestBootTimePassiveSerialDefaults:
             patch.object(server, "_ticket", ticket),
             patch("paths.create_artifact_dir", return_value=tmp_path),
             patch("socket.create_connection", return_value=MagicMock()),
-            patch.object(server, "AuditedSubprocessRunner", return_value=runner),
+            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
         ):
             await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
 
@@ -621,7 +617,7 @@ class TestBootTimeKPIExtraction:
                 patch.object(server, "_repo_cache", mock_cache),
                 patch.object(server, "_ticket", mock_ticket),
                 patch.object(server, "_ssh", MagicMock()),
-                patch.object(server, "AuditedSubprocessRunner", return_value=runner),
+                patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
                 patch(
                     "asyncio.create_subprocess_exec",
                     side_effect=mock_subprocess_exec,
@@ -662,7 +658,7 @@ class TestBootTimeDiagnostics:
     """Stall diagnostics must report actual boot samples, not all artifacts."""
 
     def test_counts_only_boot_time_log_artifacts(self, tmp_path):
-        from agents.benchmark.server import _count_boot_time_samples
+        from agents.benchmark.harnesses.boot_time import _count_boot_time_samples
 
         results_dir = tmp_path / "results-2026-09-21"
         results_dir.mkdir()
@@ -675,7 +671,7 @@ class TestBootTimeDiagnostics:
 
 class TestBootTimeSerialDiagnostics:
     def test_read_stays_bounded_when_serial_log_grows(self, monkeypatch):
-        from agents.benchmark.server import (
+        from agents.benchmark.harnesses.boot_time import (
             _MAX_BOOT_SERIAL_READ,
             _boot_serial_diagnostics,
         )
@@ -701,7 +697,7 @@ class TestBootTimeSerialDiagnostics:
         assert len(diagnostics["serial_tail"]) == 2000
 
     def test_uboot_banner_is_not_called_a_prompt(self, tmp_path):
-        from agents.benchmark.server import _boot_serial_diagnostics
+        from agents.benchmark.harnesses.boot_time import _boot_serial_diagnostics
 
         serial_log = tmp_path / "serial-capture.log"
         serial_log.write_text("U-Boot 2024.01\nHit any key to stop autoboot: 0\n")
@@ -744,7 +740,7 @@ class TestBootTimeSerialDiagnostics:
 
         runner = MagicMock()
         runner.start = AsyncMock(side_effect=start)
-        original_open_stream = server.AuditedFilesystem.open_stream
+        original_open_stream = harness.AuditedFilesystem.open_stream
         opened_streams = []
 
         def track_open_stream(filesystem, *args, **kwargs):
@@ -759,8 +755,8 @@ class TestBootTimeSerialDiagnostics:
             patch.object(server, "_ticket", ticket),
             patch("paths.create_artifact_dir", return_value=tmp_path),
             patch("socket.create_connection", return_value=MagicMock()),
-            patch.object(server, "AuditedSubprocessRunner", return_value=runner),
-            patch.object(server.AuditedFilesystem, "open_stream", track_open_stream),
+            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
+            patch.object(harness.AuditedFilesystem, "open_stream", track_open_stream),
             pytest.raises(expected_error),
         ):
             await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
@@ -815,7 +811,7 @@ class TestBootTimeSerialDiagnostics:
             patch.object(server, "_ssh", ssh),
             patch("paths.create_artifact_dir", return_value=tmp_path),
             patch("socket.create_connection", return_value=MagicMock()),
-            patch.object(server, "AuditedSubprocessRunner", return_value=runner),
+            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
             caplog.at_level("INFO", logger="agents.benchmark.server"),
         ):
             result = json.loads(
@@ -881,8 +877,8 @@ class TestOutputDirPersistence:
                 patch.object(server, "_initialized", True),
                 patch.object(server, "_repo_cache", cache),
                 patch.object(server, "_ticket", _boot_time_ticket()),
-                patch.object(server, "durable_filesystem_emitter", return_value=emit),
-                patch.object(server, "AuditedSubprocessRunner", return_value=runner),
+                patch.object(harness, "durable_filesystem_emitter", return_value=emit),
+                patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
                 patch("paths.create_artifact_dir", return_value=tmp_path),
                 patch("socket.create_connection", return_value=MagicMock()),
                 patch(
@@ -966,7 +962,7 @@ class TestAppendOutputDir:
         monkeypatch.setenv("STATE_STORE_URL", "http://fake:9090")
         monkeypatch.setenv("TICKET_ID", "T-1")
 
-        import agents.benchmark.server as srv
+        import agents.benchmark.harnesses.boot_time as srv
 
         monkeypatch.setattr(
             "providers.execution.AuditedAsyncHTTPClient",
@@ -989,7 +985,7 @@ class TestAppendOutputDir:
 
     @pytest.mark.asyncio
     async def test_append_output_dir_null_list_is_empty(self, monkeypatch):
-        import agents.benchmark.server as srv
+        import agents.benchmark.harnesses.boot_time as srv
 
         fake_client = _FakeClient(
             _FakeResponse({"custom_fields": {"output_dirs": None}})
@@ -1015,7 +1011,7 @@ class TestAppendOutputDir:
     async def test_malformed_ticket_fields_do_not_patch(
         self, monkeypatch, payload, message
     ):
-        import agents.benchmark.server as srv
+        import agents.benchmark.harnesses.boot_time as srv
 
         fake_client = _FakeClient(_FakeResponse(payload))
         monkeypatch.setattr(
@@ -1027,7 +1023,7 @@ class TestAppendOutputDir:
         assert [call[0] for call in fake_client.calls] == ["GET"]
 
     async def test_ticket_read_error_does_not_parse_or_patch(self, monkeypatch):
-        import agents.benchmark.server as srv
+        import agents.benchmark.harnesses.boot_time as srv
 
         class ErrorResponse(_FakeResponse):
             def json(self):
@@ -1043,7 +1039,7 @@ class TestAppendOutputDir:
         assert [call[0] for call in fake_client.calls] == ["GET"]
 
     async def test_audited_update_preserves_ticket_and_fence_headers(self, monkeypatch):
-        import agents.benchmark.server as srv
+        import agents.benchmark.harnesses.boot_time as srv
         from providers.execution import AuditedAsyncHTTPClient
 
         requests = []
@@ -1107,7 +1103,7 @@ class TestAppendOutputDir:
         )
         monkeypatch.setenv("STATE_STORE_URL", "http://fake:9090")
 
-        import agents.benchmark.server as srv
+        import agents.benchmark.harnesses.boot_time as srv
 
         monkeypatch.setattr(
             "providers.execution.AuditedAsyncHTTPClient",
@@ -1135,7 +1131,7 @@ class TestAppendOutputDir:
         )
         monkeypatch.setenv("STATE_STORE_URL", "http://fake:9090")
 
-        import agents.benchmark.server as srv
+        import agents.benchmark.harnesses.boot_time as srv
 
         monkeypatch.setattr(
             "providers.execution.AuditedAsyncHTTPClient",
@@ -1159,7 +1155,7 @@ class TestAppendOutputDir:
         )
         monkeypatch.setenv("STATE_STORE_URL", "http://fake:9090")
 
-        import agents.benchmark.server as srv
+        import agents.benchmark.harnesses.boot_time as srv
 
         monkeypatch.setattr(
             "providers.execution.AuditedAsyncHTTPClient",
@@ -1172,3 +1168,53 @@ class TestAppendOutputDir:
 
         with pytest.raises(RuntimeError, match="HTTP 500"):
             await srv._append_output_dir("T-4", "/data/run-1")
+
+
+class TestToolDispatch:
+    """The MCP tool in server.py must only bind server state and dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_execute_boot_time_test_dispatches_with_server_state(
+        self, monkeypatch
+    ):
+        import agents.benchmark.server as server
+
+        captured = {}
+
+        async def fake_run(ctx, sut_host, **kwargs):
+            captured["ctx"] = ctx
+            captured["sut_host"] = sut_host
+            captured["kwargs"] = kwargs
+            return json.dumps({"status": "ok"})
+
+        ownership_checks = []
+
+        async def fake_require_tool_owner(owner_harness):
+            ownership_checks.append(owner_harness)
+
+        monkeypatch.setattr(server, "run_boot_time_test", fake_run)
+        monkeypatch.setattr(server, "_require_tool_owner", fake_require_tool_owner)
+        monkeypatch.setattr(server, "_initialized", True)
+        monkeypatch.setattr(server, "_ssh", "ssh-sentinel")
+        monkeypatch.setattr(server, "_repo_cache", "cache-sentinel")
+        monkeypatch.setattr(server, "_ticket", {"id": "T-1"})
+
+        result = await server.execute_boot_time_test(
+            sut_host="192.0.2.10", samples=3, kpi_pattern="boot"
+        )
+
+        assert json.loads(result) == {"status": "ok"}
+        assert captured["sut_host"] == "192.0.2.10"
+        assert captured["kwargs"] == {
+            "samples": 3,
+            "kpi_pattern": "boot",
+            "clean_journal": False,
+            "description": "",
+        }
+        ctx = captured["ctx"]
+        assert ctx.ssh == "ssh-sentinel"
+        assert ctx.repo_cache == "cache-sentinel"
+        assert ctx.ticket == {"id": "T-1"}
+
+        await ctx.require_tool_owner()
+        assert ownership_checks == ["boot-time"]

@@ -1,7 +1,7 @@
 """Benchmark progress heartbeats.
 
 A long harness subprocess emits no events, so the orchestrator's stale-task
-detector needs periodic trace activity from the benchmark server.  These
+detector needs periodic trace activity from the benchmark harness.  These
 tests cover the progress parser, the heartbeat payload, and its failure
 tolerance.
 """
@@ -38,24 +38,25 @@ class TestBootTimeProgressParser:
         assert get_progress_parser("no-such-harness") is None
 
     def test_heartbeat_is_faster_than_the_stall_window(self) -> None:
-        from agents.benchmark import server
+        from agents.benchmark.harnesses import boot_time as harness
 
         assert (
-            server._PROGRESS_HEARTBEAT_INTERVAL_S < server._PROGRESS_COMMENT_INTERVAL_S
+            harness._PROGRESS_HEARTBEAT_INTERVAL_S
+            < harness._PROGRESS_COMMENT_INTERVAL_S
         )
 
 
 @pytest.mark.asyncio
 async def test_heartbeat_publishes_progress_and_comments_when_due() -> None:
-    from agents.benchmark import server
+    from agents.benchmark.harnesses import boot_time as harness
 
     trace = MagicMock()
     comment = AsyncMock()
     with (
-        patch.object(server, "_publish_progress_trace", trace),
-        patch.object(server, "_post_progress_comment", comment),
+        patch.object(harness, "_publish_progress_trace", trace),
+        patch.object(harness, "_post_progress_comment", comment),
     ):
-        attributes = await server._publish_progress_heartbeat(
+        attributes = await harness._publish_progress_heartbeat(
             "PERF-HB",
             [b"Sample 1 at a\nSample 2 at b\n"],
             harness="boot-time",
@@ -77,15 +78,15 @@ async def test_heartbeat_publishes_progress_and_comments_when_due() -> None:
 
 @pytest.mark.asyncio
 async def test_heartbeat_skips_comment_when_not_due() -> None:
-    from agents.benchmark import server
+    from agents.benchmark.harnesses import boot_time as harness
 
     trace = MagicMock()
     comment = AsyncMock()
     with (
-        patch.object(server, "_publish_progress_trace", trace),
-        patch.object(server, "_post_progress_comment", comment),
+        patch.object(harness, "_publish_progress_trace", trace),
+        patch.object(harness, "_post_progress_comment", comment),
     ):
-        await server._publish_progress_heartbeat(
+        await harness._publish_progress_heartbeat(
             "PERF-HB",
             [b"Sample 1 at a\n"],
             harness="boot-time",
@@ -100,21 +101,21 @@ async def test_heartbeat_skips_comment_when_not_due() -> None:
 
 @pytest.mark.asyncio
 async def test_heartbeat_failures_are_not_fatal() -> None:
-    from agents.benchmark import server
+    from agents.benchmark.harnesses import boot_time as harness
 
     with (
         patch.object(
-            server,
+            harness,
             "_publish_progress_trace",
             side_effect=RuntimeError("trace store down"),
         ),
         patch.object(
-            server,
+            harness,
             "_post_progress_comment",
             AsyncMock(side_effect=RuntimeError("store unreachable")),
         ),
     ):
-        attributes = await server._publish_progress_heartbeat(
+        attributes = await harness._publish_progress_heartbeat(
             "PERF-HB",
             [b"Sample 4 at a\n"],
             harness="boot-time",
@@ -128,11 +129,11 @@ async def test_heartbeat_failures_are_not_fatal() -> None:
 
 @pytest.mark.asyncio
 async def test_heartbeat_without_ticket_only_builds_attributes() -> None:
-    from agents.benchmark import server
+    from agents.benchmark.harnesses import boot_time as harness
 
     trace = MagicMock()
-    with patch.object(server, "_publish_progress_trace", trace):
-        attributes = await server._publish_progress_heartbeat(
+    with patch.object(harness, "_publish_progress_trace", trace):
+        attributes = await harness._publish_progress_heartbeat(
             "",
             [b"Sample 3 at a\n"],
             harness="boot-time",
@@ -146,7 +147,7 @@ async def test_heartbeat_without_ticket_only_builds_attributes() -> None:
 
 
 def test_progress_trace_uses_subprocess_action_and_flushes() -> None:
-    from agents.benchmark import server
+    from agents.benchmark.harnesses import boot_time as harness
 
     context = new_trace_context(ticket_id="PERF-HB", agent_id="benchmark-agent")
     token = bind_trace_context(context)
@@ -161,7 +162,7 @@ def test_progress_trace_uses_subprocess_action_and_flushes() -> None:
                 "providers.tracing.client.TraceClient", return_value=client
             ) as client_class,
         ):
-            server._publish_progress_trace({"samples_collected": 7})
+            harness._publish_progress_trace({"samples_collected": 7})
     finally:
         reset_trace_context(token)
 
@@ -179,7 +180,7 @@ def test_progress_trace_uses_subprocess_action_and_flushes() -> None:
 
 @pytest.mark.asyncio
 async def test_harness_kill_reason_is_patched_to_the_ticket() -> None:
-    from agents.benchmark import server
+    from agents.benchmark.harnesses import boot_time as harness
 
     reason = {
         "code": "harness_timeout",
@@ -194,7 +195,7 @@ async def test_harness_kill_reason_is_patched_to_the_ticket() -> None:
     with patch(
         "providers.execution.AuditedAsyncHTTPClient", return_value=client
     ) as client_class:
-        await server._record_subprocess_kill_reason("PERF-HB", reason)
+        await harness._record_subprocess_kill_reason("PERF-HB", reason)
 
     client_class.assert_called_once()
     assert "headers" in client_class.call_args.kwargs
@@ -207,17 +208,17 @@ async def test_harness_kill_reason_is_patched_to_the_ticket() -> None:
 
 @pytest.mark.asyncio
 async def test_harness_kill_reason_skips_writes_without_a_ticket() -> None:
-    from agents.benchmark import server
+    from agents.benchmark.harnesses import boot_time as harness
 
     with patch("providers.execution.AuditedAsyncHTTPClient") as client_class:
-        await server._record_subprocess_kill_reason("", {"code": "harness_stall"})
+        await harness._record_subprocess_kill_reason("", {"code": "harness_stall"})
 
     client_class.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_new_output_dir_clears_previous_kill_reason() -> None:
-    from agents.benchmark import server
+    from agents.benchmark.harnesses import boot_time as harness
 
     client = MagicMock()
     client.get = AsyncMock(
@@ -237,7 +238,7 @@ async def test_new_output_dir_clears_previous_kill_reason() -> None:
     client.__aexit__ = AsyncMock(return_value=None)
 
     with patch("providers.execution.AuditedAsyncHTTPClient", return_value=client):
-        await server._append_output_dir("PERF-HB", "/new")
+        await harness._append_output_dir("PERF-HB", "/new")
 
     fields = client.patch.await_args.kwargs["json"]["fields"]
     assert fields["output_dir"] == "/new"
@@ -247,7 +248,7 @@ async def test_new_output_dir_clears_previous_kill_reason() -> None:
 
 @pytest.mark.asyncio
 async def test_new_output_dir_keeps_absent_kill_reason_absent() -> None:
-    from agents.benchmark import server
+    from agents.benchmark.harnesses import boot_time as harness
 
     client = MagicMock()
     client.get = AsyncMock(
@@ -260,7 +261,7 @@ async def test_new_output_dir_keeps_absent_kill_reason_absent() -> None:
     client.__aexit__ = AsyncMock(return_value=None)
 
     with patch("providers.execution.AuditedAsyncHTTPClient", return_value=client):
-        await server._append_output_dir("PERF-HB", "/new")
+        await harness._append_output_dir("PERF-HB", "/new")
 
     fields = client.patch.await_args.kwargs["json"]["fields"]
     assert "last_subprocess_kill_reason" not in fields
