@@ -153,9 +153,11 @@ returns `None` and heartbeats carry no harness-specific progress.
 
 Registering a parser only supplies the progress payload; the harness must
 also publish it. The boot-time wait loop in
-`agents/benchmark/server.py` calls `_publish_progress_heartbeat()` while
-its subprocess runs, and that is currently the only caller. A new harness
-with a long-lived subprocess needs the same call from its own wait loop.
+`agents/benchmark/harnesses/boot_time.py` calls
+`_publish_progress_heartbeat()` while its subprocess runs, and that is
+currently the only caller. A new harness with a long-lived subprocess
+needs the same call from its own wait loop; `agents/benchmark/server.py`
+should only register MCP tools and dispatch to the harness module.
 
 The boot-time loop publishes two signals:
 

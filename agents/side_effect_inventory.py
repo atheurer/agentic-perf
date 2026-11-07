@@ -40,8 +40,12 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/benchmark/agent.py", "_resolve_benchmark_approval", "mutating_http_state"),
     ("agents/benchmark/agent.py", "_cancel_execution_after_cancellation", "mcp"),
     ("agents/benchmark/agent.py", "_execute_arcaflow_workflow", "mcp"),
-    ("agents/benchmark/server.py", "_boot_serial_diagnostics", "filesystem"),
-    ("agents/benchmark/server.py", "_drain_stream", "filesystem"),
+    (
+        "agents/benchmark/harnesses/boot_time.py",
+        "_boot_serial_diagnostics",
+        "filesystem",
+    ),
+    ("agents/benchmark/harnesses/boot_time.py", "_drain_stream", "filesystem"),
     ("agents/benchmark/server.py", "_find_controller_path", "ssh"),
     ("agents/benchmark/server.py", "_find_controller_repository", "filesystem"),
     ("agents/benchmark/server.py", "_find_controller_repository", "ssh"),
@@ -53,10 +57,18 @@ INVENTORIED_SIDE_EFFECTS = (
         "mutating_http_state",
     ),
     ("agents/benchmark/server.py", "_add_execution_note", "mutating_http_state"),
-    ("agents/benchmark/server.py", "_append_output_dir", "mutating_http_state"),
-    ("agents/benchmark/server.py", "_post_progress_comment", "mutating_http_state"),
     (
-        "agents/benchmark/server.py",
+        "agents/benchmark/harnesses/boot_time.py",
+        "_append_output_dir",
+        "mutating_http_state",
+    ),
+    (
+        "agents/benchmark/harnesses/boot_time.py",
+        "_post_progress_comment",
+        "mutating_http_state",
+    ),
+    (
+        "agents/benchmark/harnesses/boot_time.py",
         "_record_subprocess_kill_reason",
         "mutating_http_state",
     ),
@@ -65,10 +77,14 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/benchmark/server.py", "execute_benchmark", "filesystem"),
     ("agents/benchmark/server.py", "execute_benchmark", "mutating_http_state"),
     ("agents/benchmark/server.py", "execute_benchmark", "ssh"),
-    ("agents/benchmark/server.py", "execute_boot_time_test", "filesystem"),
-    ("agents/benchmark/server.py", "execute_boot_time_test", "mutating_http_state"),
-    ("agents/benchmark/server.py", "execute_boot_time_test", "ssh"),
-    ("agents/benchmark/server.py", "execute_boot_time_test", "subprocess"),
+    ("agents/benchmark/harnesses/boot_time.py", "run_boot_time_test", "filesystem"),
+    (
+        "agents/benchmark/harnesses/boot_time.py",
+        "run_boot_time_test",
+        "mutating_http_state",
+    ),
+    ("agents/benchmark/harnesses/boot_time.py", "run_boot_time_test", "ssh"),
+    ("agents/benchmark/harnesses/boot_time.py", "run_boot_time_test", "subprocess"),
     ("agents/benchmark/arcaflow_plugin_server.py", "get_plugin_schema", "ssh"),
     ("agents/benchmark/arcaflow_plugin_server.py", "execute_arcaflow_plugin", "ssh"),
     ("agents/benchmark/server.py", "get_run_logs", "ssh"),
@@ -1098,16 +1114,20 @@ INVENTORY_DISPOSITIONS = {
         "agents/benchmark/agent.py:_execute_arcaflow_workflow",
         "2027-12-31",
     ),
-    ("agents/benchmark/server.py", "_boot_serial_diagnostics", "filesystem"): (
+    (
+        "agents/benchmark/harnesses/boot_time.py",
+        "_boot_serial_diagnostics",
+        "filesystem",
+    ): (
         "audited",
         "observability-maintainers",
-        "agents/benchmark/server.py:_boot_serial_diagnostics",
+        "agents/benchmark/harnesses/boot_time.py:_boot_serial_diagnostics",
         "2027-12-31",
     ),
-    ("agents/benchmark/server.py", "_drain_stream", "filesystem"): (
+    ("agents/benchmark/harnesses/boot_time.py", "_drain_stream", "filesystem"): (
         "audited",
         "observability-maintainers",
-        "agents/benchmark/server.py:_drain_stream",
+        "agents/benchmark/harnesses/boot_time.py:_drain_stream",
         "2027-12-31",
     ),
     ("agents/benchmark/server.py", "_find_controller_path", "ssh"): (
@@ -1165,33 +1185,33 @@ INVENTORY_DISPOSITIONS = {
         "2027-12-31",
     ),
     (
-        "agents/benchmark/server.py",
+        "agents/benchmark/harnesses/boot_time.py",
         "_append_output_dir",
         "mutating_http_state",
     ): (
         "audited",
         "observability-maintainers",
-        "agents/benchmark/server.py:_append_output_dir",
+        "agents/benchmark/harnesses/boot_time.py:_append_output_dir",
         "2027-12-31",
     ),
     (
-        "agents/benchmark/server.py",
+        "agents/benchmark/harnesses/boot_time.py",
         "_post_progress_comment",
         "mutating_http_state",
     ): (
         "audited",
         "observability-maintainers",
-        "agents/benchmark/server.py:_post_progress_comment",
+        "agents/benchmark/harnesses/boot_time.py:_post_progress_comment",
         "2027-12-31",
     ),
     (
-        "agents/benchmark/server.py",
+        "agents/benchmark/harnesses/boot_time.py",
         "_record_subprocess_kill_reason",
         "mutating_http_state",
     ): (
         "audited",
         "observability-maintainers",
-        "agents/benchmark/server.py:_record_subprocess_kill_reason",
+        "agents/benchmark/harnesses/boot_time.py:_record_subprocess_kill_reason",
         "2027-12-31",
     ),
     ("agents/benchmark/server.py", "_read_controller_file", "ssh"): (
@@ -1224,28 +1244,32 @@ INVENTORY_DISPOSITIONS = {
         "agents/benchmark/server.py:execute_benchmark",
         "2027-12-31",
     ),
-    ("agents/benchmark/server.py", "execute_boot_time_test", "filesystem"): (
+    ("agents/benchmark/harnesses/boot_time.py", "run_boot_time_test", "filesystem"): (
         "audited",
         "observability-maintainers",
-        "agents/benchmark/server.py:execute_boot_time_test",
+        "agents/benchmark/harnesses/boot_time.py:run_boot_time_test",
         "2027-12-31",
     ),
-    ("agents/benchmark/server.py", "execute_boot_time_test", "mutating_http_state"): (
+    (
+        "agents/benchmark/harnesses/boot_time.py",
+        "run_boot_time_test",
+        "mutating_http_state",
+    ): (
         "audited",
         "observability-maintainers",
-        "agents/benchmark/server.py:execute_boot_time_test",
+        "agents/benchmark/harnesses/boot_time.py:run_boot_time_test",
         "2027-12-31",
     ),
-    ("agents/benchmark/server.py", "execute_boot_time_test", "ssh"): (
+    ("agents/benchmark/harnesses/boot_time.py", "run_boot_time_test", "ssh"): (
         "audited",
         "observability-maintainers",
-        "agents/benchmark/server.py:execute_boot_time_test",
+        "agents/benchmark/harnesses/boot_time.py:run_boot_time_test",
         "2027-12-31",
     ),
-    ("agents/benchmark/server.py", "execute_boot_time_test", "subprocess"): (
+    ("agents/benchmark/harnesses/boot_time.py", "run_boot_time_test", "subprocess"): (
         "audited",
         "observability-maintainers",
-        "agents/benchmark/server.py:execute_boot_time_test",
+        "agents/benchmark/harnesses/boot_time.py:run_boot_time_test",
         "2027-12-31",
     ),
     ("agents/benchmark/arcaflow_plugin_server.py", "get_plugin_schema", "ssh"): (

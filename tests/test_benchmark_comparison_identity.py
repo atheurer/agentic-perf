@@ -966,7 +966,11 @@ async def test_specialized_comparison_tools_reject_before_launch(monkeypatch):
     async def owned(*args):
         return None
 
+    async def initialized():
+        return None
+
     monkeypatch.setattr(server_utils, "assert_ticket_active", active)
+    monkeypatch.setattr(benchmark_server, "_ensure_init", initialized)
     monkeypatch.setattr(benchmark_server, "_ticket", ticket)
     monkeypatch.setattr(plugin_server, "_ticket", ticket)
     monkeypatch.setattr(benchmark_server, "_require_tool_owner", owned)
