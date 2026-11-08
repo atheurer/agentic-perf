@@ -169,23 +169,43 @@ class TestHardstopGuidanceIntegration:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("user_stop", "claim_lost", "expected_reason", "expected_comment"),
+        (
+            "user_stop",
+            "claim_lost",
+            "ticket_claim_lost",
+            "expected_reason",
+            "expected_comment",
+        ),
         [
-            (True, False, "hard_stop", "Agent stopped by user request"),
-            (False, False, "task_cancelled", "Agent stopped: task cancelled"),
+            (True, False, False, "hard_stop", "Agent stopped by user request"),
+            (False, False, False, "task_cancelled", "Agent stopped: task cancelled"),
             (
+                False,
+                True,
+                False,
+                "claim_lost",
+                "Agent stopped: orchestrator claim lost",
+            ),
+            (
+                False,
                 False,
                 True,
                 "claim_lost",
                 "Agent stopped: orchestrator claim lost",
             ),
         ],
-        ids=["user-hard-stop", "generic-cancellation", "claim-loss"],
+        ids=[
+            "user-hard-stop",
+            "generic-cancellation",
+            "leader-claim-loss",
+            "ticket-claim-loss",
+        ],
     )
     async def test_open_ticket_gets_cause_accurate_guidance(
         self,
         user_stop: bool,
         claim_lost: bool,
+        ticket_claim_lost: bool,
         expected_reason: str,
         expected_comment: str,
     ):
@@ -211,6 +231,7 @@ class TestHardstopGuidanceIntegration:
         dispatcher._claim_ids = {}
         dispatcher.was_stopped_by_user.return_value = user_stop
         dispatcher.has_lost_claim.return_value = claim_lost
+        dispatcher.has_lost_ticket_claim.return_value = ticket_claim_lost
 
         # Mock HTTP client
         mock_client = MagicMock()
@@ -611,8 +632,9 @@ class TestHardstopGuidanceIntegration:
         dispatcher.clear_agent = MagicMock()
         dispatcher.mark_done = AsyncMock()
         dispatcher.was_stopped_by_user.return_value = False
-        dispatcher.has_lost_claim.return_value = True
-        dispatcher.is_deposed.return_value = True
+        dispatcher.has_lost_claim.return_value = False
+        dispatcher.has_lost_ticket_claim.return_value = True
+        dispatcher.is_deposed.return_value = False
 
         with patch(
             "orchestrator.main.AuditedAsyncHTTPClient",

@@ -1359,7 +1359,10 @@ def _cancellation_reason(dispatcher: Dispatcher, ticket_id: str) -> str:
     """Describe why a running agent received task cancellation."""
     if dispatcher.was_stopped_by_user(ticket_id) is True:
         return "Agent stopped by user request"
-    if dispatcher.has_lost_claim() is True:
+    if (
+        dispatcher.has_lost_claim() is True
+        or dispatcher.has_lost_ticket_claim(ticket_id) is True
+    ):
         return "Agent stopped: orchestrator claim lost"
     return "Agent stopped: task cancelled"
 

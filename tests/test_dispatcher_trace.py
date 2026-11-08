@@ -156,8 +156,8 @@ async def test_direct_mark_done_does_not_expose_dispatch_during_snapshot_cleanup
         await dispatcher.mark_done("PERF-1")
         assert dispatcher._tasks["PERF-1"] is task
         assert dispatcher.is_active("PERF-1")
-        with patch("orchestrator.dispatcher.httpx.Client") as claim_client:
-            assert not dispatcher.try_claim("PERF-1", "executing_benchmark")
+        with patch("orchestrator.dispatcher.httpx.AsyncClient") as claim_client:
+            assert not await dispatcher.try_claim("PERF-1", "executing_benchmark")
             claim_client.assert_not_called()
         task.cancel()
         task.cancel()
@@ -408,12 +408,14 @@ async def test_stale_watchdog_handles_task_finishing_during_ticket_read(
     ]
 
 
-def test_claim_rejection_is_a_durable_dispatch_outcome() -> None:
+async def test_claim_rejection_is_a_durable_dispatch_outcome() -> None:
     dispatcher, sink = _dispatcher()
     client = MagicMock()
-    client.__enter__.return_value.post.return_value.status_code = 409
-    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
-        assert not dispatcher.try_claim("PERF-1", "triage_pending")
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.post = AsyncMock(return_value=MagicMock(status_code=409))
+    with patch("orchestrator.dispatcher.httpx.AsyncClient", return_value=client):
+        assert not await dispatcher.try_claim("PERF-1", "triage_pending")
     assert sink.events[-1].lifecycle.state == LifecycleState.REJECTED
 
 
@@ -426,7 +428,7 @@ async def test_claim_cancellation_is_recorded_and_still_propagates() -> None:
     outer = new_trace_context(ticket_id="control", agent_id="orchestrator")
     token = bind_trace_context(outer)
     try:
-        with patch("providers.execution.AuditedAsyncHTTPClient", return_value=client):
+        with patch("orchestrator.dispatcher.httpx.AsyncClient", return_value=client):
             with pytest.raises(asyncio.CancelledError):
                 await dispatcher.try_claim("PERF-1", "triage_pending")
         restored = current_trace_context()
@@ -481,19 +483,26 @@ async def test_renewal_loss_records_claim_failure() -> None:
     # Only this ticket's task is cancelled — global deposition flag stays False
     assert dummy.cancelled() or dummy.cancelling()
     assert not dispatcher.is_deposed()
+    assert dispatcher.has_lost_ticket_claim("PERF-1")
+    assert not dispatcher.has_lost_ticket_claim("PERF-2")
     dummy.cancel()
     try:
         await dummy
     except asyncio.CancelledError:
         pass
+    dispatcher.release_claim = AsyncMock()
+    await dispatcher.mark_done("PERF-1")
+    assert not dispatcher.has_lost_ticket_claim("PERF-1")
 
 
 async def test_introspection_is_a_sibling_child_of_dispatch() -> None:
     dispatcher, _ = _dispatcher()
     client = MagicMock()
-    client.__enter__.return_value.post.return_value.status_code = 200
-    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
-        assert dispatcher.try_claim("PERF-1", "triage_pending")
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.post = AsyncMock(return_value=MagicMock(status_code=200))
+    with patch("orchestrator.dispatcher.httpx.AsyncClient", return_value=client):
+        assert await dispatcher.try_claim("PERF-1", "triage_pending")
     primary = dispatcher.create_agent("triage_pending", {"id": "PERF-1"})
     assert dispatcher.start_introspection("PERF-1")
     observer = dispatcher._introspection_agents["PERF-1"]
@@ -716,14 +725,16 @@ async def test_unchanged_benchmark_resume_keeps_agent_dispatch() -> None:
 async def test_resume_creates_a_new_invocation_linked_to_prior_dispatch() -> None:
     dispatcher, sink = _dispatcher()
     client = MagicMock()
-    client.__enter__.return_value.post.return_value.status_code = 200
-    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
-        assert dispatcher.try_claim("PERF-1", "triage_pending")
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.post = AsyncMock(return_value=MagicMock(status_code=200))
+    with patch("orchestrator.dispatcher.httpx.AsyncClient", return_value=client):
+        assert await dispatcher.try_claim("PERF-1", "triage_pending")
     first = dispatcher._trace_contexts["PERF-1"]
     dispatcher.release_claim = AsyncMock()
     await dispatcher.mark_done("PERF-1")
-    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
-        assert dispatcher.try_claim("PERF-1", "triage_pending")
+    with patch("orchestrator.dispatcher.httpx.AsyncClient", return_value=client):
+        assert await dispatcher.try_claim("PERF-1", "triage_pending")
     second = dispatcher._trace_contexts["PERF-1"]
     assert second.invocation_id != first.invocation_id
     assert second.parent_action_id == first.action_id
@@ -746,9 +757,9 @@ async def test_handoff_waits_for_claim_cleanup_before_new_dispatch() -> None:
     dispatcher.set_task("PERF-1", cleanup, "triage_pending")
     await entered.wait()
 
-    with patch("orchestrator.dispatcher.httpx.Client") as client:
+    with patch("orchestrator.dispatcher.httpx.AsyncClient") as client:
         assert dispatcher.is_active("PERF-1")
-        assert not dispatcher.try_claim("PERF-1", "awaiting_hardware")
+        assert not await dispatcher.try_claim("PERF-1", "awaiting_hardware")
         client.assert_not_called()
     assert dispatcher._claim_ids["PERF-1"] == "old-claim"
 
@@ -756,11 +767,13 @@ async def test_handoff_waits_for_claim_cleanup_before_new_dispatch() -> None:
     await cleanup
     assert not dispatcher.is_active("PERF-1")
     client = MagicMock()
-    response = client.__enter__.return_value.post.return_value
-    response.status_code = 200
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    response = MagicMock(status_code=200)
     response.json.return_value = {"claim_id": "new-claim"}
-    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
-        assert dispatcher.try_claim("PERF-1", "awaiting_hardware")
+    client.post = AsyncMock(return_value=response)
+    with patch("orchestrator.dispatcher.httpx.AsyncClient", return_value=client):
+        assert await dispatcher.try_claim("PERF-1", "awaiting_hardware")
     assert dispatcher._claim_ids["PERF-1"] == "new-claim"
 
 
@@ -787,7 +800,7 @@ async def test_overlapping_cleanups_block_dispatch_until_both_finish() -> None:
     first.cancel()
     await asyncio.sleep(0)
     assert dispatcher.is_active("PERF-1")
-    assert not dispatcher.try_claim("PERF-1", "awaiting_hardware")
+    assert not await dispatcher.try_claim("PERF-1", "awaiting_hardware")
     assert calls == 1
     release.set()
     with pytest.raises(asyncio.CancelledError):
@@ -1095,12 +1108,14 @@ async def test_shutdown_cancels_and_awaits_all_dispatcher_background_work() -> N
     assert not dispatcher._introspection_tasks
 
 
-def test_constructed_agent_is_a_distinct_child_of_dispatch() -> None:
+async def test_constructed_agent_is_a_distinct_child_of_dispatch() -> None:
     dispatcher, sink = _dispatcher()
     client = MagicMock()
-    client.__enter__.return_value.post.return_value.status_code = 200
-    with patch("orchestrator.dispatcher.httpx.Client", return_value=client):
-        assert dispatcher.try_claim("PERF-1", "triage_pending")
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.post = AsyncMock(return_value=MagicMock(status_code=200))
+    with patch("orchestrator.dispatcher.httpx.AsyncClient", return_value=client):
+        assert await dispatcher.try_claim("PERF-1", "triage_pending")
     dispatch = dispatcher._trace_contexts["PERF-1"]
     agent = dispatcher.create_agent("triage_pending", {"id": "PERF-1"})
     assert agent.trace_context.parent_action_id == dispatch.action_id
