@@ -101,6 +101,7 @@ class Dispatcher:
         self._fencing_epoch = fencing_epoch
         self._deposed = False
         self._claim_lost = False
+        self._lost_ticket_claims: set[str] = set()
         self._stopped_tickets: set[str] = set()
         self.lease_seconds = lease_seconds
         self._user_store = user_store
@@ -153,13 +154,25 @@ class Dispatcher:
             )
         return headers
 
-    def try_claim(self, ticket_id: str, status: str) -> bool:
+    async def try_claim(self, ticket_id: str, status: str) -> bool:
         """Attempt to claim a ticket via the state store. Returns True on success."""
         if getattr(self, "_cleanup_counts", {}).get(ticket_id, 0):
             return False
+        context = new_trace_context(ticket_id=ticket_id, agent_id=status)
+        previous = self._previous_invocations.get(ticket_id)
+        attributes = {}
+        if previous is not None:
+            # A resumed dispatch must not reuse the old invocation,
+            # while its causal tree remains navigable.
+            context = context.model_copy(
+                update={"parent_action_id": previous.action_id}
+            )
+            attributes["prior_invocation_id"] = str(previous.invocation_id)
         try:
-            with httpx.Client(timeout=10.0, headers=self._auth_headers()) as client:
-                r = client.post(
+            async with httpx.AsyncClient(
+                timeout=10.0, headers=self._auth_headers()
+            ) as client:
+                r = await client.post(
                     f"{self.store_url}/api/v1/tickets/{ticket_id}/claim",
                     json={
                         "owner": self._instance_name,
@@ -170,17 +183,8 @@ class Dispatcher:
                     },
                 )
                 if r.status_code == 200:
+                    self._lost_ticket_claims.discard(ticket_id)
                     self._claim_ids[ticket_id] = r.json().get("claim_id", "")
-                    context = new_trace_context(ticket_id=ticket_id, agent_id=status)
-                    previous = self._previous_invocations.get(ticket_id)
-                    attributes = {}
-                    if previous is not None:
-                        # A resumed dispatch must not reuse the old invocation,
-                        # while its causal tree remains navigable.
-                        context = context.model_copy(
-                            update={"parent_action_id": previous.action_id}
-                        )
-                        attributes["prior_invocation_id"] = str(previous.invocation_id)
                     self._trace_contexts[ticket_id] = context
                     self._trace.record(
                         context,
@@ -190,15 +194,23 @@ class Dispatcher:
                         attributes=attributes or None,
                     )
                     return True
-                rejected = new_trace_context(ticket_id=ticket_id, agent_id=status)
                 self._trace.record(
-                    rejected,
+                    context,
                     ActionType.DISPATCH,
                     LifecycleState.REJECTED,
                     phase=status,
                     duration_ms=0,
                 )
                 return False
+        except asyncio.CancelledError:
+            self._trace.record(
+                context,
+                ActionType.DISPATCH,
+                LifecycleState.CANCELLED,
+                phase=status,
+                duration_ms=0,
+            )
+            raise
         except Exception:
             logger.exception(f"Failed to claim ticket {ticket_id}")
             return False
@@ -278,6 +290,7 @@ class Dispatcher:
                 await asyncio.sleep(interval)
                 if not await self.renew_claim(ticket_id):
                     logger.warning(f"Claim renewal failed for {ticket_id}")
+                    self._lost_ticket_claims.add(ticket_id)
                     context = self._trace_contexts.get(ticket_id)
                     if context is not None:
                         self._trace.record(
@@ -287,7 +300,14 @@ class Dispatcher:
                             phase="claim_renewal",
                             duration_ms=0,
                         )
-                    self.mark_deposed()
+                    # Cancel only this ticket's task. mark_deposed() is a
+                    # global one-way latch intended for orchestrator-level
+                    # fence loss; calling it here permanently prevents
+                    # _advance_plan from running for every subsequent ticket
+                    # for the rest of this pod's lifetime.
+                    task = self._tasks.get(ticket_id)
+                    if task is not None and not task.done():
+                        task.cancel()
                     break
         except asyncio.CancelledError:
             pass
@@ -386,6 +406,7 @@ class Dispatcher:
         self._agents.clear()
         self._introspection_agents.clear()
         self._claim_ids.clear()
+        self._lost_ticket_claims.clear()
         self._trace_contexts.clear()
         self._stopped_tickets.clear()
         self._previous_invocations.clear()
@@ -406,6 +427,10 @@ class Dispatcher:
     def has_lost_claim(self) -> bool:
         """Return whether work stopped because its orchestration claim was lost."""
         return self._claim_lost
+
+    def has_lost_ticket_claim(self, ticket_id: str) -> bool:
+        """Return whether this ticket's claim renewal failed."""
+        return ticket_id in self._lost_ticket_claims
 
     def was_stopped_by_user(self, ticket_id: str) -> bool:
         """Return True if the ticket was hard-stopped by a user request."""
@@ -571,6 +596,7 @@ class Dispatcher:
                     self._renewal_tasks.pop(ticket_id)
         await self.release_claim(ticket_id)
         getattr(self, "_claim_ids", {}).pop(ticket_id, None)
+        getattr(self, "_lost_ticket_claims", set()).discard(ticket_id)
         self.clear_handoff_blocked(ticket_id)
         if self._redactor:
             self._redactor.deregister_ticket(ticket_id)
