@@ -344,9 +344,30 @@ async def run_boot_time_test(
     _board_target = _uboot_meta.get("board_target", "").lower()
     _board_selector = _uboot_meta.get("selector", "").lower()
     _is_s32g = "s32g" in _board_target or "s32g" in _board_selector
-    _configure_bootdelay = _uboot_directives.get("configure_bootdelay", _is_s32g)
+    # Coerce the directive to bool: accept Python bools, the strings
+    # "true"/"false"/"1"/"0" (case-insensitive), and integers.  Unrecognised
+    # values fall back to the auto-detect result.  This prevents a directive
+    # value of the string "false" (truthy in Python) from enabling config
+    # when the user intended to opt out.
+    _raw_bootdelay_directive = _uboot_directives.get("configure_bootdelay", None)
+    if _raw_bootdelay_directive is None:
+        _configure_bootdelay: bool = _is_s32g
+    elif isinstance(_raw_bootdelay_directive, bool):
+        _configure_bootdelay = _raw_bootdelay_directive
+    elif isinstance(_raw_bootdelay_directive, int):
+        _configure_bootdelay = bool(_raw_bootdelay_directive)
+    elif isinstance(_raw_bootdelay_directive, str):
+        _configure_bootdelay = _raw_bootdelay_directive.strip().lower() not in (
+            "false",
+            "0",
+            "no",
+            "off",
+        )
+    else:
+        _configure_bootdelay = _is_s32g
     _uboot_env_applied: list[str] = []  # e.g. ["bootdelay=0"]
     _uboot_config_note: str = ""
+    _uboot_attempted: bool = False
 
     if _js_lease_id and _configure_bootdelay:
         _helper_script = scripts_dir / "jumpstarter-serial-helper.py"
@@ -356,103 +377,204 @@ async def run_boot_time_test(
                 "skipping U-Boot configuration",
                 _helper_script,
             )
-        else:
-            logger.info(
-                "[boot-time] Configuring U-Boot bootdelay=0 (board=%s, lease=%s)",
-                _board_target or "unknown",
-                _js_lease_id,
+            # Surface the absence so the user knows bootdelay was not configured.
+            _uboot_config_note = (
+                "U-Boot configuration skipped: jumpstarter-serial-helper.py"
+                f" not found in {scripts_dir}."
+                " bootdelay may be non-zero; measurements may include"
+                " U-Boot autoboot delay."
             )
-            try:
-                _uboot_proc = await AuditedSubprocessRunner().start(
-                    [
-                        "jmp",
-                        "shell",
-                        "--lease",
-                        _js_lease_id,
-                        "--",
-                        sys.executable,
-                        str(_helper_script),
-                        "set-uboot",
-                        "-s",
-                        "bootdelay",
-                        "0",
-                    ],
-                    mutating=True,
+        else:
+            # Guard: verify the leased board matches the SUT being benchmarked
+            # before issuing a persistent U-Boot mutation.  The lease targets
+            # the board that was provisioned; sut_host is the IP the platform
+            # agent assigned to that same board.  A mismatch signals stale or
+            # mismatched metadata and would mutate the wrong board.
+            _known_targets: list[str] = (
+                ((fields.get("assigned_hardware_ips") or {}).get("targets") or [])
+                if ctx.ticket
+                else []
+            )
+            _host_verified = (
+                not _known_targets  # no recorded IPs — cannot check, proceed
+                or sut_host in _known_targets
+            )
+            if not _host_verified:
+                logger.warning(
+                    "[boot-time] sut_host %s not in lease's assigned targets %s;"
+                    " skipping U-Boot configuration to avoid mutating wrong board",
+                    sut_host,
+                    _known_targets,
                 )
-                _uboot_out, _uboot_err = await asyncio.wait_for(
-                    _uboot_proc.communicate(),
-                    timeout=120,
+                _uboot_config_note = (
+                    f"U-Boot configuration skipped: sut_host {sut_host!r} does"
+                    f" not match lease targets {_known_targets}."
+                    " bootdelay may be non-zero."
                 )
-                if _uboot_proc.returncode == 0:
-                    logger.info(
-                        "[boot-time] U-Boot bootdelay=0 configured and verified "
-                        "(board=%s)",
-                        _board_target or "unknown",
+            else:
+                _uboot_attempted = True
+                logger.info(
+                    "[boot-time] Configuring U-Boot bootdelay=0"
+                    " (board=%s, sut=%s, lease=%s)",
+                    _board_target or "unknown",
+                    sut_host,
+                    _js_lease_id,
+                )
+                try:
+                    _uboot_result = await AuditedSubprocessRunner().run(
+                        [
+                            "jmp",
+                            "shell",
+                            "--lease",
+                            _js_lease_id,
+                            "--",
+                            sys.executable,
+                            str(_helper_script),
+                            "set-uboot",
+                            "-s",
+                            "bootdelay",
+                            "0",
+                        ],
+                        timeout=120,
+                        mutating=True,
                     )
-                    _uboot_env_applied = ["bootdelay=0"]
-                    _uboot_config_note = (
-                        f"U-Boot configured: bootdelay=0"
-                        f" (auto-applied for S32G board '{_board_target}')."
-                        " Removes U-Boot autoboot delay from measurements."
-                        " Disable with directive configure_bootdelay=false."
-                    )
-                    # set-uboot boots the board after saving env.
-                    # Wait for SSH to come back before proceeding.
-                    import socket as _uboot_sock
-
-                    _uboot_ssh_ready = False
-                    for _uboot_attempt in range(36):  # 36 × 5s = 3 min
-                        try:
-                            _s = _uboot_sock.create_connection(
-                                (sut_host, 22), timeout=5
-                            )
-                            _s.close()
-                            _uboot_ssh_ready = True
-                            break
-                        except (OSError, ConnectionRefusedError):
-                            logger.info(
-                                "[boot-time] Waiting for SSH after U-Boot config"
-                                " (attempt %d/36)",
-                                _uboot_attempt + 1,
-                            )
-                            await asyncio.sleep(5)
-                    if _uboot_ssh_ready:
-                        logger.info("[boot-time] SSH ready after U-Boot config")
-                    else:
-                        logger.warning(
-                            "[boot-time] SSH did not recover within 3 min after"
-                            " U-Boot config; proceeding anyway"
+                    if _uboot_result.returncode == 0:
+                        logger.info(
+                            "[boot-time] U-Boot bootdelay=0 configured and verified"
+                            " (board=%s)",
+                            _board_target or "unknown",
                         )
-                else:
-                    _stderr = _uboot_err.decode(errors="replace")[-500:]
+                        _uboot_env_applied = ["bootdelay=0"]
+                        _uboot_config_note = (
+                            f"U-Boot configured: bootdelay=0"
+                            f" (auto-applied for S32G board '{_board_target}')."
+                            " Removes U-Boot autoboot delay from measurements."
+                            " Disable with directive configure_bootdelay=false."
+                        )
+                    else:
+                        # Log exit code and a capped, printable-only tail of
+                        # stderr.  The helper mirrors the raw serial console
+                        # transcript to stderr; logging it verbatim could
+                        # expose board debug output in server logs.
+                        _stderr_lines = _uboot_result.stderr.decode(
+                            errors="replace"
+                        ).splitlines()
+                        _safe_tail = "\n".join(
+                            ln
+                            for ln in _stderr_lines[-10:]
+                            if ln.strip()
+                            and not any(c < " " and c not in "\t\n" for c in ln)
+                        )
+                        logger.warning(
+                            "[boot-time] U-Boot configuration failed"
+                            " (rc=%d); last helper output:\n%s",
+                            _uboot_result.returncode,
+                            _safe_tail or "(no printable output)",
+                        )
+                        _uboot_config_note = (
+                            f"U-Boot configuration attempted but failed"
+                            f" (rc={_uboot_result.returncode})."
+                            " bootdelay may be non-zero; measurements may"
+                            " include U-Boot autoboot delay."
+                        )
+                except asyncio.TimeoutError:
                     logger.warning(
-                        "[boot-time] U-Boot configuration failed (rc=%d): %s",
-                        _uboot_proc.returncode,
-                        _stderr,
+                        "[boot-time] U-Boot configuration timed out after 120s"
                     )
                     _uboot_config_note = (
-                        f"U-Boot configuration attempted but failed"
-                        f" (rc={_uboot_proc.returncode})."
+                        "U-Boot configuration timed out (120s)."
                         " bootdelay may be non-zero; measurements may include"
                         " U-Boot autoboot delay."
                     )
-            except asyncio.TimeoutError:
-                logger.warning("[boot-time] U-Boot configuration timed out after 120s")
-                _uboot_config_note = (
-                    "U-Boot configuration timed out (120s)."
-                    " bootdelay may be non-zero; measurements may include"
-                    " U-Boot autoboot delay."
-                )
-            except Exception as _uboot_exc:
-                logger.warning(
-                    "[boot-time] U-Boot configuration failed: %s", _uboot_exc
-                )
-                _uboot_config_note = (
-                    f"U-Boot configuration failed: {_uboot_exc}."
-                    " bootdelay may be non-zero; measurements may include"
-                    " U-Boot autoboot delay."
-                )
+                except Exception as _uboot_exc:
+                    logger.warning(
+                        "[boot-time] U-Boot configuration failed: %s", _uboot_exc
+                    )
+                    _uboot_config_note = (
+                        f"U-Boot configuration failed: {_uboot_exc}."
+                        " bootdelay may be non-zero; measurements may include"
+                        " U-Boot autoboot delay."
+                    )
 
+    # Persist the U-Boot config outcome to the ticket immediately so it
+    # is recorded even if the agent task is later cancelled before the
+    # tool result is processed (including the SSH-failure early return
+    # below).  Best-effort: failure to persist does not block the benchmark.
+    _uboot_ticket_id = os.environ.get("TICKET_ID", "") if ctx.ticket else ""
+    if _uboot_ticket_id and (_uboot_env_applied or _uboot_config_note):
+        try:
+            from agents.server_utils import ticket_state_headers
+            from providers.execution import AuditedAsyncHTTPClient
+
+            _uboot_store_url = os.environ.get(
+                "STATE_STORE_URL", "http://localhost:8090"
+            )
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0, headers=ticket_state_headers()
+            ) as _uboot_client:
+                await _uboot_client.patch(
+                    f"{_uboot_store_url}/api/v1/tickets/{_uboot_ticket_id}/fields",
+                    json={
+                        "fields": {
+                            "uboot_config_applied": _uboot_env_applied or None,
+                            "uboot_config_note": _uboot_config_note or None,
+                        }
+                    },
+                )
+                logger.info(
+                    "[boot-time] Persisted U-Boot config outcome to ticket %s",
+                    _uboot_ticket_id,
+                )
+        except Exception as _persist_exc:
+            logger.warning(
+                "[boot-time] Failed to persist U-Boot config outcome: %s",
+                _persist_exc,
+            )
+
+    # After any U-Boot configuration attempt (success, failure, or timeout)
+    # the helper power-cycles the board and runs 'boot'.  Wait for SSH
+    # readiness before proceeding — the board may still be booting.
+    # If SSH does not recover the board is unusable for benchmarking
+    # regardless of whether the config succeeded, so return a failure
+    # rather than letting the benchmark attempt and fail with a less
+    # diagnostic error.
+    if _uboot_attempted:
+        import socket as _uboot_sock
+
+        _uboot_ssh_ready = False
+        for _uboot_attempt in range(36):  # 36 × 5s = 3 min
+            try:
+                _s = _uboot_sock.create_connection((sut_host, 22), timeout=5)
+                _s.close()
+                _uboot_ssh_ready = True
+                break
+            except (OSError, ConnectionRefusedError):
+                logger.info(
+                    "[boot-time] Waiting for SSH after U-Boot config (attempt %d/36)",
+                    _uboot_attempt + 1,
+                )
+                await asyncio.sleep(5)
+        if _uboot_ssh_ready:
+            logger.info("[boot-time] SSH ready after U-Boot config")
+        else:
+            logger.error(
+                "[boot-time] SSH on %s did not recover within 3 min after"
+                " U-Boot config; board is not ready for benchmarking",
+                sut_host,
+            )
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "error": (
+                        f"Board at {sut_host} did not come back via SSH within"
+                        " 3 minutes after U-Boot configuration. The board may"
+                        " be stuck at the U-Boot prompt or not booting."
+                        " Manual recovery may be required."
+                    ),
+                    "uboot_config_applied": _uboot_env_applied,
+                    "notes": _uboot_config_note,
+                }
+            )
     # ── Build command ─────────────────────────────────────────
     import asyncio as _asyncio
 
