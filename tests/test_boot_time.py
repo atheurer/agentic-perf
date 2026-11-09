@@ -1218,3 +1218,265 @@ class TestToolDispatch:
 
         await ctx.require_tool_owner()
         assert ownership_checks == ["boot-time"]
+
+
+class TestBootTimeUBootConfig:
+    """U-Boot bootdelay configuration injected before the test loop."""
+
+    def _make_s32g_ticket(self, directives: dict | None = None) -> dict:
+        return _boot_time_ticket(
+            {
+                "resource_provider": "jumpstarter",
+                "resource_provider_metadata": {
+                    "lease_id": "lease-s32g",
+                    "board_target": "s32g_vnp_rdb3",
+                    "selector": "board-type=nxp-s32g-vnp-rdb3,enabled=true",
+                },
+                "directives": directives or {},
+            }
+        )
+
+    def _make_runner(self, uboot_rc: int = 0) -> tuple[MagicMock, list]:
+        """
+        Return (runner mock, call_log) where call_log accumulates every argv
+        passed to runner.start().  The first jmp-shell call is the U-Boot
+        config; subsequent jmp-shell calls are serial/power; the non-jmp call
+        is the benchmark subprocess.
+        """
+        call_log: list[list[str]] = []
+        benchmark_proc = _make_mock_process()
+        uboot_proc = _make_mock_process(returncode=uboot_rc)
+        serial_proc = MagicMock(pid=99, returncode=None)
+        serial_proc.wait = AsyncMock(return_value=0)
+
+        async def start(argv, **_kwargs):
+            call_log.append(list(argv))
+            # U-Boot config: jmp shell ... set-uboot
+            if argv[0] == "jmp" and "set-uboot" in argv:
+                return uboot_proc
+            # Passive serial capture
+            if argv[0] == "jmp":
+                return serial_proc
+            return benchmark_proc
+
+        runner = MagicMock()
+        runner.start = AsyncMock(side_effect=start)
+        return runner, call_log
+
+    async def test_s32g_triggers_uboot_config_by_default(self, tmp_path, monkeypatch):
+        """An S32G board with no directive gets bootdelay=0 configured."""
+        import sys
+
+        from agents.benchmark import server
+
+        monkeypatch.delenv("TICKET_ID", raising=False)
+        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+        (tmp_path / "jumpstarter-serial-helper.py").write_text("# stub\n")
+        mock_cache = MagicMock()
+        mock_cache.get_path.return_value = tmp_path
+        runner, call_log = self._make_runner(uboot_rc=0)
+
+        with (
+            patch.object(server, "_initialized", True),
+            patch.object(server, "_repo_cache", mock_cache),
+            patch.object(server, "_ticket", self._make_s32g_ticket()),
+            patch("paths.create_artifact_dir", return_value=tmp_path),
+            patch("socket.create_connection", return_value=MagicMock()),
+            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = json.loads(
+                await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
+            )
+
+        uboot_calls = [c for c in call_log if "set-uboot" in c]
+        assert len(uboot_calls) == 1, "Expected exactly one set-uboot call"
+        cmd = uboot_calls[0]
+        assert cmd[:4] == ["jmp", "shell", "--lease", "lease-s32g"]
+        assert cmd[4] == "--"
+        assert cmd[5] == sys.executable
+        assert cmd[7] == "set-uboot"
+        assert "-s" in cmd
+        idx = cmd.index("-s")
+        assert cmd[idx + 1] == "bootdelay"
+        assert cmd[idx + 2] == "0"
+
+        assert result.get("uboot_config_applied") == ["bootdelay=0"]
+        assert "bootdelay=0" in (result.get("notes") or "")
+        assert "configure_bootdelay=false" in (result.get("notes") or "")
+
+    async def test_non_s32g_board_skips_uboot_config(self, tmp_path, monkeypatch):
+        """A non-S32G Jumpstarter board must not receive U-Boot config."""
+        from agents.benchmark import server
+
+        monkeypatch.delenv("TICKET_ID", raising=False)
+        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+        (tmp_path / "jumpstarter-serial-helper.py").write_text("# stub\n")
+        mock_cache = MagicMock()
+        mock_cache.get_path.return_value = tmp_path
+        ticket = _boot_time_ticket(
+            {
+                "resource_provider": "jumpstarter",
+                "resource_provider_metadata": {
+                    "lease_id": "lease-qc8775",
+                    "board_target": "qc8775",
+                    "selector": "board-type=qc8775",
+                },
+            }
+        )
+        runner, call_log = self._make_runner()
+
+        with (
+            patch.object(server, "_initialized", True),
+            patch.object(server, "_repo_cache", mock_cache),
+            patch.object(server, "_ticket", ticket),
+            patch("paths.create_artifact_dir", return_value=tmp_path),
+            patch("socket.create_connection", return_value=MagicMock()),
+            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = json.loads(
+                await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
+            )
+
+        uboot_calls = [c for c in call_log if "set-uboot" in c]
+        assert uboot_calls == [], "Non-S32G board should not trigger U-Boot config"
+        assert "uboot_config_applied" not in result
+
+    async def test_configure_bootdelay_false_opts_out(self, tmp_path, monkeypatch):
+        """Directive configure_bootdelay=false suppresses config on S32G."""
+        from agents.benchmark import server
+
+        monkeypatch.delenv("TICKET_ID", raising=False)
+        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+        (tmp_path / "jumpstarter-serial-helper.py").write_text("# stub\n")
+        mock_cache = MagicMock()
+        mock_cache.get_path.return_value = tmp_path
+        runner, call_log = self._make_runner()
+
+        with (
+            patch.object(server, "_initialized", True),
+            patch.object(server, "_repo_cache", mock_cache),
+            patch.object(
+                server,
+                "_ticket",
+                self._make_s32g_ticket({"configure_bootdelay": False}),
+            ),
+            patch("paths.create_artifact_dir", return_value=tmp_path),
+            patch("socket.create_connection", return_value=MagicMock()),
+            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = json.loads(
+                await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
+            )
+
+        uboot_calls = [c for c in call_log if "set-uboot" in c]
+        assert uboot_calls == [], "configure_bootdelay=false must suppress config"
+        assert "uboot_config_applied" not in result
+
+    async def test_configure_bootdelay_true_forces_non_s32g(
+        self, tmp_path, monkeypatch
+    ):
+        """Directive configure_bootdelay=true forces U-Boot config even on non-S32G."""
+
+        from agents.benchmark import server
+
+        monkeypatch.delenv("TICKET_ID", raising=False)
+        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+        (tmp_path / "jumpstarter-serial-helper.py").write_text("# stub\n")
+        mock_cache = MagicMock()
+        mock_cache.get_path.return_value = tmp_path
+        ticket = _boot_time_ticket(
+            {
+                "resource_provider": "jumpstarter",
+                "resource_provider_metadata": {
+                    "lease_id": "lease-other",
+                    "board_target": "some_other_board",
+                    "selector": "board-type=other-board",
+                },
+                "directives": {"configure_bootdelay": True},
+            }
+        )
+        runner, call_log = self._make_runner(uboot_rc=0)
+
+        with (
+            patch.object(server, "_initialized", True),
+            patch.object(server, "_repo_cache", mock_cache),
+            patch.object(server, "_ticket", ticket),
+            patch("paths.create_artifact_dir", return_value=tmp_path),
+            patch("socket.create_connection", return_value=MagicMock()),
+            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = json.loads(
+                await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
+            )
+
+        uboot_calls = [c for c in call_log if "set-uboot" in c]
+        assert len(uboot_calls) == 1
+        assert result.get("uboot_config_applied") == ["bootdelay=0"]
+
+    async def test_uboot_failure_is_non_fatal_and_noted(self, tmp_path, monkeypatch):
+        """A set-uboot failure should not abort the benchmark; a note is added."""
+        from agents.benchmark import server
+
+        monkeypatch.delenv("TICKET_ID", raising=False)
+        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+        (tmp_path / "jumpstarter-serial-helper.py").write_text("# stub\n")
+        mock_cache = MagicMock()
+        mock_cache.get_path.return_value = tmp_path
+        runner, call_log = self._make_runner(uboot_rc=1)
+
+        with (
+            patch.object(server, "_initialized", True),
+            patch.object(server, "_repo_cache", mock_cache),
+            patch.object(server, "_ticket", self._make_s32g_ticket()),
+            patch("paths.create_artifact_dir", return_value=tmp_path),
+            patch("socket.create_connection", return_value=MagicMock()),
+            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = json.loads(
+                await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
+            )
+
+        # Benchmark still ran (failure was non-fatal)
+        uboot_calls = [c for c in call_log if "set-uboot" in c]
+        assert len(uboot_calls) == 1
+        # No config applied — set-uboot failed
+        assert "uboot_config_applied" not in result
+        # But a note warns the user
+        notes = result.get("notes", "")
+        assert notes, "A failure note must be present"
+        assert "failed" in notes.lower()
+
+    async def test_missing_helper_script_skips_gracefully(self, tmp_path, monkeypatch):
+        """Missing jumpstarter-serial-helper.py logs a warning but does not fail."""
+        from agents.benchmark import server
+
+        monkeypatch.delenv("TICKET_ID", raising=False)
+        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+        # Intentionally do NOT create jumpstarter-serial-helper.py
+        mock_cache = MagicMock()
+        mock_cache.get_path.return_value = tmp_path
+        runner, call_log = self._make_runner()
+
+        with (
+            patch.object(server, "_initialized", True),
+            patch.object(server, "_repo_cache", mock_cache),
+            patch.object(server, "_ticket", self._make_s32g_ticket()),
+            patch("paths.create_artifact_dir", return_value=tmp_path),
+            patch("socket.create_connection", return_value=MagicMock()),
+            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = json.loads(
+                await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
+            )
+
+        uboot_calls = [c for c in call_log if "set-uboot" in c]
+        assert uboot_calls == [], "No set-uboot call when helper is missing"
+        assert "uboot_config_applied" not in result
+        # Benchmark still ran
+        assert "status" in result
