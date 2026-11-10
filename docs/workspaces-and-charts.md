@@ -30,11 +30,12 @@ Crucible source snapshots are kept separately under
 provenance alongside each snapshot. `context/effective-context.json` records
 phase-owned policy and selected workspace references without exposing source
 selection to agents. The context gateway chooses the applicable source
-internally, refreshes controller context through the ticket's SSH context when
-appropriate, and caches only documents requested through the generic bootstrap,
-search, and read operations. Agents do not inspect source snapshots or
-repository catalogs directly. Existing files at the workspace root remain
-valid for compatibility.
+internally. Before controller assignment it uses the GitHub catalog; after
+assignment it uses controller MCP contract v3 and fails explicitly if that
+contract is unavailable. It caches only documents requested through the
+generic bootstrap, search, and read operations. Agents do not inspect source
+snapshots or repository catalogs directly. Existing files at the workspace
+root remain valid for compatibility.
 `list_workspace_files` includes `namespace` and `kind` so consumers can
 distinguish these files without parsing their names.
 

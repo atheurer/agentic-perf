@@ -9,9 +9,11 @@ Current operations:
 
 | Operation | Controller command |
 | --- | --- |
-| `benchmark_list` | `crucible benchmark list` |
-| `tools_list` | `crucible tools list` |
 | `userenvs_list` | `crucible userenvs list` |
+
+`benchmark_list` and `tools_list` were removed because benchmark and tool
+discovery now use controller MCP contract v3 through the scoped context
+gateway.
 
 The response contains the operation, controller, exit code, stdout, and any
 stderr. Unknown operations and non-empty arguments fail before SSH is called.
@@ -21,6 +23,6 @@ the input schema. Benchmark execution and mutating operations (`run`,
 paths.
 
 The older `list_controller_userenvs` tool remains as a compatibility wrapper
-and delegates to `userenvs_list`. New operations should be added only when
-their Crucible CLI contract is verified, read-only, schema-defined, and
-covered by rejection and dispatch tests.
+and delegates to `userenvs_list`. New operations should be added only when no
+MCP equivalent exists and their Crucible CLI contract is verified, read-only,
+schema-defined, and covered by rejection and dispatch tests.

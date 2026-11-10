@@ -7,17 +7,18 @@ This module centralizes that setup to avoid duplication.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import posixpath
-import shlex
 import sys
 import weakref
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx  # noqa: F401 - retained as a stable test patch seam
@@ -819,207 +820,22 @@ def _controller_relative_pointer(base: str, pointer: str) -> str | None:
     return _controller_relative_path(normalized)
 
 
-async def _search_controller_source(
-    *,
-    ssh: Any,
-    controller_host: str,
+async def _search_controller_source_mcp(
+    adapter: Any,
     query: str,
     scope_path: str = "",
-    max_results: int = 500,
     max_bytes: int = 131072,
 ) -> dict[str, Any]:
-    """Find candidate documents in the installed controller tree.
-
-    This is discovery, not document resolution. The agent receives
-    controller-relative paths and short matching lines, then decides what to
-    read. The scan is bounded and excludes repository and credential internals.
-    """
-    if not query.strip():
-        return {"found": False, "operation": "search", "reason": "empty_query"}
-    max_results = max(1, min(int(max_results), 500))
-    max_bytes = max(1024, min(int(max_bytes), 131072))
-    search_script = r"""
-import os
-import re
-import sys
-
-VISIBLE_ROOT = "/opt/crucible"
-EXCLUDED_PARTS = {
-    ".ssh", ".env", "secrets", "credential", "credentials", "id_rsa",
-    "id_ed25519", "known_hosts", "private_key",
-}
-EXCLUDED_FILES = {"authorized_keys"}
-MAX_DIRECTORIES = 20000
-MAX_FILES = 200000
-MAX_FILE_BYTES = 1048576
-MAX_TOTAL_FILE_BYTES = 16777216
-
-query = sys.argv[1]
-max_results = int(sys.argv[2])
-max_output_bytes = int(sys.argv[3])
-scope = sys.argv[4]
-real_root = os.path.realpath(VISIBLE_ROOT)
-root_prefix = real_root.rstrip(os.sep) + os.sep
-
-try:
-    pattern = re.compile(query)
-except re.error:
-    pattern = re.compile(re.escape(query))
-
-def is_within_root(path):
-    resolved = os.path.realpath(path)
-    return resolved == real_root or resolved.startswith(root_prefix)
-
-def is_excluded(path):
-    parts = [part.lower() for part in os.path.normpath(path).split(os.sep)]
-    if any(
-        part in EXCLUDED_PARTS
-        or part.startswith(".git")
-        or "token" in part
-        for part in parts
-    ):
-        return True
-    name = os.path.basename(path)
-    return (
-        name.lower() in EXCLUDED_FILES
-        or name.lower().endswith((".pem", ".key"))
-    )
-
-def main():
-    output = []
-    output_bytes = 0
-    truncated = False
-    incomplete = False
-    visited_directories = 0
-    visited_files = 0
-    total_file_bytes = 0
-    scan_root = VISIBLE_ROOT
-    if scope:
-        requested = os.path.join(VISIBLE_ROOT, scope)
-        resolved = os.path.realpath(requested)
-        if not is_within_root(requested):
-            sys.stdout.write("ERROR\toutside_root\n")
-            return
-        if is_excluded(requested) or is_excluded(resolved):
-            sys.stdout.write("ERROR\texcluded\n")
-            return
-        if not os.path.exists(resolved):
-            sys.stdout.write("ERROR\tmissing\n")
-            return
-        if os.path.isdir(resolved):
-            scan_root = requested
-        elif os.path.isfile(resolved):
-            scan_root = os.path.dirname(requested)
-        else:
-            sys.stdout.write("ERROR\tnot_searchable\n")
-            return
-    stack = [(scan_root, ())]
-
-    def emit(record):
-        nonlocal output_bytes, truncated
-        encoded = (record + "\n").encode("utf-8", errors="replace")
-        if output_bytes + len(encoded) > max_output_bytes:
-            truncated = True
-            return False
-        output.append(record)
-        output_bytes += len(encoded)
-        if len(output) >= max_results:
-            truncated = True
-            return False
-        return True
-
-    while stack and not truncated:
-        directory, ancestors = stack.pop()
-        real_directory = os.path.realpath(directory)
-        if (
-            not is_within_root(directory)
-            or real_directory in ancestors
-            or is_excluded(directory)
-            or is_excluded(real_directory)
-        ):
-            continue
-        visited_directories += 1
-        if visited_directories > MAX_DIRECTORIES:
-            truncated = True
-            break
-        try:
-            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
-        except OSError:
-            incomplete = True
-            continue
-
-        child_directories = []
-        next_ancestors = ancestors + (real_directory,)
-        for entry in entries:
-            path = entry.path
-            if "\t" in path or "\n" in path or "\r" in path:
-                incomplete = True
-                continue
-            if is_excluded(path) or not is_within_root(path):
-                continue
-            real_path = os.path.realpath(path)
-            if is_excluded(real_path):
-                continue
-            try:
-                if entry.is_dir(follow_symlinks=True):
-                    if pattern.search(path) and not emit("NAME\td\t\t" + path):
-                        break
-                    child_directories.append(path)
-                    continue
-                if not entry.is_file(follow_symlinks=True):
-                    continue
-                file_size = entry.stat(follow_symlinks=True).st_size
-                if pattern.search(path) and not emit(
-                    "NAME\tf\t{}\t{}".format(file_size, path)
-                ):
-                    break
-                visited_files += 1
-                if visited_files > MAX_FILES or total_file_bytes >= MAX_TOTAL_FILE_BYTES:
-                    truncated = True
-                    break
-                with open(path, "rb") as source:
-                    content = source.read(MAX_FILE_BYTES + 1)
-                if len(content) > MAX_FILE_BYTES:
-                    incomplete = True
-                total_file_bytes += min(len(content), MAX_FILE_BYTES)
-                content = content[:MAX_FILE_BYTES]
-                if b"\0" in content[:8192]:
-                    continue
-                for line_number, line in enumerate(content.splitlines(), 1):
-                    decoded = line.decode("utf-8", errors="replace")
-                    if pattern.search(decoded):
-                        decoded = decoded.replace("\t", " ")
-                        if not emit(
-                            "CONTENT\t{}\t{}\t{}".format(
-                                path, line_number, decoded[:1000]
-                            )
-                        ):
-                            break
-            except OSError:
-                incomplete = True
-                continue
-            if truncated:
-                break
-        if not truncated:
-            stack.extend((path, next_ancestors) for path in reversed(child_directories))
-
-    if truncated or incomplete:
-        output.append("TRUNCATED\tlimit_reached")
-    sys.stdout.write("\n".join(output))
-    if output:
-        sys.stdout.write("\n")
-
-main()
-"""
-    command = (
-        "python3 -c "
-        f"{shlex.quote(search_script)} "
-        f"{shlex.quote(query)} {max_results} {max_bytes} "
-        f"{shlex.quote(scope_path)}"
+    raw = await adapter.call_tool(
+        "search_documentation",
+        {
+            "query": query,
+            "limit": 20,
+        },
     )
     try:
-        result = await ssh.run(controller_host, command, timeout=30)
-    except Exception:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
         return {
             "found": False,
             "operation": "search",
@@ -1027,338 +843,258 @@ main()
             "message": "The controller search request failed.",
             "next_action": "Retry after controller connectivity is restored.",
         }
-    if result.exit_code != 0:
+    if isinstance(payload, dict) and payload.get("error"):
         return {
             "found": False,
             "operation": "search",
             "reason": "controller_transport_error",
-            "message": "The controller search request failed.",
+            "message": str(payload["error"]),
             "next_action": "Retry after controller connectivity is restored.",
         }
-    raw_output = result.stdout.encode("utf-8", errors="replace")
-    grouped: dict[str, dict[str, Any]] = {}
-    total_matches = 0
-    remote_truncated = len(raw_output) > max_bytes
-    for line in raw_output[:max_bytes].decode("utf-8", errors="replace").splitlines():
-        fields = line.split("\t", 3)
-        if not fields:
+    raw_results = (
+        payload.get("results", payload.get("documents", []))
+        if isinstance(payload, dict)
+        else payload
+        if isinstance(payload, list)
+        else []
+    )
+    if not isinstance(raw_results, list):
+        raw_results = []
+    results: list[dict[str, Any]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
             continue
-        kind = fields[0]
-        if kind == "TRUNCATED":
-            remote_truncated = True
+        ref = item.get("ref") or item.get("path") or _mcp_resource_ref(item)
+        if not isinstance(ref, str) or not ref:
             continue
-        if kind == "ERROR":
-            code = fields[1] if len(fields) == 2 else "not_searchable"
-            reason = {
-                "outside_root": "controller_path_outside_root",
-                "excluded": "controller_path_excluded",
-                "missing": "controller_document_not_found",
-                "not_searchable": "controller_path_not_searchable",
-            }.get(code, "controller_path_not_searchable")
-            messages = {
-                "controller_path_outside_root": (
-                    "The resolved search scope leaves the installed controller root.",
-                    "Use an in-root file or directory ref.",
-                ),
-                "controller_path_excluded": (
-                    "The search scope resolves to a credential or VCS path.",
-                    "Use a returned software reference outside excluded paths.",
-                ),
-                "controller_document_not_found": (
-                    "The search origin does not exist.",
-                    "Use a current ref returned by this gateway.",
-                ),
-                "controller_path_not_searchable": (
-                    "The search origin is not a file or directory.",
-                    "Use operation='list' to choose a file or directory ref.",
-                ),
-            }
-            message, next_action = messages.get(
-                reason,
-                ("The search origin cannot be resolved.", "Use a current in-root ref."),
+        content = item.get("content") or item.get("text") or item.get("snippet") or ""
+        if isinstance(content, str) and len(content.encode("utf-8")) > max_bytes:
+            content = content.encode("utf-8")[:max_bytes].decode(
+                "utf-8", errors="ignore"
             )
-            return {
-                "found": False,
-                "operation": "search",
-                "reason": reason,
-                "message": message,
-                "next_action": next_action,
-                "requested_ref": scope_path,
-            }
-        raw_size = ""
-        if kind == "NAME":
-            if len(fields) != 4:
-                continue
-            file_type, raw_size, value = fields[1:]
-            raw_path = value
-            line_number = ""
-            content = ""
-        elif kind == "CONTENT":
-            if len(fields) == 4:
-                _, raw_path, line_number, content = fields
-                file_type = "f"
-            elif len(fields) == 2:
-                # Accept the legacy grep format while older remote servers roll
-                # forward to the structured tab-separated output.
-                file_type = "f"
-                content_fields = fields[1].split(":", 2)
-                if len(content_fields) != 3:
-                    continue
-                raw_path, line_number, content = content_fields
-            else:
-                continue
-        else:
-            continue
-        if not raw_path.startswith("/opt/crucible/"):
-            continue
-        relative = _controller_relative_path(raw_path)
-        if not relative:
-            continue
-        total_matches += 1
-        entry = grouped.setdefault(
-            relative,
+        results.append(
             {
-                "ref": relative,
-                "uri": f"crucible://{relative}",
-                "type": "directory" if file_type == "d" else "file",
-                "size_bytes": (
-                    int(raw_size)
-                    if kind == "NAME" and file_type == "f" and raw_size.isdigit()
-                    else None
-                ),
-                "match_kinds": [],
-                "matches": [],
-            },
+                "ref": ref,
+                "uri": f"crucible://{ref}",
+                "path": ref,
+                "type": "file",
+                "content": content if isinstance(content, str) else "",
+                "size_bytes": len(content.encode("utf-8"))
+                if isinstance(content, str)
+                else 0,
+            }
         )
-        if (
-            kind == "NAME"
-            and entry.get("size_bytes") is None
-            and file_type == "f"
-            and raw_size.isdigit()
-        ):
-            entry["size_bytes"] = int(raw_size)
-        match_kind = "name" if kind == "NAME" else "content"
-        if match_kind not in entry["match_kinds"]:
-            entry["match_kinds"].append(match_kind)
-        if len(entry["matches"]) < 3:
-            entry["matches"].append(
-                {
-                    "kind": match_kind,
-                    "line_number": int(line_number) if line_number.isdigit() else None,
-                    "content": content[:512] if content else None,
-                }
-            )
-        else:
-            entry["matches_truncated"] = True
-    files = list(grouped.values())
-    missing_sizes = [
-        "/opt/crucible/" + entry["ref"]
-        for entry in files
-        if entry["type"] == "file" and entry.get("size_bytes") is None
-    ]
-    if missing_sizes:
-        stat_command = shlex.join(["stat", "--printf=%n\\t%s\\n", "--", *missing_sizes])
-        stat_result = await ssh.run(controller_host, stat_command, timeout=15)
-        sizes_by_path = {}
-        for line in stat_result.stdout.splitlines():
-            fields = line.split("\t", 1)
-            if len(fields) == 2 and fields[1].isdigit():
-                relative = _controller_relative_path(fields[0])
-                if relative:
-                    sizes_by_path[relative] = int(fields[1])
-        for entry in files:
-            if entry.get("size_bytes") is None:
-                entry["size_bytes"] = sizes_by_path.get(entry["ref"])
-    for entry in files:
-        entry["match_count"] = len(entry["matches"])
-        entry.setdefault("matches_truncated", False)
-    truncated = remote_truncated or total_matches >= max_results
+    if scope_path:
+        scope_prefix = f"{scope_path.rstrip('/')}/"
+        results = [item for item in results if item["path"].startswith(scope_prefix)]
+    truncated = (
+        payload.get("truncated") is True
+        if isinstance(payload, dict)
+        else len(results) >= 20
+    )
+    complete = (
+        payload.get("complete")
+        if isinstance(payload, dict) and payload.get("complete") is not None
+        else not truncated
+    )
     return {
-        "found": bool(files),
+        "found": bool(results),
         "operation": "search",
         "query": query,
         "namespace": "controller",
-        "results": files,
-        "total_files": len(files),
-        "total_matches": total_matches,
+        "results": results,
+        "total_files": len(results),
+        "total_matches": len(results),
         "truncated": truncated,
-        "complete": not truncated,
+        "complete": complete is True and not truncated,
         "scan_scope": scope_path or ".",
         "scope_semantics": "recursive subtree; file origins use their parent directory",
+        "execution_transport": "crucible_mcp",
+        "mcp_contract_version": "3",
     }
 
 
-async def _read_controller_document(
-    *,
-    ssh: Any,
-    controller_host: str,
+def _mcp_resource_ref(resource: dict[str, Any]) -> str:
+    uri = resource.get("uri") or resource.get("url") or ""
+    for prefix in ("crucible://", "context://crucible/"):
+        if isinstance(uri, str) and uri.startswith(prefix):
+            return uri[len(prefix) :]
+    value = resource.get("path") or resource.get("name") or ""
+    return value if isinstance(value, str) else ""
+
+
+async def _read_controller_document_mcp(
+    adapter: Any,
     relative: str,
-) -> Any:
-    """Read a controller document only after resolving symlinks safely.
-
-    The lexical path checks above prevent traversal syntax, but do not stop a
-    path inside /opt/crucible from being a symlink to another tree.  Resolve
-    both the installation root and the requested target on the controller and
-    require the real target to remain below the real installation root.
-    """
-    remote_path = f"/opt/crucible/{relative}"
-    quoted_path = shlex.quote(remote_path)
-    command = (
-        "root=$(realpath -e -- /opt/crucible 2>/dev/null) || exit 20; "
-        f"target={quoted_path}; "
-        'candidate=$(LC_ALL=C realpath -e -- "$target" 2>&1) || '
-        '{ case "$candidate" in *"Permission denied"*) exit 25;; *) exit 21;; esac; }; '
-        'case "$candidate" in "$root"/*) ;; *) exit 22;; esac; '
-        'case "$candidate" in */.ssh|*/.ssh/*|*/.env|*/.env/*|*/.git*/*|*/.git*|*/secrets|*/secrets/*|*/credential|*/credential/*|*/credentials|*/credentials/*|*/authorized_keys|*/id_rsa|*/id_ed25519|*/known_hosts|*/private_key|*token*|*.pem|*.key) exit 27;; esac; '
-        'if [ -d "$candidate" ]; then exit 23; fi; '
-        'if [ ! -f "$candidate" ]; then exit 24; fi; '
-        'if [ ! -r "$candidate" ]; then exit 25; fi; '
-        'printf "resolved_ref=%s\\n" "${candidate#"$root"/}" >&2; '
-        'cat -- "$candidate" || exit 26'
-    )
-    return await ssh.run(controller_host, command, timeout=30)
-
-
-async def _inspect_controller_path(
-    *,
-    ssh: Any,
-    controller_host: str,
-    relative: str,
-) -> Any:
-    """Return the safe remote type of one controller-relative path."""
-    remote_path = f"/opt/crucible/{relative}"
-    command = (
-        "root=$(realpath -e -- /opt/crucible 2>/dev/null) || exit 20; "
-        f"target={shlex.quote(remote_path)}; "
-        'candidate=$(LC_ALL=C realpath -e -- "$target" 2>&1) || '
-        '{ case "$candidate" in *"Permission denied"*) exit 25;; *) exit 21;; esac; }; '
-        'case "$candidate" in "$root"/*) ;; *) exit 22;; esac; '
-        'case "$candidate" in */.ssh|*/.ssh/*|*/.env|*/.env/*|*/.git*/*|*/.git*|*/secrets|*/secrets/*|*/credential|*/credential/*|*/credentials|*/credentials/*|*/authorized_keys|*/id_rsa|*/id_ed25519|*/known_hosts|*/private_key|*token*|*.pem|*.key) exit 27;; esac; '
-        'if [ -d "$candidate" ]; then printf directory; exit 0; fi; '
-        'if [ -f "$candidate" ]; then printf file; exit 0; fi; '
-        "exit 24"
-    )
-    return await ssh.run(controller_host, command, timeout=15)
-
-
-async def _list_controller_directory(
-    *,
-    ssh: Any,
-    controller_host: str,
-    relative: str,
-    max_entries: int = 4096,
-    max_output_bytes: int = 2 * 1024 * 1024,
-) -> dict[str, Any]:
-    """List bounded immediate children and follow only in-root symlinks."""
-    script = r"""
-import json, os, sys
-root = os.path.realpath('/opt/crucible')
-requested = os.path.join('/opt/crucible', sys.argv[1])
-max_entries, max_output = int(sys.argv[2]), int(sys.argv[3])
-prefix = root.rstrip(os.sep) + os.sep
-def inside(path):
-    resolved = os.path.realpath(path)
-    return resolved == root or resolved.startswith(prefix)
-def excluded(path):
-    return any(
-        part.lower() in {
-            '.ssh', '.env', 'secrets', 'credential', 'credentials',
-            'authorized_keys', 'id_rsa', 'id_ed25519', 'known_hosts',
-            'private_key',
-        }
-        or part.lower().startswith('.git')
-        or part.lower().endswith(('.pem', '.key'))
-        or 'token' in part.lower()
-        for part in os.path.normpath(path).split(os.sep)
-    )
-def fail(code):
-    print(json.dumps({'error': code}, separators=(',', ':')))
-if not os.path.isdir(root):
-    fail('root_unavailable')
-elif not inside(requested):
-    fail('outside_root')
-elif excluded(requested) or excluded(os.path.realpath(requested)):
-    fail('excluded')
-elif not os.path.exists(os.path.realpath(requested)):
-    fail('missing')
-elif not os.path.isdir(os.path.realpath(requested)):
-    fail('not_directory')
-else:
-    entries, incomplete = [], False
-    encoded_bytes = 0
+) -> SimpleNamespace:
+    resource_uri = f"crucible://{relative}"
     try:
-        children = sorted(os.scandir(requested), key=lambda item: item.name)
-    except OSError:
-        fail('inaccessible')
-        raise SystemExit
-    for entry in children:
-        child = entry.path
-        if "\t" in child or "\n" in child or "\r" in child:
-            incomplete = True
-            continue
-        resolved_child = os.path.realpath(child)
-        if excluded(child) or excluded(resolved_child) or not inside(child):
-            continue
-        try:
-            if entry.is_dir(follow_symlinks=True):
-                kind, size = 'directory', None
-            elif entry.is_file(follow_symlinks=True):
-                kind, size = 'file', entry.stat(follow_symlinks=True).st_size
-            else:
-                continue
-            relative = os.path.relpath(child, '/opt/crucible')
-            if excluded(relative):
-                continue
-            item = {'path': relative, 'type': kind, 'size_bytes': size}
-            if len(json.dumps(item, separators=(',', ':')).encode()) > 2048:
-                incomplete = True
-                continue
-            item_size = len(json.dumps(item, separators=(',', ':')).encode()) + 1
-            if encoded_bytes + item_size >= max_output:
-                incomplete = True
-                break
-            entries.append(item)
-            encoded_bytes += item_size
-            if len(entries) >= max_entries:
-                incomplete = True
-                break
-        except OSError:
-            incomplete = True
-    entries.sort(key=lambda item: item['path'])
-    print(json.dumps(
-        {
-            'entries': entries,
-            'complete': not incomplete,
-            'resolved_path': os.path.relpath(os.path.realpath(requested), root),
-        }, separators=(',', ':')
-    ))
-"""
-    command = (
-        "python3 -c "
-        f"{shlex.quote(script)} {shlex.quote(relative)} "
-        f"{max_entries} {max_output_bytes}"
-    )
-    try:
-        result = await ssh.run(controller_host, command, timeout=30)
+        raw = await adapter.read_resource(resource_uri)
     except Exception:
-        return {"error": "controller_transport_error"}
-    if result.exit_code != 0:
-        return {"error": "controller_transport_error"}
+        resources = await adapter.list_resources()
+        refs = {
+            ref
+            for resource in resources
+            if isinstance(resource, dict)
+            and isinstance((ref := _mcp_resource_ref(resource)), str)
+            and ref
+        }
+        if any(ref.startswith(f"{relative.rstrip('/')}/") for ref in refs):
+            return SimpleNamespace(stdout="", stderr="", exit_code=23)
+        raise
     try:
-        payload = json.loads(result.stdout)
-    except (json.JSONDecodeError, TypeError):
-        return {"error": "controller_transport_error"}
-    return (
-        payload
-        if isinstance(payload, dict)
-        else {"error": "controller_transport_error"}
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return SimpleNamespace(stdout="", stderr="", exit_code=26)
+    contents = payload.get("contents", []) if isinstance(payload, dict) else []
+    if not isinstance(contents, list):
+        contents = []
+    texts: list[str] = []
+    resolved_ref = relative
+    for content in contents:
+        if not isinstance(content, dict):
+            continue
+        candidate = _mcp_resource_ref(content)
+        if candidate:
+            resolved_ref = candidate
+        text = content.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    if not texts:
+        resources = await adapter.list_resources()
+        refs = {
+            ref
+            for resource in resources
+            if isinstance(resource, dict)
+            and isinstance((ref := _mcp_resource_ref(resource)), str)
+            and ref
+        }
+        if any(ref.startswith(f"{relative.rstrip('/')}/") for ref in refs):
+            return SimpleNamespace(stdout="", stderr="", exit_code=23)
+        return SimpleNamespace(
+            stdout="",
+            stderr=f"resolved_ref={resolved_ref}",
+            exit_code=26,
+        )
+    return SimpleNamespace(
+        stdout="\n".join(texts),
+        stderr=f"resolved_ref={resolved_ref}",
+        exit_code=0,
     )
+
+
+async def _list_controller_directory_mcp(
+    adapter: Any,
+    relative: str,
+) -> dict[str, Any]:
+    resources = await adapter.list_resources()
+    entries: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    prefix = f"{relative.rstrip('/')}/" if relative else ""
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+        ref = _mcp_resource_ref(resource)
+        if not ref or (prefix and not ref.startswith(prefix)):
+            continue
+        remainder = ref[len(prefix) :] if prefix else ref
+        if not remainder:
+            continue
+        first_segment = remainder.split("/", 1)[0]
+        child_path = (
+            f"{relative.rstrip('/')}/{first_segment}" if relative else first_segment
+        )
+        if child_path in seen_paths:
+            continue
+        seen_paths.add(child_path)
+        size = resource.get("size_bytes", resource.get("size"))
+        entries.append(
+            {
+                "path": child_path,
+                "type": "directory" if "/" in remainder else "file",
+                "size_bytes": size if isinstance(size, int) and size >= 0 else None,
+            }
+        )
+    return {
+        "entries": entries,
+        "complete": True,
+        "resolved_path": relative,
+    }
+
+
+async def _inspect_controller_path_mcp(
+    adapter: Any,
+    relative: str,
+) -> SimpleNamespace:
+    resources = await adapter.list_resources()
+    refs = {
+        ref
+        for resource in resources
+        if isinstance(resource, dict)
+        and isinstance((ref := _mcp_resource_ref(resource)), str)
+        and ref
+    }
+    if relative in refs:
+        return SimpleNamespace(stdout="file", stderr="", exit_code=0)
+    directory_prefix = f"{relative.rstrip('/')}/"
+    if any(ref.startswith(directory_prefix) for ref in refs):
+        return SimpleNamespace(stdout="directory", stderr="", exit_code=0)
+    return SimpleNamespace(stdout="", stderr="", exit_code=24)
+
+
+def _controller_metadata_target(relative: str) -> tuple[str, dict[str, Any]] | None:
+    """Map reserved controller refs to structured Crucible MCP metadata tools."""
+    if relative == "endpoints":
+        return "list_endpoints", {}
+    if relative == "tools":
+        return "list_tools", {}
+    if relative.startswith("tools/"):
+        name = relative.removeprefix("tools/")
+        if not name or "/" in name:
+            return None
+        return "list_tools", {"name": name}
+    if relative.startswith("benchmark/"):
+        name = relative.removeprefix("benchmark/")
+        if not name or "/" in name:
+            return None
+        return "describe_benchmark", {"name": name}
+    return None
+
+
+async def _read_controller_metadata_mcp(
+    adapter: Any,
+    relative: str,
+) -> dict[str, Any]:
+    """Read one structured metadata response with stable provenance fields."""
+    target = _controller_metadata_target(relative)
+    if target is None:
+        raise ValueError("not a metadata selector")
+    tool_name, arguments = target
+    raw = await adapter.call_tool(tool_name, arguments)
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Crucible MCP returned invalid metadata JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Crucible MCP returned invalid metadata JSON")
+    content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    revision = payload.get("revision")
+    if not isinstance(revision, str) or not revision:
+        revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return {
+        "tool_name": tool_name,
+        "payload": payload,
+        "content": content,
+        "revision": revision,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 async def controller_context_gateway(
     *,
     ssh: Any,
     controller_host: str | None,
+    mcp_adapter: Any | None = None,
     ticket_id: str,
     agent_name: str,
     phase: str,
@@ -1463,12 +1199,21 @@ async def controller_context_gateway(
                 "documents": documents,
             }
         )
-    if not controller_host or ssh is None:
+    if not controller_host:
         return failure(
             "controller_not_identified",
             "The ticket has no usable controller connection.",
             requested_ref=path,
             next_action="Use the configured controller-backed context source.",
+        )
+    if mcp_adapter is None:
+        return failure(
+            "unsupported_controller",
+            "The assigned Crucible controller does not support MCP contract v3.",
+            requested_ref=path,
+            next_action=(
+                "Install or update Crucible to a controller with MCP contract v3."
+            ),
         )
 
     relative: str | None
@@ -1481,9 +1226,7 @@ async def controller_context_gateway(
                 next_action="Use a controller ref from bootstrap, list, or search.",
             )
         try:
-            origin_result = await _inspect_controller_path(
-                ssh=ssh, controller_host=controller_host, relative=origin
-            )
+            origin_result = await _inspect_controller_path_mcp(mcp_adapter, origin)
         except Exception:
             return failure(
                 "controller_transport_error",
@@ -1553,11 +1296,79 @@ async def controller_context_gateway(
                 path_type="invalid_pointer" if from_ref and path else "invalid_path",
                 next_action="Use a returned controller ref or a documented relative path.",
             )
+        metadata_target = _controller_metadata_target(relative)
+        if operation == "read" and metadata_target is not None:
+            try:
+                metadata = await _read_controller_metadata_mcp(mcp_adapter, relative)
+            except Exception:
+                return failure(
+                    "controller_metadata_unavailable",
+                    "The controller could not return the requested Crucible metadata.",
+                    requested_ref=relative,
+                    path_type="metadata",
+                    next_action="Retry after controller connectivity is restored.",
+                )
+            provenance = {
+                "effective_source": "controller",
+                "controller": controller_host,
+                "path": relative,
+                "mcp_tool": metadata["tool_name"],
+                "mcp_contract_version": "3",
+                "revision": metadata["revision"],
+                "captured_at": metadata["captured_at"],
+            }
+            saved = manager.save_source_snapshot(
+                "controller", provenance, {relative: metadata["content"]}
+            )
+            document = {
+                "namespace": "controller",
+                "path": relative,
+                "ref": relative,
+                "uri": f"crucible://{relative}",
+                "source_path": relative,
+                "source": "controller",
+                "authority": "effective",
+                "provenance": provenance,
+                "entrypoint": False,
+                "type": "metadata",
+                "role": "software-metadata",
+                "revision": metadata["revision"],
+                "captured_at": metadata["captured_at"],
+                "content": metadata["content"],
+                "size_bytes": len(metadata["content"].encode("utf-8")),
+                "workspace_ref": saved.get("files", {}).get(relative),
+            }
+            if relative.startswith("benchmark/"):
+                document["benchmark"] = relative.removeprefix("benchmark/")
+            manager.index_context_documents([document])
+            page = manager.read_document(
+                relative,
+                include_alternates=include_alternates,
+                max_bytes=max_bytes,
+                offset_bytes=offset_bytes,
+            )
+            if page.get("status") != "ok":
+                return failure(
+                    "controller_snapshot_unavailable",
+                    "The controller metadata was read but could not be paged from its ticket snapshot.",
+                    requested_ref=relative,
+                    path_type="metadata",
+                    next_action="Retry the metadata read to refresh its ticket snapshot.",
+                )
+            document_result = {
+                "found": True,
+                "operation": operation,
+                "document": {**document, **page},
+                "documents": [{**document, **page}],
+                "requested_ref": relative,
+                "resolved_ref": relative,
+                "path_type": "metadata",
+            }
+            return finish(document_result)
         try:
-            result = await _read_controller_document(
-                ssh=ssh,
-                controller_host=controller_host,
-                relative=relative,
+            result = await _read_controller_document_mcp(
+                mcp_adapter,
+                relative,
             )
         except Exception:
             return failure(
@@ -1682,6 +1493,45 @@ async def controller_context_gateway(
             "document": document,
             "documents": [document],
         }
+        metadata_documents = [
+            {
+                "namespace": "controller",
+                "path": selector,
+                "ref": selector,
+                "uri": f"crucible://{selector}",
+                "source_path": selector,
+                "source": "controller",
+                "authority": "effective",
+                "entrypoint": False,
+                "type": "metadata",
+                "role": "software-metadata",
+                "size_bytes": None,
+            }
+            for selector in ("endpoints", "tools")
+        ]
+        document_result["documents"] = [document, *metadata_documents]
+        document_result["metadata_selectors"] = [
+            {
+                "ref": "endpoints",
+                "description": "Endpoint schemas and capabilities",
+                "mcp_tool": "list_endpoints",
+            },
+            {
+                "ref": "tools",
+                "description": "All Crucible tool metadata",
+                "mcp_tool": "list_tools",
+            },
+            {
+                "ref": "tools/<name>",
+                "description": "One Crucible tool's metadata",
+                "mcp_tool": "list_tools",
+            },
+            {
+                "ref": "benchmark/<name>",
+                "description": "Benchmark metadata and validation rules",
+                "mcp_tool": "describe_benchmark",
+            },
+        ]
         page = manager.read_document(
             relative,
             include_alternates=include_alternates,
@@ -1710,10 +1560,9 @@ async def controller_context_gateway(
                 next_action="Use a returned controller directory ref.",
             )
         try:
-            listing = await _list_controller_directory(
-                ssh=ssh,
-                controller_host=controller_host,
-                relative=relative,
+            listing = await _list_controller_directory_mcp(
+                mcp_adapter,
+                relative,
             )
         except Exception:
             listing = {"error": "controller_transport_error"}
@@ -1814,10 +1663,9 @@ async def controller_context_gateway(
                 next_action="Use a current ref returned by bootstrap, list, or search.",
             )
         try:
-            result = await _search_controller_source(
-                ssh=ssh,
-                controller_host=controller_host,
-                query=query,
+            result = await _search_controller_source_mcp(
+                mcp_adapter,
+                query,
                 scope_path=checked_scope or "",
                 max_bytes=max_bytes,
             )

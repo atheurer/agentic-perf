@@ -52,7 +52,7 @@ tools listed below. Provider-specific tools are attached only when configured.
 | Benchmark | `read_skills`, `list_harness_docs`, `read_harness_doc`, `get_execution_config`, `get_runfile_schema`, `get_benchmark_params`, `get_tool_params`, `get_example_runfile`, `setup_passwordless_ssh`, `execute_benchmark`, `get_run_logs`, `execute_boot_time_test` |
 | Analyze | `read_skills`, `list_skill_docs`, `get_ticket_results`, `search_tickets`, `list_benchmark_artifacts`, `read_benchmark_artifact`, `submit_analysis_result` |
 | Evaluate | `submit_evaluation_result`, `list_benchmark_artifacts`, `read_benchmark_artifact` |
-| Review | `read_skills`, `list_harness_docs`, `read_harness_doc`, `read_run_results`, `get_run_summary`, `cdm_api_requests`, `compare_results`, `get_review_config` |
+| Review | `read_skills`, `list_harness_docs`, `read_harness_doc`, `read_run_results`, `get_run_summary`, `list_cdm_periods`, `get_cdm_metric`, `compare_results`, `get_review_config` |
 | Investigation | `query_investigation_records`, `get_investigation_record`, `create_investigation_record`, `append_build_history`, `link_jira_ticket`, `close_investigation_record` |
 | Gathering context | `submit_gathering_context_result` |
 | Synthesis | `submit_synthesis_result` |

@@ -76,42 +76,31 @@ cache as an alternative source. For other harnesses,
 
 ## Step 3: Retrieve Results
 
-**First: check for local artifacts.** If `output_dir` or `output_dirs` is set
-in the ticket's custom_fields, the results are stored locally on the
-orchestrator host. Use `list_benchmark_artifacts` with the output_dir to
-discover available files, then `read_benchmark_artifact` to read them.
-This is the preferred method — it requires no SSH and no network access.
+**First for Crucible:** call `get_run_summary` with the MCP job ID or
+historical run ID. Use `read_run_results` to list and read bounded run
+artifacts through the controller's MCP contract. It does not decompress
+`.xz` files or read artifacts over the supported size; report those
+artifacts as unsupported instead of falling back to SSH.
 
-**Second: if no local artifacts exist,** start by calling `get_run_summary`
-to get the result-summary.json. This gives you the run summary AND a
-`metrics` array listing every source+type indexed in CDM. Use this metrics
-list as the gate for all subsequent queries (see CDM metric availability
-below).
+**First for non-Crucible harnesses:** if `output_dir` or `output_dirs` is set
+in the ticket's custom_fields, use `list_benchmark_artifacts` and then
+`read_benchmark_artifact`. These local artifacts require no SSH and no
+network access. For other harness result paths, follow the review config and
+available harness skill files.
 
-Use `read_run_results` (listing mode, no file_path) to discover available
-raw files. Use `read_run_results` (reading mode, with file_path) to read
-specific files — it auto-decompresses .xz files and defaults to 4000 bytes.
-Request more if needed.
+Before querying CDM metrics, call `list_cdm_periods` and select a period only
+from that response. Then call `get_cdm_metric` with the discovered period or
+an explicit time range. If periods are ambiguous, partial, or unavailable,
+report that limitation; do not choose an arbitrary period.
 
-Read retrieval guidance before choosing a method. For Crucible, use the
-gateway for guidance and source documentation, and controller/artifact tools
-for run evidence. For other harnesses, read the available harness skill files
-with `read_skills`.
-
-**DIRECTORY DISCOVERY & CACHING MANDATE:** You must discover the run results
-directory **exactly once** at the beginning of the review phase. Once located,
-cache it in your memory and reuse it for all subsequent tools and actions.
-Running expensive `find` or directory search commands repeatedly is highly
-inefficient and strictly prohibited.
-
-For harnesses that provide a structured API (indicated in the review config),
-you may also have access to tools like get_run_summary or cdm_api_requests.
-The review config will tell you when these are applicable.
+Do not discover or search controller run directories. Crucible summaries,
+artifacts, local-run metadata, periods, and metrics are available only
+through their structured review tools.
 
 ### Scratchpad Workspace & Large Tool Outputs
-When tools return large outputs (> 4 KB by default, configurable via `custom_fields.tool_spill_threshold`), they are automatically saved into your ticket workspace as files (e.g. `workspace://cdm_api_requests_1.json`).
+When tools return large outputs (> 4 KB by default, configurable via `custom_fields.tool_spill_threshold`), they are automatically saved into your ticket workspace as files (e.g. `workspace://get_cdm_metric_1.json`).
 
-- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON tool calls (e.g., `cdm_api_requests` or `get_hardware_topology`) to receive the exact filtered slice immediately in the same turn without multi-step querying. A tool that declares `jq_filter`, such as `generate_chart_from_workspace`, consumes it as an input transformation instead.
+- **In-flight `jq_filter` parameter**: You can pass `jq_filter` directly in JSON tool calls (e.g., `get_cdm_metric` or `get_hardware_topology`) to receive the exact filtered slice immediately in the same turn without multi-step querying. A tool that declares `jq_filter`, such as `generate_chart_from_workspace`, consumes it as an input transformation instead.
 - **JSON files**: Use `jq_file_from_workspace` to extract nested keys or slice array items from already-spilled files. To paginate through large arrays, use array slice ranges: `filter=".values[0:50]"` for the first chunk, then `filter=".values[50:100]"` for the next chunk, skipping the previous data.
 - **Text & Log files**: Use `read_file_from_workspace` to paginate. For a byte-truncated line range, keep the same `start_line` and `max_lines` and continue with `offset_bytes=next_offset_bytes` until it is null. Then use `start_line=next_start_line` and `offset_bytes=0` (or omit it) to request the following line range.
 - **Searching**: Use `grep_file_from_workspace` to jump directly to errors, drops, or specific pattern matches in large log files.
