@@ -162,11 +162,11 @@ def build_kernel_comparison_plan(
 ) -> tuple[dict[str, Any] | None, str]:
     """Transform a plan into the canonical kernel-comparison shape.
 
-    Returns ``(new_plan, "")`` or ``(None, reason)``. The plan must not
-    have progressed past the first benchmark step; resource and harness
-    provision steps are preserved as-is, every original benchmark step is
-    replaced by one kernel step + one benchmark step per order letter,
-    and any steps after the last benchmark (review, teardown) are kept.
+    Keeps everything before the first benchmark (resource, harness provision)
+    and everything after the last benchmark (review, teardown), replacing the
+    benchmark steps with kernel/bench pairs per the order letters. If there
+    are fewer benchmark steps than order legs, the first benchmark template
+    is cloned for the remaining legs.
     """
     normalized, err = validate_kernel_comparison(directive)
     if normalized is None:
@@ -174,7 +174,7 @@ def build_kernel_comparison_plan(
 
     steps = plan.get("steps") or []
     if not steps:
-        return None, "execution plan has no steps to transform"
+        return None, "execution plan has no benchmark step to build the comparison from"
     bench_indexes = [
         i for i, s in enumerate(steps) if s.get("agent_type") == "benchmark"
     ]
@@ -186,14 +186,6 @@ def build_kernel_comparison_plan(
             "execution plan already progressed past the first benchmark step; "
             "the kernel_comparison directive must be present at submission time"
         )
-    has_gap = bench_indexes[-1] - bench_indexes[0] > len(bench_indexes) - 1
-    if has_gap:
-        return None, (
-            "the execution plan has non-benchmark steps between the first and "
-            "last benchmark steps; the kernel comparison transform would "
-            "silently discard them. Simplify the ticket's request or remove "
-            "the kernel_comparison directive."
-        )
     if len(bench_indexes) > len(normalized["order"]):
         return None, (
             f"the plan has {len(bench_indexes)} benchmark step(s) but the "
@@ -204,21 +196,25 @@ def build_kernel_comparison_plan(
         )
 
     template = dict(steps[bench_indexes[0]])
-    head = [dict(s) for s in steps[: bench_indexes[0]]]
-    tail = [dict(s) for s in steps[bench_indexes[-1] + 1 :]]
+    pre_bench = [dict(s) for s in steps[: bench_indexes[0]]]
+    post_bench = [dict(s) for s in steps[bench_indexes[-1] + 1 :]]
 
-    new_steps: list[dict[str, Any]] = list(head)
-    for letter in normalized["order"]:
+    new_steps: list[dict[str, Any]] = list(pre_bench)
+    for letter_idx, letter in enumerate(normalized["order"]):
         release = normalized["baseline" if letter == "A" else "candidate"]
         kernel_step = _kernel_step(
             len(new_steps), release, normalized, role=_LETTER_ROLES[letter]
         )
         kernel_step["params"]["label"] = f"kernel-{letter}"
         new_steps.append(kernel_step)
+        if letter_idx < len(bench_indexes):
+            bench_source = dict(steps[bench_indexes[letter_idx]])
+        else:
+            bench_source = template
         new_steps.append(
-            _benchmark_copy(len(new_steps), template, _LETTER_ROLES[letter])
+            _benchmark_copy(len(new_steps), bench_source, _LETTER_ROLES[letter])
         )
-    new_steps.extend(tail)
+    new_steps.extend(post_bench)
 
     for i, s in enumerate(new_steps):
         s["id"] = i
