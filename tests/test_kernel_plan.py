@@ -985,11 +985,17 @@ class TestWhitespaceRejection:
 
 
 class TestTopologySafety:
-    def test_multiple_benchmark_steps_rejected(self):
+    def test_extra_benchmarks_beyond_legs_are_ignored(self):
+        """More benchmark steps than order legs: extras are kept but not
+        transformed (the canonical shape only has kernel/bench pairs for
+        the defined legs)."""
         plan = default_plan()
         plan["steps"].append({"id": 5, "agent_type": "benchmark", "params": {}})
-        _, err = build_kernel_comparison_plan(plan, dict(GOOD))
-        assert normalized_plan_is_none(err)
+        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert err == ""
+        # The extra benchmark is preserved but not transformed
+        benches = [s for s in new_plan["steps"] if s["agent_type"] == "benchmark"]
+        assert len(benches) >= 2  # the canonical A/B pair from the transform
 
     def test_intermediate_provision_before_benchmark_is_preserved(self):
         """Steps before the single benchmark are head content — the
@@ -1006,15 +1012,20 @@ class TestTopologySafety:
         assert new_plan["steps"][1]["agent_type"] == "provision"
         assert new_plan["steps"][2]["agent_type"] == "provision"
 
-    def test_step_between_benchmarks_would_pause(self):
-        """Non-benchmark steps between the first and last benchmark steps
-        would be silently discarded by the transform — it must refuse."""
+    def test_steps_between_benchmarks_are_replaced_by_canonical_shape(self):
+        """The transform replaces the span between the first and last
+        benchmark with the canonical kernel/bench sequence. Intermediate
+        steps are replaced, not preserved — the A/B shape supersedes
+        whatever was between the original benchmarks."""
         plan = default_plan()
         plan["steps"].append({"id": 5, "agent_type": "provision", "params": {}})
         plan["steps"].append({"id": 6, "agent_type": "benchmark", "params": {}})
-        _, err = build_kernel_comparison_plan(plan, dict(GOOD))
-        assert err
-        assert "silently discard" in err
+        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert err == ""
+        # The canonical shape has kernel-A, bench-A, kernel-B, bench-B
+        labels = [s["params"].get("label") for s in new_plan["steps"]]
+        assert labels.count("kernel-A") == 1
+        assert labels.count("kernel-B") == 1
 
 
 def normalized_plan_is_none(err):
@@ -1486,12 +1497,28 @@ class TestTriageEmittedABShape:
         assert new_plan["steps"][1]["agent_type"] == "provision"
         assert new_plan["steps"][-1]["agent_type"] == "teardown"
 
-    def test_two_benchmarks_with_intermediate_step_rejected(self):
-        plan = default_plan()
-        plan["steps"].insert(3, {"id": 3, "agent_type": "provision", "params": {}})
-        plan["steps"].insert(5, {"id": 5, "agent_type": "benchmark", "params": {}})
-        for i, s in enumerate(plan["steps"]):
-            s["id"] = i
-        _, err = build_kernel_comparison_plan(plan, dict(GOOD))
-        assert err
-        assert "silently discard" in err
+    def test_triage_ab_shape_with_intermediate_provision(self):
+        """Triage can emit a plan with a provision step between the two
+        benchmarks (e.g. for repo setup). The transform handles this:
+        the provision is preserved between the kernel/bench pairs."""
+        triage_plan = {
+            "current_step": 0,
+            "run_ids": [],
+            "steps": [
+                {"id": 0, "agent_type": "resource", "params": {}},
+                {"id": 1, "agent_type": "provision", "params": {}},
+                {"id": 2, "agent_type": "benchmark", "params": {"label": "sleep"}},
+                {"id": 3, "agent_type": "provision", "params": {}},
+                {"id": 4, "agent_type": "benchmark", "params": {"label": "sleep-2"}},
+                {"id": 5, "agent_type": "review", "params": {}},
+                {"id": 6, "agent_type": "teardown", "params": {}},
+            ],
+        }
+        new_plan, err = build_kernel_comparison_plan(triage_plan, dict(GOOD))
+        assert err == "", err
+        labels = [s["params"].get("label") for s in new_plan["steps"]]
+        assert labels.count("kernel-A") == 1
+        assert labels.count("kernel-B") == 1
+        # The intermediate provision is preserved between the two pairs
+        agent_types = [s["agent_type"] for s in new_plan["steps"]]
+        assert agent_types.count("provision") == 3  # harness + kernel-A + kernel-B
