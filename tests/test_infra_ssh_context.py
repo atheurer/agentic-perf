@@ -158,7 +158,7 @@ async def test_ssh_context_initialization_failure_remains_an_error(monkeypatch):
             "run_crucible_command",
             {
                 "controller": "controller.example",
-                "command": "benchmark_list",
+                "command": "userenvs_list",
                 "arguments": {},
             },
         ),

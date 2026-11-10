@@ -254,21 +254,21 @@ class TestGetEthtoolInfo:
 class TestCrucibleCommandBroker:
     @pytest.mark.asyncio
     async def test_dispatches_allowlisted_read_command(self, patch_ssh):
-        patch_ssh._results["crucible benchmark list"] = SSHResult(
+        patch_ssh._results["crucible userenvs list"] = SSHResult(
             exit_code=0,
-            stdout="uperf\nfio\n",
+            stdout="alma8\n",
         )
 
         result = await srv.run_crucible_command(
-            "controller.example", "benchmark_list", {}
+            "controller.example", "userenvs_list", {}
         )
         data = json.loads(result)
 
         assert data["exit_code"] == 0
-        assert data["command"] == "benchmark_list"
+        assert data["command"] == "userenvs_list"
         assert data["controller"] == "controller.example"
-        assert data["stdout"] == "uperf\nfio\n"
-        assert patch_ssh.calls[-1]["command"] == "crucible benchmark list"
+        assert data["stdout"] == "alma8\n"
+        assert patch_ssh.calls[-1]["command"] == "crucible userenvs list"
 
     @pytest.mark.asyncio
     async def test_schema_enumerates_operations_and_empty_arguments(self):
@@ -276,11 +276,7 @@ class TestCrucibleCommandBroker:
         tool = next(t for t in tools if t.name == "run_crucible_command")
         schema = tool.parameters
 
-        assert schema["properties"]["command"]["enum"] == [
-            "benchmark_list",
-            "tools_list",
-            "userenvs_list",
-        ]
+        assert schema["properties"]["command"]["const"] == "userenvs_list"
         assert (
             schema["properties"]["arguments"]["anyOf"][0]["additionalProperties"]
             is False
@@ -298,7 +294,7 @@ class TestCrucibleCommandBroker:
     @pytest.mark.asyncio
     async def test_rejects_arguments_before_ssh(self, patch_ssh):
         result = await srv.run_crucible_command(
-            "controller", "tools_list", {"extra": "--json"}
+            "controller", "userenvs_list", {"extra": "--json"}
         )
         data = json.loads(result)
 

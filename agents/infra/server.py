@@ -183,11 +183,9 @@ def _format_result(result: SSHResult) -> str:
 # rather than user-supplied command fragments; adding an operation requires
 # reviewing its read-only contract and adding a test.
 _CRUCIBLE_READ_COMMANDS = {
-    "benchmark_list": "crucible benchmark list",
-    "tools_list": "crucible tools list",
     "userenvs_list": "crucible userenvs list",
 }
-CrucibleCommand = Literal["benchmark_list", "tools_list", "userenvs_list"]
+CrucibleCommand = Literal["userenvs_list"]
 
 
 class CrucibleCommandArguments(BaseModel):

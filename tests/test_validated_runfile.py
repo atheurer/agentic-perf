@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -12,6 +11,7 @@ from agents.benchmark.agent import BenchmarkAgent
 from agents.benchmark.server import _compute_params_fingerprint
 from providers.skills.base import RunfileTemplate
 from tests.conftest import MockSkillProvider, MockSSHExecutor, make_benchmark_handlers
+from tests.test_benchmark_tools import BenchmarkMCP
 
 # ── Fixtures ──────────────────────────────────────────────
 
@@ -20,25 +20,18 @@ from tests.conftest import MockSkillProvider, MockSSHExecutor, make_benchmark_ha
 def _crucible_ticket_context(monkeypatch):
     import agents.benchmark.server as server
 
+    monkeypatch.setattr(server, "_crucible_mcp", BenchmarkMCP())
     monkeypatch.setattr(
         server,
         "_ticket",
         {
             "id": "PERF-TEST",
-            "custom_fields": {"directives": {"harness": "crucible"}},
+            "custom_fields": {
+                "directives": {"harness": "crucible"},
+                "assigned_hardware_ips": {"controller": "test-host"},
+            },
         },
     )
-
-
-@dataclass
-class _FakeSSHResult:
-    exit_code: int = 0
-    stdout: str = ""
-    stderr: str = ""
-
-
-RUN_DIR = "/var/lib/crucible/run/uperf--abc12345-1234-5678-9abc-def012345678"
-SUMMARY_JSON = json.dumps({"result": "pass", "primary_metric": "Gb_sec"})
 
 
 def _make_provider(
@@ -68,45 +61,6 @@ def _make_handlers(provider: MockSkillProvider):
     return h, ssh
 
 
-async def _make_crucible_ssh(
-    *,
-    run_exit_code: int = 0,
-    summary_found: bool = True,
-    summary_content: str = SUMMARY_JSON,
-):
-    async def _run(host, command, timeout=300):
-        if "crucible-valkey" in command:
-            return _FakeSSHResult(exit_code=0, stdout="OK")
-        if "crucible-opensearch" in command:
-            return _FakeSSHResult(exit_code=0, stdout="GONE")
-        if "result-summary.json" in command:
-            if summary_found:
-                return _FakeSSHResult(exit_code=0, stdout=summary_content)
-            return _FakeSSHResult(exit_code=1, stdout="")
-        if "crucible.log" in command:
-            return _FakeSSHResult(exit_code=0, stdout="log output")
-        return _FakeSSHResult(exit_code=0, stdout="ok")
-
-    async def _run_with_progress(host, command, progress_callback=None):
-        return _FakeSSHResult(
-            exit_code=run_exit_code,
-            stdout=f"run directory: {RUN_DIR}\nrun complete",
-        )
-
-    async def _copy_to(host, local_path, remote_path, timeout=60, mutating=False):
-        assert mutating is True
-        return _FakeSSHResult(exit_code=0)
-
-    class _Mock:
-        pass
-
-    m = _Mock()
-    m.run = _run
-    m.run_with_progress = _run_with_progress
-    m.copy_to = _copy_to
-    return m
-
-
 async def _validate_runfile(h, run_file, controller="test-host"):
     run_file.setdefault("tags", {})
     result = await h["validate_benchmark"](
@@ -114,7 +68,7 @@ async def _validate_runfile(h, run_file, controller="test-host"):
         run_file=run_file,
         harness="crucible",
     )
-    assert result["valid"] is True
+    assert result["status"] == "valid", result
     return result["validation_id"]
 
 
@@ -180,11 +134,7 @@ async def test_crucible_execution_does_not_use_local_validation_result():
         validation_result={"valid": False, "errors": ["missing field: benchmarks"]},
     )
     h, ssh = _make_handlers(provider)
-    mock_ssh = await _make_crucible_ssh()
-    ssh.run = mock_ssh.run
-    ssh.run_with_progress = mock_ssh.run_with_progress
-    ssh.copy_to = mock_ssh.copy_to
-    validation_id = await _validate_runfile(h, {"bad": "data"})
+    validation_id = await _validate_runfile(h, {"benchmarks": [{"name": "uperf"}]})
 
     result = await h["execute_benchmark"](
         controller="test-host",
@@ -194,6 +144,7 @@ async def test_crucible_execution_does_not_use_local_validation_result():
 
     assert result["status"] == "completed"
     assert "result_summary" in result
+    assert ssh.calls == []
 
 
 @pytest.mark.asyncio
@@ -229,8 +180,7 @@ async def test_crucible_execution_rejects_legacy_validation_without_tags(monkeyp
     )
 
     assert result["status"] == "rejected"
-    assert result["reason_code"] == "invalid_runfile_contract"
-    assert "missing required top-level key: tags" in result["message"]
+    assert result["reason_code"] == "mcp_revalidation_required"
     assert ssh.calls == []
 
 
@@ -241,21 +191,16 @@ async def test_valid_runfile_proceeds():
         validation_result={"valid": True, "errors": []},
     )
     h, ssh = _make_handlers(provider)
-
-    mock_ssh = await _make_crucible_ssh()
-    ssh.run = mock_ssh.run
-    ssh.run_with_progress = mock_ssh.run_with_progress
-    ssh.copy_to = mock_ssh.copy_to
     validation_id = await _validate_runfile(h, {"benchmarks": []})
 
     result = await h["execute_benchmark"](
         controller="test-host",
         validation_id=validation_id,
         harness="crucible",
-        run_command="crucible run",
     )
 
     assert result["status"] in ("completed", "failed")
+    assert ssh.calls == []
 
 
 # ── Persist tests ────────────────────────────────────────
@@ -267,21 +212,16 @@ async def test_persist_no_ticket_id():
     provider = _make_provider()
     h, ssh = _make_handlers(provider)
 
-    mock_ssh = await _make_crucible_ssh()
-    ssh.run = mock_ssh.run
-    ssh.run_with_progress = mock_ssh.run_with_progress
-    ssh.copy_to = mock_ssh.copy_to
-
     with patch.dict("os.environ", {}, clear=True):
         validation_id = await _validate_runfile(h, {"benchmarks": []})
         result = await h["execute_benchmark"](
             controller="test-host",
             validation_id=validation_id,
             harness="crucible",
-            run_command="crucible run",
         )
 
     assert result["status"] in ("completed", "failed")
+    assert ssh.calls == []
 
 
 # ── _build_messages injection tests ──────────────────────

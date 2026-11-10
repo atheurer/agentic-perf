@@ -125,8 +125,11 @@ TOOL_AUDIT_POLICY = (
     *_side_effecting(
         "providers.ssh.SSHExecutor",
         "agents/benchmark/server.py:setup_passwordless_ssh",
-        "agents/benchmark/server.py:validate_benchmark",
         "agents/benchmark/server.py:execute_boot_time_test",
+    ),
+    *_side_effecting(
+        "agents.crucible_mcp.CrucibleMCPAdapter",
+        "agents/benchmark/server.py:validate_benchmark",
     ),
     *_side_effecting(
         "agents.mcp_audit.MCPAuditMiddleware.operation_transition",
@@ -252,7 +255,8 @@ TOOL_AUDIT_POLICY = (
         "agents/review/server.py:read_harness_doc",
         "agents/review/server.py:read_run_results",
         "agents/review/server.py:get_run_summary",
-        "agents/review/server.py:cdm_api_requests",
+        "agents/review/server.py:list_cdm_periods",
+        "agents/review/server.py:get_cdm_metric",
         "agents/review/server.py:compare_results",
         "agents/review/server.py:get_review_config",
         "agents/triage/server.py:get_skill_context",
@@ -383,6 +387,9 @@ POLICY_BY_REGISTRATION = {policy.registration: policy for policy in TOOL_AUDIT_P
 OPERATION_OWNER_CONTRACTS = {
     "state_store.ticket_transition": "agents/base.py:_transition_ticket",
     "providers.ssh.SSHExecutor": "providers/ssh.py:SSHExecutor",
+    "agents.crucible_mcp.CrucibleMCPAdapter": (
+        "agents/crucible_mcp.py:CrucibleMCPAdapter"
+    ),
     "agents.mcp_audit.MCPAuditMiddleware.operation_transition": (
         "agents/mcp_audit.py:MCPAuditMiddleware"
     ),

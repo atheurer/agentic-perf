@@ -11,11 +11,7 @@ import pytest
 import agents.benchmark.server as benchmark_server
 import agents.server_utils as server_utils
 from agents.benchmark.server import _benchmark_intent_identity, _BenchmarkOperation
-
-
-class _ControllerResult:
-    def __init__(self, exit_code: int = 0, stdout: str = "", stderr: str = ""):
-        self.exit_code, self.stdout, self.stderr = exit_code, stdout, stderr
+from tests.test_benchmark_tools import BenchmarkMCP
 
 
 def _set_crucible_context(monkeypatch, ticket):
@@ -29,9 +25,15 @@ def _set_crucible_context(monkeypatch, ticket):
 
 
 def _crucible_fixture(
-    tmp_path, monkeypatch, *, launch=None, run_result=None, run_error=None
+    tmp_path,
+    monkeypatch,
+    *,
+    launch=None,
+    run_error=None,
+    prepare_error=None,
+    statuses=None,
 ):
-    """Wire the real execute handler to a deterministic fake controller."""
+    """Wire the real execute handler to a deterministic contract-v3 controller."""
     import paths
 
     monkeypatch.setattr(paths, "TRACE_DB_PATH", tmp_path / "trace.db")
@@ -50,6 +52,9 @@ def _crucible_fixture(
         "params_fingerprint": "no-mv-params",
         "execution_plan_fingerprint": benchmark_server._execution_plan_fingerprint({}),
         "run_command": "crucible run",
+        "execution_transport": "crucible_mcp",
+        "mcp_contract_version": "3",
+        "crucible_idempotency_key": "T-788:crucible:val-788",
         "state": "executable",
     }
     ticket = {
@@ -60,34 +65,22 @@ def _crucible_fixture(
     _set_crucible_context(monkeypatch, ticket)
     calls = []
 
-    class SSH:
-        async def run(self, host, command, **kwargs):
-            calls.append(("run", command))
-            if "result-summary.json" in command:
-                return _ControllerResult(stdout='{"result":"pass"}')
-            if "crucible-opensearch" in command:
-                return _ControllerResult(stdout="GONE")
-            if "crucible start opensearch" in command:
-                return _ControllerResult(stdout="Successfully started OpenSearch")
-            return _ControllerResult(stdout="OK")
+    class TicketBenchmarkMCP(BenchmarkMCP):
+        async def call_tool(self, name: str, arguments: dict) -> str:
+            if name == "start_run":
+                calls.append(("launch", arguments))
+            return await super().call_tool(name, arguments)
 
-        async def copy_to(self, host, local_path, remote_path, **kwargs):
-            calls.append(("copy_to", remote_path))
-            return _ControllerResult()
-
-        async def run_with_progress(self, host, command, **kwargs):
-            calls.append(("launch", command))
-            if launch:
-                await launch()
-            if run_error:
-                raise run_error
-            return run_result or _ControllerResult(
-                stdout="Results stored in: "
-                "/var/lib/crucible/run/uperf--12345678-1234-1234-1234-123456789abc\n"
-            )
+    adapter = TicketBenchmarkMCP(
+        launch=launch,
+        run_error=run_error,
+        prepare_error=prepare_error,
+        statuses=statuses,
+    )
+    monkeypatch.setattr(benchmark_server, "_crucible_mcp", adapter)
 
     async def ensure_init():
-        benchmark_server._ssh = SSH()
+        benchmark_server._ssh = object()
 
     async def active_check(**kwargs):
         return ticket
@@ -257,11 +250,15 @@ async def test_execute_path_duplicate_replay_does_not_launch(monkeypatch) -> Non
         "params_fingerprint": "no-mv-params",
         "execution_plan_fingerprint": "x",
         "run_command": "crucible run",
+        "execution_transport": "crucible_mcp",
+        "mcp_contract_version": "3",
+        "crucible_idempotency_key": "external:crucible:val-1",
         "state": "executable",
     }
     active = {"id": "", "status": "executing_benchmark", "custom_fields": {}}
     calls: list[str] = []
     _set_crucible_context(monkeypatch, active)
+    monkeypatch.setattr(benchmark_server, "_crucible_mcp", BenchmarkMCP())
 
     async def no_init() -> None:
         benchmark_server._ssh = object()
@@ -351,6 +348,7 @@ async def test_execute_new_validation_attempt_launches_second_time(
     record["validation_id"] = "val-789"
     record["attempt_id"] = "attempt-2"
     record["execution_intent_id"] = "intent-2"
+    record["crucible_idempotency_key"] = "T-788:crucible:val-789"
     record["runfile_fingerprint"] = benchmark_server._runfile_fingerprint(
         record["run_file"]
     )
@@ -403,26 +401,14 @@ async def test_execute_validation_rejection_has_zero_controller_mutation(
 async def test_execute_prelaunch_controller_crash_is_takeover_safe(
     tmp_path, monkeypatch
 ):
-    _, calls = _crucible_fixture(tmp_path, monkeypatch)
-
-    class CrashingSSH:
-        async def copy_to(self, *args, **kwargs):
-            calls.append(("copy_to", "crash"))
-            raise ConnectionError("controller lost before launch")
-
-        async def run(self, *args, **kwargs):
-            return _ControllerResult(stdout="GONE")
-
-        async def run_with_progress(self, *args, **kwargs):
-            calls.append(("launch", "must-not-run"))
-            return _ControllerResult()
-
-    async def ensure():
-        benchmark_server._ssh = CrashingSSH()
-
-    monkeypatch.setattr(benchmark_server, "_ensure_init", ensure)
+    _, calls = _crucible_fixture(
+        tmp_path,
+        monkeypatch,
+        prepare_error=ConnectionError("controller lost before planning"),
+    )
     result = await _execute()
-    assert result["status"] == "indeterminate"
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "mcp_execution_failed"
     assert not [c for c in calls if c[0] == "launch"]
 
 
@@ -433,13 +419,13 @@ async def test_execute_postlaunch_crash_is_indeterminate_and_replay_never_relaun
     _, calls = _crucible_fixture(
         tmp_path, monkeypatch, run_error=ConnectionError("lost response after launch")
     )
-    with pytest.raises(ConnectionError):
-        await _execute()
+    first = await _execute()
+    assert first["status"] == "indeterminate"
+    assert first["reason_code"] == "mcp_execution_outcome_unknown"
     replay = await _execute()
     assert replay["status"] == "indeterminate"
-    assert replay["reason_code"] == "indeterminate"
+    assert replay["reason_code"] == "mcp_execution_outcome_unknown"
     assert replay["existing_operation"] is True
-    assert replay["operation"]["terminal_outcome"] == "indeterminate"
     assert len([c for c in calls if c[0] == "launch"]) == 1
     assert any(
         c[0] == "pause" and c[1]["status"] == "awaiting_customer_guidance"
@@ -468,16 +454,23 @@ async def test_execute_mcp_reconnect_same_correlation_replays_without_launch(
 async def test_execute_terminal_failure_survives_restart_and_external_identity_is_durable(
     tmp_path, monkeypatch
 ):
-    run_result = _ControllerResult(
-        exit_code=1,
-        stdout="Results stored in: /var/lib/crucible/run/uperf--12345678-1234-1234-1234-123456789abc\n",
-        stderr="benchmark failed",
+    _, calls = _crucible_fixture(
+        tmp_path,
+        monkeypatch,
+        statuses=[
+            {
+                "state": "failed",
+                "result_status": "available",
+                "error_category": "benchmark_failed",
+                "exit_code": 1,
+            }
+        ],
     )
-    _, calls = _crucible_fixture(tmp_path, monkeypatch, run_result=run_result)
     first = await _execute()
     assert first["status"] == "failed"
-    assert first["run_id"] == "12345678-1234-1234-1234-123456789abc"
-    assert first["run_dir"].startswith("/var/lib/crucible/run/")
+    assert first["run_id"] == "cdm-run-1"
+    assert first["crucible_mcp_job_id"] == "mcp-job-1"
+    assert first["run_path"] == "/var/lib/crucible/run/one"
     # A fresh server process (new module operation adapter) still gets cached failure.
     benchmark_server._initialized = False
     second = await _execute()

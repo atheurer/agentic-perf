@@ -4,8 +4,8 @@ How to run an E2E test of the agentic-perf pipeline with Claude acting as both t
 
 ## Prerequisites
 
-1. **Crucible installed locally** at `/opt/crucible` (needed by `CrucibleSkillProvider` to read schemas, multiplex.json, and example run-files)
-2. **SSH access** from this machine to both controller and endpoint hosts using the key in `~/.agentic-perf/config.json`
+1. **Crucible catalog access** for triage and controller-side Crucible MCP contract v3 for runtime validation and execution
+2. **Endpoint and provisioning access** as required by the selected harness; the Crucible controller must expose its configured MCP endpoint and secret
 3. **Config file** at `~/.agentic-perf/config.json` with LLM backend settings (see below)
 4. **gcloud auth** active if using Vertex backend (`gcloud auth application-default login`)
 5. **Secrets deployed** at `~/.agentic-perf/secrets/` (crucible registry tokens — needed by the provisioning agent to install crucible on the controller)
@@ -160,7 +160,7 @@ print(f'Ticket {tid} ready in executing_benchmark')
 
 2. **Schema validation passed** — no "rejected" status from `execute_benchmark`
 
-3. **Crucible accepted the run-file** — log shows `crucible run <path>` executing without immediate error
+3. **Crucible accepted the run-file** — log shows the exact validated document accepted by MCP `start_run`
 
 4. **Run-file matches the request** — check the run-file in the ticket comments. For a "4k sync" request, `mv-params` should have `"bs": ["4K"]` and `"ioengine": ["sync"]`, not the full matrix from the example.
 
