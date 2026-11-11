@@ -35,7 +35,15 @@ class ReviewMCP:
                 {"artifact_path": "results.json", "size": 12, "retrievable": True},
                 {"artifact_path": "raw/result.json", "size": 20, "retrievable": True},
             ]
-            return json.dumps({"artifacts": artifacts, "complete": True})
+            offset = arguments.get("offset", 0)
+            page = artifacts[offset : offset + 1]
+            return json.dumps(
+                {
+                    "artifacts": page,
+                    "complete": offset + 1 >= len(artifacts),
+                    "next_offset": None if offset + 1 >= len(artifacts) else offset + 1,
+                }
+            )
         if name == "get_run_artifact":
             return json.dumps(
                 {
@@ -49,7 +57,12 @@ class ReviewMCP:
                 }
             )
         if name == "list_indexed_periods":
-            periods = {"run-1": ["p1"], "run-2": ["p1"], "run-3": ["p1", "p2"]}
+            periods = {
+                "run-1": ["p1"],
+                "run-2": ["p1"],
+                "run-3": ["p1", "p2"],
+                "run-4": ["p2"],
+            }
             return json.dumps(
                 {
                     "periods": [
@@ -101,15 +114,48 @@ async def test_summary_uses_direct_mcp_job_and_bounded_historical_lookup(review_
 
 @pytest.mark.asyncio
 async def test_artifacts_use_full_pages_and_bounded_reads(review_mcp):
-    listing = json.loads(await review.read_run_results("controller.example", "job-1"))
-    assert listing["status"] == "ok"
-    assert [item["path"] for item in listing["files"]] == [
-        "results.json",
-        "raw/result.json",
-    ]
-    assert ("list_run_artifacts", {"mcp_job_id": "job-1", "limit": 1000}) in (
-        review_mcp.calls
+    first_page = json.loads(
+        await review.read_run_results("controller.example", "job-1", listing_offset=0)
     )
+    assert first_page["status"] == "ok"
+    assert [item["path"] for item in first_page["files"]] == ["results.json"]
+    assert first_page["listing_offset"] == 0
+    assert first_page["next_offset"] == 1
+    assert not first_page["complete"]
+    assert (
+        "list_run_artifacts",
+        {"mcp_job_id": "job-1", "limit": 1000, "offset": 0},
+    ) in review_mcp.calls
+
+    second_page = json.loads(
+        await review.read_run_results("controller.example", "job-1", listing_offset=1)
+    )
+    assert second_page["status"] == "ok"
+    assert [item["path"] for item in second_page["files"]] == ["raw/result.json"]
+    assert second_page["listing_offset"] == 1
+    assert second_page["next_offset"] is None
+    assert second_page["complete"]
+    assert (
+        "list_run_artifacts",
+        {"mcp_job_id": "job-1", "limit": 1000, "offset": 1},
+    ) in review_mcp.calls
+
+    historical_first = json.loads(
+        await review.read_run_results(
+            "controller.example", "historical-1", listing_offset=0
+        )
+    )
+    historical_second = json.loads(
+        await review.read_run_results(
+            "controller.example", "historical-1", listing_offset=1
+        )
+    )
+    assert historical_first["next_offset"] == 1
+    assert historical_second["complete"]
+    assert (
+        "list_run_artifacts",
+        {"run_path": "/runs/historical-1", "limit": 1000, "offset": 1},
+    ) in review_mcp.calls
 
     payload = json.loads(
         await review.read_run_results(
@@ -117,6 +163,7 @@ async def test_artifacts_use_full_pages_and_bounded_reads(review_mcp):
             "historical-1",
             file_path="results.json",
             max_bytes=100,
+            offset=13,
         )
     )
     assert payload["status"] == "ok"
@@ -126,10 +173,16 @@ async def test_artifacts_use_full_pages_and_bounded_reads(review_mcp):
         {
             "run_path": "/runs/historical-1",
             "artifact_path": "results.json",
-            "offset": 0,
+            "offset": 13,
             "limit": 100,
         },
     ) in review_mcp.calls
+
+    invalid_offset = json.loads(
+        await review.read_run_results("controller.example", "job-1", listing_offset=-1)
+    )
+    assert invalid_offset["status"] == "error"
+    assert invalid_offset["reason"] == "invalid_listing_offset"
 
     compressed = json.loads(
         await review.read_run_results(
@@ -186,6 +239,8 @@ async def test_comparison_discovers_periods_before_metric_queries(review_mcp):
         )
     )
     assert comparison["status"] == "ok"
+    assert comparison["periods"] == {"run-1": "p1", "run-2": "p1"}
+    assert comparison["discovered_periods"] == {"run-1": ["p1"], "run-2": ["p1"]}
     assert comparison["results"]["run-1"]["period"] == "p1"
     assert comparison["results"]["run-1"]["aggregates"]["all"]["value"] == 5
     period_calls = [
@@ -196,6 +251,62 @@ async def test_comparison_discovers_periods_before_metric_queries(review_mcp):
     ]
     assert len(period_calls) == 2
     assert len(metric_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_comparison_uses_per_run_period_mappings(review_mcp):
+    comparison = json.loads(
+        await review.compare_results(
+            "controller.example",
+            ["run-3", "run-4"],
+            "cpu::throughput",
+            periods={"run-3": "p1", "run-4": "p2"},
+        )
+    )
+    assert comparison["status"] == "ok"
+    assert comparison["periods"] == {"run-3": "p1", "run-4": "p2"}
+    assert comparison["discovered_periods"] == {
+        "run-3": ["p1", "p2"],
+        "run-4": ["p2"],
+    }
+    metric_periods = {
+        arguments["run"]: arguments["period"]
+        for name, arguments in review_mcp.calls
+        if name == "get_indexed_metric"
+    }
+    assert metric_periods == {"run-3": "p1", "run-4": "p2"}
+
+
+@pytest.mark.asyncio
+async def test_comparison_validates_per_run_period_mappings(review_mcp):
+    invalid = json.loads(
+        await review.compare_results(
+            "controller.example",
+            ["run-1", "run-2"],
+            "cpu::throughput",
+            periods={"run-1": "missing-period"},
+        )
+    )
+    assert invalid["status"] == "invalid_period"
+    assert invalid["run_id"] == "run-1"
+    assert invalid["requested_period"] == "missing-period"
+    assert invalid["discovered_periods"] == ["p1"]
+    assert not any(call[0] == "get_indexed_metric" for call in review_mcp.calls)
+
+
+@pytest.mark.asyncio
+async def test_comparison_rejects_unknown_period_mapping_runs(review_mcp):
+    result = json.loads(
+        await review.compare_results(
+            "controller.example",
+            ["run-1", "run-2"],
+            "cpu::throughput",
+            periods={"unknown-run": "p1"},
+        )
+    )
+    assert result["status"] == "invalid_period_mapping"
+    assert result["unknown_run_ids"] == ["unknown-run"]
+    assert not review_mcp.calls
 
 
 @pytest.mark.asyncio
