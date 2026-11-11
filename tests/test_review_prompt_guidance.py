@@ -31,6 +31,9 @@ def test_crucible_review_requires_period_discovery_and_mcp_artifacts():
     assert "call `list_cdm_periods`" in prompt
     assert "call `get_cdm_metric` with the discovered period" in prompt
     assert "do not choose an arbitrary period" in prompt
+    assert "provide `compare_results` with a `periods` mapping" in prompt
+    assert "pass that value as the next call's `listing_offset`" in prompt
+    assert "Keep `offset` for paginating the content" in prompt
     assert "Do not discover or search controller run directories" in prompt
     assert "does not decompress `.xz` files" in prompt
     assert "cdm_api_requests" not in prompt

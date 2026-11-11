@@ -92,6 +92,13 @@ Before querying CDM metrics, call `list_cdm_periods` and select a period only
 from that response. Then call `get_cdm_metric` with the discovered period or
 an explicit time range. If periods are ambiguous, partial, or unavailable,
 report that limitation; do not choose an arbitrary period.
+When comparing runs whose period IDs differ, provide `compare_results` with a
+`periods` mapping from each run ID to its discovered period. Use the shared
+`period` only when that period is valid for every requested run.
+
+When artifact listings return `next_offset`, pass that value as the next call's
+`listing_offset` until `complete` is true. Keep `offset` for paginating the
+content of a selected artifact.
 
 Do not discover or search controller run directories. Crucible summaries,
 artifacts, local-run metadata, periods, and metrics are available only

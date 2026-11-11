@@ -425,6 +425,7 @@ async def _run_artifact_context(
     run_id: str,
     *,
     full_listing: bool,
+    listing_offset: int = 0,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
     adapter, error = _review_adapter(controller)
     if adapter is None or error is not None:
@@ -432,7 +433,11 @@ async def _run_artifact_context(
     try:
         raw = await adapter.call_tool(
             "list_run_artifacts",
-            {"mcp_job_id": run_id, "limit": 1000 if full_listing else 1},
+            {
+                "mcp_job_id": run_id,
+                "limit": 1000 if full_listing else 1,
+                "offset": listing_offset,
+            },
         )
         return {"mcp_job_id": run_id}, _decode_mcp_result(raw), None
     except Exception as exc:
@@ -457,7 +462,11 @@ async def _run_artifact_context(
     try:
         raw = await adapter.call_tool(
             "list_run_artifacts",
-            {"run_path": run_path, "limit": 1000 if full_listing else 1},
+            {
+                "run_path": run_path,
+                "limit": 1000 if full_listing else 1,
+                "offset": listing_offset,
+            },
         )
         return {"run_path": run_path}, _decode_mcp_result(raw), None
     except Exception:
@@ -478,11 +487,23 @@ async def read_run_results(
     file_path: str = "",
     max_bytes: int = 4000,
     offset: int = 0,
+    listing_offset: int = 0,
 ) -> str:
     """List or read bounded, approved artifacts for a Crucible MCP job or historical run."""
     await _ensure_cdm_init()
+    if type(listing_offset) is not int or listing_offset < 0:
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "invalid_listing_offset",
+                "message": "listing_offset must be a nonnegative integer.",
+            }
+        )
     target, listing, error = await _run_artifact_context(
-        controller, run_id, full_listing=not file_path
+        controller,
+        run_id,
+        full_listing=not file_path,
+        listing_offset=listing_offset if not file_path else 0,
     )
     if target is None or listing is None or error is not None:
         return error or _controller_error("run_not_found", "The run was not found.")
@@ -510,6 +531,7 @@ async def read_run_results(
                 "run_path": run_path,
                 "files": files,
                 "complete": listing.get("complete") is True,
+                "listing_offset": listing_offset,
                 "next_offset": listing.get("next_offset"),
                 "message": (
                     "Use a returned relative artifact_path. Compressed artifacts "
@@ -755,6 +777,7 @@ async def compare_results(
     run_ids: list[str],
     metric_name: str,
     period: str = "",
+    periods: dict[str, str] | None = None,
     aggregation: str = "avg",
     breakout: list[str] | None = None,
     filter: str = "",
@@ -786,10 +809,42 @@ async def compare_results(
             "metric_name must include both source and type.",
         )
 
-    period_by_run: dict[str, str] = {}
+    period_mapping = periods or {}
+    if not isinstance(period_mapping, dict):
+        return _controller_error(
+            "invalid_period_mapping",
+            "periods must map each run ID to a nonempty period ID.",
+        )
+    unknown_run_ids = [run_id for run_id in period_mapping if run_id not in run_ids]
+    if unknown_run_ids:
+        return json.dumps(
+            {
+                "status": "invalid_period_mapping",
+                "run_ids": run_ids,
+                "metric_name": metric_name,
+                "unknown_run_ids": unknown_run_ids,
+                "message": "The period mapping contains unknown run IDs.",
+            }
+        )
+    invalid_period_ids = [
+        run_id
+        for run_id, mapped_period in period_mapping.items()
+        if not isinstance(mapped_period, str) or not mapped_period
+    ]
+    if invalid_period_ids:
+        return json.dumps(
+            {
+                "status": "invalid_period_mapping",
+                "run_ids": run_ids,
+                "metric_name": metric_name,
+                "run_ids_with_invalid_periods": invalid_period_ids,
+                "message": "Each period mapping value must be a nonempty string.",
+            }
+        )
+
+    selected_period_by_run: dict[str, str] = {}
     discovered_periods: dict[str, list[str]] = {}
     for run_id in run_ids:
-        selected_period = period
         try:
             raw = await adapter.call_tool("list_indexed_periods", {"run": run_id})
             period_result = _decode_mcp_result(raw)
@@ -806,8 +861,13 @@ async def compare_results(
                 periods.append(item["primary_period_id"])
         discovered_periods[run_id] = periods
         unique_periods = list(dict.fromkeys(periods))
-        if not selected_period and len(unique_periods) == 1:
+
+        selected_period = period_mapping.get(run_id)
+        if selected_period is None and period:
+            selected_period = period
+        if selected_period is None and len(unique_periods) == 1:
             selected_period = unique_periods[0]
+
         if selected_period and selected_period not in unique_periods:
             return json.dumps(
                 {
@@ -821,12 +881,12 @@ async def compare_results(
                 }
             )
         if selected_period:
-            period_by_run[run_id] = selected_period
+            selected_period_by_run[run_id] = selected_period
 
     ambiguous = {
         run_id: periods
         for run_id, periods in discovered_periods.items()
-        if not periods or (not period and len(set(periods)) != 1)
+        if run_id not in selected_period_by_run
     }
     if ambiguous:
         return json.dumps(
@@ -848,7 +908,7 @@ async def compare_results(
             "run": run_id,
             "source": source,
             "type": metric_type,
-            "period": period_by_run[run_id],
+            "period": selected_period_by_run[run_id],
             "aggregation": aggregation,
         }
         if breakout:
@@ -865,7 +925,7 @@ async def compare_results(
             )
         aggregates, non_numeric = _metric_aggregates(metric_result, aggregation)
         results[run_id] = {
-            "period": period_by_run[run_id],
+            "period": selected_period_by_run[run_id],
             "metric": metric_result,
             "aggregates": aggregates,
             "non_numeric_samples": non_numeric,
@@ -876,6 +936,8 @@ async def compare_results(
             "run_ids": run_ids,
             "metric_name": metric_name,
             "aggregation": aggregation,
+            "periods": selected_period_by_run,
+            "discovered_periods": discovered_periods,
             "results": results,
         }
     )
