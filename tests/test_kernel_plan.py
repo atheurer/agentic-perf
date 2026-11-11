@@ -151,13 +151,17 @@ class TestBuildKernelComparisonPlan:
         assert bench_a["kernel_role"] == "baseline"
         assert bench_b["kernel_role"] == "candidate"
 
-    def test_repo_url_propagates_into_kernel_steps(self):
+    def test_repo_url_only_on_candidate_step(self):
+        """The candidate carries the directive repo; the baseline uses the
+        preinstalled stock kernel, so pointing it at the candidate repo
+        would be wrong."""
         plan, _ = build_kernel_comparison_plan(
             default_plan(), {**GOOD, "repo_url": REPO_URL}
         )
-        for idx in (2, 4):
-            kernel = plan["steps"][idx]["params"]["kernel"]
-            assert kernel["repo_url"] == REPO_URL
+        baseline_kernel = plan["steps"][2]["params"]["kernel"]
+        candidate_kernel = plan["steps"][4]["params"]["kernel"]
+        assert "repo_url" not in baseline_kernel
+        assert candidate_kernel["repo_url"] == REPO_URL
 
     def test_abba_order(self):
         plan, err = build_kernel_comparison_plan(

@@ -4227,6 +4227,7 @@ async def install_kernel(
         )
     summary = _summarize(results)
     summary["intent_id"] = intent["intent_id"]
+    summary["requested_as"] = ctx.get("requested_as", {})
     return json.dumps(summary)
 
 
@@ -4308,6 +4309,7 @@ async def select_default_kernel(
         )
     summary = _summarize(results)
     summary["intent_id"] = intent["intent_id"]
+    summary["requested_as"] = ctx.get("requested_as", {})
     return json.dumps(summary)
 
 
@@ -4791,6 +4793,7 @@ async def reboot_hosts_and_verify(
                 "stopped_at": stopped_at,
                 "transition_state": transition.get("state"),
                 "kernel": spec.release,
+                "requested_as": ctx.get("requested_as", {}),
                 "hosts": results,
                 "instruction": (
                     "The ticket is paused for the user. Do not call "
@@ -4807,6 +4810,7 @@ async def reboot_hosts_and_verify(
             "kernel": spec.release,
             "strategy": strategy,
             "reboot_policy": reboot_policy,
+            "requested_as": ctx.get("requested_as", {}),
             "hosts": results,
         }
     )
