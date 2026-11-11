@@ -210,13 +210,15 @@ async def test_model_servers_do_not_expose_raw_crucible_mcp_tools():
     assert "get_indexed_metric" not in review_tools
     assert "list_indexed_periods" not in review_tools
 
-    assert "run_crucible_command" in infra_tools
+    assert "list_controller_userenvs" in infra_tools
+    assert "run_crucible_command" not in infra_tools
+    assert "list_userenvs" not in infra_tools
     tool = next(
         tool
         for tool in await infra.mcp.list_tools()
-        if tool.name == "run_crucible_command"
+        if tool.name == "list_controller_userenvs"
     )
-    assert tool.parameters["properties"]["command"]["const"] == "userenvs_list"
+    assert set(tool.parameters["properties"]) == {"controller"}
 
 
 def test_crucible_runtime_documentation_uses_mcp_contract_v3():
@@ -232,6 +234,10 @@ def test_crucible_runtime_documentation_uses_mcp_contract_v3():
     )
 
     assert "cdm_api_requests" not in capabilities
+    assert "run_crucible_command" not in capabilities
+    assert "list_controller_userenvs" in capabilities
     assert "benchmark_list` | `crucible benchmark list" not in command_broker
     assert "tools_list` | `crucible tools list" not in command_broker
+    assert "list_userenvs" in command_broker
+    assert "does not fall back to SSH or the Crucible CLI" in command_broker
     assert "controller MCP contract v3" in workspaces

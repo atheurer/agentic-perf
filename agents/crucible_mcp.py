@@ -353,6 +353,26 @@ class CrucibleMCPAdapter:
             trace_context=self._trace_context(),
         )
 
+    async def list_userenvs(self) -> dict[str, Any]:
+        """Return Crucible userenvs from the controller MCP server."""
+        raw = await self.call_tool("list_userenvs", {})
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CrucibleMCPError(
+                "invalid_userenv_response",
+                "Crucible MCP userenv response is not valid JSON",
+            ) from exc
+        if not isinstance(result, dict) or not all(
+            isinstance(result.get(key), list)
+            for key in ("official", "external", "deprecated")
+        ):
+            raise CrucibleMCPError(
+                "invalid_userenv_response",
+                "Crucible MCP userenv response is invalid",
+            )
+        return result
+
     async def list_resources(self) -> list[dict[str, Any]]:
         """List Crucible MCP resources through the audited client API."""
         if not self._connected:

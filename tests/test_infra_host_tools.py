@@ -247,73 +247,58 @@ class TestGetEthtoolInfo:
 
 
 # ---------------------------------------------------------------------------
-# run_crucible_command
+# list_controller_userenvs
 # ---------------------------------------------------------------------------
 
 
-class TestCrucibleCommandBroker:
+class FakeCrucibleMCPAdapter:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def list_userenvs(self) -> dict:
+        self.calls.append("list_userenvs")
+        return {
+            "official": [{"name": "fedora44", "label": "Fedora 44"}],
+            "external": [],
+            "deprecated": [],
+        }
+
+    @classmethod
+    def from_config(cls, **kwargs: object) -> "FakeCrucibleMCPAdapter":
+        return cls()
+
+
+class TestListControllerUserenvs:
     @pytest.mark.asyncio
-    async def test_dispatches_allowlisted_read_command(self, patch_ssh):
-        patch_ssh._results["crucible userenvs list"] = SSHResult(
-            exit_code=0,
-            stdout="alma8\n",
-        )
+    async def test_uses_crucible_mcp_and_caches_adapter(self, monkeypatch):
+        monkeypatch.setattr(srv, "_ticket_id", "PERF-TEST")
+        monkeypatch.setattr(srv, "_crucible_mcp", {})
+        monkeypatch.setattr(srv, "CrucibleMCPAdapter", FakeCrucibleMCPAdapter)
 
-        result = await srv.run_crucible_command(
-            "controller.example", "userenvs_list", {}
-        )
-        data = json.loads(result)
+        first = await srv.list_controller_userenvs("controller.example")
+        second = await srv.list_controller_userenvs("controller.example")
 
-        assert data["exit_code"] == 0
-        assert data["command"] == "userenvs_list"
+        assert len(srv._crucible_mcp) == 1
+        adapter = srv._crucible_mcp["controller.example"]
+        assert adapter.calls == ["list_userenvs", "list_userenvs"]
+
+        data = json.loads(first)
         assert data["controller"] == "controller.example"
-        assert data["stdout"] == "alma8\n"
-        assert patch_ssh.calls[-1]["command"] == "crucible userenvs list"
+        assert data["source"] == "crucible_mcp"
+        assert data["official"] == [{"name": "fedora44", "label": "Fedora 44"}]
+        assert data["external"] == []
+        assert data["deprecated"] == []
+        assert json.loads(second) == data
 
     @pytest.mark.asyncio
-    async def test_schema_enumerates_operations_and_empty_arguments(self):
-        tools = await srv.mcp.list_tools()
-        tool = next(t for t in tools if t.name == "run_crucible_command")
-        schema = tool.parameters
+    async def test_does_not_use_ssh(self, monkeypatch, patch_ssh):
+        monkeypatch.setattr(srv, "_ticket_id", "PERF-TEST")
+        monkeypatch.setattr(srv, "_crucible_mcp", {})
+        monkeypatch.setattr(srv, "CrucibleMCPAdapter", FakeCrucibleMCPAdapter)
 
-        assert schema["properties"]["command"]["const"] == "userenvs_list"
-        assert (
-            schema["properties"]["arguments"]["anyOf"][0]["additionalProperties"]
-            is False
-        )
-
-    @pytest.mark.asyncio
-    async def test_rejects_unknown_or_mutating_operation_without_ssh(self, patch_ssh):
-        for command in ("shell", "run", "benchmark_install"):
-            result = await srv.run_crucible_command("controller", command, {})
-            data = json.loads(result)
-            assert data["success"] is False
+        await srv.list_controller_userenvs("controller.example")
 
         assert patch_ssh.calls == []
-
-    @pytest.mark.asyncio
-    async def test_rejects_arguments_before_ssh(self, patch_ssh):
-        result = await srv.run_crucible_command(
-            "controller", "userenvs_list", {"extra": "--json"}
-        )
-        data = json.loads(result)
-
-        assert data["success"] is False
-        assert "does not accept arguments" in data["error"]
-        assert patch_ssh.calls == []
-
-    @pytest.mark.asyncio
-    async def test_userenv_compatibility_wrapper_uses_broker(self, patch_ssh):
-        patch_ssh._results["crucible userenvs list"] = SSHResult(
-            exit_code=0, stdout="alma8\n"
-        )
-
-        result = await srv.list_controller_userenvs("controller")
-        data = json.loads(result)
-
-        assert data["stdout"] == "alma8\n"
-        assert data["command"] == "userenvs_list"
-        assert patch_ssh.calls[-1]["command"] == "crucible userenvs list"
 
 
 # ---------------------------------------------------------------------------
