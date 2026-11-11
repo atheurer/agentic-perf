@@ -878,7 +878,11 @@ def _prepare_step_overrides(next_step: dict, cf: dict) -> dict:
     # agent's section so it falls back to structured data
     # (required_hosts) instead of stale ticket-level text.
     scoped = dict(cf.get("scoped_context", {}))
-    if step_params.get("scoped_context"):
+    # The LLM sometimes emits scoped_context as a plain string (e.g.
+    # "provision, benchmark, review") instead of the expected dict; a
+    # non-dict value cannot be merged and would crash _advance_plan,
+    # leaving the plan stuck and skipping kernel-step dispatch.
+    if isinstance(step_params.get("scoped_context"), dict):
         scoped.update(step_params["scoped_context"])
         override_fields["scoped_context"] = scoped
     elif agent_type in ("resource", "provision", "benchmark", "review"):

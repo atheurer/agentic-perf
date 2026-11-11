@@ -1613,7 +1613,7 @@ class TriageAgent(AgentBase):
         # it was written moments earlier by this same triage run
         # and cannot be stale.  Clearing only applies to steps ≥ 1
         # (multi-iteration text from prior runs).
-        if first_params.get("scoped_context"):
+        if isinstance(first_params.get("scoped_context"), dict):
             fields.setdefault("scoped_context", {}).update(
                 first_params["scoped_context"]
             )

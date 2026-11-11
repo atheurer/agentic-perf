@@ -126,7 +126,11 @@ def _kernel_step(
         "reboot_strategy": "serial",
         "hosts": None,
     }
-    if params["repo_url"]:
+    # Only the candidate needs the directive repo (kernel-rt is not in the
+    # distro repos). The baseline uses the preinstalled stock kernel, so
+    # pointing it at the candidate repo would be wrong (and refused by the
+    # approved_repositories check if the entry only covers the RT tree).
+    if params["repo_url"] and role == "candidate":
         kernel["repo_url"] = params["repo_url"]
     return {
         "id": step_id,
