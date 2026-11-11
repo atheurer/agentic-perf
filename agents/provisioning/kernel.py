@@ -728,15 +728,34 @@ async def authorize_action(
         if consumed.status_code >= 300:
             return False, "approval_not_approved", {"consume": consumed.status_code}
 
-    try:
-        intent = await update_intent(
-            ticket_id,
-            intent_id,
-            progress={action: "started"},
-            reserve_reboot=action == "reboot",
+    if action == "reboot":
+        # The consume endpoint already reserved the reboot atomically: it set
+        # progress reboot->started and bumped the record version. A further
+        # update_intent(reserve_reboot=True) would demand progress "pending",
+        # which the consume just consumed — it would always raise and reject
+        # the action AFTER the approval was spent (observed on
+        # PERF-CAC81A1F/PERF-7A00EB92). Re-read the intent instead.
+        async with AuditedAsyncHTTPClient(
+            timeout=10.0, headers=ticket_state_headers()
+        ) as client:
+            ticket = await _get_ticket(client, ticket_id)
+        intent = (
+            ticket.get("custom_fields", {})
+            .get("kernel_change_intents", {})
+            .get("records", {})
+            .get(intent_id, {})
         )
-    except ValueError:
-        return False, "reboot_requires_reconciliation", {}
+        if not intent:
+            return False, "intent_not_found", {"intent_id": intent_id}
+    else:
+        try:
+            intent = await update_intent(
+                ticket_id,
+                intent_id,
+                progress={action: "started"},
+            )
+        except ValueError:
+            return False, "action_requires_reconciliation", {}
     return True, "", {"intent": intent}
 
 
