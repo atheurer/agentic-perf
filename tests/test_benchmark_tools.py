@@ -181,7 +181,13 @@ class BenchmarkMCP:
         self.valid = valid
         self.errors = errors or []
         self.statuses = statuses or [
-            {"state": "completed", "result_status": "available"}
+            {
+                "state": "completed",
+                "result_status": "available",
+                "cdm_run_id": "cdm-run-1",
+                "rickshaw_run_id": "rickshaw-run-1",
+                "run_directory": "/var/lib/crucible/run/one",
+            }
         ]
         self.expire_first_start = expire_first_start
         self.validate_too_large = validate_too_large
@@ -230,12 +236,7 @@ class BenchmarkMCP:
             key = arguments["idempotency_key"]
             job = self.jobs_by_key.get(key)
             if job is None:
-                job = {
-                    "mcp_job_id": "mcp-job-1",
-                    "cdm_run_id": "cdm-run-1",
-                    "rickshaw_run_id": "rickshaw-run-1",
-                    "run_directory": "/var/lib/crucible/run/one",
-                }
+                job = {"mcp_job_id": "mcp-job-1"}
                 self.jobs_by_key[key] = job
             return json.dumps(
                 {"created": job is not self.jobs_by_key.get(key), "job": job}
@@ -450,6 +451,77 @@ async def test_crucible_execution_uses_prepare_start_and_distinct_ids(benchmark_
         "document": run_file,
         "plan_handle": "plan-1",
     }
+
+
+@pytest.mark.asyncio
+async def test_crucible_execution_persists_top_level_status_identifiers(
+    monkeypatch, benchmark_mcp
+):
+    import agents.benchmark.server as server
+
+    class CountingOperationGuard(ReusableOperationGuard):
+        external_id_transitions = 0
+
+        async def transition(self, action: str, record: dict, **kwargs: object):
+            if action == "external-id":
+                CountingOperationGuard.external_id_transitions += 1
+            return await super().transition(action, record, **kwargs)
+
+    ReusableOperationGuard.records = {}
+    CountingOperationGuard.external_id_transitions = 0
+    benchmark_mcp.statuses = [
+        {
+            "state": "running",
+            "result_status": "not_available",
+            "cdm_run_id": "cdm-run-1",
+            "rickshaw_run_id": "rickshaw-run-1",
+            "run_directory": "/var/lib/crucible/run/one",
+        },
+        {
+            "state": "completed",
+            "result_status": "available",
+            "cdm_run_id": "cdm-run-1",
+            "rickshaw_run_id": "rickshaw-run-1",
+            "run_directory": "/var/lib/crucible/run/one",
+        },
+    ]
+
+    async def immediate_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(server.asyncio, "sleep", immediate_sleep)
+    monkeypatch.setattr(server, "_BenchmarkOperation", CountingOperationGuard)
+    handlers = _benchmark_handlers_with_mcp()
+    validation_id = (
+        await handlers["validate_benchmark"](
+            controller="controller.example",
+            run_file={
+                "benchmarks": [{"name": "uperf", "mv-params": {}}],
+                "tags": {},
+            },
+            harness="crucible",
+        )
+    )["validation_id"]
+
+    result = await handlers["execute_benchmark"](
+        controller="controller.example",
+        validation_id=validation_id,
+        harness="crucible",
+    )
+
+    assert result["status"] == "completed"
+    assert result["run_id"] == "cdm-run-1"
+    assert result["cdm_run_id"] == "cdm-run-1"
+    assert result["rickshaw_run_id"] == "rickshaw-run-1"
+    assert result["run_path"] == "/var/lib/crucible/run/one"
+    assert len(ReusableOperationGuard.records) == 1
+    external_ids = next(iter(ReusableOperationGuard.records.values()))["external_ids"]
+    assert external_ids["crucible_mcp_job_id"] == "mcp-job-1"
+    assert external_ids["cdm_run_id"] == "cdm-run-1"
+    assert external_ids["run_id"] == "cdm-run-1"
+    assert external_ids["rickshaw_run_id"] == "rickshaw-run-1"
+    assert external_ids["run_path"] == "/var/lib/crucible/run/one"
+    assert CountingOperationGuard.external_id_transitions == 3
 
 
 @pytest.mark.asyncio

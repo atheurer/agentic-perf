@@ -252,8 +252,11 @@ class TestGetEthtoolInfo:
 
 
 class FakeCrucibleMCPAdapter:
+    created: list["FakeCrucibleMCPAdapter"] = []
+
     def __init__(self) -> None:
         self.calls: list[str] = []
+        FakeCrucibleMCPAdapter.created.append(self)
 
     async def list_userenvs(self) -> dict:
         self.calls.append("list_userenvs")
@@ -268,11 +271,16 @@ class FakeCrucibleMCPAdapter:
         return cls()
 
 
+async def trusted_controller(_ticket_id: str) -> str:
+    return "controller.example"
+
+
 class TestListControllerUserenvs:
     @pytest.mark.asyncio
     async def test_uses_crucible_mcp_and_caches_adapter(self, monkeypatch):
         monkeypatch.setattr(srv, "_ticket_id", "PERF-TEST")
         monkeypatch.setattr(srv, "_crucible_mcp", {})
+        monkeypatch.setattr(srv, "_trusted_ticket_controller", trusted_controller)
         monkeypatch.setattr(srv, "CrucibleMCPAdapter", FakeCrucibleMCPAdapter)
 
         first = await srv.list_controller_userenvs("controller.example")
@@ -294,10 +302,36 @@ class TestListControllerUserenvs:
     async def test_does_not_use_ssh(self, monkeypatch, patch_ssh):
         monkeypatch.setattr(srv, "_ticket_id", "PERF-TEST")
         monkeypatch.setattr(srv, "_crucible_mcp", {})
+        monkeypatch.setattr(srv, "_trusted_ticket_controller", trusted_controller)
         monkeypatch.setattr(srv, "CrucibleMCPAdapter", FakeCrucibleMCPAdapter)
 
         await srv.list_controller_userenvs("controller.example")
 
+        assert patch_ssh.calls == []
+
+    @pytest.mark.asyncio
+    async def test_rejects_controller_mismatch_before_adapter_resolution(
+        self, monkeypatch, patch_ssh
+    ):
+        FakeCrucibleMCPAdapter.created.clear()
+        monkeypatch.setattr(srv, "_ticket_id", "PERF-TEST")
+        monkeypatch.setattr(srv, "_crucible_mcp", {})
+        monkeypatch.setattr(srv, "_trusted_ticket_controller", trusted_controller)
+        monkeypatch.setattr(srv, "CrucibleMCPAdapter", FakeCrucibleMCPAdapter)
+
+        result = await srv.list_controller_userenvs("untrusted.example")
+
+        assert result.is_error is True
+        assert result.structured_content == {
+            "status": "rejected",
+            "error": "controller_context_mismatch",
+            "message": (
+                "The requested controller does not match the controller assigned "
+                "to this ticket."
+            ),
+        }
+        assert FakeCrucibleMCPAdapter.created == []
+        assert srv._crucible_mcp == {}
         assert patch_ssh.calls == []
 
 
