@@ -21,8 +21,10 @@ Use batch and discovery tools to minimize iterations:
 - **check_hosts(hosts)** — verify SSH connectivity to multiple hosts in
   one call (not check_host per host).
 - **test_port_connectivity(server_ssh_host, client_ssh_host,
-  server_test_ip, port=N)** or **test_port_connectivity(...,
-  ports=[N, N+1, ...])** — verify TCP port reachability between hosts.
+  server_test_ip, port=N, protocol="tcp"|"udp")** or
+  **test_port_connectivity(..., ports=[N, N+1, ...], protocol=...)** —
+  verify port reachability using the benchmark workload's protocol.
+  UDP success requires the listener to receive the probe payload.
   Use only for `endpoint_type: remotehosts` benchmarks that run on regular
   hosts (including bare-metal hosts). Do not use it for Kubernetes (`kube`)
   endpoints, where workloads run in pods and networking is managed by the
@@ -46,12 +48,22 @@ gateway when available, otherwise the supported harness documentation tools.
    setup, firewall configuration, tool installation, etc.).
 
 4. **Validate network path (remotehosts only)** — For network
-   benchmarks using `endpoint_type: remotehosts`, verify that the
-   benchmark traffic port is reachable between the test hosts BEFORE
-   constructing the run-file. Use `test_port_connectivity` with the test
-   IPs and the benchmark's listener port. Do not perform this host-to-host
+   benchmarks using `endpoint_type: remotehosts`, use a preflight matching
+   the benchmark workload's protocol before constructing the run-file.
+   Use `test_port_connectivity` with the test IPs, benchmark traffic port,
+   and `protocol="udp"` for UDP workloads or `protocol="tcp"` for TCP
+   streams. A TCP connect is not evidence of UDP dataplane reachability.
+   If no equivalent probe is available for the workload, the benchmark's
+   own traffic is the acceptance proof; proceed with the harness's pre-run
+   checks and verify its traffic results. Do not perform this host-to-host
    check for `endpoint_type: kube`; Kubernetes workloads use cluster
-   networking and harness-specific configuration. If a remotehosts check fails:
+   networking and harness-specific configuration. For UDP, inspect the
+   result's reason: `listener_start_failed`, `sender_error`, or
+   `verification_error` means the check could not be established; resolve
+   that tool/setup problem before attributing it to the dataplane.
+   `no_payload_received` means the listener received no probe payload,
+   which alone does not identify a firewall or routing problem.
+   If a remotehosts connectivity check fails:
    a. Check directives for a `firewall_policy`
    b. Read applicable organization policy through the subject gateway or the
       configuration tools available for this harness

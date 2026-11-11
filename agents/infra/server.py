@@ -11,10 +11,12 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -1115,6 +1117,157 @@ async def check_hosts(hosts: list[str]) -> str:
     )
 
 
+async def _cleanup_connectivity_listener(
+    ssh: SSHExecutor, host: str, pid: int | None, directory: str = ""
+) -> None:
+    """Await listener cleanup even if the caller is repeatedly cancelled."""
+    command = f"kill {pid} 2>/dev/null" if pid is not None else "true"
+    if directory:
+        command += f"; rm -rf -- {shlex.quote(directory)}"
+    cleanup_task = asyncio.create_task(ssh.run(host, command, timeout=5))
+    was_cancelled = False
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            was_cancelled = True
+        except Exception:
+            # Retrieve and log the failure below without discarding the
+            # connectivity verdict or an outstanding cancellation.
+            break
+    try:
+        cleanup_task.result()
+    except asyncio.CancelledError:
+        was_cancelled = True
+    except Exception as exc:
+        logger.warning(
+            "Failed to clean up nc listener pid %s on %s: %s", pid, host, exc
+        )
+    if was_cancelled:
+        raise asyncio.CancelledError
+
+
+async def _test_udp_connectivity_direction(
+    ssh: SSHExecutor,
+    listener_ssh: str,
+    connector_ssh: str,
+    listen_ip: str,
+    port: int,
+    timeout: int,
+    label: str,
+) -> dict[str, Any]:
+    """Verify reception of a unique datagram, independently of sender status."""
+    result: dict[str, Any] = {
+        "direction": label,
+        "port": port,
+        "protocol": "udp",
+        "reachable": False,
+        "reason": "listener_start_failed",
+        "error": "Failed to start ncat UDP listener",
+    }
+    nonce = secrets.token_hex(16)
+    ip = shlex.quote(listen_ip)
+    # stdout contains only received bytes; diagnostics must never count as
+    # evidence of delivery. The deadline also bounds a listener whose SSH
+    # launch reply is lost before we can learn its PID and directory.
+    start_cmd = (
+        "umask 077; "
+        "probe_dir=$(mktemp -d /tmp/agentic-perf-udp.XXXXXXXXXX) || exit 1; "
+        'printf "__UDP_DIR:%s\\n" "$probe_dir"; '
+        f"LC_ALL=C nohup timeout {2 * timeout + 30}s ncat -u -l -v {ip} {port} "
+        '< /dev/null > "$probe_dir/payload" 2> "$probe_dir/error" & '
+        f"echo {_PID_SENTINEL}$!"
+    )
+    pid: int | None = None
+    directory = ""
+    launch = asyncio.create_task(ssh.run(listener_ssh, start_cmd, timeout=10))
+    was_cancelled = False
+    try:
+        # Learn the launch identifiers before propagating cancellation so
+        # cleanup can terminate a listener started by the remote shell.
+        while not launch.done():
+            try:
+                await asyncio.shield(launch)
+            except asyncio.CancelledError:
+                was_cancelled = True
+        start = launch.result()
+        pid = parse_pid_sentinel(start.stdout or "")
+        match = re.search(
+            r"^__UDP_DIR:(/tmp/agentic-perf-udp\.[A-Za-z0-9]{10})$",
+            start.stdout or "",
+            re.MULTILINE,
+        )
+        if match:
+            directory = match[1]
+        if was_cancelled:
+            raise asyncio.CancelledError
+        if start.exit_code != 0 or pid is None or not directory:
+            result["error"] = start.stderr.strip() or result["error"]
+            return result
+
+        payload_path = shlex.quote(f"{directory}/payload")
+        error_path = shlex.quote(f"{directory}/error")
+        # ncat's verbose diagnostic follows a successful bind. A PID alone
+        # would also accept an immediately failing listener (e.g. port busy).
+        ready_cmd = (
+            'i=0; while [ "$i" -lt 20 ]; do '
+            f"kill -0 {pid} 2>/dev/null || break; "
+            f"grep -Fq 'Listening on ' {error_path} && exit 0; "
+            "sleep 0.05; i=$((i + 1)); done; "
+            f"cat {error_path} >&2; exit 1"
+        )
+        ready = await ssh.run(listener_ssh, ready_cmd, timeout=5)
+        if ready.exit_code != 0:
+            result["error"] = ready.stderr.strip() or result["error"]
+            return result
+
+        sender_error = ""
+        try:
+            # -w alone only bounds connection setup. --send-only closes on
+            # EOF rather than waiting forever for a response to our datagram.
+            sent = await ssh.run(
+                connector_ssh,
+                f"printf %s {nonce} | ncat -u --send-only -w {timeout} {ip} {port}",
+                timeout=timeout + 5,
+            )
+            if sent.exit_code != 0:
+                sender_error = sent.stderr.strip() or "UDP sender failed"
+        except Exception as exc:
+            sender_error = str(exc) or type(exc).__name__
+
+        # Allow delivery after the sender exits; UDP send success itself is
+        # not evidence that the listener received anything.
+        receive_cmd = (
+            f'i=0; while [ "$i" -lt {timeout * 10} ]; do '
+            f"grep -Fxq -- {nonce} {payload_path}; rc=$?; "
+            '[ "$rc" -eq 0 ] && exit 0; '
+            '[ "$rc" -gt 1 ] && exit "$rc"; '
+            "sleep 0.1; i=$((i + 1)); done; exit 1"
+        )
+        result["reason"] = "verification_error"
+        received = await ssh.run(listener_ssh, receive_cmd, timeout=timeout + 5)
+        if received.exit_code == 0:
+            result.update(reachable=True, reason="", error="")
+        elif received.exit_code != 1:
+            result["error"] = received.stderr.strip() or "Could not verify UDP receipt"
+        elif sender_error:
+            result.update(reason="sender_error", error=sender_error)
+        else:
+            result.update(
+                reason="no_payload_received",
+                error="Listener did not receive the UDP probe payload",
+            )
+        return result
+    except Exception as exc:
+        result["error"] = str(exc) or type(exc).__name__
+        return result
+    finally:
+        if pid is not None or directory:
+            await _cleanup_connectivity_listener(ssh, listener_ssh, pid, directory)
+        if was_cancelled:
+            raise asyncio.CancelledError
+
+
 @mcp.tool()
 @_requires_ssh_context
 async def test_port_connectivity(
@@ -1125,11 +1278,14 @@ async def test_port_connectivity(
     client_test_ip: str = "",
     timeout: int = 10,
     ports: list[int] | None = None,
+    protocol: str = "tcp",
 ) -> str:
-    """Test TCP port connectivity between two hosts.
+    """Test TCP or UDP port connectivity between two hosts.
 
     This is harness-agnostic — it works for any benchmark that needs to
-    verify that a client can reach a server on specific TCP port(s).
+    verify that a client can reach a server on specific port(s). TCP is the
+    default. UDP requires ncat and confirms that a unique probe payload was
+    received by the listener, rather than trusting a connectionless send.
 
     Accepts either a single ``port`` or a list of ``ports`` (exactly one
     must be provided).  When ``ports`` is given, all ports are tested
@@ -1144,13 +1300,16 @@ async def test_port_connectivity(
         server_ssh_host: IP to SSH into the server machine
         client_ssh_host: IP to SSH into the client machine
         server_test_ip: IP the server listens on (the IP being tested)
-        port: Single TCP port to test (mutually exclusive with ports). This
+        port: Single port to test (mutually exclusive with ports). This
             remains in its original positional position for compatibility.
         client_test_ip: Optional — if provided, also tests reverse
             connectivity (server connecting to client on the same port(s))
         timeout: Seconds to wait for each connection test
-        ports: List of TCP ports to test concurrently (mutually exclusive
+        ports: List of ports to test concurrently (mutually exclusive
             with port)
+        protocol: "tcp" (default) or "udp", matching the workload traffic.
+            UDP failures include a reason: listener_start_failed,
+            no_payload_received, sender_error, or verification_error.
     """
     _MAX_PORTS = 64
 
@@ -1172,6 +1331,21 @@ async def test_port_connectivity(
         port_list = list(dict.fromkeys(ports))
     else:
         port_list = [port]  # type: ignore[list-item]
+    if protocol not in ("tcp", "udp"):
+        return json.dumps({"error": "'protocol' must be 'tcp' or 'udp'."})
+    if protocol == "udp" and (
+        timeout <= 0 or any(p < 1 or p > 65535 for p in port_list)
+    ):
+        return json.dumps(
+            {"error": "UDP requires ports in 1..65535 and a positive timeout."}
+        )
+    if protocol == "udp":
+        try:
+            ipaddress.ip_address(server_test_ip)
+            if client_test_ip:
+                ipaddress.ip_address(client_test_ip)
+        except ValueError:
+            return json.dumps({"error": "UDP test addresses must be IP literals."})
     ssh = _get_ssh()
 
     async def _test_direction(
@@ -1181,6 +1355,10 @@ async def test_port_connectivity(
         test_port: int,
         label: str,
     ) -> dict[str, Any]:
+        if protocol == "udp":
+            return await _test_udp_connectivity_direction(
+                ssh, listener_ssh, connector_ssh, listen_ip, test_port, timeout, label
+            )
         bg_cmd = (
             f"nohup nc -l {listen_ip} {test_port} > /dev/null 2>&1 &"
             f" echo {_PID_SENTINEL}$!"
@@ -1205,32 +1383,7 @@ async def test_port_connectivity(
                 "error": (test.stderr.strip() if test.exit_code != 0 else ""),
             }
         finally:
-            # Cleanup must complete even when the connectivity probe is
-            # cancelled. Shielding a task alone is insufficient: the outer
-            # task can still receive CancelledError while awaiting it. Keep
-            # waiting for the kill command, then propagate cancellation.
-            cleanup_task = asyncio.create_task(
-                ssh.run(listener_ssh, f"kill {pid} 2>/dev/null", timeout=5)
-            )
-            was_cancelled = False
-            while not cleanup_task.done():
-                try:
-                    await asyncio.shield(cleanup_task)
-                except asyncio.CancelledError:
-                    was_cancelled = True
-            try:
-                cleanup_task.result()
-            except asyncio.CancelledError:
-                was_cancelled = True
-            except Exception as exc:
-                logger.warning(
-                    "Failed to clean up nc listener pid %s on %s: %s",
-                    pid,
-                    listener_ssh,
-                    exc,
-                )
-            if was_cancelled:
-                raise asyncio.CancelledError
+            await _cleanup_connectivity_listener(ssh, listener_ssh, pid)
 
     async def _test_port(test_port: int) -> list[dict[str, Any]]:
         port_results: list[dict[str, Any]] = []

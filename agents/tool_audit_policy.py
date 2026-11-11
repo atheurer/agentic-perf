@@ -152,10 +152,10 @@ TOOL_AUDIT_POLICY = (
         "agents/infra/server.py:list_interfaces",
         "agents/infra/server.py:get_interface_inventory",
         "agents/infra/server.py:check_hosts",
-        "agents/infra/server.py:test_port_connectivity",
     ),
     *_side_effecting(
         "providers.ssh.SSHExecutor",
+        "agents/infra/server.py:test_port_connectivity",
         "agents/infra/server.py:write_remote_file",
         "agents/infra/server.py:deploy_secret",
         "agents/infra/server.py:transfer_file",

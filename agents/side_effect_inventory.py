@@ -120,9 +120,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/image_builder/agent.py", "_update_fields", "image"),
     ("agents/image_builder/agent.py", "run", "image"),
     ("agents/infra/server.py", "_check_one", "ssh"),
+    ("agents/infra/server.py", "_cleanup_connectivity_listener", "ssh"),
     ("agents/infra/server.py", "set_ssh_context", "mcp"),
     ("agents/infra/server.py", "_ssh_context_required_result", "mcp"),
     ("agents/infra/server.py", "_test_direction", "ssh"),
+    ("agents/infra/server.py", "_test_udp_connectivity_direction", "ssh"),
     ("agents/infra/server.py", "check_host", "ssh"),
     ("agents/infra/server.py", "cleanup_passwordless_ssh", "ssh"),
     ("agents/infra/server.py", "deploy_secret", "ssh"),
@@ -1486,6 +1488,12 @@ INVENTORY_DISPOSITIONS = {
         "agents/infra/server.py:_check_one",
         "2027-12-31",
     ),
+    ("agents/infra/server.py", "_cleanup_connectivity_listener", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/infra/server.py:_cleanup_connectivity_listener",
+        "2027-12-31",
+    ),
     ("agents/infra/server.py", "set_ssh_context", "mcp"): (
         "audited",
         "observability-maintainers",
@@ -1496,6 +1504,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/infra/server.py:_test_direction",
+        "2027-12-31",
+    ),
+    ("agents/infra/server.py", "_test_udp_connectivity_direction", "ssh"): (
+        "audited",
+        "observability-maintainers",
+        "agents/infra/server.py:_test_udp_connectivity_direction",
         "2027-12-31",
     ),
     ("agents/infra/server.py", "_ssh_context_required_result", "mcp"): (
