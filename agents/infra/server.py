@@ -34,10 +34,16 @@ from agents.ethtool import flow_rule_is_verifiable, parse_ethtool_flow_rules
 from agents.infra.topology import discover_cache_topology
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
+    assert_ticket_active as _assert_ticket_active,
+)
+from agents.server_utils import (
     build_secrets_provider as _build_secrets,
 )
 from agents.server_utils import (
     build_ssh_from_ticket,
+)
+from agents.server_utils import (
+    ticket_controller_host as _ticket_controller_host,
 )
 from providers.execution import (
     AuditedFilesystem,
@@ -61,6 +67,10 @@ _ssh_context_lock = asyncio.Lock()
 _crucible_mcp: dict[str, CrucibleMCPAdapter] = {}
 
 
+class _ControllerContextMismatchError(ValueError):
+    """Raised when a tool controller does not match trusted ticket state."""
+
+
 def _store_headers() -> dict[str, str]:
     token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
     if token:
@@ -74,12 +84,42 @@ def _get_ssh() -> SSHExecutor:
     return _ssh
 
 
-def _crucible_mcp_adapter(controller: str) -> CrucibleMCPAdapter:
+async def _trusted_ticket_controller(ticket_id: str) -> str:
+    """Resolve the controller from ticket state, never from caller input."""
+    ticket = await _assert_ticket_active(ticket_id)
+    if ticket.get("status") == "rejected":
+        raise RuntimeError("The owning ticket is no longer active")
+    controller = _ticket_controller_host(ticket)
+    if not controller:
+        raise RuntimeError("The ticket has no assigned Crucible controller")
+    return controller
+
+
+def _controller_mismatch_result() -> ToolResult:
+    payload = {
+        "status": "rejected",
+        "error": "controller_context_mismatch",
+        "message": (
+            "The requested controller does not match the controller assigned "
+            "to this ticket."
+        ),
+    }
+    return ToolResult(
+        content=json.dumps(payload, sort_keys=True),
+        structured_content=payload,
+        is_error=True,
+    )
+
+
+async def _crucible_mcp_adapter(controller: str) -> CrucibleMCPAdapter:
     """Return the ticket-bound MCP adapter for one Crucible controller."""
-    controller = controller.strip()
     ticket_id = _ticket_id or os.environ.get("TICKET_ID", "")
     if not ticket_id:
         raise RuntimeError("Ticket context is required for Crucible MCP access")
+    trusted_controller = await _trusted_ticket_controller(ticket_id)
+    controller = controller.strip()
+    if controller != trusted_controller:
+        raise _ControllerContextMismatchError
     adapter = _crucible_mcp.get(controller)
     if adapter is None:
         adapter = CrucibleMCPAdapter.from_config(
@@ -331,9 +371,13 @@ async def read_remote_file(host: str, remote_path: str, max_bytes: int = 10000) 
 
 
 @mcp.tool()
-async def list_controller_userenvs(controller: str) -> str:
+async def list_controller_userenvs(controller: str) -> str | ToolResult:
     """List userenvs from a controller's Crucible MCP server."""
-    result = await _crucible_mcp_adapter(controller).list_userenvs()
+    try:
+        adapter = await _crucible_mcp_adapter(controller)
+    except _ControllerContextMismatchError:
+        return _controller_mismatch_result()
+    result = await adapter.list_userenvs()
     return json.dumps(
         {
             "controller": controller,

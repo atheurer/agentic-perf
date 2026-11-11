@@ -1802,7 +1802,7 @@ class FakeCrucibleMCP:
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.resources = [
             {
-                "uri": "crucible://AGENTS.md",
+                "uri": "crucible://docs/agentic-perf-workflow",
                 "mimeType": "text/markdown",
                 "size": 35,
             },
@@ -1825,7 +1825,9 @@ class FakeCrucibleMCP:
     async def read_resource(self, uri: str) -> str:
         self.calls.append(("resources/read", {"uri": uri}))
         content = {
-            "crucible://AGENTS.md": "Read repos/example/README.md next.",
+            "crucible://docs/agentic-perf-workflow": (
+                "Read repos/example/README.md next."
+            ),
             "crucible://repos/example/README.md": "perftest guidance",
         }.get(uri)
         if content is None:
@@ -1869,8 +1871,9 @@ class FakeCrucibleMCP:
             raise AssertionError(f"invalid search arguments {arguments}")
         return json.dumps(
             {
-                "results": [
+                "resources": [
                     {
+                        "uri": "context://crucible/repos/example/README.md",
                         "path": "repos/example/README.md",
                         "snippet": "device guidance",
                     }
@@ -1904,7 +1907,9 @@ async def test_controller_context_gateway_uses_scoped_mcp_resources(
     bootstrap = json.loads(
         await controller_context_gateway(**common, operation="bootstrap")
     )
-    assert bootstrap["document"]["ref"] == "AGENTS.md"
+    assert bootstrap["document"]["ref"] == "docs/agentic-perf-workflow"
+    assert bootstrap["document"]["uri"] == ("crucible://docs/agentic-perf-workflow")
+    assert bootstrap["document"]["entrypoint"] is True
     assert bootstrap["document"]["content"] == "Read repos/example/README.md next."
 
     read = json.loads(
@@ -1938,6 +1943,7 @@ async def test_controller_context_gateway_uses_scoped_mcp_resources(
     )
     assert search["found"] is True
     assert search["results"][0]["ref"] == "repos/example/README.md"
+    assert search["results"][0]["uri"] == ("context://crucible/repos/example/README.md")
     assert search["complete"] is True
     assert search["truncated"] is False
     assert ("search_documentation", {"query": "device", "limit": 20}) in adapter.calls

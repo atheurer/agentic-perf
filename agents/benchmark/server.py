@@ -4596,22 +4596,11 @@ async def execute_benchmark(
                 reconcile=False,
             )
 
-        external_job = job if isinstance(job, dict) else {}
-        cdm_run_id = external_job.get("cdm_run_id")
-        rickshaw_run_id = external_job.get("rickshaw_run_id")
-        run_path = external_job.get("run_directory")
         external_ids = {
             **((operation_record or {}).get("external_ids") or {}),
             "crucible_mcp_job_id": mcp_job_id,
             "crucible_idempotency_key": idempotency_key,
         }
-        if isinstance(cdm_run_id, str) and cdm_run_id:
-            external_ids["cdm_run_id"] = cdm_run_id
-            external_ids["run_id"] = cdm_run_id
-        if isinstance(rickshaw_run_id, str) and rickshaw_run_id:
-            external_ids["rickshaw_run_id"] = rickshaw_run_id
-        if isinstance(run_path, str) and run_path:
-            external_ids["run_path"] = run_path
 
         if operation_guard and operation_owned:
             assert operation_record is not None
@@ -4651,13 +4640,6 @@ async def execute_benchmark(
             "crucible_idempotency_key": idempotency_key,
             "harness": "crucible",
         }
-        if isinstance(cdm_run_id, str) and cdm_run_id:
-            response["run_id"] = cdm_run_id
-        if isinstance(rickshaw_run_id, str) and rickshaw_run_id:
-            response["rickshaw_run_id"] = rickshaw_run_id
-        if isinstance(run_path, str) and run_path:
-            response["run_path"] = run_path
-
         log_offset = 0
         poll_count = 0
         readiness_deadline: float | None = None
@@ -4679,6 +4661,82 @@ async def execute_benchmark(
                 log_offset = next_offset
             return text if isinstance(text, str) else ""
 
+        async def persist_status_identifiers(current_status: dict[str, Any]) -> bool:
+            nonlocal operation_record
+            values = {
+                key: current_status.get(key)
+                for key in ("cdm_run_id", "rickshaw_run_id", "run_directory")
+            }
+            if not any(isinstance(value, str) and value for value in values.values()):
+                return True
+
+            cdm_run_id = values["cdm_run_id"]
+            rickshaw_run_id = values["rickshaw_run_id"]
+            run_path = values["run_directory"]
+            if isinstance(cdm_run_id, str) and cdm_run_id:
+                response["run_id"] = cdm_run_id
+                response["cdm_run_id"] = cdm_run_id
+            if isinstance(rickshaw_run_id, str) and rickshaw_run_id:
+                response["rickshaw_run_id"] = rickshaw_run_id
+            if isinstance(run_path, str) and run_path:
+                response["run_path"] = run_path
+
+            if not (operation_guard and operation_owned):
+                return True
+            assert operation_record is not None
+            status_external_ids = {
+                **(operation_record.get("external_ids") or {}),
+                "crucible_mcp_job_id": mcp_job_id,
+                "crucible_idempotency_key": idempotency_key,
+            }
+            if isinstance(cdm_run_id, str) and cdm_run_id:
+                status_external_ids["cdm_run_id"] = cdm_run_id
+                status_external_ids["run_id"] = cdm_run_id
+            if isinstance(rickshaw_run_id, str) and rickshaw_run_id:
+                status_external_ids["rickshaw_run_id"] = rickshaw_run_id
+            if isinstance(run_path, str) and run_path:
+                status_external_ids["run_path"] = run_path
+
+            existing_external_ids = operation_record.get("external_ids") or {}
+            if all(
+                existing_external_ids.get(key) == value
+                for key, value in status_external_ids.items()
+            ):
+                return True
+
+            try:
+                operation_record = await operation_guard.transition(
+                    "external-id",
+                    operation_record,
+                    external_ids=status_external_ids,
+                )
+            except Exception:
+                await operation_guard.terminalize(
+                    operation_record,
+                    "indeterminate",
+                    {
+                        "outcome": "indeterminate",
+                        "external_id_persistence_failed": True,
+                        "known_external_ids": status_external_ids,
+                    },
+                )
+                await operation_guard.close()
+                await pause_for_reconciliation(
+                    "Crucible run identifiers could not be persisted"
+                )
+                response.update(
+                    {
+                        "status": "indeterminate",
+                        "reason_code": "external_id_persistence_failed",
+                        "message": (
+                            "The run identifiers returned by get_run_status "
+                            "could not be persisted."
+                        ),
+                    }
+                )
+                return False
+            return True
+
         while True:
             raw_status = await _crucible_mcp.call_tool(
                 "get_run_status", {"mcp_job_id": mcp_job_id}
@@ -4686,6 +4744,8 @@ async def execute_benchmark(
             status = decode_mcp_result(raw_status)
             state = str(status.get("state", ""))
             result_status = str(status.get("result_status", ""))
+            if not await persist_status_identifiers(status):
+                return json.dumps(response)
 
             if state in {
                 "queued",
@@ -4809,24 +4869,6 @@ async def execute_benchmark(
                     },
                     "fail",
                 )
-            final_status = status.get("status")
-            if isinstance(final_status, dict):
-                response.update(
-                    {
-                        key: final_status.get(key)
-                        for key in (
-                            "cdm_run_id",
-                            "rickshaw_run_id",
-                            "run_directory",
-                            "exit_code",
-                        )
-                        if final_status.get(key) is not None
-                    }
-                )
-                if final_status.get("run_directory") is not None:
-                    response["run_path"] = final_status["run_directory"]
-                if isinstance(final_status.get("cdm_run_id"), str):
-                    response["run_id"] = final_status["cdm_run_id"]
             response.update(
                 {
                     "status": "completed",

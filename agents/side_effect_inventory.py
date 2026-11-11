@@ -120,6 +120,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/infra/server.py", "set_ssh_context", "mcp"),
     ("agents/crucible_mcp.py", "list_userenvs", "mcp"),
     ("agents/infra/server.py", "_ssh_context_required_result", "mcp"),
+    ("agents/infra/server.py", "_controller_mismatch_result", "mcp"),
     ("agents/infra/server.py", "_test_direction", "ssh"),
     ("agents/infra/server.py", "check_host", "ssh"),
     ("agents/infra/server.py", "cleanup_passwordless_ssh", "ssh"),
@@ -1480,6 +1481,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/infra/server.py:_ssh_context_required_result",
+        "2027-12-31",
+    ),
+    ("agents/infra/server.py", "_controller_mismatch_result", "mcp"): (
+        "audited",
+        "observability-maintainers",
+        "agents/infra/server.py:_controller_mismatch_result",
         "2027-12-31",
     ),
     ("agents/infra/server.py", "check_host", "ssh"): (

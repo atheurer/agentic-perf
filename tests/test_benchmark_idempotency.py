@@ -463,6 +463,9 @@ async def test_execute_terminal_failure_survives_restart_and_external_identity_i
                 "result_status": "available",
                 "error_category": "benchmark_failed",
                 "exit_code": 1,
+                "cdm_run_id": "cdm-run-1",
+                "rickshaw_run_id": "rickshaw-run-1",
+                "run_directory": "/var/lib/crucible/run/one",
             }
         ],
     )

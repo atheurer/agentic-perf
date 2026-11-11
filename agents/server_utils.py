@@ -852,7 +852,7 @@ async def _search_controller_source_mcp(
             "next_action": "Retry after controller connectivity is restored.",
         }
     raw_results = (
-        payload.get("results", payload.get("documents", []))
+        payload.get("resources", payload.get("results", payload.get("documents", [])))
         if isinstance(payload, dict)
         else payload
         if isinstance(payload, list)
@@ -864,6 +864,7 @@ async def _search_controller_source_mcp(
     for item in raw_results:
         if not isinstance(item, dict):
             continue
+        uri = item.get("uri") or item.get("url")
         ref = item.get("ref") or item.get("path") or _mcp_resource_ref(item)
         if not isinstance(ref, str) or not ref:
             continue
@@ -875,7 +876,7 @@ async def _search_controller_source_mcp(
         results.append(
             {
                 "ref": ref,
-                "uri": f"crucible://{ref}",
+                "uri": uri if isinstance(uri, str) and uri else f"crucible://{ref}",
                 "path": ref,
                 "type": "file",
                 "content": content if isinstance(content, str) else "",
@@ -1171,7 +1172,7 @@ async def controller_context_gateway(
         return finish(payload)
 
     if operation == "bootstrap":
-        path = "AGENTS.md"
+        path = "docs/agentic-perf-workflow"
     if operation == "read" and not from_ref:
         cached = manager.read_document(
             path,
@@ -1472,7 +1473,7 @@ async def controller_context_gateway(
             "source": "controller",
             "authority": "effective",
             "provenance": provenance,
-            "entrypoint": relative == "AGENTS.md",
+            "entrypoint": relative == "docs/agentic-perf-workflow",
             "type": "file",
             "content": content,
             "size_bytes": len(content.encode("utf-8")),
