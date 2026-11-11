@@ -21,15 +21,15 @@ import tempfile
 from contextlib import AsyncExitStack
 from functools import wraps
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any
 
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from fastmcp.tools.base import ToolResult
-from pydantic import BaseModel, ConfigDict
 
+from agents.crucible_mcp import CrucibleMCPAdapter
 from agents.ethtool import flow_rule_is_verifiable, parse_ethtool_flow_rules
 from agents.infra.topology import discover_cache_topology
 from agents.mcp_audit import create_ticket_mcp
@@ -58,6 +58,7 @@ _secrets_provider = None
 _ticket_id: str | None = None
 _ssh_has_key = False
 _ssh_context_lock = asyncio.Lock()
+_crucible_mcp: dict[str, CrucibleMCPAdapter] = {}
 
 
 def _store_headers() -> dict[str, str]:
@@ -71,6 +72,23 @@ def _get_ssh() -> SSHExecutor:
     if _ssh is None:
         raise RuntimeError("SSH context not set. Call set_ssh_context() first.")
     return _ssh
+
+
+def _crucible_mcp_adapter(controller: str) -> CrucibleMCPAdapter:
+    """Return the ticket-bound MCP adapter for one Crucible controller."""
+    controller = controller.strip()
+    ticket_id = _ticket_id or os.environ.get("TICKET_ID", "")
+    if not ticket_id:
+        raise RuntimeError("Ticket context is required for Crucible MCP access")
+    adapter = _crucible_mcp.get(controller)
+    if adapter is None:
+        adapter = CrucibleMCPAdapter.from_config(
+            controller=controller,
+            ticket_id=ticket_id,
+            agent_id="infra-agent",
+        )
+        _crucible_mcp[controller] = adapter
+    return adapter
 
 
 class _SSHContextRequiredError(RuntimeError):
@@ -177,39 +195,6 @@ def _format_result(result: SSHResult) -> str:
     if result.stderr:
         out["stderr"] = result.stderr
     return json.dumps(out, indent=2)
-
-
-# Keep this mapping deliberately explicit.  The values are complete commands,
-# rather than user-supplied command fragments; adding an operation requires
-# reviewing its read-only contract and adding a test.
-_CRUCIBLE_READ_COMMANDS = {
-    "userenvs_list": "crucible userenvs list",
-}
-CrucibleCommand = Literal["userenvs_list"]
-
-
-class CrucibleCommandArguments(BaseModel):
-    """Placeholder for operation-specific arguments; currently none exist."""
-
-    model_config = ConfigDict(extra="forbid")
-
-
-def _crucible_command(
-    command: str, arguments: dict[str, Any] | None
-) -> tuple[str | None, str | None]:
-    """Resolve a broker operation to a fixed command, failing closed."""
-    if command not in _CRUCIBLE_READ_COMMANDS:
-        allowed = ", ".join(sorted(_CRUCIBLE_READ_COMMANDS))
-        return None, f"Unknown Crucible command {command!r}; allowed: {allowed}"
-    if arguments is not None:
-        supplied = (
-            arguments.model_dump()
-            if isinstance(arguments, CrucibleCommandArguments)
-            else arguments
-        )
-        if supplied:
-            return None, f"Command {command!r} does not accept arguments"
-    return _CRUCIBLE_READ_COMMANDS[command], None
 
 
 @mcp.tool()
@@ -346,40 +331,17 @@ async def read_remote_file(host: str, remote_path: str, max_bytes: int = 10000) 
 
 
 @mcp.tool()
-@_requires_ssh_context
 async def list_controller_userenvs(controller: str) -> str:
-    """List userenvs available from a running Crucible controller.
-
-    The controller's output is authoritative for selecting a Crucible
-    userenv. This intentionally runs only the fixed discovery command rather
-    than exposing arbitrary remote command execution.
-    """
-    return await run_crucible_command(controller, "userenvs_list", {})
-
-
-@mcp.tool()
-@_requires_ssh_context
-async def run_crucible_command(
-    controller: str,
-    command: CrucibleCommand,
-    arguments: CrucibleCommandArguments | None = None,
-) -> str:
-    """Run one allowlisted, read-only Crucible discovery operation.
-
-    This is a command broker, not a shell: ``command`` selects a fixed
-    implementation and ``arguments`` must currently be empty.  Benchmark
-    execution and all mutating operations remain separate tools requiring
-    their existing validation/approval paths.
-    """
-    resolved, error = _crucible_command(command, arguments)
-    if error:
-        return json.dumps({"success": False, "error": error})
-
-    ssh = _get_ssh()
-    result = await ssh.run(controller, resolved, timeout=30)
-    response = json.loads(_format_result(result))
-    response.update({"controller": controller, "command": command})
-    return json.dumps(response, indent=2)
+    """List userenvs from a controller's Crucible MCP server."""
+    result = await _crucible_mcp_adapter(controller).list_userenvs()
+    return json.dumps(
+        {
+            "controller": controller,
+            "source": "crucible_mcp",
+            **result,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()

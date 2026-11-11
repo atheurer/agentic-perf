@@ -118,6 +118,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/image_builder/agent.py", "run", "image"),
     ("agents/infra/server.py", "_check_one", "ssh"),
     ("agents/infra/server.py", "set_ssh_context", "mcp"),
+    ("agents/crucible_mcp.py", "list_userenvs", "mcp"),
     ("agents/infra/server.py", "_ssh_context_required_result", "mcp"),
     ("agents/infra/server.py", "_test_direction", "ssh"),
     ("agents/infra/server.py", "check_host", "ssh"),
@@ -131,7 +132,6 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/infra/server.py", "read_remote_dir", "filesystem"),
     ("agents/infra/server.py", "read_remote_dir", "ssh"),
     ("agents/infra/server.py", "read_remote_file", "ssh"),
-    ("agents/infra/server.py", "run_crucible_command", "ssh"),
     ("agents/infra/server.py", "transfer_file", "ssh"),
     ("agents/infra/server.py", "verify_ssh_path", "ssh"),
     ("agents/infra/server.py", "write_remote_file", "filesystem"),
@@ -1464,6 +1464,12 @@ INVENTORY_DISPOSITIONS = {
         "agents/infra/server.py:set_ssh_context",
         "2027-12-31",
     ),
+    ("agents/crucible_mcp.py", "list_userenvs", "mcp"): (
+        "audited",
+        "observability-maintainers",
+        "agents/crucible_mcp.py:list_userenvs",
+        "2027-12-31",
+    ),
     ("agents/infra/server.py", "_test_direction", "ssh"): (
         "audited",
         "observability-maintainers",
@@ -1540,12 +1546,6 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/infra/server.py:read_remote_file",
-        "2027-12-31",
-    ),
-    ("agents/infra/server.py", "run_crucible_command", "ssh"): (
-        "audited",
-        "observability-maintainers",
-        "agents/infra/server.py:run_crucible_command",
         "2027-12-31",
     ),
     ("agents/infra/server.py", "transfer_file", "ssh"): (

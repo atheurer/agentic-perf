@@ -146,7 +146,6 @@ TOOL_AUDIT_POLICY = (
         "agents/infra/server.py:check_host",
         "agents/infra/server.py:read_remote_file",
         "agents/infra/server.py:list_controller_userenvs",
-        "agents/infra/server.py:run_crucible_command",
         "agents/infra/server.py:get_ethtool_info",
         "agents/infra/server.py:get_sysctl_values",
         "agents/infra/server.py:get_hardware_topology",
