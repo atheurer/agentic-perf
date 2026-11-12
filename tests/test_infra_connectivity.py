@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
 
 import pytest
 
@@ -250,6 +251,47 @@ async def _udp_probe(**kwargs) -> dict:
 
 
 class TestPortConnectivityUDP:
+    async def test_launcher_self_cleans_after_listener_exit(
+        self, udp_ssh: MockSSHExecutor
+    ) -> None:
+        await _udp_probe()
+        command = udp_ssh.calls[0]["command"]
+        assert "LC_ALL=C nohup sh -c " in command
+        launcher = shlex.split(command)
+        supervisor = launcher[launcher.index("-c") + 1]
+        assert supervisor.startswith("trap 'rm -rf -- \"$1\"' EXIT; ")
+        assert "timeout 50s ncat -u -l -v 192.168.1.1 5201 & " in supervisor
+        assert (
+            "listener_pid=$!; trap 'kill \"$listener_pid\" 2>/dev/null' TERM INT; "
+            in supervisor
+        )
+        assert supervisor.endswith('wait "$listener_pid"')
+        assert launcher[launcher.index("-c") + 2 :][:2] == ["sh", "$probe_dir"]
+
+    @pytest.mark.parametrize("transport_exception", [False, True])
+    async def test_lost_launch_reply_remains_structured(
+        self, udp_ssh: MockSSHExecutor, transport_exception: bool
+    ) -> None:
+        original = udp_ssh.run
+
+        async def lose_launch_reply(
+            host: str, command: str, *, timeout: int
+        ) -> SSHResult:
+            # Record the launch as sent before losing its identifiers.
+            await original(host, command, timeout=timeout)
+            if transport_exception:
+                raise OSError("launch reply lost")
+            return SSHResult(exit_code=255, stderr="launch reply lost")
+
+        udp_ssh.run = lose_launch_reply
+        result = await _udp_probe()
+        assert result["all_reachable"] is False
+        assert result["tests"][0]["protocol"] == "udp"
+        assert result["tests"][0]["reason"] == "listener_start_failed"
+        assert result["tests"][0]["error"] == "launch reply lost"
+        # Without identifiers, cleanup relies on the detached supervisor.
+        assert len(udp_ssh.calls) == 1
+
     async def test_received_payload_and_protocol_commands(self, udp_ssh):
         result = await _udp_probe()
         assert result["all_reachable"] is True

@@ -1168,13 +1168,20 @@ async def _test_udp_connectivity_direction(
     nonce = secrets.token_hex(16)
     ip = shlex.quote(listen_ip)
     # stdout contains only received bytes; diagnostics must never count as
-    # evidence of delivery. The deadline also bounds a listener whose SSH
-    # launch reply is lost before we can learn its PID and directory.
+    # evidence of delivery. A detached supervisor removes the directory even
+    # when the launch reply is lost, and forwards explicit cleanup to ncat.
+    listener_cmd = (
+        "trap 'rm -rf -- \"$1\"' EXIT; "
+        f"timeout {2 * timeout + 30}s ncat -u -l -v {ip} {port} & "
+        "listener_pid=$!; "
+        "trap 'kill \"$listener_pid\" 2>/dev/null' TERM INT; "
+        'wait "$listener_pid"'
+    )
     start_cmd = (
         "umask 077; "
         "probe_dir=$(mktemp -d /tmp/agentic-perf-udp.XXXXXXXXXX) || exit 1; "
         'printf "__UDP_DIR:%s\\n" "$probe_dir"; '
-        f"LC_ALL=C nohup timeout {2 * timeout + 30}s ncat -u -l -v {ip} {port} "
+        f'LC_ALL=C nohup sh -c {shlex.quote(listener_cmd)} sh "$probe_dir" '
         '< /dev/null > "$probe_dir/payload" 2> "$probe_dir/error" & '
         f"echo {_PID_SENTINEL}$!"
     )

@@ -9,7 +9,7 @@ You need SSH access to both hosts.
 
 ## Quick connectivity test — use `test_port_connectivity`
 
-The `test_port_connectivity` tool handles the full nc listener/client
+The `test_port_connectivity` tool handles the full nc/ncat listener/client
 lifecycle in a single call. Use it instead of manually orchestrating
 nc commands — it saves iterations and handles cleanup automatically.
 
@@ -18,10 +18,17 @@ test_port_connectivity(
     server_ssh_host="3.1.2.3",       # SSH address to reach the server
     client_ssh_host="3.4.5.6",       # SSH address to reach the client
     server_test_ip="172.31.1.10",    # IP the server listens on (may differ from SSH)
-    port=30002,                       # TCP port to test
+    port=30002,                     # Port to test for the selected protocol
+    protocol="tcp",                 # Use "udp" for UDP workload traffic
     client_test_ip="172.31.1.20",    # Optional: also test reverse direction
 )
 ```
+
+Choose `protocol="tcp"` (the default) for TCP streams and
+`protocol="udp"` for UDP traffic. TCP connect success is not evidence
+of UDP reachability on the same IP and port. UDP testing requires
+`ncat` on both hosts and verifies that the listener received a unique
+probe payload; a successful UDP send alone does not prove delivery.
 
 The SSH hosts are how you reach the machines (may be public IPs).
 The test IPs are what you actually test connectivity on (may be
@@ -38,6 +45,7 @@ test_port_connectivity(
     client_ssh_host="3.4.5.6",
     server_test_ip="172.31.1.10",
     ports=[30002, 30003, 30004, 30005, 30006, 30007, 30008, 30009],
+    protocol="tcp",  # Select "udp" when testing UDP workload ports
 )
 ```
 
@@ -49,8 +57,12 @@ manual steps below.
 
 ## Manual connectivity test (fallback)
 
-Use `nc` (netcat) to test whether a specific IP/port pair is
-reachable from a specific source interface.
+Match the workload protocol: use `nc` (netcat) for TCP, or `ncat`
+with receiver-side payload verification for UDP. Both examples test
+a specific IP/port pair from a specific source interface. Keep the
+listener's shell open and perform cleanup in that same shell.
+
+### TCP
 
 **Step 1 — start a listener on Host A:**
 
@@ -58,6 +70,7 @@ reachable from a specific source interface.
 # On Host A: listen on a specific IP and port
 # Use background=true or & to background it
 nc -l 10.10.0.1 9999 &
+listener_pid=$!
 ```
 
 **Step 2 — probe from Host B:**
@@ -72,13 +85,70 @@ echo $?  # 0 = success, 1 = failed
 **Step 3 — clean up the listener:**
 
 ```bash
-# On Host A: kill the backgrounded nc
-kill %1 2>/dev/null; pkill -f "nc -l 10.10.0.1 9999" 2>/dev/null
+# On Host A: stop only the listener started above
+kill "$listener_pid" 2>/dev/null
+wait "$listener_pid" 2>/dev/null || true
 ```
+
+### UDP
+
+Use `ncat` on both hosts; `nc -z` and a UDP sender's exit code
+cannot establish UDP reachability. Keep received stdout separate
+from stderr so diagnostics cannot count as received payload.
+
+**Step 1 — start a bounded listener on Host A:**
+
+```bash
+# On Host A: private storage and a unique token for this probe
+umask 077
+probe_dir=$(mktemp -d /tmp/agentic-perf-udp.XXXXXXXXXX) || exit 1
+probe_token=$(cat /proc/sys/kernel/random/uuid)
+timeout 120s ncat -u -l -v 10.10.0.1 9999 < /dev/null \
+    > "$probe_dir/payload" 2> "$probe_dir/error" &
+listener_pid=$!
+cleanup_probe() {
+    kill "$listener_pid" 2>/dev/null
+    wait "$listener_pid" 2>/dev/null || true
+    rm -rf -- "$probe_dir"
+}
+trap cleanup_probe EXIT
+printf 'Probe token: %s\n' "$probe_token"
+```
+
+Before sending, check `kill -0 "$listener_pid"` and
+`grep -F 'Listening on ' "$probe_dir/error"` on Host A. Wait for
+the bind diagnostic; if the listener exits or fails to bind, inspect
+`"$probe_dir/error"`, clean up, and retry with a new token.
+
+**Step 2 — send the token from Host B:**
+
+```bash
+# On Host B: copy the exact token printed by Host A
+probe_token='<token printed by Host A>'
+printf '%s\n' "$probe_token" | ncat -u --send-only -w 5 \
+    -s 10.2.0.1 10.10.0.1 9999
+```
+
+**Step 3 — verify receipt and clean up on Host A:**
+
+```bash
+# On Host A: only an exact match in listener stdout proves receipt
+grep -Fxq -- "$probe_token" "$probe_dir/payload"
+echo $?  # 0 = received; 1 = no matching payload; >1 = verification error
+# Allow a short delivery delay and recheck before declaring no receipt.
+cleanup_probe
+trap - EXIT
+```
+
+Only the listener's receipt of this probe's token proves UDP
+reachability in the tested direction. The deadline bounds the
+listener if interrupted; explicit cleanup (also run on shell exit)
+removes its private directory and stops only its recorded PID.
 
 **Step 4 — test the reverse direction (B→A may work, A→B may not):**
 
-Repeat with roles swapped. Firewalls are often asymmetric.
+Repeat the matching protocol's steps with roles swapped (and a new
+token for UDP). Firewalls are often asymmetric.
 
 If connectivity succeeds in both directions, no further diagnosis
 is needed. If it fails, proceed through the layers below.
