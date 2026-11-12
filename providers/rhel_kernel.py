@@ -78,6 +78,16 @@ class KernelSpec:
         )
 
     @property
+    def rpm_release(self) -> str:
+        """The RPM release for this kernel package.
+
+        The kernel release may carry a variant suffix (e.g. "+rt" for the
+        realtime variant); the RPM itself is built with the base release —
+        only the installed vmlinuz/initramfs filenames carry the suffix.
+        """
+        return self.release.split("+", 1)[0]
+
+    @property
     def nevra(self) -> str:
         return f"{self.package}-{self.release}"
 
@@ -185,7 +195,7 @@ def build_repo_setup_command(
 
 
 def build_install_command(spec: KernelSpec) -> str:
-    parts = [spec.nevra]
+    parts = [f"{spec.package}-{spec.rpm_release}"]
     for cp in spec.companion_packages:
         parts.append(f"{spec.package}-{cp}")
     return f"dnf install -y {' '.join(parts)} 2>&1"
