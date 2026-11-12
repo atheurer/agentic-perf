@@ -3462,7 +3462,7 @@ async def _kernel_inventory_one(
     if spec is None:
         return response
 
-    if spec.release in inv.installed:
+    if spec.rpm_release in inv.installed:
         response["requested"] = {"release": spec.release, "state": "installed"}
         return response
     avail_result = await _ssh.run(target, build_available_command(spec), timeout=30)
@@ -3709,7 +3709,7 @@ async def _install_kernel_one(
             "error": "could not read inventory before install",
         }
 
-    if spec.release in before.installed:
+    if spec.rpm_release in before.installed:
         return {
             "host": host,
             "state": "already_installed",
@@ -3826,7 +3826,7 @@ async def _install_kernel_one(
             "error": "could not read inventory after install",
             "before": before.to_dict(),
         }
-    if spec.release in after.installed:
+    if spec.rpm_release in after.installed:
         record = {
             "host": host,
             "state": "installed",
