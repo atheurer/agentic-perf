@@ -2779,7 +2779,10 @@ async def execute_benchmark(
                 }
             )
 
-    if run_command is not None and record.get("execution_transport") != "crucible_mcp":
+    if run_command is not None and (
+        harness_name != "crucible"
+        or record.get("execution_transport") != "crucible_mcp"
+    ):
         valid, reason = _validate_run_command(run_command, harness_name)
         if not valid:
             logger.warning("[benchmark] run_command rejected: %s", reason)
@@ -5119,9 +5122,25 @@ async def get_run_logs(
     harness: str | None = None,
     results_dir_pattern: str | None = None,
     max_kb: int = 50,
+    offset: int = 0,
 ) -> str:
-    """Retrieve logs from a benchmark run on the controller. Use this to diagnose failures — especially when execute_benchmark reports a missing result-summary. max_kb controls how much log to return (default 50 KB, max 200 KB)."""
+    """Retrieve logs from a benchmark run on the controller.
+
+    Use this to diagnose failures — especially when execute_benchmark reports a
+    missing result-summary. max_kb controls how much log to return (default
+    50 KB, max 200 KB). Pass a returned next_offset as offset to continue a
+    truncated result.
+    """
     await _ensure_init()
+
+    if type(offset) is not int or offset < 0:
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "invalid_offset",
+                "message": "offset must be a nonnegative integer.",
+            }
+        )
 
     byte_limit = min(max_kb, 200) * 1024
 
@@ -5163,7 +5182,7 @@ async def get_run_logs(
         try:
             raw_logs = await _crucible_mcp.call_tool(
                 "get_run_logs",
-                {"mcp_job_id": run_id, "offset": 0, "limit": byte_limit},
+                {"mcp_job_id": run_id, "offset": offset, "limit": byte_limit},
             )
             logs = json.loads(raw_logs)
             if not isinstance(logs, dict):
@@ -5172,6 +5191,7 @@ async def get_run_logs(
                 {
                     "status": "ok",
                     "crucible_mcp_job_id": run_id,
+                    "offset": offset,
                     "log_lines": logs.get("text", ""),
                     "next_offset": logs.get("next_offset"),
                     "complete": logs.get("complete") is True,

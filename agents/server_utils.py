@@ -1062,6 +1062,25 @@ def _controller_metadata_target(relative: str) -> tuple[str, dict[str, Any]] | N
     return None
 
 
+def _controller_metadata_snapshot_path(relative: str) -> str | None:
+    """Map a logical metadata selector to a distinct snapshot filename."""
+    if relative == "endpoints":
+        return "endpoints.json"
+    if relative == "tools":
+        return "tools/index.json"
+    if relative.startswith("tools/"):
+        name = relative.removeprefix("tools/")
+        if not name or "/" in name:
+            return None
+        return f"tools/{name}.json"
+    if relative.startswith("benchmark/"):
+        name = relative.removeprefix("benchmark/")
+        if not name or "/" in name:
+            return None
+        return f"benchmark/{name}.json"
+    return None
+
+
 async def _read_controller_metadata_mcp(
     adapter: Any,
     relative: str,
@@ -1318,8 +1337,16 @@ async def controller_context_gateway(
                 "revision": metadata["revision"],
                 "captured_at": metadata["captured_at"],
             }
+            snapshot_path = _controller_metadata_snapshot_path(relative)
+            if snapshot_path is None:
+                return failure(
+                    "invalid_controller_path",
+                    "The requested Crucible metadata selector is invalid.",
+                    requested_ref=relative,
+                    path_type="metadata",
+                )
             saved = manager.save_source_snapshot(
-                "controller", provenance, {relative: metadata["content"]}
+                "controller", provenance, {snapshot_path: metadata["content"]}
             )
             document = {
                 "namespace": "controller",
@@ -1337,7 +1364,7 @@ async def controller_context_gateway(
                 "captured_at": metadata["captured_at"],
                 "content": metadata["content"],
                 "size_bytes": len(metadata["content"].encode("utf-8")),
-                "workspace_ref": saved.get("files", {}).get(relative),
+                "workspace_ref": saved.get("files", {}).get(snapshot_path),
             }
             if relative.startswith("benchmark/"):
                 document["benchmark"] = relative.removeprefix("benchmark/")

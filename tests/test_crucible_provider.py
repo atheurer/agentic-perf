@@ -2022,6 +2022,61 @@ async def test_controller_context_gateway_snapshots_structured_mcp_metadata(
     assert manager.read_document("benchmark/uperf")["status"] == "ok"
     assert manager.read_document("endpoints")["status"] == "ok"
     assert manager.read_document("tools/uperf")["status"] == "ok"
+    assert (
+        len(
+            {
+                manager.read_document(ref)["workspace_ref"]
+                for ref in ("benchmark/uperf", "endpoints", "tools/uperf")
+            }
+        )
+        == 3
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "order",
+    [("tools", "tools/sysstat"), ("tools/sysstat", "tools")],
+)
+async def test_controller_context_gateway_tool_snapshots_coexist(
+    tmp_path, monkeypatch, order
+):
+    import paths
+    from agents.server_utils import controller_context_gateway
+    from providers.workspace.manager import WorkspaceManager
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    adapter = FakeCrucibleMCP()
+    ticket_id = "PERF-MCP-TOOLS-COEXIST"
+    manager = WorkspaceManager(
+        ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark"
+    )
+    documents = []
+
+    for path in order:
+        result = json.loads(
+            await controller_context_gateway(
+                mcp_adapter=adapter,
+                controller_host="controller.example.test",
+                ssh=None,
+                ticket_id=ticket_id,
+                agent_name="benchmark-agent",
+                phase="benchmark",
+                operation="read",
+                path=path,
+                max_bytes=4096,
+            )
+        )
+        assert result["document"]["ref"] == path
+        documents.append(result["document"])
+
+    assert manager.read_document("tools")["status"] == "ok"
+    assert manager.read_document("tools/sysstat")["status"] == "ok"
+    tools_ref = manager.read_document("tools")["workspace_ref"]
+    sysstat_ref = manager.read_document("tools/sysstat")["workspace_ref"]
+    assert tools_ref != sysstat_ref
+    assert tools_ref.endswith("tools/index.json")
+    assert sysstat_ref.endswith("tools/sysstat.json")
 
 
 @pytest.mark.asyncio
