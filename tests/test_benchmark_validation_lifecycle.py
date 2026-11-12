@@ -86,6 +86,27 @@ def _ticket(store: TicketStore) -> str:
     ).id
 
 
+def test_validation_record_supports_legacy_and_mcp_contract_fields():
+    legacy = _record("val-" + "d" * 32)
+    legacy.pop("creator")
+    legacy.pop("server_pid")
+
+    parsed_legacy = ValidationRecordV1.model_validate(legacy)
+    assert parsed_legacy.execution_transport is None
+    assert parsed_legacy.mcp_contract_version is None
+    assert parsed_legacy.crucible_idempotency_key is None
+
+    mcp = legacy | {
+        "execution_transport": "crucible_mcp",
+        "mcp_contract_version": "3",
+        "crucible_idempotency_key": "PERF-mcp:crucible:val-" + "d" * 32,
+    }
+    parsed_mcp = ValidationRecordV1.model_validate(mcp)
+    assert parsed_mcp.execution_transport == "crucible_mcp"
+    assert parsed_mcp.mcp_contract_version == "3"
+    assert parsed_mcp.crucible_idempotency_key == ("PERF-mcp:crucible:val-" + "d" * 32)
+
+
 def test_validation_output_uses_shared_redactor_for_all_persisted_surfaces():
     ticket_id = "PERF-shared-validation-redaction"
     sentinel = "arbitrary-non-regex-secret-821"
@@ -482,6 +503,15 @@ async def test_audited_http_preserves_validation_capability_binding(tmp_path):
             record = _record("val-" + "a" * 32)
             record.pop("creator")
             record.pop("server_pid")
+            record.update(
+                {
+                    "execution_transport": "crucible_mcp",
+                    "mcp_contract_version": "3",
+                    "crucible_idempotency_key": (
+                        f"{ticket_id}:crucible:val-" + "a" * 32
+                    ),
+                }
+            )
             create_response = await client.post(
                 f"/api/v1/tickets/{ticket_id}/validations",
                 json={"record": record, "expected_version": 0},
@@ -491,6 +521,12 @@ async def test_audited_http_preserves_validation_capability_binding(tmp_path):
                 },
             )
             assert create_response.status_code == 200
+            stored = create_response.json()["record"]
+            assert stored["execution_transport"] == "crucible_mcp"
+            assert stored["mcp_contract_version"] == "3"
+            assert stored["crucible_idempotency_key"] == (
+                f"{ticket_id}:crucible:val-" + "a" * 32
+            )
     finally:
         reset_trace_context(trace_token)
 
@@ -554,7 +590,77 @@ async def test_validation_producer_sends_only_schema_owned_fields(monkeypatch):
     create_payload = next(
         kwargs["json"] for url, kwargs in posted if not url.endswith("/capability")
     )
-    assert set(create_payload["record"]) == set(ValidationRecordV1.model_fields)
+    assert set(create_payload["record"]) <= set(ValidationRecordV1.model_fields)
+    assert "execution_transport" not in create_payload["record"]
+    assert "mcp_contract_version" not in create_payload["record"]
+    assert "crucible_idempotency_key" not in create_payload["record"]
+
+
+async def test_validation_producer_sends_mcp_contract_fields(monkeypatch):
+    posted: list[tuple[str, dict]] = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url):
+            return Response({"custom_fields": {"benchmark_validations": {}}})
+
+        async def post(self, url, **kwargs):
+            posted.append((url, kwargs))
+            if url.endswith("/capability"):
+                return Response({"capability": "capability-1"})
+            return Response({})
+
+    monkeypatch.setattr(
+        "providers.execution.AuditedAsyncHTTPClient", lambda **_kwargs: Client()
+    )
+    ticket_id = "PERF-producer-mcp-schema"
+    monkeypatch.setenv("TICKET_ID", ticket_id)
+    monkeypatch.setenv("AGENTIC_PERF_BENCHMARK_VALIDATOR_TOKEN", "validator")
+    context = new_trace_context(ticket_id=ticket_id, agent_id="benchmark-agent")
+    trace_token = bind_trace_context(context)
+    try:
+        validation_id = await _persist_validated_runfile(
+            {"benchmarks": [{"name": "sleep"}]},
+            "crucible",
+            "controller.example",
+            "params",
+            "a" * 64,
+            "crucible run",
+            "crucible validate",
+            "valid",
+            "1.0",
+            execution_transport="crucible_mcp",
+            mcp_contract_version="3",
+        )
+    finally:
+        reset_trace_context(trace_token)
+
+    assert validation_id
+    create_payload = next(
+        kwargs["json"] for url, kwargs in posted if not url.endswith("/capability")
+    )
+    assert create_payload["record"]["execution_transport"] == "crucible_mcp"
+    assert create_payload["record"]["mcp_contract_version"] == "3"
+    assert create_payload["record"]["crucible_idempotency_key"] == (
+        f"{ticket_id}:crucible:{validation_id}"
+    )
 
 
 async def test_validation_http_capability_is_bound_one_time_and_idempotent(tmp_path):
