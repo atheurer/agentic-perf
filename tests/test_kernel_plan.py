@@ -275,10 +275,9 @@ class TestKernelSpecRepoUrl:
         assert "sslcacert=/etc/pki/ca.pem" in cmd
         assert "gpgcheck=0" not in cmd
         assert "sslverify=0" not in cmd
-        assert f"dnf -q list --available {spec.nevra}" in cmd
+        assert f"dnf -q repoquery --available {spec.nevra}" in cmd
         assert " && dnf clean metadata" in cmd
-        assert " && dnf -q list" in cmd
-        assert "; dnf -q list" not in cmd
+        assert "dnf -q list --available" not in cmd
 
     def test_build_repo_setup_command_requires_url(self):
         with pytest.raises(ValueError):
