@@ -228,8 +228,14 @@ def test_connect_delegates_to_connect_command():
 
 
 @pytest.mark.asyncio
-async def test_ticket_server_connection_injects_required_context():
+async def test_ticket_server_connection_injects_required_context(
+    monkeypatch: pytest.MonkeyPatch,
+):
     from providers.tracing import new_trace_context, trace_context_environment
+
+    # The spawn env conditionally carries the instance API token; a leaked
+    # export from another test would otherwise break the exact-env assertion.
+    monkeypatch.delenv("AGENTIC_PERF_API_TOKEN", raising=False)
 
     trace_context = new_trace_context(
         ticket_id="PERF-12345678", agent_id="triage-agent"
