@@ -180,7 +180,7 @@ def build_repo_setup_command(
         f" 'sslcacert={ca_cert_path}'"
         f" > {_REPO_FILE}"
         f" && dnf clean metadata >/dev/null 2>&1"
-        f" && dnf -q list --available {spec.nevra} >/dev/null 2>&1"
+        f" && dnf -q repoquery --available {spec.nevra} >/dev/null 2>&1"
     )
 
 
