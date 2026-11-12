@@ -63,6 +63,45 @@ Agent-specific filtering is assembled when the dispatcher creates the agent
 MCP client. A tool in this table is not evidence that every agent can call it.
 For a live deployment, inspect the tool list in the agent startup event.
 
+### Remote-host port preflight
+
+`test_port_connectivity` accepts `protocol="tcp"` (the default) or
+`protocol="udp"`. Select the protocol from the benchmark's traffic, using
+the dataplane test IPs and traffic port. Both modes accept either `port=N`
+or `ports=[N, ...]` (up to 64 entries, deduplicated and tested concurrently).
+Supplying `client_test_ip` also checks the reverse direction. Existing TCP
+calls and result shapes remain unchanged.
+
+UDP mode starts a temporary `ncat -u` listener, verifies that it bound, sends
+a unique small payload, and reports `reachable: true` only when that payload
+appears in the listener's received data. Diagnostics are stored separately.
+`nc -z -u` alone is not sufficient evidence: UDP is connectionless, and a
+successful sender exit does not prove delivery. The listener requires ncat
+and the standard shell utilities `mktemp`, `timeout`, and `grep`. A private
+temporary directory and listener are cleaned up after each probe, including
+cancellation. A remote deadline bounds listener lifetime if its SSH launch
+reply is lost; lost SSH access can still prevent temporary-file cleanup.
+
+Each UDP direction includes `protocol`, `reachable`, `error`, and `reason`:
+
+| Reason | Meaning |
+|---|---|
+| `""` | The listener received the probe payload. |
+| `listener_start_failed` | Listener launch or readiness failed; the path was not checked. |
+| `sender_error` | Sending failed and receipt was not confirmed; the path was not established. |
+| `no_payload_received` | The listener started and the sender succeeded, but no matching payload arrived within the timeout. |
+| `verification_error` | The receiver's data could not be checked, for example because SSH failed. |
+
+A UDP success proves small-datagram delivery for that direction at that
+moment. It does not establish sustained throughput, loss rate, MTU support,
+application readiness, or firewall policy. A failed probe does not by itself
+identify a firewall or routing failure. These probes need an available port;
+an existing listener can prevent the temporary listener from binding.
+
+Host-to-host preflight applies to `remotehosts`, not Kubernetes pod networks.
+When the workload has no equivalent TCP/UDP probe, use the benchmark's own
+traffic as the acceptance proof instead of substituting a TCP connect.
+
 ## Native workspace tools
 
 All agents can use `jq_query`, `grep_file`, `read_file_slice`,
