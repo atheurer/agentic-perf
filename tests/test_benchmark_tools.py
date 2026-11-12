@@ -177,6 +177,7 @@ class BenchmarkMCP:
         launch=None,
         run_error=None,
         prepare_error=None,
+        logs: list[dict] | None = None,
     ) -> None:
         self.valid = valid
         self.errors = errors or []
@@ -195,6 +196,7 @@ class BenchmarkMCP:
         self.launch = launch
         self.run_error = run_error
         self.prepare_error = prepare_error
+        self.log_responses = logs or [{"text": "progress line", "next_offset": None}]
         self.calls: list[tuple[str, dict]] = []
         self.prepare_count = 0
         self.start_count = 0
@@ -248,12 +250,11 @@ class BenchmarkMCP:
             )
             return json.dumps(self.statuses[index])
         if name == "get_run_logs":
-            return json.dumps(
-                {
-                    "text": "progress line",
-                    "next_offset": None,
-                }
+            log_index = min(
+                sum(1 for tool, _ in self.calls if tool == "get_run_logs") - 1,
+                len(self.log_responses) - 1,
             )
+            return json.dumps(self.log_responses[log_index])
         if name == "get_run_summary":
             return json.dumps({"summary": {"result": "pass"}})
         raise AssertionError(f"unexpected MCP tool {name}")
@@ -451,6 +452,74 @@ async def test_crucible_execution_uses_prepare_start_and_distinct_ids(benchmark_
         "document": run_file,
         "plan_handle": "plan-1",
     }
+
+
+@pytest.mark.asyncio
+async def test_zathras_execution_accepts_allowed_run_command(monkeypatch):
+    import agents.benchmark.server as server
+
+    monkeypatch.setattr(
+        server,
+        "_ticket",
+        {"custom_fields": {"directives": {"harness": "zathras"}}},
+    )
+    skill_provider = MockSkillProvider(
+        private_config={
+            "zathras": {
+                "execution": {
+                    "controller_required": True,
+                    "run_command": "/opt/zathras/bin/burden",
+                    "run_file_format": "yaml_scenario",
+                    "results_dir_pattern": "/tmp/results_*",
+                }
+            }
+        }
+    )
+    skill_provider.generic_execution_supported = True
+    ssh = MockSSHExecutor()
+    handlers = make_benchmark_handlers(ssh=ssh, skill_provider=skill_provider)
+
+    result = await handlers["execute_benchmark"](
+        controller="controller.example",
+        harness="zathras",
+        run_command="/opt/zathras/bin/burden",
+        run_file={
+            "scenario": {
+                "global": {"test": "fio"},
+                "systems": {"client": {"test": "fio"}},
+            }
+        },
+    )
+
+    assert result["status"] == "completed"
+    assert ssh.calls
+    assert any("burden" in call["command"] for call in ssh.calls)
+
+
+@pytest.mark.asyncio
+async def test_zathras_execution_rejects_invalid_run_command(monkeypatch):
+    import agents.benchmark.server as server
+
+    monkeypatch.setattr(
+        server,
+        "_ticket",
+        {"custom_fields": {"directives": {"harness": "zathras"}}},
+    )
+    skill_provider = MockSkillProvider()
+    skill_provider.generic_execution_supported = True
+    ssh = MockSSHExecutor()
+    handlers = make_benchmark_handlers(ssh=ssh, skill_provider=skill_provider)
+
+    result = await handlers["execute_benchmark"](
+        controller="controller.example",
+        harness="zathras",
+        run_command="arbitrary-command",
+        run_file={"scenario": {"global": {}, "systems": {}}},
+    )
+
+    assert result["status"] == "rejected"
+    assert "run_command rejected" in result["message"]
+    assert ssh.calls == []
 
 
 @pytest.mark.asyncio
@@ -892,6 +961,59 @@ async def test_crucible_run_paths_do_not_fall_back_to_ssh(monkeypatch, benchmark
 
     assert result["status"] == "error"
     assert result["reason"] == "invalid_run_id"
+    assert benchmark_mcp.calls == []
+
+
+@pytest.mark.asyncio
+async def test_crucible_log_offset_is_forwarded_and_continued(benchmark_mcp):
+    benchmark_mcp.log_responses = [
+        {"text": "first page", "next_offset": 100, "complete": False},
+        {"text": "second page", "next_offset": None, "complete": True},
+    ]
+    handlers = _benchmark_handlers_with_mcp()
+
+    first = await handlers["get_run_logs"](
+        controller="controller.example",
+        run_id="mcp-job-1",
+        harness="crucible",
+        max_kb=1,
+    )
+    second = await handlers["get_run_logs"](
+        controller="controller.example",
+        run_id="mcp-job-1",
+        harness="crucible",
+        max_kb=1,
+        offset=100,
+    )
+
+    assert first["offset"] == 0
+    assert first["log_lines"] == "first page"
+    assert first["next_offset"] == 100
+    assert first["complete"] is False
+    assert second["offset"] == 100
+    assert second["log_lines"] == "second page"
+    assert second["next_offset"] is None
+    assert second["complete"] is True
+    assert [arguments for name, arguments in benchmark_mcp.calls] == [
+        {"mcp_job_id": "mcp-job-1", "offset": 0, "limit": 1024},
+        {"mcp_job_id": "mcp-job-1", "offset": 100, "limit": 1024},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("offset", [-1, True, "100"])
+async def test_crucible_log_offset_rejects_invalid_values(benchmark_mcp, offset):
+    handlers = _benchmark_handlers_with_mcp()
+
+    result = await handlers["get_run_logs"](
+        controller="controller.example",
+        run_id="mcp-job-1",
+        harness="crucible",
+        offset=offset,
+    )
+
+    assert result["status"] == "error"
+    assert result["reason"] == "invalid_offset"
     assert benchmark_mcp.calls == []
 
 
