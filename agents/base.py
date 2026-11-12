@@ -1479,7 +1479,21 @@ class AgentBase(ABC):
                         f"[{self.agent_name}] submit_* call detected: "
                         f"{submit_call.name} (iter {iteration})"
                     )
-                    block_msg = self._should_block_submit(ticket_id)
+                    sibling_calls = [
+                        tc for tc in response.tool_calls if tc.id != submit_call.id
+                    ]
+                    block_msg = None
+                    if sibling_calls:
+                        sibling_names = ", ".join(tc.name for tc in sibling_calls)
+                        block_msg = (
+                            f"{submit_call.name} must be the only tool call in a "
+                            "response. The following tool calls were not executed: "
+                            f"{sibling_names}. Run them first, inspect their "
+                            "results, and submit again in a later response only "
+                            "after all mutations are complete and verified."
+                        )
+                    if not block_msg:
+                        block_msg = self._should_block_submit(ticket_id)
                     if not block_msg:
                         block_msg = await self._validate_submit_call(
                             ticket_id, submit_call
@@ -1508,20 +1522,56 @@ class AgentBase(ABC):
                             duration_ms=0,
                             outcome=OperationOutcome.REJECTED,
                         )
+                        blocked_results = []
+                        for tc in response.tool_calls:
+                            if tc.id == submit_call.id:
+                                blocked_results.append(
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": tc.id,
+                                        "content": block_msg,
+                                        "is_error": True,
+                                    }
+                                )
+                                continue
+                            skipped_context = tool_contexts[tc.id]
+                            reason = (
+                                f"{submit_call.name} cannot be mixed with other "
+                                "tool calls"
+                            )
+                            self._trace.record(
+                                skipped_context,
+                                ActionType.TOOL,
+                                LifecycleState.SHORT_CIRCUITED,
+                                phase=tc.name,
+                                duration_ms=0,
+                                outcome=OperationOutcome.SUCCESS,
+                                attributes={"reason": reason},
+                            )
+                            self._emit(
+                                ticket_id,
+                                "tool_skipped",
+                                {"tool": tc.name, "reason": reason},
+                            )
+                            blocked_results.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tc.id,
+                                    "content": (
+                                        "Not executed because the submit call was "
+                                        "rejected. Reissue this tool call in the "
+                                        "next response, then submit separately."
+                                    ),
+                                    "is_error": True,
+                                }
+                            )
                         messages.append(
                             {"role": "assistant", "content": response.raw_content}
                         )
                         messages.append(
                             {
                                 "role": "user",
-                                "content": [
-                                    {
-                                        "type": "tool_result",
-                                        "tool_use_id": submit_call.id,
-                                        "content": block_msg,
-                                        "is_error": True,
-                                    }
-                                ],
+                                "content": blocked_results,
                             }
                         )
                         await self._save_messages(ticket_id, messages, required=True)

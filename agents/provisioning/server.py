@@ -2816,6 +2816,48 @@ async def _verify_host_tuning_one(
         "ok": ch_ok,
     }
 
+    # MTU and IPv4 address are part of the required interface gate when the
+    # ticket asks for either. Read the live interface rather than the NM
+    # profile so an effective-but-not-persistent change cannot pass.
+    expected_mtu = exp.get("mtu")
+    if expected_mtu is not None:
+        r_link = await _ssh.run(
+            host, f"ip link show {shlex.quote(interface)} 2>/dev/null"
+        )
+        mtu_match = re.search(r"mtu (\d+)", r_link.stdout)
+        actual_mtu = int(mtu_match.group(1)) if mtu_match else None
+        try:
+            expected_mtu_value = int(expected_mtu)
+        except (TypeError, ValueError):
+            expected_mtu_value = None
+        mtu_ok = actual_mtu is not None and actual_mtu == expected_mtu_value
+        all_ok = all_ok and mtu_ok
+        checks["mtu"] = {
+            "actual": actual_mtu,
+            "expected": expected_mtu,
+            "ok": mtu_ok,
+        }
+
+    expected_ip = exp.get("ip")
+    if expected_ip is not None:
+        r_addr = await _ssh.run(
+            host,
+            f"ip addr show {shlex.quote(interface)} 2>/dev/null | grep 'inet '",
+        )
+        actual_ips = [
+            line.strip().split()[1].split("/")[0]
+            for line in r_addr.stdout.splitlines()
+            if "inet " in line
+        ]
+        expected_ip_value = str(expected_ip).split("/")[0]
+        ip_ok = expected_ip_value in actual_ips
+        all_ok = all_ok and ip_ok
+        checks["ip"] = {
+            "actual": actual_ips,
+            "expected": expected_ip,
+            "ok": ip_ok,
+        }
+
     # IRQ affinity — verify every assigned IRQ, not just one. `msi_irqs`
     # discovery (via _discover_irqs) works for drivers that don't put the
     # interface name in /proc/interrupts (e.g. mlx5).
@@ -2873,7 +2915,7 @@ async def verify_host_tuning(
     user: str = "root",
     ssh_key_path: str = "",
 ) -> str:
-    """Verify that host tuning settings match expected values. Re-reads sysctl, ethtool channel count, IRQ CPU affinity, and irqbalance status. Returns pass/fail per parameter with actual values. Call after tuning to confirm settings applied, and after benchmarks to detect drift (e.g. irqbalance overriding a pin mid-run).
+    """Verify that host tuning and interface settings match expected values. Re-reads sysctl, live MTU/IP, ethtool channel count, IRQ CPU affinity, and irqbalance status. Returns pass/fail per parameter with actual values. Pass mtu and ip in expected when the ticket requires them. Call after tuning to confirm settings applied, and after benchmarks to detect drift (e.g. irqbalance overriding a pin mid-run).
 
     For IRQ verification, pass `expected["irq_assignments"]` as the exact
     `assignments` list returned by pin_irq (e.g. [{"irq": 407, "cpu": 2},
@@ -2971,6 +3013,10 @@ async def tune_hosts(targets: list[dict]) -> str:
             expected["qdisc"] = t["qdisc"]
         if t.get("channels") is not None:
             expected["channels"] = t["channels"]
+        if t.get("mtu") is not None:
+            expected["mtu"] = t["mtu"]
+        if t.get("expected_ip") is not None:
+            expected["ip"] = t["expected_ip"]
         if pin_irq_result and pin_irq_result.get("assignments"):
             expected["irq_assignments"] = pin_irq_result["assignments"]
         if expected:
