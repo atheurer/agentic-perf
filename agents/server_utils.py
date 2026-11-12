@@ -1049,6 +1049,8 @@ def _controller_metadata_target(relative: str) -> tuple[str, dict[str, Any]] | N
         return "list_endpoints", {}
     if relative == "tools":
         return "list_tools", {}
+    if relative == "benchmarks":
+        return "list_benchmarks", {}
     if relative.startswith("tools/"):
         name = relative.removeprefix("tools/")
         if not name or "/" in name:
@@ -1068,6 +1070,8 @@ def _controller_metadata_snapshot_path(relative: str) -> str | None:
         return "endpoints.json"
     if relative == "tools":
         return "tools/index.json"
+    if relative == "benchmarks":
+        return "benchmarks/index.json"
     if relative.startswith("tools/"):
         name = relative.removeprefix("tools/")
         if not name or "/" in name:
@@ -1535,7 +1539,7 @@ async def controller_context_gateway(
                 "role": "software-metadata",
                 "size_bytes": None,
             }
-            for selector in ("endpoints", "tools")
+            for selector in ("endpoints", "tools", "benchmarks")
         ]
         document_result["documents"] = [document, *metadata_documents]
         document_result["metadata_selectors"] = [
@@ -1553,6 +1557,11 @@ async def controller_context_gateway(
                 "ref": "tools/<name>",
                 "description": "One Crucible tool's metadata",
                 "mcp_tool": "list_tools",
+            },
+            {
+                "ref": "benchmarks",
+                "description": "Installed benchmark inventory",
+                "mcp_tool": "list_benchmarks",
             },
             {
                 "ref": "benchmark/<name>",

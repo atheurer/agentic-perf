@@ -456,6 +456,11 @@ reads. Ticket responses include the selected child revision and capture time,
 along with the separate core catalog commit. Upstream files are not treated as
 installed-runtime truth.
 
+After a controller is assigned, the software source also exposes the logical
+`benchmarks` reference through Crucible MCP's `list_benchmarks` tool. This
+returns the installed-runtime inventory; `benchmark/<name>` remains the
+selector for one installed benchmark's metadata and validation rules.
+
 Organization guidance is an additional source for the same subject. It does not
 replace the upstream catalog or the controller's documentation. Provisioning
 uses applicable organization guidance/configuration; benchmark and review use

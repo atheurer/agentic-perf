@@ -1855,6 +1855,17 @@ class FakeCrucibleMCP:
                     "revision": "tools-v1",
                 }
             )
+        if name == "list_benchmarks":
+            if set(arguments) != set():
+                raise AssertionError(f"invalid benchmark arguments {arguments}")
+            return json.dumps(
+                {
+                    "benchmarks": [
+                        {"name": "uperf"},
+                        {"name": "sysstat"},
+                    ],
+                }
+            )
         if name == "describe_benchmark":
             if set(arguments) != {"name"}:
                 raise AssertionError(f"invalid benchmark arguments {arguments}")
@@ -2011,10 +2022,26 @@ async def test_controller_context_gateway_snapshots_structured_mcp_metadata(
     assert tool["document"]["ref"] == "tools/uperf"
     assert tool["document"]["revision"] == "tools-v1"
 
+    inventory = json.loads(
+        await controller_context_gateway(
+            **common,
+            operation="read",
+            path="benchmarks",
+            max_bytes=4096,
+        )
+    )
+    assert inventory["document"]["ref"] == "benchmarks"
+    assert json.loads(inventory["document"]["content"])["benchmarks"] == [
+        {"name": "uperf"},
+        {"name": "sysstat"},
+    ]
+    assert inventory["document"]["revision"]
+
     assert [
         ("describe_benchmark", {"name": "uperf"}),
         ("list_endpoints", {}),
         ("list_tools", {"name": "uperf"}),
+        ("list_benchmarks", {}),
     ] == [call for call in adapter.calls if call[0] != "resources/list"]
     manager = WorkspaceManager(
         ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark"
@@ -2022,15 +2049,60 @@ async def test_controller_context_gateway_snapshots_structured_mcp_metadata(
     assert manager.read_document("benchmark/uperf")["status"] == "ok"
     assert manager.read_document("endpoints")["status"] == "ok"
     assert manager.read_document("tools/uperf")["status"] == "ok"
+    assert manager.read_document("benchmarks")["status"] == "ok"
     assert (
         len(
             {
                 manager.read_document(ref)["workspace_ref"]
-                for ref in ("benchmark/uperf", "endpoints", "tools/uperf")
+                for ref in ("benchmark/uperf", "endpoints", "tools/uperf", "benchmarks")
             }
         )
-        == 3
+        == 4
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "order",
+    [("benchmarks", "benchmark/uperf"), ("benchmark/uperf", "benchmarks")],
+)
+async def test_controller_context_gateway_benchmark_snapshots_coexist(
+    tmp_path, monkeypatch, order
+):
+    import paths
+    from agents.server_utils import controller_context_gateway
+    from providers.workspace.manager import WorkspaceManager
+
+    monkeypatch.setattr(paths, "TICKET_DIR", tmp_path / "tickets")
+    adapter = FakeCrucibleMCP()
+    ticket_id = "PERF-MCP-BENCHMARKS-COEXIST"
+    manager = WorkspaceManager(
+        ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark"
+    )
+
+    for path in order:
+        result = json.loads(
+            await controller_context_gateway(
+                mcp_adapter=adapter,
+                controller_host="controller.example.test",
+                ssh=None,
+                ticket_id=ticket_id,
+                agent_name="benchmark-agent",
+                phase="benchmark",
+                operation="read",
+                path=path,
+                max_bytes=4096,
+            )
+        )
+        assert result["document"]["ref"] == path
+
+    assert manager.read_document("benchmarks")["status"] == "ok"
+    assert manager.read_document("benchmark/uperf")["status"] == "ok"
+    inventory_ref = manager.read_document("benchmarks")["workspace_ref"]
+    benchmark_ref = manager.read_document("benchmark/uperf")["workspace_ref"]
+    assert inventory_ref != benchmark_ref
+    assert inventory_ref.endswith("benchmarks/index.json")
+    assert benchmark_ref.endswith("benchmark/uperf.json")
 
 
 @pytest.mark.asyncio
@@ -2269,10 +2341,12 @@ async def test_software_mcp_metadata_refs_stay_behind_skill_gateway(
         "endpoints",
         "tools",
         "tools/<name>",
+        "benchmarks",
         "benchmark/<name>",
     }
     document_refs = {item["path"] for item in bootstrap["documents"]}
-    assert {"endpoints", "tools"} <= document_refs
+    assert {"endpoints", "tools", "benchmarks"} <= document_refs
+    assert ("list_benchmarks", {}) not in adapter.calls
 
     result = json.loads(
         await skill_context_gateway(
@@ -2285,3 +2359,17 @@ async def test_software_mcp_metadata_refs_stay_behind_skill_gateway(
     assert result["document"]["ref"] == skill_gateway._software_ref("benchmark/uperf")
     assert json.loads(result["document"]["content"])["name"] == "uperf"
     assert ("describe_benchmark", {"name": "uperf"}) in adapter.calls
+
+    inventory = json.loads(
+        await skill_context_gateway(
+            **common,
+            operation="read",
+            ref=skill_gateway._software_ref("benchmarks"),
+            max_bytes=4096,
+        )
+    )
+    assert inventory["document"]["ref"] == skill_gateway._software_ref("benchmarks")
+    assert json.loads(inventory["document"]["content"])["benchmarks"][0]["name"] == (
+        "uperf"
+    )
+    assert ("list_benchmarks", {}) in adapter.calls
