@@ -964,23 +964,62 @@ async def write_transition(
     step_id: int | str,
     transition: dict[str, Any],
 ) -> dict[str, Any]:
-    """CAS the version actually observed; stale writes are never retried."""
-    async with _write_lock:
-        async with AuditedAsyncHTTPClient(
-            timeout=10.0, headers=ticket_state_headers()
-        ) as client:
-            transition["updated_at"] = _now()
-            stored = await _write_kernel_record(
-                client,
-                ticket_id,
-                "transition",
-                str(step_id),
-                transition,
-                int(transition.get("record_version", 0)),
-            )
-            transition.clear()
-            transition.update(stored)
+    """CAS the version actually observed, retrying stale-version conflicts.
+
+    A CAS rejection means another fenced writer bumped the record between
+    our read and write (observed when the orchestrator's step-result
+    capture races the reboot checkpoint). The retry re-reads the stored
+    record, merges the host records on top of it, and rewrites with the
+    fresh version — the checkpoint content is always authoritative.
+    """
+    for attempt in range(4):
+        async with _write_lock:
+            async with AuditedAsyncHTTPClient(
+                timeout=10.0, headers=ticket_state_headers()
+            ) as client:
+                transition["updated_at"] = _now()
+                try:
+                    stored = await _write_kernel_record(
+                        client,
+                        ticket_id,
+                        "transition",
+                        str(step_id),
+                        transition,
+                        int(transition.get("record_version", 0)),
+                    )
+                except Exception as exc:
+                    status = getattr(
+                        getattr(exc, "response", None), "status_code", None
+                    )
+                    if status != 409 or attempt == 3:
+                        raise
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    # Re-read and merge: keep the stored record's version,
+                    # overlay our host records and metadata.
+                    stored_record = await _read_transition_record(
+                        client, ticket_id, step_id
+                    )
+                    merged_hosts = dict(stored_record.get("hosts") or {})
+                    merged_hosts.update(transition.get("hosts") or {})
+                    transition["hosts"] = merged_hosts
+                    transition["record_version"] = int(
+                        stored_record.get("record_version", 0)
+                    )
+                    continue
+                transition.clear()
+                transition.update(stored)
+        return transition
     return transition
+
+
+async def _read_transition_record(
+    client: Any, ticket_id: str, step_id: int | str
+) -> dict[str, Any]:
+    """Fetch the stored transition record for the CAS retry merge."""
+    response = await client.get(f"{_store_url()}/api/v1/tickets/{ticket_id}")
+    response.raise_for_status()
+    cf = response.json().get("custom_fields", {})
+    return read_transition(cf, step_id)
 
 
 async def pause_ticket(ticket_id: str, comment: str) -> None:
