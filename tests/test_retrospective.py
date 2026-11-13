@@ -598,6 +598,31 @@ class TestStateTransitions:
         allowed = VALID_TRANSITIONS[TicketStatus.RETROSPECTIVE_PENDING]
         assert TicketStatus.CLOSED in allowed
 
+    def test_retrospective_can_pause_for_guidance_using_real_store(self, tmp_path):
+        from state_store.models import (
+            CreateTicketRequest,
+            TicketStatus,
+            TransitionRequest,
+        )
+        from state_store.store import TicketStore
+
+        store = TicketStore(persist_dir=tmp_path)
+        ticket = store.create_ticket(
+            CreateTicketRequest(summary="retrospective", description="pause")
+        )
+        for status in (
+            TicketStatus.TRIAGE_PENDING,
+            TicketStatus.GATHERING_CONTEXT,
+            TicketStatus.RETROSPECTIVE_PENDING,
+            TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
+        ):
+            ticket = store.transition_ticket(
+                ticket.id, TransitionRequest(status=status)
+            )
+
+        assert ticket.status == TicketStatus.AWAITING_CUSTOMER_GUIDANCE
+        assert ticket.previous_status == TicketStatus.RETROSPECTIVE_PENDING
+
     def test_dispatcher_maps_retrospective(self):
         from orchestrator.dispatcher import STATUS_AGENT_MAP
 

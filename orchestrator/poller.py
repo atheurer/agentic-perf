@@ -21,3 +21,13 @@ async def fetch_all_tickets(store_url: str) -> list[dict[str, Any]]:
         )
         r.raise_for_status()
         return r.json()
+
+
+async def fetch_tickets_by_status(store_url: str, status: str) -> list[dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=10.0, headers=_auth_headers()) as client:
+        response = await client.get(
+            f"{store_url}/api/v1/tickets",
+            params={"status": status},
+        )
+        response.raise_for_status()
+        return response.json()

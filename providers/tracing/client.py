@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import socket
+import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -21,6 +24,15 @@ from .spool import (
 
 class TraceDeliveryError(RuntimeError):
     """Central trace persistence did not succeed."""
+
+
+class _TraceFlushDeadlineExceeded(Exception):
+    """Internal control flow used to stop a best-effort flush at its deadline."""
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _TraceFlushDeadlineExceeded
 
 
 class TraceClient:
@@ -43,6 +55,10 @@ class TraceClient:
             "X-Trace-Instance": self.instance_id,
         }
         self._closed = False
+        self._flush_state_lock = threading.Lock()
+        self._flush_thread: threading.Thread | None = None
+        self._resources_closed = False
+        self._resource_close_lock = threading.Lock()
         # Best effort at startup: an outage must not prevent the caller from
         # recording new durable events, which can be replayed on a later flush.
         try:
@@ -77,24 +93,76 @@ class TraceClient:
             ) from exc
 
     def flush(self, *, deadline: float | None = None) -> int:
+        """Flush the spool while honoring a hard caller-visible deadline.
+
+        A thread boundary is required because an already-blocked read, fsync,
+        mutex wait, or HTTP request cannot be interrupted reliably from Python.
+        The worker keeps the durable spool safe if it outlives the deadline;
+        subsequent bounded flushes return immediately until that worker exits.
+        """
+        if deadline is None:
+            return self._flush_until_deadline(None)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 0
+        with self._flush_state_lock:
+            active = self._flush_thread
+            if active is not None and active.is_alive():
+                return 0
+            outcome: list[tuple[bool, Any]] = []
+
+            def run() -> None:
+                try:
+                    outcome.append((True, self._flush_until_deadline(deadline)))
+                except BaseException as exc:  # re-raised in the caller thread
+                    outcome.append((False, exc))
+
+            worker = threading.Thread(
+                target=run,
+                name="trace-flush",
+                daemon=True,
+            )
+            self._flush_thread = worker
+            worker.start()
+
+        worker.join(remaining)
+        if worker.is_alive():
+            return 0
+        with self._flush_state_lock:
+            if self._flush_thread is worker:
+                self._flush_thread = None
+        if not outcome:
+            return 0
+        succeeded, value = outcome[0]
+        if not succeeded:
+            raise value
+        return int(value)
+
+    def _flush_until_deadline(self, deadline: float | None) -> int:
         delivered = 0
+
+        def check_cancelled() -> None:
+            _check_deadline(deadline)
+
         try:
             batch: list[tuple[int, TraceEventV1]] = []
-            budget_exhausted = False
-            for item in self.spool.pending():
+            for item in self.spool.pending(check_cancelled=check_cancelled):
                 batch.append(item)
                 if len(batch) == 100:
-                    if deadline is not None and time.monotonic() >= deadline:
-                        budget_exhausted = True
-                        break
+                    check_cancelled()
                     delivered += self._send_batch(batch, deadline=deadline)
                     batch = []
-            if batch and not budget_exhausted:
-                if deadline is None or time.monotonic() < deadline:
-                    delivered += self._send_batch(batch, deadline=deadline)
-            self.spool.compact()
+            if batch:
+                check_cancelled()
+                delivered += self._send_batch(batch, deadline=deadline)
+            self.spool.compact(check_cancelled=check_cancelled)
+            return delivered
+        except _TraceFlushDeadlineExceeded:
             return delivered
         except (httpx.HTTPError, ValueError, KeyError, SpoolError, OSError) as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                return delivered
             raise TraceDeliveryError("trace spool delivery failed") from exc
 
     def _send_batch(
@@ -103,23 +171,43 @@ class TraceClient:
         *,
         deadline: float | None = None,
     ) -> int:
-        request_timeout = (
-            {}
-            if deadline is None
-            else {"timeout": max(0.01, deadline - time.monotonic())}
-        )
-        response = self._client.post(
-            self.url + "/batch",
-            headers=self._headers,
-            json={"events": [event.model_dump(mode="json") for _, event in batch]},
-            **request_timeout,
-        )
-        response.raise_for_status()
-        acks = response.json()["acknowledgements"]
+        _check_deadline(deadline)
+        body = {"events": [event.model_dump(mode="json") for _, event in batch]}
+        if deadline is None:
+            response = self._client.post(
+                self.url + "/batch", headers=self._headers, json=body
+            )
+            response.raise_for_status()
+            payload = response.json()
+        else:
+            remaining = max(0.01, deadline - time.monotonic())
+            timeout = httpx.Timeout(remaining)
+            with self._client.stream(
+                "POST",
+                self.url + "/batch",
+                headers=self._headers,
+                json=body,
+                timeout=timeout,
+            ) as response:
+                watchdog = threading.Timer(remaining, response.close)
+                watchdog.daemon = True
+                watchdog.start()
+                try:
+                    response.raise_for_status()
+                    content = bytearray()
+                    for chunk in response.iter_bytes():
+                        _check_deadline(deadline)
+                        content.extend(chunk)
+                    _check_deadline(deadline)
+                finally:
+                    watchdog.cancel()
+            payload = json.loads(content)
+        acks = payload["acknowledgements"]
         if len(acks) != len(batch):
             raise TraceDeliveryError("incomplete trace batch acknowledgement")
         delivered = 0
         for (offset, event), ack in zip(batch, acks, strict=True):
+            _check_deadline(deadline)
             if (
                 ack.get("event_id") != str(event.event_id)
                 or not ack.get("accepted")
@@ -131,18 +219,53 @@ class TraceClient:
         return delivered
 
     def close(self, *, flush_timeout: float | None = 5.0) -> None:
-        if not self._closed:
+        if self._closed:
+            return
+        self._closed = True
+        failure: BaseException | None = None
+        try:
+            deadline = (
+                None
+                if flush_timeout is None
+                else time.monotonic() + max(0.0, flush_timeout)
+            )
+            self.flush(deadline=deadline)
+        except BaseException as exc:
+            failure = exc
+
+        with self._flush_state_lock:
+            active_flush = self._flush_thread
+        # Resource shutdown can itself wait on a wedged spool mutex. Keep it
+        # behind the same caller deadline and detach when that deadline wins;
+        # process exit is then independent of the durable spool.
+        cleanup = threading.Thread(
+            target=self._close_after_flush,
+            args=(active_flush,),
+            name="trace-flush-cleanup",
+            daemon=True,
+        )
+        cleanup.start()
+        if flush_timeout is None:
+            cleanup.join()
+        elif deadline is not None:
+            cleanup.join(max(0.0, deadline - time.monotonic()))
+        if failure is not None:
+            raise failure
+
+    def _close_after_flush(self, active_flush: threading.Thread | None) -> None:
+        if active_flush is not None:
+            active_flush.join()
+        self._close_resources()
+
+    def _close_resources(self) -> None:
+        with self._resource_close_lock:
+            if self._resources_closed:
+                return
+            self._resources_closed = True
             try:
-                deadline = (
-                    None
-                    if flush_timeout is None
-                    else time.monotonic() + max(0.0, flush_timeout)
-                )
-                self.flush(deadline=deadline)
-            finally:
                 self._client.close()
+            finally:
                 self.spool.close()
-                self._closed = True
 
     def sweep_abandoned(self) -> int:
         """Drain other producer spools using this authenticated transport."""

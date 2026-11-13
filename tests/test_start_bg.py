@@ -256,6 +256,283 @@ done
     assert not (home / "logs" / "orchestrator.log.6").exists()
 
 
+def test_supervisor_restarts_and_reports_crash_loop(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python = fake_bin / "python3"
+    python.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then
+                exec -a "python3 -m orchestrator.main" /usr/bin/python3 -c '
+import fcntl, os
+from pathlib import Path
+folder = Path(os.environ["AGENTIC_PERF_HOME"])
+fd = os.open(folder / "orchestrator.pid", os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.write(fd, str(os.getpid()).encode())
+os.fsync(fd)
+print("simulated orchestrator crash", flush=True)
+raise SystemExit(7)
+'
+            fi
+            exec /usr/bin/python3 "$@"
+            """
+        )
+    )
+    python.chmod(python.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_RESTART_BACKOFF": "1",
+            "START_BG_RESTART_BACKOFF_MAX": "1",
+            "START_BG_RESTART_STABLE_SECONDS": "60",
+            "START_BG_CRASH_LOOP_THRESHOLD": "2",
+        }
+    )
+    process = subprocess.Popen(
+        [str(SCRIPT), "__supervise-orchestrator"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    status_path = home / "orchestrator-supervisor.status"
+    try:
+        deadline = time.monotonic() + 8
+        status = {}
+        while time.monotonic() < deadline:
+            if status_path.exists():
+                try:
+                    status = json.loads(status_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    status = {}
+                if status.get("phase") == "crash_looping":
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("supervisor did not enter crash-loop status")
+
+        assert status["consecutive_failures"] >= 2
+        assert status["next_restart_epoch"] > 0
+        assert (home / "logs" / "orchestrator.log.1").exists()
+        assert (
+            "CRASH LOOP" in (home / "logs" / "orchestrator-supervisor.log").read_text()
+        )
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)
+
+
+def test_supervisor_stop_during_backoff_does_not_restart_orchestrator(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    invocations = home / "orchestrator-invocations"
+    python = fake_bin / "python3"
+    python.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then
+                printf 'start\\n' >> {shlex.quote(str(invocations))}
+                exec -a "python3 -m orchestrator.main" /usr/bin/python3 -c '
+import fcntl, os
+from pathlib import Path
+folder = Path(os.environ["AGENTIC_PERF_HOME"])
+fd = os.open(folder / "orchestrator.pid", os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.write(fd, str(os.getpid()).encode())
+os.fsync(fd)
+raise SystemExit(7)
+'
+            fi
+            exec /usr/bin/python3 "$@"
+            """
+        )
+    )
+    python.chmod(python.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_RESTART_BACKOFF": "30",
+            "START_BG_RESTART_BACKOFF_MAX": "30",
+            "START_BG_RESTART_STABLE_SECONDS": "60",
+            "START_BG_CRASH_LOOP_THRESHOLD": "3",
+        }
+    )
+    process = subprocess.Popen(
+        [str(SCRIPT), "__supervise-orchestrator"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    status_path = home / "orchestrator-supervisor.status"
+    try:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if status_path.exists():
+                try:
+                    status = json.loads(status_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    status = {}
+                if status.get("phase") == "restarting":
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("supervisor did not enter restart backoff")
+
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=5)
+        time.sleep(0.1)
+
+        assert process.returncode == 0
+        assert invocations.read_text().splitlines() == ["start"]
+        assert (
+            "orchestrator supervisor stopped"
+            in (home / "logs" / "orchestrator-supervisor.log").read_text()
+        )
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)
+
+
+def test_replacement_supervisor_acquires_lock_when_child_survives(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python = fake_bin / "python3"
+    python.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then
+                exec -a "python3 -m orchestrator.main" /usr/bin/python3 -c '
+import fcntl, os, time
+from pathlib import Path
+folder = Path(os.environ["AGENTIC_PERF_HOME"])
+fd = os.open(folder / "orchestrator.pid", os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.write(fd, str(os.getpid()).encode())
+os.fsync(fd)
+time.sleep(30)
+'
+            fi
+            exec /usr/bin/python3 "$@"
+            """
+        )
+    )
+    python.chmod(python.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_RESTART_BACKOFF": "30",
+            "START_BG_RESTART_BACKOFF_MAX": "30",
+            "START_BG_RESTART_STABLE_SECONDS": "60",
+            "START_BG_CRASH_LOOP_THRESHOLD": "3",
+        }
+    )
+    first = subprocess.Popen(
+        [str(SCRIPT), "__supervise-orchestrator"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    second: subprocess.Popen | None = None
+    child_pid = 0
+    status_path = home / "orchestrator-supervisor.status"
+    try:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            try:
+                child_pid = int((home / "orchestrator.pid").read_text())
+                status = json.loads(status_path.read_text())
+            except (OSError, ValueError, json.JSONDecodeError):
+                time.sleep(0.05)
+                continue
+            if status.get("phase") == "running" and child_pid:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("first supervisor did not launch its orchestrator")
+
+        first.kill()
+        first.wait(timeout=5)
+        os.kill(child_pid, 0)
+
+        second = subprocess.Popen(
+            [str(SCRIPT), "__supervise-orchestrator"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if second.poll() is not None:
+                raise AssertionError("replacement supervisor exited")
+            try:
+                status = json.loads(status_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                status = {}
+            if status.get("pid") == second.pid and status.get("phase") == "monitoring":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("replacement supervisor did not acquire its lock")
+    finally:
+        if second is not None and second.poll() is None:
+            second.send_signal(signal.SIGTERM)
+            second.wait(timeout=5)
+        if child_pid:
+            try:
+                os.kill(child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    state = (
+                        Path(f"/proc/{child_pid}/stat")
+                        .read_text()
+                        .rsplit(") ", 1)[1]
+                        .split()[0]
+                    )
+                except (OSError, IndexError):
+                    break
+                if state in {"Z", "X"}:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("surviving orchestrator child did not exit")
+
+
 def test_stop_reclaims_lock_metadata_after_launcher_kills_process(
     tmp_path: Path,
 ) -> None:

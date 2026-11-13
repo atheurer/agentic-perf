@@ -4,10 +4,12 @@ import asyncio
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -98,6 +100,32 @@ def mount_routers(
     app.include_router(chat_router)
 
 
+def _trace_read_operation(path: str) -> str | None:
+    if path == "/api/v1/traces/export":
+        return "trace_export"
+    if path == "/api/v1/traces/query":
+        return "trace_query"
+    if path.startswith(
+        (
+            "/api/v1/traces/tickets/",
+            "/api/v1/traces/invocations/",
+            "/api/v1/traces/actions/",
+        )
+    ):
+        return "trace_query"
+    return None
+
+
+def _trace_read_ticket_id(request: Request) -> str | None:
+    ticket_id = request.query_params.get("ticket_id")
+    if ticket_id:
+        return ticket_id
+    prefix = "/api/v1/traces/tickets/"
+    if request.url.path.startswith(prefix):
+        return unquote(request.url.path[len(prefix) :].split("/", 1)[0]) or None
+    return None
+
+
 def _initialize_runtime(app: FastAPI, port: int, cfg: dict) -> None:
     """Construct writable runtime components only after the root lock is held."""
     logger.info("Initializing trace store...")
@@ -106,6 +134,67 @@ def _initialize_runtime(app: FastAPI, port: int, cfg: dict) -> None:
     record_store_status("initializing_trace_store")
     app.state.trace_store = TraceStore(TRACE_DB_PATH)
     app.state.trace_instance_id = get_instance_name()
+    trace_cfg = cfg.get("trace", {})
+    query_cfg = trace_cfg.get("query", {}) if isinstance(trace_cfg, dict) else {}
+    if not isinstance(query_cfg, dict):
+        raise ConfigFileError("trace.query must be a JSON object")
+    query_workers = _validate_positive_int(
+        query_cfg.get("workers", 2),
+        "trace.query.workers",
+        allow_zero=False,
+    )
+    max_rss_value = os.environ.get(
+        "TRACE_QUERY_MAX_RSS_MB", query_cfg.get("max_rss_mb", 4096)
+    )
+    if isinstance(max_rss_value, str):
+        try:
+            max_rss_value = int(max_rss_value)
+        except ValueError as exc:
+            raise ConfigFileError("trace.query.max_rss_mb must be an integer") from exc
+    max_rss_mb = _validate_positive_int(
+        max_rss_value,
+        "trace.query.max_rss_mb",
+    )
+    control_value = os.environ.get("STATE_STORE_CONTROL_WORKERS", 2)
+    if isinstance(control_value, str):
+        try:
+            control_value = int(control_value)
+        except ValueError as exc:
+            raise ConfigFileError(
+                "STATE_STORE_CONTROL_WORKERS must be an integer"
+            ) from exc
+    control_workers = _validate_positive_int(
+        control_value,
+        "STATE_STORE_CONTROL_WORKERS",
+        allow_zero=False,
+    )
+    lease_value = os.environ.get("STATE_STORE_LEASE_WORKERS", 1)
+    if isinstance(lease_value, str):
+        try:
+            lease_value = int(lease_value)
+        except ValueError as exc:
+            raise ConfigFileError(
+                "STATE_STORE_LEASE_WORKERS must be an integer"
+            ) from exc
+    lease_workers = _validate_positive_int(
+        lease_value,
+        "STATE_STORE_LEASE_WORKERS",
+        allow_zero=False,
+    )
+    app.state.trace_query_shutdown = threading.Event()
+    app.state.trace_query_executor = ThreadPoolExecutor(
+        max_workers=query_workers,
+        thread_name_prefix="trace-query",
+    )
+    app.state.control_executor = ThreadPoolExecutor(
+        max_workers=control_workers,
+        thread_name_prefix="state-store-control",
+    )
+    app.state.lease_executor = ThreadPoolExecutor(
+        max_workers=lease_workers,
+        thread_name_prefix="state-store-lease",
+    )
+    app.state.trace_query_max_rss_bytes = max_rss_mb * 1024 * 1024
     app.state.trace_health = {
         "ingested": 0,
         "ingestion_failures": 0,
@@ -397,6 +486,14 @@ def _close_runtime(app: FastAPI) -> None:
     if getattr(app.state, "runtime_pid", None) != os.getpid():
         _discard_inherited_runtime(app)
         return
+    shutdown = getattr(app.state, "trace_query_shutdown", None)
+    if shutdown is not None:
+        shutdown.set()
+    for name in ("trace_query_executor", "control_executor", "lease_executor"):
+        executor = getattr(app.state, name, None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+            setattr(app.state, name, None)
     for name in ("event_bus", "audit_log"):
         adapter = getattr(app.state, name, None)
         if adapter is not None:
@@ -488,22 +585,21 @@ def create_app(*, initialize_immediately: bool = False) -> FastAPI:
 
     @app.middleware("http")
     async def audit_trace_auth_attempt(request: Request, call_next):
-        """Audit trace reads rejected before route dependencies run."""
+        """Audit trace reads rejected before endpoint code runs."""
         response = await call_next(request)
-        if request.url.path.endswith(
-            ("/traces/query", "/traces/export")
-        ) and response.status_code in (401, 429):
+        operation = _trace_read_operation(request.url.path)
+        if operation and response.status_code in (401, 422, 429):
             audit_log = getattr(request.app.state, "audit_log", None)
             if audit_log is not None:
-                operation = (
-                    "trace_export"
-                    if request.url.path.endswith("/export")
-                    else "trace_query"
-                )
+                error = {
+                    401: "authentication rejected",
+                    422: "request validation rejected",
+                    429: "rate limit rejected",
+                }[response.status_code]
                 audit_log.log(
                     operation,
-                    request.query_params.get("ticket_id") or "*",
-                    {"outcome": "denied", "error": "authentication rejected"},
+                    _trace_read_ticket_id(request) or "*",
+                    {"outcome": "denied", "error": error},
                 )
         return response
 

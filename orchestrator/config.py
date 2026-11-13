@@ -133,6 +133,18 @@ class OrchestratorConfig:
                 lease_cfg.get("max_attempts", 12),
             )
         )
+        self.leader_lease_drain_timeout_seconds = float(
+            os.environ.get(
+                "ORCHESTRATOR_LEASE_DRAIN_TIMEOUT_SECONDS",
+                lease_cfg.get("drain_timeout_seconds", 20.0),
+            )
+        )
+        self.leader_lease_recovery_delay_seconds = float(
+            os.environ.get(
+                "ORCHESTRATOR_LEASE_RECOVERY_DELAY_SECONDS",
+                lease_cfg.get("recovery_delay_seconds", 5.0),
+            )
+        )
         if (
             not isinstance(self.leader_lease_max_attempts, int)
             or self.leader_lease_max_attempts < 1
@@ -141,6 +153,10 @@ class OrchestratorConfig:
                 f"leader_lease_max_attempts must be an integer >= 1, "
                 f"got {self.leader_lease_max_attempts!r}"
             )
+        if self.leader_lease_drain_timeout_seconds < 0:
+            raise ValueError("leader_lease_drain_timeout_seconds must be >= 0")
+        if self.leader_lease_recovery_delay_seconds < 0:
+            raise ValueError("leader_lease_recovery_delay_seconds must be >= 0")
         self.llm_provider = (
             llm_provider
             or os.environ.get("LLM_PROVIDER")
@@ -834,6 +850,12 @@ def build_redacted_config(
             "leader_lease_ttl_seconds": config.leader_lease_ttl_seconds,
             "leader_lease_renew_interval": config.leader_lease_renew_interval,
             "leader_lease_max_attempts": config.leader_lease_max_attempts,
+            "leader_lease_drain_timeout_seconds": (
+                config.leader_lease_drain_timeout_seconds
+            ),
+            "leader_lease_recovery_delay_seconds": (
+                config.leader_lease_recovery_delay_seconds
+            ),
         },
         "harness": {
             "crucible_home": config.crucible_home,
