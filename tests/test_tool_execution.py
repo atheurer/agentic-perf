@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient, MCPToolCallError, _ServerConnection
-from providers.llm.base import ToolCall, ToolDefinition
+from providers.llm.base import LLMResponse, ToolCall, ToolDefinition
 from providers.tracing import current_trace_context, new_trace_context
 
 
@@ -20,6 +21,15 @@ class DummyAgent(AgentBase):
 
     async def _handle_completion(self, ticket_id, response):
         return None
+
+
+class _SubmitAgent(DummyAgent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.completion_calls: list[list[str]] = []
+
+    async def _handle_completion(self, ticket_id, response):
+        self.completion_calls.append([tc.id for tc in response.tool_calls])
 
 
 @pytest.fixture
@@ -242,3 +252,77 @@ async def test_signature_mismatch_is_rejected_before_handler_entry(agent):
     assert result.is_error
     assert "missing a required argument" in result.content
     assert "required (str)" in result.content
+
+
+async def test_submit_with_sibling_tool_is_rejected_and_requires_separate_turn():
+    responses = iter(
+        [
+            LLMResponse(
+                text=None,
+                tool_calls=[
+                    ToolCall(id="submit-mixed", name="submit_test", input={}),
+                    ToolCall(id="mutate-mixed", name="mutate", input={}),
+                ],
+                stop_reason="tool_use",
+                raw_content=[],
+            ),
+            LLMResponse(
+                text=None,
+                tool_calls=[
+                    ToolCall(id="submit-after", name="submit_test", input={}),
+                ],
+                stop_reason="tool_use",
+                raw_content=[],
+            ),
+        ]
+    )
+    llm_messages = []
+
+    class _LLM:
+        async def complete(self, **kwargs):
+            llm_messages.append(kwargs["messages"])
+            return next(responses)
+
+    test_agent = _SubmitAgent(
+        agent_name="submit-test-agent",
+        llm_provider=_LLM(),
+        state_store_url="http://fake-store",
+        tools=[
+            ToolDefinition(
+                name="submit_test",
+                description="Submit the test result.",
+                input_schema={"type": "object"},
+            )
+        ],
+        max_iterations=3,
+    )
+    test_agent._tool_min_interval = 0
+    test_agent._client = SimpleNamespace(headers={})
+    test_agent._get_ticket = AsyncMock(
+        return_value={
+            "id": "PERF-MIXED-SUBMIT",
+            "status": "provisioning",
+            "custom_fields": {},
+        }
+    )
+    test_agent._update_fields = AsyncMock()
+    test_agent._check_interject = AsyncMock(return_value=None)
+    test_agent._check_drift = lambda: None
+    test_agent._get_previous_iteration_counts = lambda _ticket_id: (0, 0)
+    mutate = AsyncMock(return_value="mutated")
+    test_agent._tool_handlers["mutate"] = mutate
+
+    await test_agent.run("PERF-MIXED-SUBMIT")
+
+    mutate.assert_not_awaited()
+    assert test_agent.completion_calls == [["submit-after"]]
+    blocked_results = {
+        item["tool_use_id"]: item
+        for message in llm_messages[1]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        for item in message["content"]
+    }
+    assert "must be the only tool call" in blocked_results["submit-mixed"]["content"]
+    assert "Not executed" in blocked_results["mutate-mixed"]["content"]
+    assert blocked_results["submit-mixed"]["is_error"] is True
+    assert blocked_results["mutate-mixed"]["is_error"] is True

@@ -28,8 +28,16 @@ direct-execution harnesses (no controller), omit `controller_host`.
 
 All batched tools return results keyed by host, with a summary line.
 
+Network configuration tools (`nm_show_connection`, `nm_set_mtu`,
+`nm_set_ip`, `nm_set_dhcp`, `nm_verify_interface`) take a single host per
+call. Use `nm_show_connection` to audit the active profile, the `nm_set_*`
+tools for persistent changes, and `nm_verify_interface` to verify live MTU,
+IP, and link state. Call them once per affected host.
+
 Network tuning tools (tune_nic, tune_tcp, pin_irq, verify_host_tuning)
-take a single host per call — call them once per host that needs tuning.
+also take a single host per call — call them once per host that needs tuning.
+Use `tune_hosts` when the same multi-step tuning can be expressed for all
+hosts in one batched call; it does not configure static IP addresses.
 
 ## Combined Tools
 
@@ -98,13 +106,33 @@ installs the harness when it is missing, then verifies it, in one batched call.
    has no tools for this — if you don't apply it here, it never
    happens, silently. Check the ticket's parsed_specs for IRQ
    pinning, NIC queue count, congestion control, qdisc, or other
-   tuning. If ANY are present:
-   a. Read `read_skills(docs=[{"harness": "general",
+   tuning. Also inspect the ticket directives and parsed_specs for an
+   MTU, a static test-interface address, DHCP, or other test-interface
+   configuration. These requirements may appear only in verbatim
+   directives, so do not rely on structured fields alone.
+   a. If an MTU, static address, or DHCP setting is required, read
+      `read_skills(docs=[{"harness": "general",
+      "filename": "network-manager.md"}])`. Use `nm_set_mtu`,
+      `nm_set_ip`, and `nm_set_dhcp` as required. Never substitute
+      `ip link` or `ip addr` for a persistent NetworkManager change,
+      and never guess an MTU or test-network address.
+   b. If host tuning is required, read
+      `read_skills(docs=[{"harness": "general",
       "filename": "host-tuning.md"}])` for required ordering
-      (tune_nic → pin_irq) and irqbalance strategy
-   b. Apply with tune_nic, tune_tcp, pin_irq as needed — one
-      call per host per tool
-   c. When RX flow-steering rules are requested, call
+      (tune_nic → pin_irq) and irqbalance strategy.
+   c. Apply host tuning with tune_nic, tune_tcp, pin_irq, or tune_hosts
+      as needed. Use one call per host for the per-host tuning tools.
+   d. For every interface with an MTU or static-address requirement,
+      call `nm_verify_interface` with `expected_mtu` and/or
+      `expected_ip`, including the complete CIDR when a subnet is
+      required. Include the complete result in
+      submit_provisioning_result. If `all_ok` is false, do not report
+      provisioning as complete. For DHCP, use `nm_show_connection` to
+      confirm `ipv4.method: auto` and record the live interface state;
+      it does not expose DHCP lease metadata, so do not treat a live
+      address as lease proof. Request clarification if lease
+      verification is required.
+   e. When RX flow-steering rules are requested, call
       configure_flow_steering after tune_nic and before pin_irq.
       It reads back the active ethtool rule table and checks
       requested, preserved, and unexpected rules. Include its
@@ -116,10 +144,11 @@ installs the harness when it is missing, then verifies it, in one batched call.
       NIC cannot return its active rules, request clarification
       instead of treating successful rule-add responses as
       verification.
-   d. Call verify_host_tuning and include results in your
-      submission. If verification shows tuning did NOT take
-      effect, do NOT report provisioning_complete=true — call
-      request_clarification instead.
+   f. Call verify_host_tuning and include its results in your
+      submission. Pass `mtu` and `ip` in `expected` when those values
+      were requested. If verification shows any requested setting did
+      NOT take effect, do NOT report provisioning_complete=true —
+      call request_clarification instead.
 
 12. **Kernel transitions.** Kernel steps run deterministically unless the
     ticket explicitly selects `kernel_step_mode: "llm"`. Only call kernel
@@ -158,7 +187,14 @@ Set `provisioning_complete=true` only when at least one host is listed and
 verification succeeded. For success, set `verification.status` to `verified`
 and include non-empty details describing the verification evidence. Do not
 claim success based only on install or configuration commands; use the results
-from verify_harness_install and any requested host tuning verification.
+from verify_harness_install, nm_verify_interface for requested MTU/IP and
+link-state checks, nm_show_connection for DHCP profile and live-address state,
+and
+any requested host tuning verification.
+
+Do not call submit_provisioning_result in the same response as another tool.
+Run the other tool calls first, inspect their results, and submit in a later
+response only after all mutations are complete and verified.
 
 If provisioning is incomplete, set `provisioning_complete=false` and include
 actionable, non-empty `notes` describing what failed and what is needed next.

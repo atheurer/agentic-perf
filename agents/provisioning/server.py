@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import ipaddress
 import json
 import logging
 import os
@@ -124,6 +125,27 @@ def _summarize(results: dict[str, dict]) -> dict:
         "results": results,
         "summary": f"{total} host(s): {success} success, {failed} failed",
     }
+
+
+def _ipv4_interface_matches(expected: object, actual: object) -> bool:
+    """Match a live IPv4 interface against an exact CIDR or address expectation."""
+    expected_text = str(expected).strip()
+    actual_text = str(actual).strip()
+    try:
+        if "/" in expected_text:
+            expected_interface = ipaddress.IPv4Interface(expected_text)
+            if "/" not in actual_text:
+                return False
+            actual_interface = ipaddress.IPv4Interface(actual_text)
+            return (
+                actual_interface.ip == expected_interface.ip
+                and actual_interface.network.prefixlen
+                == expected_interface.network.prefixlen
+            )
+        actual_address = ipaddress.IPv4Address(actual_text.split("/", 1)[0])
+        return actual_address == ipaddress.IPv4Address(expected_text)
+    except ValueError:
+        return False
 
 
 async def _gather_for_hosts(
@@ -2816,6 +2838,52 @@ async def _verify_host_tuning_one(
         "ok": ch_ok,
     }
 
+    # MTU and IPv4 address are part of the required interface gate when the
+    # ticket asks for either. Compare live kernel state and preserve CIDRs so a
+    # prefix mismatch cannot pass. Profile persistence is audited separately.
+    expected_mtu = exp.get("mtu")
+    if expected_mtu is not None:
+        r_link = await _ssh.run(
+            host, f"ip link show {shlex.quote(interface)} 2>/dev/null"
+        )
+        mtu_match = re.search(r"mtu (\d+)", r_link.stdout)
+        actual_mtu = int(mtu_match.group(1)) if mtu_match else None
+        try:
+            expected_mtu_value = int(expected_mtu)
+        except (TypeError, ValueError):
+            expected_mtu_value = None
+        mtu_ok = actual_mtu is not None and actual_mtu == expected_mtu_value
+        all_ok = all_ok and mtu_ok
+        checks["mtu"] = {
+            "actual": actual_mtu,
+            "expected": expected_mtu,
+            "ok": mtu_ok,
+        }
+
+    expected_ip = exp.get("ip")
+    if expected_ip is not None:
+        r_addr = await _ssh.run(
+            host,
+            f"ip addr show {shlex.quote(interface)} 2>/dev/null | grep 'inet '",
+        )
+        actual_interfaces = [
+            fields[1]
+            for line in r_addr.stdout.splitlines()
+            if (fields := line.split()) and fields[0] == "inet" and len(fields) > 1
+        ]
+        actual_ips = [interface.split("/", 1)[0] for interface in actual_interfaces]
+        ip_ok = any(
+            _ipv4_interface_matches(expected_ip, interface)
+            for interface in actual_interfaces
+        )
+        all_ok = all_ok and ip_ok
+        checks["ip"] = {
+            "actual": actual_ips,
+            "actual_interfaces": actual_interfaces,
+            "expected": expected_ip,
+            "ok": ip_ok,
+        }
+
     # IRQ affinity — verify every assigned IRQ, not just one. `msi_irqs`
     # discovery (via _discover_irqs) works for drivers that don't put the
     # interface name in /proc/interrupts (e.g. mlx5).
@@ -2873,7 +2941,7 @@ async def verify_host_tuning(
     user: str = "root",
     ssh_key_path: str = "",
 ) -> str:
-    """Verify that host tuning settings match expected values. Re-reads sysctl, ethtool channel count, IRQ CPU affinity, and irqbalance status. Returns pass/fail per parameter with actual values. Call after tuning to confirm settings applied, and after benchmarks to detect drift (e.g. irqbalance overriding a pin mid-run).
+    """Verify that host tuning and interface settings match expected values. Re-reads sysctl, live MTU/IP, ethtool channel count, IRQ CPU affinity, and irqbalance status. Returns pass/fail per parameter with actual values. Pass mtu and ip in expected when the ticket requires them. Call after tuning to confirm settings applied, and after benchmarks to detect drift (e.g. irqbalance overriding a pin mid-run).
 
     For IRQ verification, pass `expected["irq_assignments"]` as the exact
     `assignments` list returned by pin_irq (e.g. [{"irq": 407, "cpu": 2},
@@ -2971,6 +3039,10 @@ async def tune_hosts(targets: list[dict]) -> str:
             expected["qdisc"] = t["qdisc"]
         if t.get("channels") is not None:
             expected["channels"] = t["channels"]
+        if t.get("mtu") is not None:
+            expected["mtu"] = t["mtu"]
+        if t.get("expected_ip") is not None:
+            expected["ip"] = t["expected_ip"]
         if pin_irq_result and pin_irq_result.get("assignments"):
             expected["irq_assignments"] = pin_irq_result["assignments"]
         if expected:
@@ -3178,14 +3250,23 @@ async def nm_verify_interface(
     r_addr = await _ssh.run(
         host, f"ip addr show {interface} 2>/dev/null | grep 'inet '"
     )
-    actual_ips = [
-        line.strip().split()[1].split("/")[0]
+    actual_interfaces = [
+        fields[1]
         for line in r_addr.stdout.splitlines()
-        if "inet " in line
+        if (fields := line.split()) and fields[0] == "inet" and len(fields) > 1
     ]
-    ip_ok = (expected_ip is None) or (expected_ip in actual_ips)
+    actual_ips = [interface.split("/", 1)[0] for interface in actual_interfaces]
+    ip_ok = expected_ip is None or any(
+        _ipv4_interface_matches(expected_ip, interface)
+        for interface in actual_interfaces
+    )
     all_ok = all_ok and ip_ok
-    checks["ip"] = {"actual": actual_ips, "expected": expected_ip, "ok": ip_ok}
+    checks["ip"] = {
+        "actual": actual_ips,
+        "actual_interfaces": actual_interfaces,
+        "expected": expected_ip,
+        "ok": ip_ok,
+    }
 
     state_ok = "UP" in link_output and "state UP" in link_output
     checks["state"] = {"up": state_ok, "ok": state_ok}
