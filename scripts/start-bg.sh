@@ -12,7 +12,8 @@
 #   ./scripts/start-bg.sh status   # inspect ownership and readiness
 #
 # START_BG_STORE_TIMEOUT, START_BG_ORCH_TIMEOUT, and START_BG_STOP_TIMEOUT
-# can override the readiness and shutdown timeouts for diagnostics.
+# override readiness and shutdown waits. START_BG_LOG_BACKUPS and the
+# START_BG_RESTART_* settings control log retention and supervisor backoff.
 
 set -Eeuo pipefail
 
@@ -29,6 +30,10 @@ STORE_PID_FILE="$LOG_DIR/state-store.pid"
 STORE_LOG="$LOG_DIR/state-store.log"
 ORCH_LOCK="$AP_HOME/orchestrator.pid"
 ORCH_LOG="$LOG_DIR/orchestrator.log"
+ORCH_SUPERVISOR_LOCK="$AP_HOME/orchestrator-supervisor.lock"
+ORCH_SUPERVISOR_PID_FILE="$LOG_DIR/orchestrator-supervisor.pid"
+ORCH_SUPERVISOR_LOG="$LOG_DIR/orchestrator-supervisor.log"
+ORCH_SUPERVISOR_STATUS_FILE="$AP_HOME/orchestrator-supervisor.status"
 LAUNCH_LOCK="$AP_HOME/state-store-launch.lock"
 STORE_STATUS_FILE="$AP_HOME/state-store.status"
 ORCH_STATUS_FILE="$AP_HOME/orchestrator.status"
@@ -37,8 +42,41 @@ ORCH_START_TIMEOUT="${START_BG_ORCH_TIMEOUT:-45}"
 STOP_TIMEOUT="${START_BG_STOP_TIMEOUT:-10}"
 INACTIVITY_TIMEOUT="${START_BG_INACTIVITY_TIMEOUT:-20}"
 MAX_START_TIMEOUT="${START_BG_MAX_START_TIMEOUT:-180}"
+LOG_BACKUPS="${START_BG_LOG_BACKUPS:-5}"
+RESTART_BACKOFF="${START_BG_RESTART_BACKOFF:-2}"
+RESTART_BACKOFF_MAX="${START_BG_RESTART_BACKOFF_MAX:-60}"
+RESTART_STABLE_SECONDS="${START_BG_RESTART_STABLE_SECONDS:-60}"
+CRASH_LOOP_THRESHOLD="${START_BG_CRASH_LOOP_THRESHOLD:-3}"
 
 mkdir -p "$LOG_DIR"
+
+validate_launch_settings() {
+    [[ "$LOG_BACKUPS" =~ ^[1-9][0-9]*$ ]] || {
+        echo "ERROR: START_BG_LOG_BACKUPS must be a positive integer" >&2
+        return 2
+    }
+    for setting in \
+        "START_BG_RESTART_BACKOFF=$RESTART_BACKOFF" \
+        "START_BG_RESTART_BACKOFF_MAX=$RESTART_BACKOFF_MAX" \
+        "START_BG_RESTART_STABLE_SECONDS=$RESTART_STABLE_SECONDS" \
+        "START_BG_CRASH_LOOP_THRESHOLD=$CRASH_LOOP_THRESHOLD"; do
+        [[ "${setting#*=}" =~ ^[1-9][0-9]*$ ]] || {
+            echo "ERROR: ${setting%%=*} must be a positive integer" >&2
+            return 2
+        }
+    done
+}
+
+rotate_log() {
+    local path="$1" index
+    [ -s "$path" ] || return 0
+    for ((index = LOG_BACKUPS; index > 1; index--)); do
+        if [ -f "$path.$((index - 1))" ]; then
+            mv -f "$path.$((index - 1))" "$path.$index"
+        fi
+    done
+    mv -f "$path" "$path.1"
+}
 
 revision() {
     local sha dirty
@@ -161,6 +199,35 @@ raise SystemExit(1)
 PY
 }
 
+clear_lock_metadata() {
+    local path="$1"
+    python3 - "$path" <<'PY'
+import fcntl
+import os
+import sys
+
+path = sys.argv[1]
+try:
+    fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+except FileNotFoundError:
+    raise SystemExit(0)
+except OSError:
+    raise SystemExit(2)
+try:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(3)
+    try:
+        os.ftruncate(fd, 0)
+        os.fsync(fd)
+    except OSError:
+        raise SystemExit(4)
+finally:
+    os.close(fd)
+PY
+}
+
 wait_for_lock_release() {
     local path="$1" label="$2" deadline=$((SECONDS + STORE_START_TIMEOUT))
     echo "$label lock is held by an unverifiable process; waiting up to ${STORE_START_TIMEOUT}s for it to release..."
@@ -200,6 +267,71 @@ orchestrator_owner_valid() {
     local pid="$1"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     process_matches "$pid" orchestrator
+}
+
+supervisor_pid() {
+    tr -d '[:space:]' < "$ORCH_SUPERVISOR_PID_FILE" 2>/dev/null || true
+}
+
+supervisor_lock_pid() {
+    tr -d '[:space:]' < "$ORCH_SUPERVISOR_LOCK" 2>/dev/null || true
+}
+
+supervisor_owner_valid() {
+    local pid="$1" cmd
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    process_alive "$pid" || return 1
+    [ "$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)" = "$REPO_DIR" ] || return 1
+    cmd="$(process_cmdline "$pid")"
+    [[ "$cmd" == *"start-bg.sh __supervise-orchestrator"* ]]
+}
+
+write_supervisor_status() {
+    local phase="$1" detail="$2" failures="$3" next_restart="$4" temporary
+    temporary="${ORCH_SUPERVISOR_STATUS_FILE}.tmp.$$"
+    python3 - "$temporary" "$$" "$phase" "$detail" "$failures" \
+        "$next_restart" <<'PY'
+import json
+import os
+import sys
+import time
+
+path, pid, phase, detail, failures, next_restart = sys.argv[1:]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "pid": int(pid),
+            "phase": phase,
+            "detail": detail,
+            "consecutive_failures": int(failures),
+            "next_restart_epoch": int(next_restart),
+            "updated_at": time.time(),
+        },
+        handle,
+        separators=(",", ":"),
+    )
+os.replace(path, path.removesuffix(f".tmp.{pid}"))
+PY
+}
+
+read_supervisor_status() {
+    python3 - "$ORCH_SUPERVISOR_STATUS_FILE" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        status = json.load(handle)
+    print(
+        status.get("phase", ""),
+        status.get("detail", ""),
+        status.get("consecutive_failures", 0),
+        status.get("next_restart_epoch", 0),
+        sep="\t",
+    )
+except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
 }
 
 write_pid_file() {
@@ -427,11 +559,15 @@ cleanup_failed_orchestrator_start() {
         error "orchestrator lock is still held after failed startup PID $pid"
         return 1
     fi
-    rm -f "$ORCH_LOCK"
+    clear_lock_metadata "$ORCH_LOCK" || {
+        error "orchestrator lock changed ownership while the previous owner exited"
+        return 1
+    }
 }
 
 terminate_process() {
     local pid="$1" kind="$2" deadline lock_path="" label="state store" port_detail="port $STORE_PORT"
+    local forced=0 lock_wait_deadline owner=""
     [ "$kind" = store ] && lock_path="$STORE_LOCK"
     if [ "$kind" = orchestrator ]; then
         lock_path="$ORCH_LOCK"
@@ -445,17 +581,44 @@ terminate_process() {
     if process_alive "$pid"; then
         echo "$label did not stop after ${STOP_TIMEOUT}s; sending SIGKILL (PID $pid; $port_detail)."
         kill -KILL "$pid" 2>/dev/null || true
+        forced=1
     fi
-    sleep 0.2
-    if [ -n "$lock_path" ] && lock_is_held "$lock_path"; then
-        error "$label PID $pid was signalled but still owns its lock"
+    deadline=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$deadline" ] && process_alive "$pid"; do sleep 0.1; done
+    if process_alive "$pid"; then
+        error "$label PID $pid did not exit after SIGKILL; refusing to continue while it may hold $lock_path"
         return 1
+    fi
+    if [ -n "$lock_path" ] && lock_is_held "$lock_path"; then
+        lock_wait_deadline=$((SECONDS + 5))
+        while [ "$SECONDS" -lt "$lock_wait_deadline" ] && lock_is_held "$lock_path"; do
+            sleep 0.1
+        done
+        if lock_is_held "$lock_path"; then
+            if [ "$kind" = store ]; then
+                owner="$(store_lock_pid || true)"
+            else
+                owner="$(orchestrator_pid || true)"
+            fi
+            error "$label PID $pid exited but $lock_path is still held by live PID ${owner:-unknown}; refusing unsafe removal"
+            return 1
+        fi
+    fi
+    if [ -n "$lock_path" ] && [ -f "$lock_path" ]; then
+        if ! clear_lock_metadata "$lock_path"; then
+            error "$label lock $lock_path changed ownership; refusing unsafe removal"
+            return 1
+        fi
+        if [ "$forced" -eq 1 ]; then
+            echo "Cleared stale $label lock metadata after confirmed process exit."
+        fi
     fi
     echo "$label stopped (PID $pid; $port_detail)."
 }
 
 stop_orchestrator() {
     local pid=""
+    stop_orchestrator_supervisor || return 1
     if lock_is_held "$ORCH_LOCK"; then
         pid="$(orchestrator_pid || true)"
         orchestrator_owner_valid "$pid" || {
@@ -466,7 +629,10 @@ stop_orchestrator() {
         terminate_process "$pid" orchestrator || { error "orchestrator did not release its lock"; return 1; }
     else
         if [ -f "$ORCH_LOCK" ]; then
-            rm -f "$ORCH_LOCK"
+            clear_lock_metadata "$ORCH_LOCK" || {
+                error "orchestrator lock changed ownership while stopping"
+                return 1
+            }
             echo "Orchestrator already stopped (removed stale lock metadata)."
         else
             echo "Orchestrator already stopped."
@@ -534,6 +700,7 @@ start_store() {
     esac
     echo "Starting state store on port $STORE_PORT..."
     rm -f "$STORE_STATUS_FILE"
+    rotate_log "$STORE_LOG"
     STORE_PORT="$STORE_PORT" nohup python3 -m uvicorn state_store.main:app \
         --host 0.0.0.0 --port "$STORE_PORT" --log-level warning > "$STORE_LOG" 2>&1 &
     pid=$!
@@ -554,32 +721,61 @@ start_store() {
 
 start_orchestrator() {
     local pid="" pid_start_identity="" attempt deadline=$((SECONDS + ORCH_START_TIMEOUT))
+    local supervisor=""
     if lock_is_held "$ORCH_LOCK"; then
         pid="$(orchestrator_pid || true)"
         if ! orchestrator_owner_valid "$pid"; then
             if wait_for_lock_release "$ORCH_LOCK" "Orchestrator"; then
                 echo "Previous orchestrator lock owner released the lock; continuing with a fresh orchestrator start."
-                rm -f "$ORCH_LOCK"
+                clear_lock_metadata "$ORCH_LOCK" || {
+                    error "orchestrator lock changed ownership before restart"
+                    return 1
+                }
             else
                 error "orchestrator lock is held by an unverifiable process (PID ${pid:-unknown}); see $ORCH_LOG"
                 return 1
             fi
         else
+            start_orchestrator_supervisor || return 1
             echo "Orchestrator already running (PID $pid; state-store port $STORE_PORT); did not start a new service."
             echo "  The existing process was left untouched; its loaded revision is not changed by this checkout."
             return 2
         fi
     fi
-    rm -f "$ORCH_LOCK"
+    supervisor="$(supervisor_pid)"
+    if supervisor_owner_valid "$supervisor"; then
+        echo "Orchestrator supervisor is active; waiting for it to start the service..."
+        while [ "$SECONDS" -lt "$deadline" ]; do
+            if lock_is_held "$ORCH_LOCK"; then
+                pid="$(orchestrator_pid || true)"
+                if orchestrator_owner_valid "$pid"; then
+                    echo "Orchestrator started by supervisor (PID $pid; state-store port $STORE_PORT)."
+                    return 2
+                fi
+            fi
+            supervisor_owner_valid "$supervisor" || break
+            sleep 0.1
+        done
+        error "orchestrator supervisor did not start the service; see $ORCH_SUPERVISOR_LOG"
+        return 1
+    fi
+    clear_lock_metadata "$ORCH_LOCK" || {
+        error "orchestrator lock changed ownership before startup"
+        return 1
+    }
     while [ "$SECONDS" -lt "$deadline" ]; do
         # The orchestrator owns this file after launch.  Never replace a
         # pathname that may still be locked by a process exiting between
         # retries.
         if ! lock_is_held "$ORCH_LOCK"; then
-            rm -f "$ORCH_LOCK"
+            clear_lock_metadata "$ORCH_LOCK" || {
+                error "orchestrator lock changed ownership during startup"
+                return 1
+            }
         fi
         echo "Starting orchestrator..."
         rm -f "$ORCH_STATUS_FILE"
+        rotate_log "$ORCH_LOG"
         nohup python3 -m orchestrator.main > "$ORCH_LOG" 2>&1 &
         pid=$!
         for attempt in 1 2 3 4 5; do
@@ -592,6 +788,10 @@ start_orchestrator() {
             pid_start_identity=""
         fi
         if wait_for_orchestrator "$pid"; then
+            if ! start_orchestrator_supervisor; then
+                terminate_process "$pid" orchestrator || true
+                return 1
+            fi
             echo "Orchestrator started (PID $pid; state-store port $STORE_PORT)."
             return 0
         fi
@@ -607,7 +807,10 @@ start_orchestrator() {
         dump_process_diagnostics "$ORCH_LOG" "Orchestrator" "$pid"
         rm -f "$ORCH_STATUS_FILE"
         if ! lock_is_held "$ORCH_LOCK"; then
-            rm -f "$ORCH_LOCK"
+            clear_lock_metadata "$ORCH_LOCK" || {
+                error "could not safely clear the failed orchestrator lock"
+                return 3
+            }
         fi
         return 1
     done
@@ -617,7 +820,173 @@ start_orchestrator() {
     return 1
 }
 
+start_orchestrator_supervisor() {
+    local pid="" deadline
+    pid="$(supervisor_pid)"
+    if supervisor_owner_valid "$pid"; then
+        return 0
+    fi
+    rm -f "$ORCH_SUPERVISOR_PID_FILE" "$ORCH_SUPERVISOR_STATUS_FILE"
+    rotate_log "$ORCH_SUPERVISOR_LOG"
+    START_BG_RESTART_BACKOFF="$RESTART_BACKOFF" \
+    START_BG_RESTART_BACKOFF_MAX="$RESTART_BACKOFF_MAX" \
+    START_BG_RESTART_STABLE_SECONDS="$RESTART_STABLE_SECONDS" \
+    START_BG_CRASH_LOOP_THRESHOLD="$CRASH_LOOP_THRESHOLD" \
+        nohup bash "$SCRIPT_DIR/start-bg.sh" __supervise-orchestrator \
+        >> "$ORCH_SUPERVISOR_LOG" 2>&1 &
+    pid=$!
+    write_pid_file "$ORCH_SUPERVISOR_PID_FILE" "$pid"
+    deadline=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        supervisor_owner_valid "$pid" && return 0
+        process_alive "$pid" || break
+        sleep 0.05
+    done
+    error "orchestrator supervisor failed to start; see $ORCH_SUPERVISOR_LOG"
+    rm -f "$ORCH_SUPERVISOR_PID_FILE"
+    return 1
+}
+
+stop_orchestrator_supervisor() {
+    local pid="" deadline
+    pid="$(supervisor_pid)"
+    if ! supervisor_owner_valid "$pid"; then
+        pid="$(supervisor_lock_pid)"
+    fi
+    if ! supervisor_owner_valid "$pid"; then
+        if lock_is_held "$ORCH_SUPERVISOR_LOCK"; then
+            error "orchestrator supervisor lock is held by an unverifiable process (PID ${pid:-unknown}); refusing to stop"
+            return 1
+        fi
+        rm -f "$ORCH_SUPERVISOR_PID_FILE" "$ORCH_SUPERVISOR_STATUS_FILE"
+        return 0
+    fi
+    echo "Stopping orchestrator supervisor (PID $pid)..."
+    kill -TERM "$pid" 2>/dev/null || true
+    deadline=$((SECONDS + STOP_TIMEOUT))
+    while [ "$SECONDS" -lt "$deadline" ] && process_alive "$pid"; do sleep 0.1; done
+    if process_alive "$pid"; then
+        echo "Orchestrator supervisor did not stop after ${STOP_TIMEOUT}s; sending SIGKILL."
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    deadline=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$deadline" ] && process_alive "$pid"; do sleep 0.1; done
+    if process_alive "$pid"; then
+        error "orchestrator supervisor PID $pid did not exit"
+        return 1
+    fi
+    deadline=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$deadline" ] && lock_is_held "$ORCH_SUPERVISOR_LOCK"; do
+        sleep 0.1
+    done
+    if lock_is_held "$ORCH_SUPERVISOR_LOCK"; then
+        error "orchestrator supervisor PID $pid exited but its lock is still held"
+        return 1
+    fi
+    clear_lock_metadata "$ORCH_SUPERVISOR_LOCK" || {
+        error "orchestrator supervisor lock changed ownership while stopping"
+        return 1
+    }
+    rm -f "$ORCH_SUPERVISOR_PID_FILE" "$ORCH_SUPERVISOR_STATUS_FILE"
+}
+
+cmd_supervise_orchestrator() {
+    local child="" stopping=0 failures=0 exit_status=0 delay=0
+    local started_at=0 now=0 elapsed=0 next_restart=0 sleep_pid=""
+    validate_launch_settings || exit $?
+    exec {supervisor_fd}<>"$ORCH_SUPERVISOR_LOCK"
+    flock -n "$supervisor_fd" || exit 0
+    printf '%s\n' "$$" > "$ORCH_SUPERVISOR_LOCK"
+    trap 'stopping=1; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null || true; fi; if [ -n "$sleep_pid" ]; then kill -TERM "$sleep_pid" 2>/dev/null || true; fi' TERM INT
+    write_pid_file "$ORCH_SUPERVISOR_PID_FILE" "$$"
+    write_supervisor_status "starting" "waiting for an orchestrator process" 0 0
+    echo "$(date -Is) orchestrator supervisor started" >> "$ORCH_SUPERVISOR_LOG"
+    while [ "$stopping" -eq 0 ]; do
+        if lock_is_held "$ORCH_LOCK"; then
+            write_supervisor_status \
+                "monitoring" "orchestrator PID $(orchestrator_pid || echo unknown)" \
+                "$failures" 0
+            sleep 2 {supervisor_fd}>&- &
+            sleep_pid=$!
+            if [ "$stopping" -ne 0 ]; then
+                kill -TERM "$sleep_pid" 2>/dev/null || true
+            fi
+            wait "$sleep_pid" || true
+            sleep_pid=""
+            continue
+        fi
+        [ "$stopping" -eq 0 ] || break
+        if ! clear_lock_metadata "$ORCH_LOCK"; then
+            echo "$(date -Is) orchestrator lock changed ownership before launch; retrying" \
+                >> "$ORCH_SUPERVISOR_LOG"
+            sleep 2 {supervisor_fd}>&-
+            continue
+        fi
+        rm -f "$ORCH_STATUS_FILE"
+        rotate_log "$ORCH_LOG"
+        started_at="$(date +%s)"
+        echo "$(date -Is) starting orchestrator (restart failure count: $failures)" \
+            >> "$ORCH_SUPERVISOR_LOG"
+        # The child must not inherit the supervisor lock; otherwise a crashed
+        # supervisor cannot be replaced while that child remains alive.
+        nohup python3 -m orchestrator.main > "$ORCH_LOG" 2>&1 {supervisor_fd}>&- &
+        child=$!
+        if [ "$stopping" -ne 0 ]; then
+            kill -TERM "$child" 2>/dev/null || true
+        fi
+        write_supervisor_status "running" "orchestrator PID $child" "$failures" 0
+        if wait "$child"; then
+            exit_status=0
+        else
+            exit_status=$?
+        fi
+        child=""
+        [ "$stopping" -eq 0 ] || break
+        now="$(date +%s)"
+        elapsed=$((now - started_at))
+        if [ "$elapsed" -ge "$RESTART_STABLE_SECONDS" ]; then
+            failures=0
+        else
+            failures=$((failures + 1))
+        fi
+        delay="$RESTART_BACKOFF"
+        local exponent=$((failures > 1 ? failures - 1 : 0))
+        local step=0
+        while [ "$step" -lt "$exponent" ] && [ "$delay" -lt "$RESTART_BACKOFF_MAX" ]; do
+            delay=$((delay * 2))
+            step=$((step + 1))
+        done
+        [ "$delay" -le "$RESTART_BACKOFF_MAX" ] || delay="$RESTART_BACKOFF_MAX"
+        next_restart=$((now + delay))
+        if [ "$failures" -ge "$CRASH_LOOP_THRESHOLD" ]; then
+            echo "$(date -Is) CRASH LOOP: orchestrator exited with status $exit_status; restarting in ${delay}s (failures=$failures)" \
+                >> "$ORCH_SUPERVISOR_LOG"
+            write_supervisor_status \
+                "crash_looping" \
+                "orchestrator exited with status $exit_status; retrying in ${delay}s" \
+                "$failures" "$next_restart"
+        else
+            echo "$(date -Is) orchestrator exited with status $exit_status; restarting in ${delay}s (failures=$failures)" \
+                >> "$ORCH_SUPERVISOR_LOG"
+            write_supervisor_status \
+                "restarting" \
+                "orchestrator exited with status $exit_status; retrying in ${delay}s" \
+                "$failures" "$next_restart"
+        fi
+        sleep "$delay" {supervisor_fd}>&- &
+        sleep_pid=$!
+        if [ "$stopping" -ne 0 ]; then
+            kill -TERM "$sleep_pid" 2>/dev/null || true
+        fi
+        wait "$sleep_pid" || true
+        sleep_pid=""
+    done
+    rm -f "$ORCH_SUPERVISOR_PID_FILE" "$ORCH_SUPERVISOR_STATUS_FILE"
+    echo "$(date -Is) orchestrator supervisor stopped" >> "$ORCH_SUPERVISOR_LOG"
+}
+
 cmd_start() {
+    validate_launch_settings || return $?
     [ -f "$CONFIG" ] || { error "config file not found: $CONFIG"; return 1; }
     echo "Launcher checkout revision: $(revision)"
     exec {launch_fd}>"$LAUNCH_LOCK"
@@ -668,7 +1037,8 @@ cmd_restart() {
 }
 
 cmd_status() {
-    local store_pid="" orch_pid=""
+    local store_pid="" orch_pid="" supervisor_status="" supervisor_phase="" supervisor_detail=""
+    local supervisor_failures="" supervisor_next=""
     echo "Launcher checkout revision: $(revision)"
     if lock_is_held "$STORE_LOCK"; then
         store_pid="$(store_lock_pid || true)"
@@ -692,6 +1062,23 @@ cmd_status() {
     else
         echo "Orchestrator: STOPPED"
     fi
+    orch_pid="$(supervisor_pid)"
+    if supervisor_owner_valid "$orch_pid"; then
+        supervisor_status="$(read_supervisor_status 2>/dev/null || true)"
+        IFS=$'\t' read -r supervisor_phase supervisor_detail supervisor_failures \
+            supervisor_next <<< "$supervisor_status" || true
+        echo "Orchestrator supervisor: RUNNING (PID $orch_pid; phase ${supervisor_phase:-unknown}; failures ${supervisor_failures:-0})"
+        if [ -n "$supervisor_detail" ]; then
+            echo "  $supervisor_detail"
+        fi
+    elif [ -f "$ORCH_SUPERVISOR_STATUS_FILE" ]; then
+        supervisor_status="$(read_supervisor_status 2>/dev/null || true)"
+        IFS=$'\t' read -r supervisor_phase supervisor_detail supervisor_failures \
+            supervisor_next <<< "$supervisor_status" || true
+        echo "Orchestrator supervisor: STOPPED (last phase ${supervisor_phase:-unknown})"
+    else
+        echo "Orchestrator supervisor: STOPPED"
+    fi
 }
 
 case "${1:-start}" in
@@ -699,5 +1086,6 @@ case "${1:-start}" in
     restart) cmd_restart ;;
     stop) cmd_stop ;;
     status) cmd_status ;;
+    __supervise-orchestrator) cmd_supervise_orchestrator ;;
     *) error "usage: $0 {start|restart|stop|status}"; exit 2 ;;
 esac

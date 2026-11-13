@@ -11,7 +11,9 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +54,7 @@ from state_store.status import (
 from .config import OrchestratorConfig, _provider_family
 from .dispatcher import STATUS_AGENT_MAP, Dispatcher, _await_cleanup
 from .handoff import check_handoff
-from .poller import fetch_all_tickets
+from .poller import fetch_all_tickets, fetch_tickets_by_status
 from .retry_guard import (
     DISPATCH_RETRY_BASE_SECONDS,
     DISPATCH_RETRY_LIMIT,
@@ -2955,6 +2957,220 @@ async def _prune_stale_retry_state(
         logger.exception("Could not clear stale retry state for %s", ticket_id)
 
 
+DEPOSED_CLAIM_RECONCILIATION_FIELD = "deposed_claim_reconciliation"
+
+
+def _claim_reconciliation_marker(
+    claim: Any, *, session_id: str, epoch: int
+) -> dict[str, Any]:
+    if not isinstance(claim, dict):
+        claim = {}
+    return {
+        "claim_id": claim.get("claim_id"),
+        "owner": claim.get("owner"),
+        "session_id": claim.get("session_id"),
+        "epoch": claim.get("epoch"),
+        "reason": "orchestrator lease taken over",
+        "reconciled_by_session_id": session_id,
+        "reconciled_by_epoch": epoch,
+        "reconciled_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _claim_is_deposed(claim: Any, *, session_id: str, epoch: int) -> bool:
+    if not isinstance(claim, dict):
+        return True
+    claim_session = claim.get("session_id")
+    claim_epoch = claim.get("epoch")
+    if any(key in claim for key in ("session_id", "epoch", "claim_id")):
+        if (
+            not isinstance(claim_session, str)
+            or not claim_session
+            or not isinstance(claim_epoch, int)
+            or isinstance(claim_epoch, bool)
+            or claim_epoch <= 0
+            or not isinstance(claim.get("claim_id"), str)
+            or not claim["claim_id"]
+        ):
+            return True
+    if isinstance(claim_session, str) and claim_session != session_id:
+        return True
+    if isinstance(claim_epoch, int) and not isinstance(claim_epoch, bool):
+        if claim_epoch != epoch:
+            return True
+    try:
+        expires = datetime.fromisoformat(claim["expires"])
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires <= datetime.now(timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+async def _reconcile_deposed_claims(
+    store_url: str,
+    tickets: list[dict[str, Any]],
+) -> tuple[set[str], set[str]]:
+    """Block stale claims and make prior-leader interruption explicit."""
+    session_id = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    raw_epoch = os.environ.get("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    try:
+        epoch = int(raw_epoch)
+    except ValueError:
+        return set(), set()
+    if not session_id or epoch <= 0:
+        return set(), set()
+
+    blocked: set[str] = set()
+    failed: set[str] = set()
+    headers = _mutation_headers(None)
+    for ticket in tickets:
+        ticket_id = ticket.get("id")
+        status = ticket.get("status", "")
+        custom_fields = ticket.get("custom_fields", {})
+        claim = custom_fields.get("claim") if isinstance(custom_fields, dict) else None
+        if not isinstance(ticket_id, str) or claim is None:
+            continue
+        if not _claim_is_deposed(claim, session_id=session_id, epoch=epoch):
+            continue
+
+        marker = _claim_reconciliation_marker(claim, session_id=session_id, epoch=epoch)
+        existing = custom_fields.get(DEPOSED_CLAIM_RECONCILIATION_FIELD)
+        marker_matches = (
+            isinstance(existing, dict)
+            and existing.get("claim_id") == marker["claim_id"]
+        )
+        blocked.add(ticket_id)
+        logger.warning(
+            "Reconciling deposed claim %s on %s at %s",
+            marker.get("claim_id") or "unknown",
+            ticket_id,
+            status,
+        )
+
+        try:
+            async with AuditedAsyncHTTPClient(timeout=10.0, headers=headers) as client:
+                if status in {"closed", "retrospective_pending"}:
+                    if status == "retrospective_pending":
+                        response = await client.post(
+                            f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                            json={
+                                "status": "closed",
+                                "comment": (
+                                    "The orchestrator lease changed while retrospective "
+                                    "analysis was in progress. Retrospective tickets "
+                                    "cannot pause for guidance, so the ticket was closed."
+                                ),
+                            },
+                        )
+                        if response.status_code != 200:
+                            logger.warning(
+                                "Could not close deposed retrospective ticket %s: "
+                                "HTTP %d: %s",
+                                ticket_id,
+                                response.status_code,
+                                response.text[:200],
+                            )
+                            failed.add(ticket_id)
+                            continue
+                    response = await client.patch(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                        json={
+                            "fields": {
+                                "claim": None,
+                                DEPOSED_CLAIM_RECONCILIATION_FIELD: {
+                                    **marker,
+                                    "status": "reconciled",
+                                },
+                            }
+                        },
+                    )
+                    if response.status_code != 200:
+                        logger.warning(
+                            "Could not clear deposed claim on terminal ticket %s: "
+                            "HTTP %d: %s",
+                            ticket_id,
+                            response.status_code,
+                            response.text[:200],
+                        )
+                        failed.add(ticket_id)
+                    continue
+
+                if not marker_matches:
+                    pending = {**marker, "status": "pending"}
+                    response = await client.patch(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                        json={
+                            "fields": {
+                                DEPOSED_CLAIM_RECONCILIATION_FIELD: pending,
+                                "interrupted": True,
+                                "guidance_summary": (
+                                    _build_cancellation_guidance_summary(
+                                        ticket, status, "claim_lost"
+                                    )
+                                ),
+                            }
+                        },
+                    )
+                    if response.status_code != 200:
+                        logger.warning(
+                            "Could not mark deposed claim on %s: HTTP %d: %s",
+                            ticket_id,
+                            response.status_code,
+                            response.text[:200],
+                        )
+                        failed.add(ticket_id)
+                        continue
+
+                if status != "awaiting_customer_guidance":
+                    response = await client.post(
+                        f"{store_url}/api/v1/tickets/{ticket_id}/transition",
+                        json={
+                            "status": "awaiting_customer_guidance",
+                            "comment": (
+                                "The orchestrator lease changed while this ticket "
+                                "was in progress. The previous claim was deposed; "
+                                "committed work must be reviewed before resuming."
+                            ),
+                        },
+                    )
+                    if response.status_code != 200:
+                        logger.warning(
+                            "Could not transition deposed ticket %s to guidance: "
+                            "HTTP %d: %s",
+                            ticket_id,
+                            response.status_code,
+                            response.text[:200],
+                        )
+                        failed.add(ticket_id)
+                        continue
+
+                response = await client.patch(
+                    f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+                    json={
+                        "fields": {
+                            "claim": None,
+                            DEPOSED_CLAIM_RECONCILIATION_FIELD: {
+                                **marker,
+                                "status": "reconciled",
+                            },
+                        }
+                    },
+                )
+                if response.status_code != 200:
+                    logger.warning(
+                        "Could not clear deposed claim on %s: HTTP %d: %s",
+                        ticket_id,
+                        response.status_code,
+                        response.text[:200],
+                    )
+                    failed.add(ticket_id)
+        except Exception:
+            failed.add(ticket_id)
+            logger.exception("Failed to reconcile deposed ticket %s", ticket_id)
+    return blocked, failed
+
+
 # Ticket custom fields that the orchestrator or state store rewrite on their own
 # during a dispatch: claim renewal, pre-run image resolution, iteration grants,
 # retry bookkeeping, and the introspection observer.  They must not be mistaken
@@ -2967,6 +3183,7 @@ _ORCHESTRATOR_MANAGED_FIELDS = frozenset(
         "iteration_budget",
         RETRY_STATE_FIELD,
         "introspection",
+        DEPOSED_CLAIM_RECONCILIATION_FIELD,
     }
 )
 
@@ -3111,6 +3328,10 @@ async def _record_dispatch_retry_outcome(
             )
 
 
+class LeaderLeaseLost(RuntimeError):
+    """The orchestrator can no longer prove ownership of the leader lease."""
+
+
 async def _renew_leader_lease(
     lease: Any,
     interval: float,
@@ -3121,12 +3342,12 @@ async def _renew_leader_lease(
 
     Retry transient transport and server errors with bounded backoff, but
     stop before the last confirmed lease expiration if renewal cannot succeed.
+    The caller releases the lease only after dispatcher work has drained.
     """
 
     if started is not None:
         started.set()
 
-    max_consecutive_failures = 3
     consecutive_failures = 0
     loss_notified = False
     loop = asyncio.get_running_loop()
@@ -3142,7 +3363,15 @@ async def _renew_leader_lease(
 
     def fail_lost(exc: Exception) -> None:
         mark_lost()
-        raise RuntimeError("orchestrator leader lease lost") from exc
+        raise LeaderLeaseLost("orchestrator leader lease lost") from exc
+
+    def retryable(exc: Exception) -> bool:
+        if isinstance(exc, (TimeoutError, httpx.TransportError)):
+            return True
+        return isinstance(exc, httpx.HTTPStatusError) and (
+            exc.response.status_code in {408, 425, 429}
+            or 500 <= exc.response.status_code < 600
+        )
 
     def safe_remaining() -> float:
         deadline = getattr(lease, "confirmed_deadline", None)
@@ -3152,62 +3381,142 @@ async def _renew_leader_lease(
 
     next_delay = interval
 
-    try:
-        while True:
-            remaining = safe_remaining()
-            if remaining <= 0:
-                fail_lost(RuntimeError("no confirmed lease time remains"))
-            if next_delay >= remaining:
-                # Preserve time for a renewal attempt when the usual cadence
-                # would consume the remaining confirmed lease window.
-                next_delay = remaining / 2
-            await asyncio.sleep(next_delay)
-            remaining = safe_remaining()
-            if remaining <= 0:
-                fail_lost(RuntimeError("confirmed lease deadline reached"))
+    while True:
+        remaining = safe_remaining()
+        if remaining <= 0:
+            fail_lost(RuntimeError("no confirmed lease time remains"))
+        if next_delay >= remaining:
+            # Preserve time for a renewal attempt when the usual cadence
+            # would consume the remaining confirmed lease window.
+            next_delay = remaining / 2
+        await asyncio.sleep(next_delay)
+        remaining = safe_remaining()
+        if remaining <= 0:
+            fail_lost(RuntimeError("confirmed lease deadline reached"))
 
-            try:
-                await asyncio.wait_for(lease.renew(), timeout=remaining)
-                if consecutive_failures > 0:
-                    logger.info(
-                        "Orchestrator lease renewal recovered "
-                        "after %d transient failure(s)",
-                        consecutive_failures,
-                    )
-                consecutive_failures = 0
-                next_delay = interval
-            except Exception as exc:
-                retryable = isinstance(exc, httpx.TransportError) or (
-                    isinstance(exc, httpx.HTTPStatusError)
-                    and 500 <= exc.response.status_code < 600
-                )
-                if not retryable:
-                    logger.critical(
-                        "Orchestrator leader lease renewal rejected: %s", exc
-                    )
-                    fail_lost(exc)
-
-                consecutive_failures += 1
-                logger.warning(
-                    "Orchestrator lease renewal transient failure %d/%d: %s",
+        try:
+            attempt_timeout = min(2.0, max(0.01, remaining - 0.05))
+            await asyncio.wait_for(lease.renew(), timeout=attempt_timeout)
+            if consecutive_failures > 0:
+                logger.info(
+                    "Orchestrator lease renewal recovered "
+                    "after %d transient failure(s)",
                     consecutive_failures,
-                    max_consecutive_failures,
+                )
+            consecutive_failures = 0
+            next_delay = interval
+        except Exception as exc:
+            if not retryable(exc):
+                logger.critical(
+                    "Orchestrator leader lease renewal rejected (%s, "
+                    "remaining=%.2fs): %r",
+                    type(exc).__name__,
+                    remaining,
                     exc,
                 )
-                if consecutive_failures >= max_consecutive_failures:
-                    logger.critical(
-                        "Orchestrator lease renewal failed %d consecutive times "
-                        "— declaring lease lost",
-                        consecutive_failures,
-                    )
-                    fail_lost(exc)
+                fail_lost(exc)
 
-                remaining = safe_remaining()
-                if remaining <= 0:
-                    fail_lost(exc)
-                next_delay = min(2.0 * consecutive_failures, interval / 2, remaining)
-    finally:
-        await lease.release()
+            consecutive_failures += 1
+            logger.warning(
+                "Orchestrator lease renewal transient failure %d (remaining=%.2fs): %r",
+                consecutive_failures,
+                remaining,
+                exc,
+            )
+            remaining = safe_remaining()
+            if remaining <= 0:
+                fail_lost(exc)
+            retry_delay = min(
+                2.0 ** min(consecutive_failures - 1, 3),
+                max(0.1, interval / 2),
+            )
+            next_delay = min(retry_delay, remaining)
+
+
+class _LeaderLeaseRenewer:
+    """Run lease renewal on a dedicated loop so application I/O cannot starve it."""
+
+    def __init__(self, lease: Any, interval: float, on_lost: Any) -> None:
+        self.lease = lease
+        self.interval = interval
+        self.on_lost = on_lost
+        self.started = threading.Event()
+        self._stopping = threading.Event()
+        self.failure: Exception | None = None
+        self._main_loop: asyncio.AbstractEventLoop | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task | None = None
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name="orchestrator-lease-renewal",
+            daemon=True,
+        )
+
+    def start(self, main_loop: asyncio.AbstractEventLoop) -> None:
+        self._main_loop = main_loop
+        self._thread.start()
+
+    def _notify_loss(self) -> None:
+        if self._main_loop is not None:
+            try:
+                self._main_loop.call_soon_threadsafe(self.on_lost)
+            except RuntimeError:
+                # The application loop is already closing; the failed renewer
+                # still surfaces the loss through ``raise_if_failed``.
+                pass
+
+    def _thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        try:
+            asyncio.set_event_loop(loop)
+            self._task = loop.create_task(
+                _renew_leader_lease(
+                    self.lease,
+                    self.interval,
+                    self._notify_loss,
+                    self.started,
+                )
+            )
+            loop.run_until_complete(self._task)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self.failure = exc
+        finally:
+            self._task = None
+            self._loop = None
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+
+    def raise_if_failed(self) -> None:
+        if self._stopping.is_set():
+            return
+        if self.failure is not None:
+            raise self.failure
+        if self.started.is_set() and not self._thread.is_alive():
+            raise LeaderLeaseLost(
+                "orchestrator leader lease renewal stopped unexpectedly"
+            )
+
+    def stop(self, *, timeout: float = 10.0) -> None:
+        self._stopping.set()
+        deadline = time.monotonic() + timeout
+        while (
+            self._loop is None
+            and self._thread.is_alive()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        loop = self._loop
+        task = self._task
+        if loop is not None and task is not None:
+            loop.call_soon_threadsafe(task.cancel)
+        self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if self._thread.is_alive():
+            logger.warning(
+                "Leader lease renewal thread did not stop within %.1fs", timeout
+            )
 
 
 async def _cancel_and_await(task: asyncio.Task | None) -> None:
@@ -3238,6 +3547,10 @@ class _LeaseLossGate:
         self.lost = True
         if self.dispatcher is not None:
             self.dispatcher.mark_deposed()
+
+    def raise_if_lost(self) -> None:
+        if self.lost:
+            raise LeaderLeaseLost("orchestrator leader lease lost")
 
     def bind(self, dispatcher: Any) -> None:
         self.dispatcher = dispatcher
@@ -3316,49 +3629,54 @@ async def poll_loop(config: OrchestratorConfig) -> None:
     write_effective_config(config)
     _ensure_state_store_environment(config)
 
-    from .leader_lease import LeaderLeaseClient
+    from .leader_lease import LeaderLeaseClient, LeaderLeaseUnavailable
 
-    leader_lease = LeaderLeaseClient(
-        config.state_store_url,
-        instance_name=config.instance_name,
-        ttl_seconds=config.leader_lease_ttl_seconds,
-    )
     # Lease acquisition is itself a mutating, audited control-plane request.
     # Bind a durable control trace before using the audited HTTP client; ticket
     # traces are created later by the dispatcher for individual work items.
     bind_trace_context(new_trace_context(ticket_id="control", agent_id="orchestrator"))
-    # Mutable container so _poll_loop_after_lease can store
-    # the renewal task for cleanup in the finally block.
-    lease_state: dict[str, Any] = {
-        "renew_task": None,
-        "started": asyncio.Event(),
-    }
-    try:
-        # Lease acquisition is deferred until after initialization
-        # completes inside _poll_loop_after_lease.  Initialization
-        # (model checks, MCP connections, telemetry) can take 30+
-        # seconds on slow storage, which would expire a 30s TTL
-        # lease acquired here.
-        lease_loss_gate = _LeaseLossGate()
-        await _poll_loop_after_lease(
-            config,
-            leader_lease,
-            lease_loss_gate,
-            lease_state,
+    while True:
+        # Each acquisition attempt gets a fresh session, dispatcher, and gate.
+        # A fresh session fences claims retained by a stopped dispatcher even
+        # when the previous lease release failed and the state store still has
+        # the old session's lease. Lease acquisition is deferred until
+        # initialization completes so startup I/O cannot consume the new TTL
+        # before the process is ready.
+        leader_lease = LeaderLeaseClient(
+            config.state_store_url,
+            instance_name=config.instance_name,
+            ttl_seconds=config.leader_lease_ttl_seconds,
         )
-    finally:
+        lease_state: dict[str, Any] = {
+            "renewer": None,
+            "started": threading.Event(),
+        }
+        lease_loss_gate = _LeaseLossGate()
+        try:
+            try:
+                await _poll_loop_after_lease(
+                    config,
+                    leader_lease,
+                    lease_loss_gate,
+                    lease_state,
+                )
+                return
+            finally:
 
-        async def finish_leader_lease() -> None:
-            renew_task = lease_state["renew_task"]
-            started = lease_state["started"]
-            if renew_task is None:
-                await leader_lease.release()
-            else:
-                await _cancel_and_await(renew_task)
-                if not started.is_set():
+                async def finish_leader_lease() -> None:
+                    renewer = lease_state["renewer"]
+                    if renewer is not None:
+                        await asyncio.to_thread(renewer.stop)
                     await leader_lease.release()
 
-        await _await_cleanup(asyncio.create_task(finish_leader_lease()))
+                await _await_cleanup(asyncio.create_task(finish_leader_lease()))
+        except (LeaderLeaseLost, LeaderLeaseUnavailable) as exc:
+            logger.warning(
+                "Leader lease unavailable; reacquiring in %.1fs: %s",
+                config.leader_lease_recovery_delay_seconds,
+                exc,
+            )
+            await asyncio.sleep(config.leader_lease_recovery_delay_seconds)
 
 
 async def _poll_loop_after_lease(
@@ -3375,7 +3693,7 @@ async def _poll_loop_after_lease(
     dispatcher: Dispatcher | None = None
     trace_sweep_task: asyncio.Task | None = None
     jumpstarter_sweep_task: asyncio.Task | None = None
-    lease_renew_task: asyncio.Task | None = None
+    lease_renewer: _LeaderLeaseRenewer | None = None
     repo_cache = RepoCache()
 
     # Create an MCP client for arcaflow plugin discovery
@@ -3626,16 +3944,13 @@ async def _poll_loop_after_lease(
         # It was constructed before acquire() with placeholder values.
         dispatcher._session_id = str(leader_lease.session_id)
         dispatcher._fencing_epoch = leader_lease.epoch
-        lease_renewal_started = lease_state["started"]
-        lease_renew_task = asyncio.create_task(
-            _renew_leader_lease(
-                leader_lease,
-                config.leader_lease_renew_interval,
-                lease_loss_gate.mark_deposed,
-                lease_renewal_started,
-            )
+        lease_renewer = _LeaderLeaseRenewer(
+            leader_lease,
+            config.leader_lease_renew_interval,
+            lease_loss_gate.mark_deposed,
         )
-        lease_state["renew_task"] = lease_renew_task
+        lease_renewer.start(asyncio.get_running_loop())
+        lease_state["renewer"] = lease_renewer
         logger.info(
             "Orchestrator started (store=%s, poll=%ss, llm=%s, max_agents=%s)",
             config.state_store_url,
@@ -3652,11 +3967,13 @@ async def _poll_loop_after_lease(
         last_jumpstarter_sweep = 0.0
         last_skill_snapshot_sweep = 0.0
         repos_refreshed = False
+        closed_claims_reconciled = False
         normalization_delivery_states: dict[str, dict[str, Any]] = {}
 
         while True:
-            if lease_renew_task is not None and lease_renew_task.done():
-                lease_renew_task.result()
+            lease_loss_gate.raise_if_lost()
+            if lease_renewer is not None:
+                lease_renewer.raise_if_failed()
             if time.monotonic() - last_trace_sweep >= 60.0 and (
                 trace_sweep_task is None or trace_sweep_task.done()
             ):
@@ -3677,6 +3994,21 @@ async def _poll_loop_after_lease(
                 except Exception:
                     logger.exception("Jumpstarter orphan lease sweep failed")
                 jumpstarter_sweep_task = None
+            if not closed_claims_reconciled:
+                try:
+                    closed_tickets = await fetch_tickets_by_status(
+                        config.state_store_url, "closed"
+                    )
+                    _, failed_closed_claims = await _reconcile_deposed_claims(
+                        config.state_store_url, closed_tickets
+                    )
+                    if not failed_closed_claims:
+                        closed_claims_reconciled = True
+                except Exception:
+                    logger.warning(
+                        "Closed-ticket claim reconciliation failed; retrying",
+                        exc_info=True,
+                    )
             now = time.monotonic()
             if (
                 jumpstarter_configured
@@ -3752,6 +4084,15 @@ async def _poll_loop_after_lease(
                     logger.exception("Skill gateway snapshot sweep failed")
                 last_skill_snapshot_sweep = time.monotonic()
 
+            (
+                reconciled_claim_tickets,
+                failed_claim_tickets,
+            ) = await _reconcile_deposed_claims(config.state_store_url, all_fetched)
+            if failed_claim_tickets:
+                # A terminal ticket can fall out of the ordinary open-ticket poll
+                # after its transition succeeds but its claim clear fails.
+                closed_claims_reconciled = False
+
             # Clear retry limits as soon as any ticket leaves the status
             # where its failures occurred. Guidance and terminal statuses
             # are not dispatched below, so this must happen before filtering
@@ -3785,6 +4126,7 @@ async def _poll_loop_after_lease(
 
                 tickets = tickets_by_status.get(status, [])
                 for ticket in tickets:
+                    lease_loss_gate.raise_if_lost()
                     active_count = len(dispatcher.active_tasks())
                     if active_count >= config.max_concurrent_agents:
                         if not was_at_capacity:
@@ -3811,6 +4153,14 @@ async def _poll_loop_after_lease(
                     tid = ticket["id"]
                     if dispatcher.is_active(tid):
                         logger.info(f"Skipping {tid} at {status}: is_active")
+                        continue
+
+                    if tid in reconciled_claim_tickets:
+                        logger.warning(
+                            "Skipping %s at %s until its deposed claim is reconciled",
+                            tid,
+                            status,
+                        )
                         continue
 
                     cf = ticket.get("custom_fields", {})
@@ -4093,8 +4443,9 @@ async def _poll_loop_after_lease(
                         tid,
                     )
 
-                    if lease_renew_task is not None and lease_renew_task.done():
-                        lease_renew_task.result()
+                    if lease_renewer is not None:
+                        lease_renewer.raise_if_failed()
+                    lease_loss_gate.raise_if_lost()
                     logger.info(f"Dispatching {status} agent for ticket {tid}")
                     task = asyncio.create_task(
                         run_agent_task(
@@ -4135,8 +4486,13 @@ async def _poll_loop_after_lease(
             await _cancel_and_await(trace_sweep_task)
             await _cancel_and_await(jumpstarter_sweep_task)
             if dispatcher is not None:
+                if dispatcher.is_deposed():
+                    await dispatcher.drain_for_lease_loss(
+                        config.leader_lease_drain_timeout_seconds
+                    )
                 await dispatcher.shutdown()
-            await _cancel_and_await(lease_renew_task)
+            if lease_renewer is not None:
+                await asyncio.to_thread(lease_renewer.stop)
             if arcaflow_mcp is not None:
                 try:
                     await arcaflow_mcp.disconnect()

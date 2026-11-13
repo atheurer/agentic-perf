@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -16,6 +18,11 @@ from providers.tracing import (
     LifecycleDescriptor,
     LifecycleState,
     TraceEventV1,
+)
+from providers.tracing.query import (
+    TraceQuery,
+    TraceQueryCancelled,
+    TraceQueryTooBroad,
 )
 from state_store.trace_store import (
     OperationRecord,
@@ -104,6 +111,87 @@ def test_shared_store_serializes_reads_with_write_transactions(
             release.set()
             assert writer.result().state == "prepared"
             assert reader.result().state == "prepared"
+
+
+def test_query_waiting_for_store_lock_observes_cancellation(tmp_path: Path) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        cancelled = threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as executor, store._lock:
+            future = executor.submit(
+                store.query_events,
+                TraceQuery(limit=1),
+                cancelled=cancelled.is_set,
+            )
+            time.sleep(0.15)
+            assert not future.done()
+            cancelled.set()
+            with pytest.raises(TraceQueryCancelled):
+                future.result(timeout=2)
+
+
+def test_query_events_uses_bound_filters_and_causal_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    occurred_at = datetime(2026, 11, 12, 20, 0, tzinfo=timezone.utc)
+    with TraceStore(tmp_path / "trace.db") as store:
+        root = store.insert_event(event(occurred_at=occurred_at))
+        child = store.insert_event(
+            event(
+                trace_id=root.trace_id,
+                parent_action_id=root.action_id,
+                occurred_at=occurred_at,
+            )
+        )
+        grandchild = store.insert_event(
+            event(
+                trace_id=root.trace_id,
+                parent_action_id=child.action_id,
+                occurred_at=occurred_at,
+            )
+        )
+        store.insert_event(event(ticket_id="PERF-other", occurred_at=occurred_at))
+
+        scoped = store.query_events(
+            TraceQuery(
+                ticket_id="PERF-1",
+                since=occurred_at,
+                until=occurred_at,
+                limit=10,
+            )
+        )
+        assert [item.action_id for item in scoped] == [
+            root.action_id,
+            child.action_id,
+            grandchild.action_id,
+        ]
+
+        monkeypatch.setattr(store, "MAX_CAUSAL_EVENTS", 2)
+        with pytest.raises(TraceQueryTooBroad):
+            store.query_events(
+                TraceQuery(
+                    ticket_id="PERF-1",
+                    action_id=child.action_id,
+                    causal=True,
+                    limit=10,
+                )
+            )
+
+        with pytest.raises(TraceQueryCancelled):
+            store.query_events(
+                TraceQuery(retry_kind="not-present"),
+                cancelled=lambda: True,
+            )
+
+
+def test_query_events_enforces_serialized_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        store.insert_event(event(attributes={"payload": "\u00e9" * 600}))
+        monkeypatch.setattr(store, "MAX_QUERY_RAW_BYTES", 1024)
+
+        with pytest.raises(TraceQueryTooBroad, match="query budget"):
+            store.query_events(TraceQuery(limit=10))
 
 
 def test_multiprocess_cold_start_has_gap_free_sequences(tmp_path: Path) -> None:

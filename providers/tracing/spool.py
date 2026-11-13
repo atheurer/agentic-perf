@@ -170,35 +170,79 @@ class TraceSpool:
         self._filesystem.write(self.ack_path.name, str(offset), mode=0o600)
         self._fsync_dir()
 
-    def pending(self) -> Iterator[tuple[int, TraceEventV1]]:
+    def _iter_pending(
+        self,
+        stream: BinaryIO,
+        offset: int,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+        limit: int | None = None,
+    ) -> Iterator[tuple[int, TraceEventV1]]:
+        stream.seek(offset)
+        count = 0
+        while limit is None or count < limit:
+            if check_cancelled is not None:
+                check_cancelled()
+            header = stream.read(_HEADER.size)
+            if not header:
+                return
+            if len(header) != _HEADER.size:
+                self._quarantine("truncated-header")
+                raise SpoolCorruption("truncated spool frame")
+            length = _HEADER.unpack(header)[0]
+            if length > _MAX_FRAME:
+                self._quarantine("invalid-length")
+                raise SpoolCorruption("untrusted spool frame length")
+            payload = stream.read(length)
+            digest = stream.read(_DIGEST_SIZE)
+            if check_cancelled is not None:
+                check_cancelled()
+            if len(payload) != length or len(digest) != _DIGEST_SIZE:
+                self._quarantine("truncated-frame")
+                raise SpoolCorruption("truncated spool frame")
+            if hashlib.sha256(payload).digest() != digest:
+                self._quarantine("checksum")
+                raise SpoolCorruption("spool checksum failure")
+            try:
+                event = TraceEventV1.model_validate_json(payload)
+            except ValueError as exc:
+                self._quarantine("invalid-json")
+                raise SpoolCorruption("invalid spool event") from exc
+            count += 1
+            yield stream.tell(), event
+
+    def pending(
+        self, *, check_cancelled: Callable[[], None] | None = None
+    ) -> Iterator[tuple[int, TraceEventV1]]:
         with self._mutex, self.path.open("rb") as stream:
+            if check_cancelled is not None:
+                check_cancelled()
             offset = self._validate_ack_boundary(stream, self._ack_offset())
-            stream.seek(offset)
-            while True:
-                header = stream.read(_HEADER.size)
-                if not header:
-                    return
-                if len(header) != _HEADER.size:
-                    self._quarantine("truncated-header")
-                    raise SpoolCorruption("truncated spool frame")
-                length = _HEADER.unpack(header)[0]
-                if length > _MAX_FRAME:
-                    self._quarantine("invalid-length")
-                    raise SpoolCorruption("untrusted spool frame length")
-                payload = stream.read(length)
-                digest = stream.read(_DIGEST_SIZE)
-                if len(payload) != length or len(digest) != _DIGEST_SIZE:
-                    self._quarantine("truncated-frame")
-                    raise SpoolCorruption("truncated spool frame")
-                if hashlib.sha256(payload).digest() != digest:
-                    self._quarantine("checksum")
-                    raise SpoolCorruption("spool checksum failure")
-                try:
-                    event = TraceEventV1.model_validate_json(payload)
-                except ValueError as exc:
-                    self._quarantine("invalid-json")
-                    raise SpoolCorruption("invalid spool event") from exc
-                yield stream.tell(), event
+            yield from self._iter_pending(
+                stream, offset, check_cancelled=check_cancelled
+            )
+
+    def pending_batch(
+        self,
+        limit: int,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> list[tuple[int, TraceEventV1]]:
+        """Read one bounded batch without holding the spool mutex during I/O."""
+        if limit <= 0:
+            raise ValueError("pending batch limit must be positive")
+        with self._mutex, self.path.open("rb") as stream:
+            if check_cancelled is not None:
+                check_cancelled()
+            offset = self._validate_ack_boundary(stream, self._ack_offset())
+            return list(
+                self._iter_pending(
+                    stream,
+                    offset,
+                    check_cancelled=check_cancelled,
+                    limit=limit,
+                )
+            )
 
     def acknowledge(self, offset: int) -> None:
         with self._mutex:
@@ -206,7 +250,7 @@ class TraceSpool:
                 self._validate_ack_boundary(stream, offset)
             self._write_ack(offset)
 
-    def compact(self) -> None:
+    def compact(self, *, check_cancelled: Callable[[], None] | None = None) -> None:
         """Atomically discard acknowledged bytes; old file remains on crash."""
         with self._mutex:
             offset = self._ack_offset()
@@ -217,7 +261,14 @@ class TraceSpool:
                 source.seek(offset)
                 temporary = self._filesystem.temporary_file(prefix=".spool-")
                 try:
-                    self._filesystem.write_stream(temporary, source, mode=0o600)
+                    self._filesystem.write_stream(
+                        temporary,
+                        source,
+                        mode=0o600,
+                        check_cancelled=check_cancelled,
+                    )
+                    if check_cancelled is not None:
+                        check_cancelled()
                     # Reset before replace: either crash window replays the old file
                     # or uses the compacted file from offset zero; neither loses data.
                     self._write_ack(0)

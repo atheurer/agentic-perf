@@ -80,6 +80,63 @@ time.sleep(600)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def _stubborn_store_holder(path: Path, *, lock_path: Path, store_id: str) -> None:
+    code = """
+import fcntl, json, os, signal, sys, time
+lock_path, store_id = sys.argv[1:]
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+fields = open(f'/proc/{os.getpid()}/stat').read().rsplit(') ', 1)[1].split()
+metadata = {
+    'pid': os.getpid(),
+    'process_start_identity': f'{os.getpid()}:{fields[19]}',
+    'configured_port': 18903,
+    'store_id': store_id,
+}
+os.ftruncate(fd, 0)
+os.write(fd, json.dumps(metadata).encode())
+os.fsync(fd)
+time.sleep(600)
+"""
+    script = textwrap.dedent(
+        f"""\
+        #!/usr/bin/env bash
+        exec -a {shlex.quote("python3 -m uvicorn state_store.main:app")} \\
+            /usr/bin/python3 -c {shlex.quote(code)} "$@"
+        """
+    ).lstrip()
+    path.write_text(script)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _supervisor_lock_holder(path: Path, *, lock_path: Path, write_pid: bool) -> None:
+    code = """
+import fcntl, os, sys, time
+from pathlib import Path
+
+lock_path = sys.argv[1]
+write_pid = sys.argv[2] == "1"
+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+if write_pid:
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode())
+    os.fsync(fd)
+Path(lock_path + ".ready").write_text("ready")
+time.sleep(600)
+"""
+    script = textwrap.dedent(
+        f"""\
+        #!/usr/bin/env bash
+        exec -a {shlex.quote(f"bash {SCRIPT} __supervise-orchestrator")} \\
+            /usr/bin/python3 -c {shlex.quote(code)} "$@"
+        """
+    ).lstrip()
+    path.write_text(script)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
 def test_start_repairs_metadata_and_stop_uses_lock_owner(tmp_path: Path) -> None:
     home = tmp_path / "home"
     (home / "logs").mkdir(parents=True)
@@ -181,7 +238,13 @@ def test_stop_reports_already_stopped_services(tmp_path: Path) -> None:
     home = tmp_path / "home"
     (home / "logs").mkdir(parents=True)
     env = os.environ.copy()
-    env["AGENTIC_PERF_HOME"] = str(home)
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_LOG_BACKUPS": "invalid",
+            "START_BG_RESTART_BACKOFF": "invalid",
+        }
+    )
     result = subprocess.run(
         [str(SCRIPT), "stop"],
         cwd=REPO,
@@ -194,6 +257,642 @@ def test_stop_reports_already_stopped_services(tmp_path: Path) -> None:
     assert "Orchestrator already stopped" in result.stdout
     assert "State store already stopped" in result.stdout
     assert "Services stopped" in result.stdout
+
+
+def test_start_rejects_invalid_launch_settings(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_RESTART_BACKOFF": "invalid",
+        }
+    )
+    result = subprocess.run(
+        [str(SCRIPT), "start"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "START_BG_RESTART_BACKOFF must be a positive integer" in result.stderr
+
+
+def test_log_rotation_keeps_bounded_history(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_LOG_BACKUPS": "5",
+        }
+    )
+    script = f"""
+source {shlex.quote(str(SCRIPT))} status
+for index in 1 2 3 4 5 6 7; do
+    printf 'content-%s\\n' "$index" > "$AGENTIC_PERF_HOME/logs/orchestrator.log"
+    rotate_log "$AGENTIC_PERF_HOME/logs/orchestrator.log"
+done
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (home / "logs" / "orchestrator.log.1").read_text() == "content-7\n"
+    assert (home / "logs" / "orchestrator.log.5").read_text() == "content-3\n"
+    assert not (home / "logs" / "orchestrator.log.6").exists()
+
+
+def test_supervisor_restarts_and_reports_crash_loop(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python = fake_bin / "python3"
+    python.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then
+                exec -a "python3 -m orchestrator.main" /usr/bin/python3 -c '
+import fcntl, os
+from pathlib import Path
+folder = Path(os.environ["AGENTIC_PERF_HOME"])
+fd = os.open(folder / "orchestrator.pid", os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.write(fd, str(os.getpid()).encode())
+os.fsync(fd)
+print("simulated orchestrator crash", flush=True)
+raise SystemExit(7)
+'
+            fi
+            exec /usr/bin/python3 "$@"
+            """
+        )
+    )
+    python.chmod(python.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_RESTART_BACKOFF": "1",
+            "START_BG_RESTART_BACKOFF_MAX": "1",
+            "START_BG_RESTART_STABLE_SECONDS": "60",
+            "START_BG_CRASH_LOOP_THRESHOLD": "2",
+        }
+    )
+    process = subprocess.Popen(
+        [str(SCRIPT), "__supervise-orchestrator"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    status_path = home / "orchestrator-supervisor.status"
+    try:
+        deadline = time.monotonic() + 8
+        status = {}
+        while time.monotonic() < deadline:
+            if status_path.exists():
+                try:
+                    status = json.loads(status_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    status = {}
+                if status.get("phase") == "crash_looping":
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("supervisor did not enter crash-loop status")
+
+        assert status["consecutive_failures"] >= 2
+        assert status["next_restart_epoch"] > 0
+        assert (home / "logs" / "orchestrator.log.1").exists()
+        assert (
+            "CRASH LOOP" in (home / "logs" / "orchestrator-supervisor.log").read_text()
+        )
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)
+
+
+def test_supervisor_stop_during_backoff_does_not_restart_orchestrator(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    invocations = home / "orchestrator-invocations"
+    python = fake_bin / "python3"
+    python.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then
+                printf 'start\\n' >> {shlex.quote(str(invocations))}
+                exec -a "python3 -m orchestrator.main" /usr/bin/python3 -c '
+import fcntl, os
+from pathlib import Path
+folder = Path(os.environ["AGENTIC_PERF_HOME"])
+fd = os.open(folder / "orchestrator.pid", os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.write(fd, str(os.getpid()).encode())
+os.fsync(fd)
+raise SystemExit(7)
+'
+            fi
+            exec /usr/bin/python3 "$@"
+            """
+        )
+    )
+    python.chmod(python.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_RESTART_BACKOFF": "30",
+            "START_BG_RESTART_BACKOFF_MAX": "30",
+            "START_BG_RESTART_STABLE_SECONDS": "60",
+            "START_BG_CRASH_LOOP_THRESHOLD": "3",
+        }
+    )
+    process = subprocess.Popen(
+        [str(SCRIPT), "__supervise-orchestrator"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    status_path = home / "orchestrator-supervisor.status"
+    try:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if status_path.exists():
+                try:
+                    status = json.loads(status_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    status = {}
+                if status.get("phase") == "restarting":
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("supervisor did not enter restart backoff")
+
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=5)
+        time.sleep(0.1)
+
+        assert process.returncode == 0
+        assert invocations.read_text().splitlines() == ["start"]
+        assert (
+            "orchestrator supervisor stopped"
+            in (home / "logs" / "orchestrator-supervisor.log").read_text()
+        )
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=5)
+
+
+def test_replacement_supervisor_acquires_lock_after_forced_backoff_exit(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    invocations = home / "orchestrator-invocations"
+    python = fake_bin / "python3"
+    python.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/usr/bin/env bash
+            if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then
+                printf 'start\\n' >> {shlex.quote(str(invocations))}
+                exit 7
+            fi
+            exec /usr/bin/python3 "$@"
+            """
+        )
+    )
+    python.chmod(python.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_RESTART_BACKOFF": "30",
+            "START_BG_RESTART_BACKOFF_MAX": "30",
+            "START_BG_RESTART_STABLE_SECONDS": "60",
+            "START_BG_CRASH_LOOP_THRESHOLD": "3",
+        }
+    )
+    first = subprocess.Popen(
+        [str(SCRIPT), "__supervise-orchestrator"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    second: subprocess.Popen | None = None
+    status_path = home / "orchestrator-supervisor.status"
+    try:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            try:
+                status = json.loads(status_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                time.sleep(0.05)
+                continue
+            if status.get("phase") == "restarting":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("supervisor did not enter restart backoff")
+
+        time.sleep(0.1)
+        first.kill()
+        first.wait(timeout=5)
+        second = subprocess.Popen(
+            [str(SCRIPT), "__supervise-orchestrator"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if invocations.exists() and len(invocations.read_text().splitlines()) >= 2:
+                break
+            if second.poll() is not None:
+                raise AssertionError("replacement supervisor exited before launching")
+            time.sleep(0.05)
+        else:
+            raise AssertionError("replacement supervisor did not acquire the lock")
+    finally:
+        for process in (first, second):
+            if process is not None and process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=5)
+
+
+def test_stop_uses_supervisor_lock_owner_when_pid_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    holder = tmp_path / "supervisor-holder"
+    lock_path = home / "orchestrator-supervisor.lock"
+    _supervisor_lock_holder(holder, lock_path=lock_path, write_pid=True)
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+    process = subprocess.Popen(
+        [str(holder), str(lock_path), "1"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    ready = Path(f"{lock_path}.ready")
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.05)
+        assert ready.exists()
+
+        result = subprocess.run(
+            [str(SCRIPT), "stop"], cwd=REPO, env=env, capture_output=True, text=True
+        )
+        process.wait(timeout=5)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f"Stopping orchestrator supervisor (PID {process.pid})" in result.stdout
+        assert "Services stopped." in result.stdout
+        assert lock_path.read_text() == ""
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_competing_supervisor_preserves_active_lock_metadata(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    holder = tmp_path / "supervisor-holder"
+    lock_path = home / "orchestrator-supervisor.lock"
+    _supervisor_lock_holder(holder, lock_path=lock_path, write_pid=True)
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+    process = subprocess.Popen(
+        [str(holder), str(lock_path), "1"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    ready = Path(f"{lock_path}.ready")
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.05)
+        assert ready.exists()
+
+        contender = subprocess.run(
+            [str(SCRIPT), "__supervise-orchestrator"],
+            cwd=REPO,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        assert contender.returncode == 0, contender.stdout + contender.stderr
+        assert process.poll() is None
+        assert lock_path.read_text() == str(process.pid)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_stop_refuses_unverifiable_live_supervisor_lock(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    holder = tmp_path / "supervisor-holder"
+    lock_path = home / "orchestrator-supervisor.lock"
+    _supervisor_lock_holder(holder, lock_path=lock_path, write_pid=False)
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+    process = subprocess.Popen(
+        [str(holder), str(lock_path), "0"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    ready = Path(f"{lock_path}.ready")
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.05)
+        assert ready.exists()
+
+        result = subprocess.run(
+            [str(SCRIPT), "stop"], cwd=REPO, env=env, capture_output=True, text=True
+        )
+
+        assert result.returncode != 0
+        assert "supervisor lock is held by an unverifiable process" in (
+            result.stdout + result.stderr
+        )
+        assert process.poll() is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_replacement_supervisor_acquires_lock_when_child_survives(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    python = fake_bin / "python3"
+    python.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then
+                exec -a "python3 -m orchestrator.main" /usr/bin/python3 -c '
+import fcntl, os, time
+from pathlib import Path
+folder = Path(os.environ["AGENTIC_PERF_HOME"])
+fd = os.open(folder / "orchestrator.pid", os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.write(fd, str(os.getpid()).encode())
+os.fsync(fd)
+(folder / "orchestrator-ready").write_text(str(os.getpid()))
+time.sleep(30)
+'
+            fi
+            exec /usr/bin/python3 "$@"
+            """
+        )
+    )
+    python.chmod(python.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_RESTART_BACKOFF": "30",
+            "START_BG_RESTART_BACKOFF_MAX": "30",
+            "START_BG_RESTART_STABLE_SECONDS": "60",
+            "START_BG_CRASH_LOOP_THRESHOLD": "3",
+        }
+    )
+    first = subprocess.Popen(
+        [str(SCRIPT), "__supervise-orchestrator"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    second: subprocess.Popen | None = None
+    child_pid = 0
+    child_ready = home / "orchestrator-ready"
+    status_path = home / "orchestrator-supervisor.status"
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                launched_pid = int(child_ready.read_text())
+                child_pid = int((home / "orchestrator.pid").read_text())
+            except (OSError, ValueError, json.JSONDecodeError):
+                time.sleep(0.05)
+                continue
+            if launched_pid == child_pid:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("first supervisor did not launch its orchestrator")
+
+        first.kill()
+        first.wait(timeout=5)
+        os.kill(child_pid, 0)
+
+        second = subprocess.Popen(
+            [str(SCRIPT), "__supervise-orchestrator"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if second.poll() is not None:
+                raise AssertionError("replacement supervisor exited")
+            try:
+                status = json.loads(status_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                status = {}
+            if status.get("pid") == second.pid and status.get("phase") == "monitoring":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("replacement supervisor did not acquire its lock")
+    finally:
+        for process in (first, second):
+            if process is not None and process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=5)
+        if child_pid:
+            try:
+                os.kill(child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    state = (
+                        Path(f"/proc/{child_pid}/stat")
+                        .read_text()
+                        .rsplit(") ", 1)[1]
+                        .split()[0]
+                    )
+                except (OSError, IndexError):
+                    break
+                if state in {"Z", "X"}:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("surviving orchestrator child did not exit")
+
+
+def test_stop_reclaims_lock_metadata_after_launcher_kills_process(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    store_id = str(uuid.uuid4())
+    holder = tmp_path / "stubborn-store-holder"
+    _stubborn_store_holder(
+        holder,
+        lock_path=home / "state-store.lock",
+        store_id=store_id,
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_STOP_TIMEOUT": "1",
+        }
+    )
+    process = subprocess.Popen(
+        [str(holder), str(home / "state-store.lock"), store_id],
+        cwd=REPO,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if (home / "state-store.lock").exists():
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("stubborn store holder did not acquire its lock")
+        lock_inode = (home / "state-store.lock").stat().st_ino
+
+        result = subprocess.run(
+            [str(SCRIPT), "stop"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "sending SIGKILL" in result.stdout
+        assert "Cleared stale state store lock metadata" in result.stdout
+        assert (home / "state-store.lock").read_text() == ""
+        assert (home / "state-store.lock").stat().st_ino == lock_inode
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
+def test_lock_cleanup_refuses_live_replacement_owner(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    store_id = str(uuid.uuid4())
+    lock_path = home / "state-store.lock"
+    holder = tmp_path / "stubborn-store-holder"
+    _stubborn_store_holder(holder, lock_path=lock_path, store_id=store_id)
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+    process = subprocess.Popen(
+        [str(holder), str(lock_path), store_id],
+        cwd=REPO,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if lock_path.exists() and lock_path.stat().st_size:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("replacement store holder did not acquire its lock")
+        inode = lock_path.stat().st_ino
+        contents = lock_path.read_text()
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"source {shlex.quote(str(SCRIPT))} status; "
+                f"clear_lock_metadata {shlex.quote(str(lock_path))}",
+            ],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert lock_path.stat().st_ino == inode
+        assert lock_path.read_text() == contents
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
 
 
 def test_fresh_start_waits_for_lock_creation(tmp_path: Path) -> None:
