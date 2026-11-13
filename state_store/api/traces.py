@@ -16,15 +16,17 @@ from providers.tracing import TraceEventV1
 from providers.tracing.payloads import PayloadBlobStore, PayloadStorageError
 from providers.tracing.query import (
     TraceQuery,
+    TraceQueryCancelled,
+    TraceQueryTooBroad,
+    decode_cursor,
     diagnostics,
     export_events,
     export_manifest,
     page_events,
-    query_events,
 )
 
 from ..auth import Principal
-from ..trace_store import TraceEventConflictError, TraceStoreWriteError
+from ..trace_store import TraceEventConflictError, TraceStore, TraceStoreWriteError
 from .events import invalidate_closed_ticket_usage_cache
 
 router = APIRouter(prefix="/traces/events", tags=["traces"])
@@ -63,6 +65,11 @@ def _authorize_query(request: Request, ticket_id: str | None) -> bool:
     return False
 
 
+async def _authorize_query_off_loop(request: Request, ticket_id: str | None) -> bool:
+    """Keep ticket-store lock waits and deferred reads off the ASGI loop."""
+    return await asyncio.to_thread(_authorize_query, request, ticket_id)
+
+
 def _event_json(event: TraceEventV1, detailed: bool) -> dict[str, object]:
     data = event.model_dump(mode="json")
     if not detailed:
@@ -89,7 +96,7 @@ def _query_from_params(
     until: datetime | None,
     causal: bool,
     limit: int,
-    cursor: int,
+    cursor: int = 0,
 ) -> TraceQuery:
     return TraceQuery(
         ticket_id=ticket_id,
@@ -111,7 +118,19 @@ def _query_from_params(
     )
 
 
-def _record_query_audit(
+def _cursor_sequence(cursor: str | None) -> int:
+    marker = decode_cursor(cursor)
+    if marker is None:
+        return 0
+    if marker[0] != 0:
+        raise ValueError("invalid trace cursor for stored events")
+    value = int(marker[1])
+    if value < 0 or value > 2**63 - 1:
+        raise ValueError("invalid trace cursor for stored events")
+    return value
+
+
+async def _record_query_audit(
     request: Request,
     operation: str,
     ticket_id: str | None,
@@ -120,11 +139,45 @@ def _record_query_audit(
 ) -> None:
     audit_log = getattr(request.app.state, "audit_log", None)
     if audit_log is not None:
-        audit_log.log(
-            operation,
-            ticket_id or "*",
-            {"outcome": outcome, "error": error, "ticket_scoped": bool(ticket_id)},
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                audit_log.log,
+                operation,
+                ticket_id or "*",
+                {
+                    "outcome": outcome,
+                    "error": error,
+                    "ticket_scoped": bool(ticket_id),
+                },
+            )
         )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.add_done_callback(_consume_audit_result)
+            raise
+
+
+def _consume_audit_result(task: asyncio.Task[None]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def _record_cancelled_query(
+    request: Request,
+    operation: str,
+    ticket_id: str | None,
+) -> None:
+    """Finalize cancellation even if the request task is cancelled again."""
+    await asyncio.shield(
+        _record_query_audit(
+            request,
+            operation,
+            ticket_id,
+            "cancelled",
+            "request cancelled",
+        )
+    )
 
 
 def _verified_blob_refs(events: list[TraceEventV1]) -> set[str]:
@@ -144,8 +197,118 @@ def _verified_blob_refs(events: list[TraceEventV1]) -> set[str]:
     return refs
 
 
+async def _query_store(
+    request: Request,
+    store: TraceStore,
+    query: TraceQuery,
+    *,
+    include_diagnostics: bool = False,
+) -> tuple[list[TraceEventV1], list[TraceEventV1] | None]:
+    """Run a bounded trace scan off-loop and stop it when the client leaves."""
+
+    def consume_result(task: asyncio.Task) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    cancelled = threading.Event()
+    method = (
+        store.query_events_with_diagnostics
+        if include_diagnostics
+        else store.query_events
+    )
+    task = asyncio.create_task(
+        asyncio.to_thread(method, query, cancelled=cancelled.is_set)
+    )
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=0.2)
+            if task in done:
+                result = task.result()
+                if include_diagnostics:
+                    return result
+                return result, None
+            if await request.is_disconnected():
+                cancelled.set()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+                except TimeoutError:
+                    pass
+                raise TraceQueryCancelled("trace query cancelled")
+    finally:
+        if task.done():
+            consume_result(task)
+        else:
+            cancelled.set()
+            task.add_done_callback(consume_result)
+
+
+def _render_query_response(
+    events: list[TraceEventV1],
+    diagnostics_events: list[TraceEventV1] | None,
+    *,
+    cursor: str | None,
+    limit: int,
+    detailed: bool,
+    include_payloads: bool,
+    causal: bool,
+) -> dict[str, object]:
+    selected, has_more, next_cursor = page_events(events, cursor=cursor, limit=limit)
+    return {
+        "events": [
+            _event_json(event, detailed and include_payloads) for event in selected
+        ],
+        "count": len(selected),
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "diagnostics": diagnostics(diagnostics_events or events) if causal else {},
+    }
+
+
+def _render_export_response(
+    events: list[TraceEventV1],
+    *,
+    format: str,
+    cursor: str | None,
+    limit: int,
+    detailed: bool,
+    include_payloads: bool,
+) -> tuple[str, str, dict[str, object]]:
+    selected, has_more, next_cursor = page_events(events, cursor=cursor, limit=limit)
+    verified_blob_refs = _verified_blob_refs(selected) if detailed else set()
+    media = (
+        "text/csv"
+        if format == "csv"
+        else ("application/x-ndjson" if format == "jsonl" else "application/json")
+    )
+    if not detailed or not include_payloads:
+        selected = [
+            event.model_copy(update={"input": None, "output": None, "attributes": None})
+            for event in selected
+        ]
+    content = export_events(selected, format)
+    export_meta = export_manifest(
+        selected, content, verified_blob_refs=verified_blob_refs
+    )
+    export_meta["has_more"] = has_more
+    export_meta["next_cursor"] = next_cursor
+    if format == "json":
+        content = json.dumps(
+            {"manifest": export_meta, "events": json.loads(content)}, indent=2
+        )
+    elif format == "jsonl":
+        content += json.dumps({"_manifest": export_meta}, separators=(",", ":")) + "\n"
+    else:
+        content = (
+            "# trace-export-manifest: "
+            + json.dumps(export_meta, separators=(",", ":"))
+            + "\n"
+            + content
+        )
+    return content, media, export_meta
+
+
 @query_router.get("/query")
-def query(
+async def query(
     request: Request,
     ticket_id: str | None = None,
     trace_id: str | None = None,
@@ -165,54 +328,84 @@ def query(
     cursor: str | None = None,
     include_payloads: bool = False,
 ) -> dict[str, object]:
+    terminal_audit_started = False
+
+    async def record_terminal(outcome: str, error: str | None = None) -> None:
+        nonlocal terminal_audit_started
+        terminal_audit_started = True
+        await _record_query_audit(request, "trace_query", ticket_id, outcome, error)
+
     try:
-        detailed = _authorize_query(request, ticket_id)
+        detailed = await _authorize_query_off_loop(request, ticket_id)
     except HTTPException as exc:
-        _record_query_audit(
+        await _record_query_audit(
             request, "trace_query", ticket_id, "denied", str(exc.detail)
         )
         raise
-    raw_events = request.app.state.trace_store.list_events()
-    base_query = _query_from_params(
-        ticket_id=ticket_id,
-        trace_id=trace_id,
-        invocation_id=invocation_id,
-        action_id=action_id,
-        parent_action_id=parent_action_id,
-        action_type=action_type,
-        lifecycle_state=lifecycle_state,
-        outcome=outcome,
-        producer_component=producer_component,
-        retry_kind=retry_kind,
-        idempotency_outcome=idempotency_outcome,
-        since=since,
-        until=until,
-        causal=causal,
-        limit=max(len(raw_events), limit),
-        cursor=0,
-    )
-    all_selected = query_events(raw_events, base_query)
+    except asyncio.CancelledError:
+        await _record_cancelled_query(request, "trace_query", ticket_id)
+        raise
     try:
-        selected, has_more, next_cursor = page_events(
-            all_selected, cursor=cursor, limit=limit
+        try:
+            query_cursor = _cursor_sequence(cursor)
+        except ValueError as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        base_query = _query_from_params(
+            ticket_id=ticket_id,
+            trace_id=trace_id,
+            invocation_id=invocation_id,
+            action_id=action_id,
+            parent_action_id=parent_action_id,
+            action_type=action_type,
+            lifecycle_state=lifecycle_state,
+            outcome=outcome,
+            producer_component=producer_component,
+            retry_kind=retry_kind,
+            idempotency_outcome=idempotency_outcome,
+            since=since,
+            until=until,
+            causal=causal,
+            limit=limit + 1,
+            cursor=query_cursor,
         )
-    except ValueError as exc:
-        _record_query_audit(request, "trace_query", ticket_id, "failed", str(exc))
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _record_query_audit(request, "trace_query", ticket_id, "success")
-    return {
-        "events": [
-            _event_json(event, detailed and include_payloads) for event in selected
-        ],
-        "count": len(selected),
-        "next_cursor": next_cursor,
-        "has_more": has_more,
-        "diagnostics": diagnostics(all_selected) if causal else {},
-    }
+        try:
+            all_selected, diagnostics_events = await _query_store(
+                request,
+                request.app.state.trace_store,
+                base_query,
+                include_diagnostics=causal,
+            )
+        except TraceQueryTooBroad as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TraceQueryCancelled as exc:
+            await record_terminal("cancelled", str(exc))
+            raise HTTPException(status_code=408, detail=str(exc)) from exc
+        try:
+            response = await asyncio.to_thread(
+                _render_query_response,
+                all_selected,
+                diagnostics_events,
+                cursor=cursor,
+                limit=limit,
+                detailed=detailed,
+                include_payloads=include_payloads,
+                causal=causal,
+            )
+        except ValueError as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        if not terminal_audit_started:
+            await _record_cancelled_query(request, "trace_query", ticket_id)
+        raise
+    await record_terminal("success")
+    return response
 
 
 @query_router.get("/export")
-def export(
+async def export(
     request: Request,
     format: Literal["json", "jsonl", "csv"] = "json",
     ticket_id: str | None = None,
@@ -234,17 +427,30 @@ def export(
     include_payloads: bool = False,
     manifest: bool = False,
 ) -> Response:
+    terminal_audit_started = False
+
+    async def record_terminal(outcome: str, error: str | None = None) -> None:
+        nonlocal terminal_audit_started
+        terminal_audit_started = True
+        await _record_query_audit(request, "trace_export", ticket_id, outcome, error)
+
     try:
-        detailed = _authorize_query(request, ticket_id)
+        detailed = await _authorize_query_off_loop(request, ticket_id)
     except HTTPException as exc:
-        _record_query_audit(
+        await _record_query_audit(
             request, "trace_export", ticket_id, "denied", str(exc.detail)
         )
         raise
-    raw_events = request.app.state.trace_store.list_events()
-    selected = query_events(
-        raw_events,
-        TraceQuery(
+    except asyncio.CancelledError:
+        await _record_cancelled_query(request, "trace_export", ticket_id)
+        raise
+    try:
+        try:
+            query_cursor = _cursor_sequence(cursor)
+        except ValueError as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        base_query = TraceQuery(
             ticket_id=ticket_id,
             trace_id=trace_id,
             invocation_id=invocation_id,
@@ -259,63 +465,46 @@ def export(
             since=since,
             until=until,
             causal=causal,
-            limit=max(len(raw_events), limit),
-            cursor=0,
-        ),
-    )
-    try:
-        selected, has_more, next_cursor = page_events(
-            selected, cursor=cursor, limit=limit
+            limit=limit + 1,
+            cursor=query_cursor,
         )
-    except ValueError as exc:
-        _record_query_audit(request, "trace_export", ticket_id, "failed", str(exc))
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    verified_blob_refs = _verified_blob_refs(selected) if detailed else set()
-    media = (
-        "text/csv"
-        if format == "csv"
-        else ("application/x-ndjson" if format == "jsonl" else "application/json")
-    )
-    if not detailed or not include_payloads:
-        selected = [
-            event.model_copy(update={"input": None, "output": None, "attributes": None})
-            for event in selected
-        ]
-    content = export_events(selected, format)
-    export_meta = export_manifest(
-        selected, content, verified_blob_refs=verified_blob_refs
-    )
-    export_meta["has_more"] = has_more
-    export_meta["next_cursor"] = next_cursor
-    # Every artifact is self-describing; ``manifest`` remains accepted for
-    # compatibility but cannot disable integrity metadata.
-    manifest = True
-    if manifest:
-        if format == "json":
-            content = json.dumps(
-                {"manifest": export_meta, "events": json.loads(content)}, indent=2
+        try:
+            selected, _ = await _query_store(
+                request, request.app.state.trace_store, base_query
             )
-        elif format == "jsonl":
-            content += (
-                json.dumps({"_manifest": export_meta}, separators=(",", ":")) + "\n"
+        except TraceQueryTooBroad as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TraceQueryCancelled as exc:
+            await record_terminal("cancelled", str(exc))
+            raise HTTPException(status_code=408, detail=str(exc)) from exc
+        try:
+            content, media, export_meta = await asyncio.to_thread(
+                _render_export_response,
+                selected,
+                format=format,
+                cursor=cursor,
+                limit=limit,
+                detailed=detailed,
+                include_payloads=include_payloads,
             )
-        else:
-            content = (
-                "# trace-export-manifest: "
-                + json.dumps(export_meta, separators=(",", ":"))
-                + "\n"
-                + content
-            )
+        except ValueError as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        if not terminal_audit_started:
+            await _record_cancelled_query(request, "trace_export", ticket_id)
+        raise
     response = Response(content, media_type=media)
     response.headers["X-Trace-Manifest"] = json.dumps(
         export_meta, separators=(",", ":")
     )
-    _record_query_audit(request, "trace_export", ticket_id, "success")
+    await record_terminal("success")
     return response
 
 
 @query_router.get("/tickets/{ticket_id}")
-def ticket_trace(
+async def ticket_trace(
     ticket_id: str,
     request: Request,
     trace_id: str | None = None,
@@ -335,7 +524,7 @@ def ticket_trace(
     include_payloads: bool = False,
     limit: int = Query(1000, ge=1, le=10000),
 ) -> dict[str, object]:
-    return query(
+    return await query(
         request,
         ticket_id=ticket_id,
         trace_id=trace_id,
@@ -358,7 +547,7 @@ def ticket_trace(
 
 
 @query_router.get("/invocations/{invocation_id}")
-def invocation_trace(
+async def invocation_trace(
     invocation_id: str,
     request: Request,
     ticket_id: str | None = None,
@@ -378,7 +567,7 @@ def invocation_trace(
     include_payloads: bool = False,
     limit: int = Query(1000, ge=1, le=10000),
 ) -> dict[str, object]:
-    return query(
+    return await query(
         request,
         invocation_id=invocation_id,
         ticket_id=ticket_id,
@@ -401,7 +590,7 @@ def invocation_trace(
 
 
 @query_router.get("/actions/{action_id}")
-def action_trace(
+async def action_trace(
     action_id: str,
     request: Request,
     ticket_id: str | None = None,
@@ -421,7 +610,7 @@ def action_trace(
     include_payloads: bool = False,
     limit: int = Query(1000, ge=1, le=10000),
 ) -> dict[str, object]:
-    return query(
+    return await query(
         request,
         action_id=action_id,
         ticket_id=ticket_id,

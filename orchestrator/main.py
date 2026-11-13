@@ -3144,6 +3144,14 @@ async def _renew_leader_lease(
         mark_lost()
         raise RuntimeError("orchestrator leader lease lost") from exc
 
+    def retryable(exc: Exception) -> bool:
+        if isinstance(exc, (TimeoutError, httpx.TransportError)):
+            return True
+        return isinstance(exc, httpx.HTTPStatusError) and (
+            exc.response.status_code in {408, 425, 429}
+            or 500 <= exc.response.status_code < 600
+        )
+
     def safe_remaining() -> float:
         deadline = getattr(lease, "confirmed_deadline", None)
         if deadline is None:
@@ -3167,7 +3175,8 @@ async def _renew_leader_lease(
                 fail_lost(RuntimeError("confirmed lease deadline reached"))
 
             try:
-                await asyncio.wait_for(lease.renew(), timeout=remaining)
+                attempt_timeout = min(2.0, max(0.01, remaining - 0.05))
+                await asyncio.wait_for(lease.renew(), timeout=attempt_timeout)
                 if consecutive_failures > 0:
                     logger.info(
                         "Orchestrator lease renewal recovered "
@@ -3177,21 +3186,23 @@ async def _renew_leader_lease(
                 consecutive_failures = 0
                 next_delay = interval
             except Exception as exc:
-                retryable = isinstance(exc, httpx.TransportError) or (
-                    isinstance(exc, httpx.HTTPStatusError)
-                    and 500 <= exc.response.status_code < 600
-                )
-                if not retryable:
+                if not retryable(exc):
                     logger.critical(
-                        "Orchestrator leader lease renewal rejected: %s", exc
+                        "Orchestrator leader lease renewal rejected (%s, "
+                        "remaining=%.2fs): %r",
+                        type(exc).__name__,
+                        remaining,
+                        exc,
                     )
                     fail_lost(exc)
 
                 consecutive_failures += 1
                 logger.warning(
-                    "Orchestrator lease renewal transient failure %d/%d: %s",
+                    "Orchestrator lease renewal transient failure %d/%d "
+                    "(remaining=%.2fs): %r",
                     consecutive_failures,
                     max_consecutive_failures,
+                    remaining,
                     exc,
                 )
                 if consecutive_failures >= max_consecutive_failures:

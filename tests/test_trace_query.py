@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timedelta, timezone
 
 from providers.tracing import (
     ActionDescriptor,
@@ -139,3 +140,60 @@ def test_cursor_decoder_rejects_malformed_shapes() -> None:
         pass
     else:
         raise AssertionError("malformed cursor was accepted")
+
+
+def test_query_normalizes_naive_timestamps_to_utc() -> None:
+    occurred_at = datetime(2026, 11, 12, 20, 0, tzinfo=timezone.utc)
+    event = TraceEventV1(
+        ticket_id="PERF-time",
+        occurred_at=occurred_at,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+    naive = occurred_at.replace(tzinfo=None)
+
+    naive_result = query_events(
+        [event],
+        TraceQuery(
+            since=naive,
+            until=naive + timedelta(seconds=1),
+        ),
+    )
+    aware_result = query_events(
+        [event],
+        TraceQuery(
+            since=occurred_at,
+            until=occurred_at + timedelta(seconds=1),
+        ),
+    )
+
+    assert naive_result == aware_result == [event]
+
+
+def test_diagnostics_reports_cycles_and_missing_parents() -> None:
+    first = TraceEventV1(
+        ticket_id="PERF-cycle",
+        action_id="1" * 16,
+        parent_action_id="2" * 16,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+    second = TraceEventV1(
+        ticket_id="PERF-cycle",
+        action_id="2" * 16,
+        parent_action_id=first.action_id,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+    orphan = TraceEventV1(
+        ticket_id="PERF-cycle",
+        action_id="3" * 16,
+        parent_action_id="4" * 16,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+
+    result = diagnostics([first, second, orphan])
+
+    assert result["cycles"] == [first.action_id, second.action_id]
+    assert result["missing_parents"] == [orphan.parent_action_id]

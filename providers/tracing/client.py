@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import time
 from pathlib import Path
 
 import httpx
@@ -45,7 +46,7 @@ class TraceClient:
         # Best effort at startup: an outage must not prevent the caller from
         # recording new durable events, which can be replayed on a later flush.
         try:
-            self.flush()
+            self.flush(deadline=time.monotonic() + 5.0)
         except TraceDeliveryError:
             pass
 
@@ -75,27 +76,43 @@ class TraceClient:
                 "critical trace event was not centrally persisted"
             ) from exc
 
-    def flush(self) -> int:
+    def flush(self, *, deadline: float | None = None) -> int:
         delivered = 0
         try:
             batch: list[tuple[int, TraceEventV1]] = []
+            budget_exhausted = False
             for item in self.spool.pending():
                 batch.append(item)
                 if len(batch) == 100:
-                    delivered += self._send_batch(batch)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        budget_exhausted = True
+                        break
+                    delivered += self._send_batch(batch, deadline=deadline)
                     batch = []
-            if batch:
-                delivered += self._send_batch(batch)
+            if batch and not budget_exhausted:
+                if deadline is None or time.monotonic() < deadline:
+                    delivered += self._send_batch(batch, deadline=deadline)
             self.spool.compact()
             return delivered
         except (httpx.HTTPError, ValueError, KeyError, SpoolError, OSError) as exc:
             raise TraceDeliveryError("trace spool delivery failed") from exc
 
-    def _send_batch(self, batch: list[tuple[int, TraceEventV1]]) -> int:
+    def _send_batch(
+        self,
+        batch: list[tuple[int, TraceEventV1]],
+        *,
+        deadline: float | None = None,
+    ) -> int:
+        request_timeout = (
+            {}
+            if deadline is None
+            else {"timeout": max(0.01, deadline - time.monotonic())}
+        )
         response = self._client.post(
             self.url + "/batch",
             headers=self._headers,
             json={"events": [event.model_dump(mode="json") for _, event in batch]},
+            **request_timeout,
         )
         response.raise_for_status()
         acks = response.json()["acknowledgements"]
@@ -113,10 +130,15 @@ class TraceClient:
             delivered += 1
         return delivered
 
-    def close(self) -> None:
+    def close(self, *, flush_timeout: float | None = 5.0) -> None:
         if not self._closed:
             try:
-                self.flush()
+                deadline = (
+                    None
+                    if flush_timeout is None
+                    else time.monotonic() + max(0.0, flush_timeout)
+                )
+                self.flush(deadline=deadline)
             finally:
                 self._client.close()
                 self.spool.close()
