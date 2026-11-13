@@ -831,7 +831,7 @@ async def test_renewal_task_can_call_mark_done_without_self_wait() -> None:
     assert "PERF-1" not in dispatcher._renewal_tasks
 
 
-async def test_deposed_renewal_is_joined_before_claim_release() -> None:
+async def test_deposed_renewal_is_joined_without_releasing_stale_claim() -> None:
     dispatcher, _ = _dispatcher()
     dispatcher._claim_ids["PERF-1"] = "old-claim"
     renewal_started = asyncio.Event()
@@ -849,10 +849,7 @@ async def test_deposed_renewal_is_joined_before_claim_release() -> None:
     renewal_task = asyncio.create_task(renewal())
     dispatcher._renewal_tasks["PERF-1"] = renewal_task
 
-    async def release(_ticket_id):
-        assert renewal_task.done(), "release preceded renewal shutdown"
-
-    dispatcher.release_claim = AsyncMock(side_effect=release)
+    dispatcher.release_claim = AsyncMock()
     await asyncio.wait_for(renewal_started.wait(), 2)
     dispatcher.mark_deposed()
     await asyncio.wait_for(renewal_stopping.wait(), 2)
@@ -863,12 +860,13 @@ async def test_deposed_renewal_is_joined_before_claim_release() -> None:
     assert dispatcher.is_active("PERF-1")
     allow_stop.set()
     await asyncio.wait_for(cleanup, 2)
-    dispatcher.release_claim.assert_awaited_once_with("PERF-1")
+    dispatcher.release_claim.assert_not_awaited()
     assert renewal_task.done()
     assert "PERF-1" not in dispatcher._renewal_tasks
+    assert "PERF-1" not in dispatcher._claim_ids
 
 
-async def test_shutdown_waits_for_already_cancelled_renewal() -> None:
+async def test_shutdown_waits_for_cancelled_renewal_and_retains_stale_claim() -> None:
     dispatcher, _ = _dispatcher()
     dispatcher._claim_ids["PERF-1"] = "old-claim"
     started = asyncio.Event()
@@ -886,10 +884,7 @@ async def test_shutdown_waits_for_already_cancelled_renewal() -> None:
     renewal_task = asyncio.create_task(renewal())
     dispatcher._renewal_tasks["PERF-1"] = renewal_task
 
-    async def release(_ticket_id):
-        assert renewal_task.done(), "release preceded renewal shutdown"
-
-    dispatcher.release_claim = AsyncMock(side_effect=release)
+    dispatcher.release_claim = AsyncMock()
     await asyncio.wait_for(started.wait(), 2)
     dispatcher.mark_deposed()
     await asyncio.wait_for(stopping.wait(), 2)
@@ -901,7 +896,8 @@ async def test_shutdown_waits_for_already_cancelled_renewal() -> None:
     dispatcher.release_claim.assert_not_awaited()
     allow_stop.set()
     await asyncio.wait_for(shutdown, 2)
-    dispatcher.release_claim.assert_awaited_once_with("PERF-1")
+    dispatcher.release_claim.assert_not_awaited()
+    assert not dispatcher._claim_ids
 
 
 @pytest.mark.parametrize("phase", ["drain", "release"])
@@ -959,6 +955,38 @@ async def test_shutdown_cancellation_waits_for_cleanup_and_restores_context(
     assert task.done()
     assert not dispatcher._claim_ids
     assert not dispatcher._tasks
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_drains_agents_before_cancelling_remainder(caplog) -> None:
+    dispatcher, _ = _dispatcher()
+    finish = asyncio.Event()
+    agent = MagicMock()
+    finished = asyncio.create_task(finish.wait())
+    stuck = asyncio.create_task(asyncio.Event().wait())
+    dispatcher._agents["PERF-finish"] = agent
+    dispatcher.set_task("PERF-finish", finished, "executing_benchmark")
+    dispatcher.set_task("PERF-stuck", stuck, "awaiting_provision")
+
+    dispatcher.mark_deposed()
+
+    assert agent.request_stop.called
+    assert not finished.cancelled()
+    drain = asyncio.create_task(dispatcher.drain_for_lease_loss(0.05))
+    await asyncio.sleep(0)
+    assert not drain.done()
+    finish.set()
+    await asyncio.wait_for(drain, 2)
+
+    assert finished.done()
+    assert stuck.cancelled()
+    cancel_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if "cancelling" in record.getMessage()
+    )
+    assert "PERF-stuck" in cancel_log
+    assert "PERF-finish" not in cancel_log
 
 
 async def test_shutdown_excludes_its_registered_caller() -> None:

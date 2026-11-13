@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
+import threading
+import time
 
 import httpx
 import pytest
@@ -349,3 +352,152 @@ def test_plain_flush_preserves_configured_http_timeout(tmp_path) -> None:
     assert observed_timeouts == [
         {"connect": 10.0, "read": 10.0, "write": 10.0, "pool": 10.0}
     ]
+
+
+def test_slow_trickle_response_honors_total_flush_deadline(tmp_path) -> None:
+    expected = event()
+
+    class Trickle(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'{"acknowledgements":'
+            for _ in range(100):
+                time.sleep(0.02)
+                yield b" "
+            yield b"[]}"
+
+    def trickle(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=Trickle())
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(trickle)),
+    )
+    client.record(expected)
+    started = time.monotonic()
+    delivered = client.flush(deadline=started + 0.12)
+    elapsed = time.monotonic() - started
+    client.close(flush_timeout=0)
+
+    assert delivered == 0
+    assert elapsed < 0.25
+    assert [item.event_id for _, item in client.spool.pending()] == [expected.event_id]
+
+
+def test_slow_spool_compaction_honors_flush_deadline(tmp_path, monkeypatch) -> None:
+    expected = event()
+
+    def accepted(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "acknowledgements": [
+                    {
+                        "event_id": str(expected.event_id),
+                        "accepted": True,
+                        "status": "stored",
+                    }
+                ]
+            },
+        )
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(accepted)),
+    )
+    client.record(expected)
+
+    def slow_compact(*, check_cancelled=None):
+        assert check_cancelled is not None
+        check_cancelled()
+        time.sleep(0.15)
+        check_cancelled()
+
+    monkeypatch.setattr(client.spool, "compact", slow_compact)
+    started = time.monotonic()
+    delivered = client.flush(deadline=started + 0.05)
+    elapsed = time.monotonic() - started
+    active = client._flush_thread
+    if active is not None:
+        active.join(2)
+    client.close(flush_timeout=0)
+
+    assert delivered == 0
+    assert elapsed < 0.25
+    assert list(client.spool.pending()) == []
+
+
+def test_delayed_http_headers_cannot_exceed_flush_deadline(tmp_path) -> None:
+    expected = event()
+
+    def delayed_headers(request: httpx.Request) -> httpx.Response:
+        time.sleep(0.3)
+        body = request.read()
+        event_id = json.loads(body)["events"][0]["event_id"]
+        return httpx.Response(
+            200,
+            json={
+                "acknowledgements": [
+                    {
+                        "event_id": event_id,
+                        "accepted": True,
+                        "status": "stored",
+                    }
+                ]
+            },
+        )
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(delayed_headers)),
+    )
+    client.record(expected)
+    started = time.monotonic()
+    delivered = client.flush(deadline=started + 0.05)
+    elapsed = time.monotonic() - started
+
+    assert delivered == 0
+    assert elapsed < 0.2
+    active = client._flush_thread
+    if active is not None:
+        active.join(2)
+    client.close(flush_timeout=0)
+
+
+def test_blocked_spool_io_cannot_exceed_flush_or_close_deadline(
+    tmp_path, monkeypatch
+) -> None:
+    release = threading.Event()
+    completed = threading.Event()
+    expected = event()
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(lambda _: None)),
+    )
+    client.record(expected)
+
+    def blocked_pending(*, check_cancelled=None):
+        release.wait(2)
+        completed.set()
+        return iter(())
+
+    monkeypatch.setattr(client.spool, "pending", blocked_pending)
+    started = time.monotonic()
+    assert client.flush(deadline=started + 0.05) == 0
+    flush_elapsed = time.monotonic() - started
+    started = time.monotonic()
+    client.close(flush_timeout=0.05)
+    close_elapsed = time.monotonic() - started
+    release.set()
+    assert completed.wait(2)
+
+    assert flush_elapsed < 0.2
+    assert close_elapsed < 0.2

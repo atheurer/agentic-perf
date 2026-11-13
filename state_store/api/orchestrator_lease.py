@@ -9,6 +9,7 @@ from ..models import (
     RenewOrchestratorLeaseRequest,
 )
 from ..store import OrchestratorLeaseHeld
+from .executors import run_lease_worker
 
 router = APIRouter(prefix="/control/orchestrator-lease", tags=["control-plane"])
 
@@ -29,15 +30,16 @@ def _store(request: Request):
 
 
 @router.get("", dependencies=[Depends(_service_or_admin)])
-def inspect_lease(request: Request):
-    lease = _store(request).get_orchestrator_lease()
+async def inspect_lease(request: Request):
+    lease = await run_lease_worker(request, _store(request).get_orchestrator_lease)
     return {"lease": lease.model_dump(mode="json") if lease else None}
 
 
 @router.post("/acquire", status_code=200, dependencies=[Depends(_service_or_admin)])
-def acquire_lease(body: AcquireOrchestratorLeaseRequest, request: Request):
+async def acquire_lease(body: AcquireOrchestratorLeaseRequest, request: Request):
+    store = _store(request)
     try:
-        lease = _store(request).acquire_orchestrator_lease(body)
+        lease = await run_lease_worker(request, store.acquire_orchestrator_lease, body)
     except OrchestratorLeaseHeld as exc:
         holder = exc.holder.model_dump(mode="json")
         # Never return session credentials to a competing process.
@@ -54,10 +56,15 @@ def acquire_lease(body: AcquireOrchestratorLeaseRequest, request: Request):
 
 
 @router.post("/renew", dependencies=[Depends(_service_or_admin)])
-def renew_lease(body: RenewOrchestratorLeaseRequest, request: Request):
+async def renew_lease(body: RenewOrchestratorLeaseRequest, request: Request):
+    store = _store(request)
     try:
-        lease = _store(request).renew_orchestrator_lease(
-            body.session_id, body.epoch, body.ttl_seconds
+        lease = await run_lease_worker(
+            request,
+            store.renew_orchestrator_lease,
+            body.session_id,
+            body.epoch,
+            body.ttl_seconds,
         )
     except PermissionError as exc:
         raise HTTPException(
@@ -67,9 +74,13 @@ def renew_lease(body: RenewOrchestratorLeaseRequest, request: Request):
 
 
 @router.post("/release", dependencies=[Depends(_service_or_admin)])
-def release_lease(body: ReleaseOrchestratorLeaseRequest, request: Request):
+async def release_lease(body: ReleaseOrchestratorLeaseRequest, request: Request):
+    store = _store(request)
     return {
-        "released": _store(request).release_orchestrator_lease(
-            body.session_id, body.epoch
+        "released": await run_lease_worker(
+            request,
+            store.release_orchestrator_lease,
+            body.session_id,
+            body.epoch,
         )
     }

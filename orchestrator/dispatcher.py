@@ -340,19 +340,69 @@ class Dispatcher:
             statuses.pop(ticket_id, None)
 
     def mark_deposed(self) -> None:
-        """Stop all agent work after losing the control-plane fence."""
+        """Stop new work and let active agents unwind after lease loss."""
+        if self._deposed:
+            return
         self._deposed = True
         self._claim_lost = True
-        renewals = set(self._renewal_tasks.values())
-        for task in (
-            list(self._tasks.values())
-            + list(self._renewal_tasks.values())
-            + list(self._introspection_tasks.values())
-        ):
-            if not task.done() and (task not in renewals or not task.cancelling()):
+        drained = [
+            ticket_id for ticket_id, task in self._tasks.items() if not task.done()
+        ]
+        for ticket_id in drained:
+            agent = self._agents.get(ticket_id)
+            if agent is not None and hasattr(agent, "request_stop"):
+                agent.request_stop()
+        for agent in list(self._introspection_agents.values()):
+            if hasattr(agent, "request_stop"):
+                agent.request_stop()
+        for task in list(self._renewal_tasks.values()):
+            if not task.done() and not task.cancelling():
                 task.cancel()
+        logger.warning(
+            "Lease lost: draining %d agent task(s) for tickets %s",
+            len(drained),
+            drained,
+        )
         # Retain cancelled renewals so ticket cleanup or shutdown can join them
         # before releasing their claims.
+
+    async def drain_for_lease_loss(self, timeout: float) -> None:
+        """Let active tool calls finish for a bounded interval before stopping."""
+        if not self._deposed:
+            self.mark_deposed()
+        current = asyncio.current_task()
+        tasks = {
+            (ticket_id, task)
+            for ticket_id, task in self._tasks.items()
+            if task is not current and not task.done()
+        }
+        if not tasks:
+            return
+        if timeout > 0:
+            _, pending = await asyncio.wait(
+                {task for _, task in tasks}, timeout=timeout
+            )
+        else:
+            pending = {task for _, task in tasks}
+        if not pending:
+            logger.info(
+                "Lease-loss drain completed for tickets %s",
+                sorted(ticket_id for ticket_id, _ in tasks),
+            )
+            return
+        cancelled_tickets = sorted(
+            ticket_id for ticket_id, task in tasks if task in pending
+        )
+        logger.warning(
+            "Lease-loss drain timed out after %.1fs; cancelling %d agent task(s) "
+            "for tickets %s",
+            timeout,
+            len(cancelled_tickets),
+            cancelled_tickets,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
     async def shutdown(self) -> None:
         """Cancel and await dispatcher work before its EventBus is closed."""
@@ -391,14 +441,21 @@ class Dispatcher:
                 if isinstance(result, Exception):
                     logger.error("Dispatcher task failed during shutdown: %s", result)
 
-        for ticket_id in list(self._claim_ids):
-            context = self._trace_contexts.get(ticket_id)
-            token = bind_trace_context(context) if context is not None else None
-            try:
-                await self.release_claim(ticket_id)
-            finally:
-                if token is not None:
-                    reset_trace_context(token)
+        if self._claim_lost:
+            logger.warning(
+                "Retaining %d stale ticket claim(s) for next-leader reconciliation: %s",
+                len(self._claim_ids),
+                sorted(self._claim_ids),
+            )
+        else:
+            for ticket_id in list(self._claim_ids):
+                context = self._trace_contexts.get(ticket_id)
+                token = bind_trace_context(context) if context is not None else None
+                try:
+                    await self.release_claim(ticket_id)
+                finally:
+                    if token is not None:
+                        reset_trace_context(token)
 
         self._tasks.clear()
         self._renewal_tasks.clear()
@@ -594,7 +651,13 @@ class Dispatcher:
             finally:
                 if self._renewal_tasks.get(ticket_id) is renewal:
                     self._renewal_tasks.pop(ticket_id)
-        await self.release_claim(ticket_id)
+        if self._claim_lost:
+            logger.warning(
+                "Retaining stale claim %s for next-leader reconciliation",
+                self._claim_ids.get(ticket_id, "unknown"),
+            )
+        else:
+            await self.release_claim(ticket_id)
         getattr(self, "_claim_ids", {}).pop(ticket_id, None)
         getattr(self, "_lost_ticket_claims", set()).discard(ticket_id)
         self.clear_handoff_blocked(ticket_id)

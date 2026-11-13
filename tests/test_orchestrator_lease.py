@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
@@ -14,11 +15,16 @@ import pytest
 from fastapi import Depends, FastAPI
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.leader_lease import LeaderLeaseClient
+from orchestrator.leader_lease import LeaderLeaseClient, LeaderLeaseUnavailable
 from orchestrator.main import (
+    DEPOSED_CLAIM_RECONCILIATION_FIELD,
+    LeaderLeaseLost,
+    _agent_progress_fields,
     _handle_shutdown_signal,
+    _LeaderLeaseRenewer,
     _LeaseLossGate,
     _poll_loop_after_lease,
+    _reconcile_deposed_claims,
     _renew_leader_lease,
     poll_loop,
 )
@@ -192,7 +198,7 @@ async def test_acquire_409_then_200_retries_successfully(
 async def test_acquire_409_exhaustion_raises_runtime_error(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """409 through all max_attempts raises RuntimeError after exactly max_attempts."""
+    """409 through all max_attempts raises a recoverable acquisition error."""
     attempt_count = 0
 
     class Client:
@@ -216,16 +222,56 @@ async def test_acquire_409_exhaustion_raises_runtime_error(
     )
 
     lc = LeaderLeaseClient("http://state-store", instance_name="test")
-    with pytest.raises(RuntimeError, match="unavailable after 3 attempts"):
+    with pytest.raises(LeaderLeaseUnavailable, match="unavailable after 3 attempts"):
         await lc.acquire(max_attempts=3, retry_interval=0)
     assert attempt_count == 3
 
 
+@pytest.mark.parametrize("status_code", [408, 425, 429, 500, 503])
 @pytest.mark.asyncio
-async def test_acquire_500_is_immediately_fatal(
+async def test_acquire_transient_status_retries_successfully(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+):
+    """Temporary overload or timeout-style responses are retried."""
+    attempt_count = 0
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, json):
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                return httpx.Response(
+                    status_code,
+                    text="temporarily unavailable",
+                    request=httpx.Request("POST", url),
+                )
+            return httpx.Response(
+                200,
+                json={"epoch": 11},
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.httpx.AsyncClient", lambda **_kwargs: Client()
+    )
+
+    lc = LeaderLeaseClient("http://state-store", instance_name="test")
+    lease = await lc.acquire(max_attempts=3, retry_interval=0)
+    assert lease["epoch"] == 11
+    assert attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_acquire_transient_status_exhaustion_is_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Non-409 HTTP errors (e.g. 500) are immediately fatal via raise_for_status."""
     attempt_count = 0
 
     class Client:
@@ -239,8 +285,42 @@ async def test_acquire_500_is_immediately_fatal(
             nonlocal attempt_count
             attempt_count += 1
             return httpx.Response(
-                500,
-                text="Internal Server Error",
+                503,
+                text="temporarily unavailable",
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.httpx.AsyncClient", lambda **_kwargs: Client()
+    )
+
+    lc = LeaderLeaseClient("http://state-store", instance_name="test")
+    with pytest.raises(LeaderLeaseUnavailable, match="unavailable after 3 attempts"):
+        await lc.acquire(max_attempts=3, retry_interval=0)
+    assert attempt_count == 3
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 410])
+@pytest.mark.asyncio
+async def test_acquire_terminal_status_is_immediately_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+):
+    attempt_count = 0
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, json):
+            nonlocal attempt_count
+            attempt_count += 1
+            return httpx.Response(
+                status_code,
+                text="rejected",
                 request=httpx.Request("POST", url),
             )
 
@@ -409,6 +489,212 @@ async def test_transient_lease_failure_retries_at_backoff_and_recovers():
 
 
 @pytest.mark.asyncio
+async def test_transient_failures_do_not_lose_lease_before_ttl():
+    request = httpx.Request("POST", "http://state-store/renew")
+    lease = _RenewalLease(
+        [httpx.ConnectError("temporary", request=request)] * 4,
+        ttl_seconds=3.0,
+    )
+    task = asyncio.create_task(_renew_leader_lease(lease, 0.05))
+
+    await asyncio.wait_for(lease.recovered.wait(), timeout=3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(lease.attempts) == 5
+    assert lease.released == 1
+
+
+@pytest.mark.asyncio
+async def test_dedicated_renewer_continues_while_main_loop_is_blocked():
+    attempts = 0
+    lost = threading.Event()
+    forked = threading.Event()
+
+    class ThreadLease:
+        ttl_seconds = 2.0
+        confirmed_deadline = time.monotonic() + 2.0
+
+        async def renew(self):
+            nonlocal attempts
+            attempts += 1
+            self.confirmed_deadline = time.monotonic() + self.ttl_seconds
+            forked.set()
+
+        async def release(self):
+            return None
+
+    renewer = _LeaderLeaseRenewer(ThreadLease(), 0.05, lost.set)
+    renewer.start(asyncio.get_running_loop())
+    time.sleep(0.3)
+    await asyncio.to_thread(renewer.stop)
+
+    assert forked.is_set()
+    assert attempts >= 2
+    assert not lost.is_set()
+    renewer.raise_if_failed()
+
+
+@pytest.mark.asyncio
+async def test_deposed_claim_is_reconciled_to_explicit_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    current_session = str(uuid4())
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "service")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", current_session)
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "9")
+    calls: list[tuple[str, str, dict, dict]] = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.headers = kwargs["headers"]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            calls.append(("patch", url, json, self.headers))
+            return Response()
+
+        async def post(self, url, *, json):
+            calls.append(("post", url, json, self.headers))
+            return Response()
+
+    monkeypatch.setattr("orchestrator.main.AuditedAsyncHTTPClient", Client)
+    old_claim = {
+        "claim_id": "claim-old",
+        "owner": "orchestrator-old",
+        "session_id": str(uuid4()),
+        "epoch": 4,
+        "expires": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+    }
+    tickets = [
+        {
+            "id": "PERF-old",
+            "status": "awaiting_provision",
+            "custom_fields": {"claim": old_claim},
+        },
+        {
+            "id": "PERF-current",
+            "status": "awaiting_provision",
+            "custom_fields": {
+                "claim": {
+                    **old_claim,
+                    "claim_id": "claim-current",
+                    "session_id": current_session,
+                    "epoch": 9,
+                }
+            },
+        },
+    ]
+
+    blocked = await _reconcile_deposed_claims("http://store", tickets)
+
+    assert blocked == {"PERF-old"}
+    assert [call[0] for call in calls] == ["patch", "post", "patch"]
+    assert calls[0][2]["fields"][DEPOSED_CLAIM_RECONCILIATION_FIELD]["status"] == (
+        "pending"
+    )
+    summary = calls[0][2]["fields"]["guidance_summary"]
+    assert summary["reason"] == "claim_lost"
+    assert summary["agent"] == "provisioning"
+    assert "interrupted" in summary["details"]
+    assert summary["suggested_actions"]
+    assert calls[1][2]["status"] == "awaiting_customer_guidance"
+    assert calls[2][2]["fields"]["claim"] is None
+    assert calls[2][2]["fields"][DEPOSED_CLAIM_RECONCILIATION_FIELD]["status"] == (
+        "reconciled"
+    )
+    assert all(call[3]["X-Agentic-Perf-Mutation-Scope"] == "leader" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_closed_ticket_clears_deposed_claim_without_guidance_transition(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "service")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", str(uuid4()))
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "10")
+    calls: list[tuple[str, str, dict]] = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            calls.append(("patch", url, json))
+            return Response()
+
+        async def post(self, url, *, json):
+            calls.append(("post", url, json))
+            return Response()
+
+    monkeypatch.setattr("orchestrator.main.AuditedAsyncHTTPClient", Client)
+    ticket = {
+        "id": "PERF-closed",
+        "status": "closed",
+        "custom_fields": {
+            "claim": {
+                "claim_id": "claim-old",
+                "session_id": str(uuid4()),
+                "epoch": 4,
+                "expires": (
+                    datetime.now(timezone.utc) - timedelta(minutes=1)
+                ).isoformat(),
+            }
+        },
+    }
+
+    blocked = await _reconcile_deposed_claims("http://store", [ticket])
+
+    assert blocked == {"PERF-closed"}
+    assert [call[0] for call in calls] == ["patch"]
+    assert calls[0][2]["fields"]["claim"] is None
+    assert calls[0][2]["fields"][DEPOSED_CLAIM_RECONCILIATION_FIELD]["status"] == (
+        "reconciled"
+    )
+
+
+def test_reconciliation_marker_is_not_agent_progress():
+    assert _agent_progress_fields(
+        {
+            DEPOSED_CLAIM_RECONCILIATION_FIELD: {"status": "reconciled"},
+            "benchmark_result": {"score": 1},
+        }
+    ) == {"benchmark_result": {"score": 1}}
+
+
+def test_lease_loss_gate_deposes_dispatcher_bound_after_loss():
+    dispatcher = MagicMock()
+    gate = _LeaseLossGate()
+
+    gate.mark_deposed()
+    gate.bind(dispatcher)
+
+    dispatcher.mark_deposed.assert_called_once_with()
+    with pytest.raises(LeaderLeaseLost, match="leader lease lost"):
+        gate.raise_if_lost()
+
+
+@pytest.mark.asyncio
 async def test_local_renewal_timeout_consumes_retry_budget(caplog):
     lease = _RenewalLease(["hang"], ttl_seconds=1.0)
     lost = []
@@ -424,7 +710,7 @@ async def test_local_renewal_timeout_consumes_retry_budget(caplog):
     assert len(lease.attempts) == 2
     assert lost == []
     assert lease.released == 1
-    assert "transient failure 1/3" in caplog.text
+    assert "transient failure 1" in caplog.text
     assert "TimeoutError" in caplog.text
 
 
@@ -456,9 +742,10 @@ async def test_httpx_transport_errors_are_retryable(error_type):
     assert lease.released == 1
 
 
+@pytest.mark.parametrize("status_code", [408, 425, 429, 500, 503])
 @pytest.mark.asyncio
-async def test_http_5xx_lease_renewal_is_retryable():
-    lease = _RenewalLease([_lease_http_error(503)])
+async def test_http_transient_status_lease_renewal_is_retryable(status_code: int):
+    lease = _RenewalLease([_lease_http_error(status_code)])
     lost = []
     task = asyncio.create_task(
         _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
@@ -474,9 +761,10 @@ async def test_http_5xx_lease_renewal_is_retryable():
     assert lease.released == 1
 
 
+@pytest.mark.parametrize("status_code", [401, 403, 409, 410])
 @pytest.mark.asyncio
-async def test_http_4xx_lease_renewal_fails_immediately():
-    lease = _RenewalLease([_lease_http_error(403)])
+async def test_http_rejection_lease_renewal_fails_immediately(status_code: int):
+    lease = _RenewalLease([_lease_http_error(status_code)])
     lost = []
 
     with pytest.raises(RuntimeError, match="orchestrator leader lease lost"):
@@ -488,24 +776,25 @@ async def test_http_4xx_lease_renewal_fails_immediately():
 
 
 @pytest.mark.asyncio
-async def test_retry_exhaustion_marks_lease_lost_once():
+async def test_transient_failures_retry_until_confirmed_deadline():
     request = httpx.Request("POST", "http://state-store/renew")
     lease = _RenewalLease(
-        [httpx.ConnectError("temporary connection failure", request=request)] * 4
+        [httpx.ConnectError("temporary connection failure", request=request)] * 20,
+        ttl_seconds=0.5,
     )
     lost = []
 
     with pytest.raises(RuntimeError, match="orchestrator leader lease lost"):
-        await _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
+        await _renew_leader_lease(lease, 0.05, on_lost=lambda: lost.append(True))
 
-    assert len(lease.attempts) == 3
+    assert len(lease.attempts) > 3
     assert lost == [True]
     assert lease.released == 1
 
 
 @pytest.mark.asyncio
 async def test_hung_renewal_is_cancelled_before_confirmed_deadline():
-    lease = _RenewalLease(["hang"] * 4, ttl_seconds=1.0)
+    lease = _RenewalLease(["hang"] * 20, ttl_seconds=0.5)
     deadline = lease.confirmed_deadline
     lost_at = []
 
@@ -516,7 +805,7 @@ async def test_hung_renewal_is_cancelled_before_confirmed_deadline():
             on_lost=lambda: lost_at.append(asyncio.get_running_loop().time()),
         )
 
-    assert len(lease.attempts) == 3
+    assert len(lease.attempts) > 1
     assert lease.cancelled
     assert lost_at[0] < deadline
     assert lease.released == 1
@@ -640,6 +929,9 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
     observed = asyncio.get_running_loop().create_future()
     dispatchers = []
     phases = []
+    closed_ticket = {"id": "PERF-closed", "status": "closed", "custom_fields": {}}
+    fetch_closed = AsyncMock(return_value=[closed_ticket])
+    reconcile_claims = AsyncMock(return_value=set())
 
     class Lease(_PollLoopLease):
         async def renew(self):
@@ -660,6 +952,9 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
 
         def reconcile_handoff_blocked(self, _tickets):
             pass
+
+        def is_deposed(self):
+            return False
 
         async def shutdown(self):
             pass
@@ -706,13 +1001,17 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
     monkeypatch.setattr(orchestrator_main, "_sweep_orphaned_leases", no_op)
     monkeypatch.setattr(orchestrator_main, "_sweep_trace_spools", lambda: None)
     monkeypatch.setattr(orchestrator_main, "fetch_all_tickets", fetch_tickets)
+    monkeypatch.setattr(orchestrator_main, "fetch_tickets_by_status", fetch_closed)
+    monkeypatch.setattr(
+        orchestrator_main, "_reconcile_deposed_claims", reconcile_claims
+    )
     telemetry_module = ModuleType("providers.telemetry")
     telemetry_module.setup_telemetry = lambda **_kwargs: None
     monkeypatch.setitem(sys.modules, "providers.telemetry", telemetry_module)
     monkeypatch.setattr("providers.redaction.get_shared_redactor", lambda: object())
 
     lease = Lease()
-    lease_state = {"renew_task": None, "started": asyncio.Event()}
+    lease_state = {"renewer": None, "started": threading.Event()}
     task = asyncio.create_task(
         _poll_loop_after_lease(config, lease, _LeaseLossGate(), lease_state)
     )
@@ -725,6 +1024,8 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
             "lease_acquired",
             "running",
         ]
+        fetch_closed.assert_awaited_once_with("http://state-store", "closed")
+        reconcile_claims.assert_any_await("http://state-store", [closed_ticket])
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -766,6 +1067,9 @@ async def test_poll_loop_repeated_cancellation_finishes_teardown(monkeypatch):
 
         def reconcile_handoff_blocked(self, _tickets):
             pass
+
+        def is_deposed(self):
+            return False
 
         async def shutdown(self):
             shutdown_started.set()
@@ -816,13 +1120,16 @@ async def test_poll_loop_repeated_cancellation_finishes_teardown(monkeypatch):
     monkeypatch.setattr(orchestrator_main, "_process_stop_requests", AsyncMock())
     monkeypatch.setattr(orchestrator_main, "_sweep_trace_spools", lambda: None)
     monkeypatch.setattr(orchestrator_main, "fetch_all_tickets", fetch_tickets)
+    monkeypatch.setattr(
+        orchestrator_main, "fetch_tickets_by_status", AsyncMock(return_value=[])
+    )
     monkeypatch.setattr(orchestrator_main, "_renew_leader_lease", renew_lease)
     telemetry_module = ModuleType("providers.telemetry")
     telemetry_module.setup_telemetry = lambda **_kwargs: None
     monkeypatch.setitem(sys.modules, "providers.telemetry", telemetry_module)
     monkeypatch.setattr("providers.redaction.get_shared_redactor", lambda: object())
 
-    lease_state = {"renew_task": None, "started": asyncio.Event()}
+    lease_state = {"renewer": None, "started": threading.Event()}
     task = asyncio.create_task(
         _poll_loop_after_lease(config, Lease(), _LeaseLossGate(), lease_state)
     )
@@ -906,6 +1213,66 @@ async def test_poll_loop_cancellation_releases_lease(
     assert lease.release_count == 1
 
 
+@pytest.mark.asyncio
+async def test_poll_loop_reacquires_after_lease_loss(monkeypatch):
+    lease = _PollLoopLease()
+    config = _poll_config()
+    config.leader_lease_recovery_delay_seconds = 0
+    attempts = 0
+    reacquired = asyncio.Event()
+
+    async def run_attempt(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise LeaderLeaseLost("lease lost")
+        reacquired.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.LeaderLeaseClient", lambda *_a, **_k: lease
+    )
+    monkeypatch.setattr("orchestrator.main._poll_loop_after_lease", run_attempt)
+    task = asyncio.create_task(poll_loop(config))
+    await asyncio.wait_for(reacquired.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert attempts == 2
+    assert lease.release_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_reacquires_after_lease_acquisition_exhaustion(monkeypatch):
+    lease = _PollLoopLease()
+    config = _poll_config()
+    config.leader_lease_recovery_delay_seconds = 0
+    attempts = 0
+    reacquired = asyncio.Event()
+
+    async def run_attempt(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise LeaderLeaseUnavailable("store temporarily unavailable")
+        reacquired.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.LeaderLeaseClient", lambda *_a, **_k: lease
+    )
+    monkeypatch.setattr("orchestrator.main._poll_loop_after_lease", run_attempt)
+    task = asyncio.create_task(poll_loop(config))
+    await asyncio.wait_for(reacquired.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert attempts == 2
+    assert lease.release_count >= 1
+
+
 def _request(session_id=None, *, instance_name="shared"):
     return AcquireOrchestratorLeaseRequest(
         session_id=session_id or uuid4(),
@@ -980,7 +1347,8 @@ def test_lease_cache_unchanged_when_disk_write_fails(tmp_path, monkeypatch):
     assert current.expires_at == lease.expires_at
 
 
-def test_public_health_does_not_disclose_lease_holder_identity(tmp_path):
+@pytest.mark.asyncio
+async def test_public_health_does_not_disclose_lease_holder_identity(tmp_path):
     store = TicketStore(persist_dir=tmp_path)
     store.acquire_orchestrator_lease(_request())
     request = SimpleNamespace(
@@ -992,13 +1360,14 @@ def test_public_health_does_not_disclose_lease_holder_identity(tmp_path):
         ),
         client=None,
     )
-    result = health(request)
+    result = await health(request)
     assert result["orchestrator_lease"] == {"active": True}
     assert result["total"] == 0
     assert all(count == 0 for count in result["ticket_counts"].values())
 
 
-def test_public_health_counts_tickets_without_listing_them(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_public_health_counts_tickets_without_listing_them(tmp_path, monkeypatch):
     store = TicketStore(persist_dir=tmp_path)
     for summary in ("first", "second"):
         store.create_ticket(CreateTicketRequest(summary=summary, description="test"))
@@ -1017,7 +1386,7 @@ def test_public_health_counts_tickets_without_listing_them(tmp_path, monkeypatch
         client=None,
     )
 
-    result = health(request)
+    result = await health(request)
 
     assert result["ticket_counts"][TicketStatus.NEW.value] == 2
     assert set(result["ticket_counts"]) == {status.value for status in TicketStatus}

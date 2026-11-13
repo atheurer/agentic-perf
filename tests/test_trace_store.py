@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from multiprocessing import get_context
@@ -110,6 +111,22 @@ def test_shared_store_serializes_reads_with_write_transactions(
             release.set()
             assert writer.result().state == "prepared"
             assert reader.result().state == "prepared"
+
+
+def test_query_waiting_for_store_lock_observes_cancellation(tmp_path: Path) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        cancelled = threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as executor, store._lock:
+            future = executor.submit(
+                store.query_events,
+                TraceQuery(limit=1),
+                cancelled=cancelled.is_set,
+            )
+            time.sleep(0.15)
+            assert not future.done()
+            cancelled.set()
+            with pytest.raises(TraceQueryCancelled):
+                future.result(timeout=2)
 
 
 def test_query_events_uses_bound_filters_and_causal_cap(

@@ -835,7 +835,10 @@ class TraceStore:
                 )
             scoped.extend(
                 self._query_rows(
-                    ["ticket_id = ?", "trace_id = ?"],
+                    [
+                        "ticket_id = ?",
+                        "trace_id = ?",
+                    ],
                     [ticket_id, trace_id],
                     remaining,
                     cancelled=cancelled,
@@ -927,7 +930,11 @@ class TraceStore:
             if cancelled is not None and cancelled():
                 raise TraceQueryCancelled("trace query cancelled")
 
-        with self._lock:
+        lock_held = False
+        try:
+            while not self._lock.acquire(timeout=0.1):
+                check_cancelled()
+            lock_held = True
             try:
                 connections = [self._open_connection()]
                 history_connection = self._open_history_connection()
@@ -954,6 +961,9 @@ class TraceStore:
                 raise
             except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
                 raise TraceStoreWriteError("could not query trace events") from exc
+        finally:
+            if lock_held:
+                self._lock.release()
 
         rows.sort(key=lambda item: item[0])
         events: list[TraceEventV1] = []

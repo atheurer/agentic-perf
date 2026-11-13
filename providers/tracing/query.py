@@ -51,6 +51,30 @@ class TraceQueryCancelled(RuntimeError):
     """The caller abandoned a trace query before it completed."""
 
 
+class TraceQueryResourceExhausted(RuntimeError):
+    """The state store cannot safely admit another trace query right now."""
+
+
+def _check_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise TraceQueryCancelled("trace query cancelled")
+
+
+def _json_dumps(
+    value: object,
+    *,
+    indent: int | None = None,
+    separators: tuple[str, str] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> str:
+    encoder = json.JSONEncoder(indent=indent, separators=separators)
+    fragments: list[str] = []
+    for fragment in encoder.iterencode(value):
+        _check_cancelled(cancelled)
+        fragments.append(fragment)
+    return "".join(fragments)
+
+
 def _as_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -112,15 +136,31 @@ def decode_cursor(cursor: str | None) -> tuple[int, int | str, str] | None:
 
 
 def page_events(
-    events: Iterable[TraceEventV1], *, cursor: str | None, limit: int
+    events: Iterable[TraceEventV1],
+    *,
+    cursor: str | None,
+    limit: int,
+    cancelled: Callable[[], bool] | None = None,
 ) -> tuple[list[TraceEventV1], bool, str | None]:
     """Page a complete ordered scope without ordinal insert races."""
-    ordered = sorted(events, key=_ordering_key)
+    ordered: list[TraceEventV1] = []
+    for event in events:
+        _check_cancelled(cancelled)
+        ordered.append(event)
+    ordered.sort(key=_ordering_key)
+    _check_cancelled(cancelled)
     marker = decode_cursor(cursor)
-    if marker is not None:
-        ordered = [event for event in ordered if _ordering_key(event) > marker]
-    selected = ordered[:limit]
-    has_more = len(ordered) > len(selected)
+    selected: list[TraceEventV1] = []
+    has_more = False
+    for event in ordered:
+        _check_cancelled(cancelled)
+        if marker is not None and _ordering_key(event) <= marker:
+            continue
+        if len(selected) < limit:
+            selected.append(event)
+        else:
+            has_more = True
+            break
     return (
         selected,
         has_more,
@@ -198,17 +238,28 @@ def expand_causal_events(
     return expanded[:limit]
 
 
-def diagnostics(events: Iterable[TraceEventV1]) -> dict[str, object]:
+def diagnostics(
+    events: Iterable[TraceEventV1],
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> dict[str, object]:
     """Report incomplete causal data without inventing relationships."""
-    values = list(events)
-    ids = {event.action_id for event in values}
-    parents = {
-        event.action_id: event.parent_action_id
-        for event in values
-        if event.parent_action_id
-    }
+    values: list[TraceEventV1] = []
+    for event in events:
+        _check_cancelled(cancelled)
+        values.append(event)
+    ids: set[str] = set()
+    parents: dict[str, str] = {}
+    seqs: list[int] = []
+    for event in values:
+        _check_cancelled(cancelled)
+        ids.add(event.action_id)
+        if event.parent_action_id:
+            parents[event.action_id] = event.parent_action_id
+        if event.ticket_seq is not None:
+            seqs.append(event.ticket_seq)
     missing = sorted({parent for parent in parents.values() if parent not in ids})
-    seqs = sorted(item.ticket_seq for item in values if item.ticket_seq is not None)
+    seqs.sort()
     gaps = [
         number
         for left, right in zip(seqs, seqs[1:])
@@ -216,9 +267,9 @@ def diagnostics(events: Iterable[TraceEventV1]) -> dict[str, object]:
     ]
     return {
         "missing_parents": missing,
-        "cycles": _causal_cycles(parents),
+        "cycles": _causal_cycles(parents, cancelled=cancelled),
         "sequence_gaps": gaps,
-        "unmatched_lifecycle_pairs": _unmatched_pairs(values),
+        "unmatched_lifecycle_pairs": _unmatched_pairs(values, cancelled=cancelled),
         "indeterminate_operations": sorted(
             event.action_id
             for event in values
@@ -229,11 +280,14 @@ def diagnostics(events: Iterable[TraceEventV1]) -> dict[str, object]:
     }
 
 
-def _causal_cycles(parents: dict[str, str]) -> list[str]:
+def _causal_cycles(
+    parents: dict[str, str], *, cancelled: Callable[[], bool] | None = None
+) -> list[str]:
     """Return every action in a parent cycle using one pass over the graph."""
     state: dict[str, int] = {}
     cycles: set[str] = set()
     for start in parents:
+        _check_cancelled(cancelled)
         if state.get(start) is not None:
             continue
         path: list[str] = []
@@ -251,18 +305,24 @@ def _causal_cycles(parents: dict[str, str]) -> list[str]:
     return sorted(cycles)
 
 
-def _unmatched_pairs(values: list[TraceEventV1]) -> list[str]:
-    starts = {
-        event.action_id
-        for event in values
-        if event.lifecycle.state.value in {"started", "requested", "claimed"}
-    }
-    terminals = {
-        event.action_id
-        for event in values
-        if event.lifecycle.state.value
-        in {"completed", "failed", "cancelled", "aborted", "rejected", "indeterminate"}
-    }
+def _unmatched_pairs(
+    values: list[TraceEventV1], *, cancelled: Callable[[], bool] | None = None
+) -> list[str]:
+    starts: set[str] = set()
+    terminals: set[str] = set()
+    for event in values:
+        _check_cancelled(cancelled)
+        if event.lifecycle.state.value in {"started", "requested", "claimed"}:
+            starts.add(event.action_id)
+        if event.lifecycle.state.value in {
+            "completed",
+            "failed",
+            "cancelled",
+            "aborted",
+            "rejected",
+            "indeterminate",
+        }:
+            terminals.add(event.action_id)
     return sorted(starts - terminals)
 
 
@@ -292,13 +352,27 @@ def _matches(event: TraceEventV1, query: TraceQuery) -> bool:
     return True
 
 
-def export_events(events: Iterable[TraceEventV1], format: str = "json") -> str:
+def export_events(
+    events: Iterable[TraceEventV1],
+    format: str = "json",
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> str:
     """Serialize events as JSON, newline-delimited JSON, or a compact CSV."""
-    rows = [event.model_dump(mode="json") for event in events]
+    rows: list[dict[str, object]] = []
+    for event in events:
+        _check_cancelled(cancelled)
+        rows.append(event.model_dump(mode="json"))
     if format == "json":
-        return json.dumps(rows, indent=2)
+        return _json_dumps(rows, indent=2, cancelled=cancelled)
     if format == "jsonl":
-        return "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows)
+        output: list[str] = []
+        for row in rows:
+            _check_cancelled(cancelled)
+            output.append(
+                _json_dumps(row, separators=(",", ":"), cancelled=cancelled) + "\n"
+            )
+        return "".join(output)
     if format == "csv":
         output = io.StringIO()
         fields = [
@@ -315,6 +389,7 @@ def export_events(events: Iterable[TraceEventV1], format: str = "json") -> str:
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
         for row in rows:
+            _check_cancelled(cancelled)
             writer.writerow(
                 {
                     "global_seq": row.get("global_seq"),
@@ -337,10 +412,18 @@ def export_manifest(
     content: str,
     *,
     verified_blob_refs: Iterable[str] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
     """Return integrity metadata for an export without including payload bytes."""
-    values = list(events)
-    sequences = [event.global_seq for event in values if event.global_seq is not None]
+    values: list[TraceEventV1] = []
+    sequences: list[int] = []
+    schema_versions: set[str] = set()
+    for event in events:
+        _check_cancelled(cancelled)
+        values.append(event)
+        if event.global_seq is not None:
+            sequences.append(event.global_seq)
+        schema_versions.add(event.schema_version)
     # A descriptor digest may be HMAC'd metadata and is not an address for a
     # stored blob.  Exports must only claim references that can be resolved by
     # the payload endpoint.
@@ -354,16 +437,18 @@ def export_manifest(
             if descriptor and descriptor.blob_ref
         )
     )
-    digests = sorted(
-        {ref for ref in candidates if re.fullmatch(r"sha256:[0-9a-f]{64}", ref)}
-    )
+    digests: set[str] = set()
+    for ref in candidates:
+        _check_cancelled(cancelled)
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", ref):
+            digests.add(ref)
     return {
         "manifest_version": "trace-export-v1",
-        "schema_versions": sorted({event.schema_version for event in values}),
+        "schema_versions": sorted(schema_versions),
         "first_seq": min(sequences) if sequences else None,
         "last_seq": max(sequences) if sequences else None,
         "count": len(values),
-        "blob_digests": digests,
+        "blob_digests": sorted(digests),
         "content_digest_algorithm": "sha256-utf8",
         "content_digest": hashlib.sha256(content.encode()).hexdigest(),
         # Kept as an alias for consumers of the initial PR contract.

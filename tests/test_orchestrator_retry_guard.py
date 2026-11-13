@@ -608,6 +608,7 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
     dispatcher = MagicMock()
     dispatcher.events = None
     dispatcher.active_tasks.return_value = []
+    dispatcher.is_deposed.return_value = False
     dispatcher.is_active.return_value = False
     dispatcher.is_handoff_blocked.return_value = False
     dispatcher.try_claim = AsyncMock(return_value=False)
@@ -706,6 +707,7 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
         return deepcopy(tickets)
 
     monkeypatch.setattr(main, "fetch_all_tickets", fetch)
+    monkeypatch.setattr(main, "fetch_tickets_by_status", AsyncMock(return_value=[]))
     lease = SimpleNamespace(
         session_id=uuid4(),
         epoch=None,
@@ -806,6 +808,7 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
     }
     dispatcher = MagicMock()
     dispatcher.active_tasks.return_value = []
+    dispatcher.is_deposed.return_value = False
     dispatcher.is_active.return_value = False
     dispatcher.try_claim = AsyncMock(return_value=False)
     dispatcher.shutdown = AsyncMock()
@@ -910,6 +913,7 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
         return [deepcopy(ticket)]
 
     monkeypatch.setattr(main, "fetch_all_tickets", fetch)
+    monkeypatch.setattr(main, "fetch_tickets_by_status", AsyncMock(return_value=[]))
     lease = SimpleNamespace(
         session_id=uuid4(),
         epoch=None,
