@@ -4,16 +4,23 @@ import pytest
 
 from providers.skills.base import RunfileTemplate
 from tests.conftest import MockSkillProvider, MockSSHExecutor, make_benchmark_handlers
+from tests.test_benchmark_tools import BenchmarkMCP
 
 
 @pytest.fixture(autouse=True)
 def _crucible_ticket_context(monkeypatch):
     import agents.benchmark.server as server
 
+    monkeypatch.setattr(server, "_crucible_mcp", BenchmarkMCP())
     monkeypatch.setattr(
         server,
         "_ticket",
-        {"custom_fields": {"directives": {"harness": "crucible"}}},
+        {
+            "custom_fields": {
+                "directives": {"harness": "crucible"},
+                "assigned_hardware_ips": {"controller": "controller.example"},
+            }
+        },
     )
 
 
@@ -222,16 +229,14 @@ async def test_execute_benchmark_accepts_llm_constructed_runfile(handlers_with_s
         ],
     }
     validation = await handlers_with_schema["validate_benchmark"](
-        controller="10.0.0.1",
+        controller="controller.example",
         run_file=llm_runfile,
         harness="crucible",
     )
     result = await handlers_with_schema["execute_benchmark"](
-        controller="10.0.0.1",
+        controller="controller.example",
         validation_id=validation["validation_id"],
         harness="crucible",
-        run_command="crucible run",
     )
-    # May fail at SCP (no real SSH in tests), but must not be rejected for
-    # supplying an unvalidated or mismatched runfile.
+    # The exact MCP-validated document is eligible for execution.
     assert result["status"] != "rejected"

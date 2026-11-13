@@ -52,12 +52,12 @@ tools listed below. Provider-specific tools are attached only when configured.
 | Benchmark | `read_skills`, `list_harness_docs`, `read_harness_doc`, `get_execution_config`, `get_runfile_schema`, `get_benchmark_params`, `get_tool_params`, `get_example_runfile`, `setup_passwordless_ssh`, `execute_benchmark`, `get_run_logs`, `execute_boot_time_test` |
 | Analyze | `read_skills`, `list_skill_docs`, `get_ticket_results`, `search_tickets`, `list_benchmark_artifacts`, `read_benchmark_artifact`, `submit_analysis_result` |
 | Evaluate | `submit_evaluation_result`, `list_benchmark_artifacts`, `read_benchmark_artifact` |
-| Review | `read_skills`, `list_harness_docs`, `read_harness_doc`, `read_run_results`, `get_run_summary`, `cdm_api_requests`, `compare_results`, `get_review_config` |
+| Review | `read_skills`, `list_harness_docs`, `read_harness_doc`, `read_run_results`, `get_run_summary`, `list_cdm_periods`, `get_cdm_metric`, `compare_results`, `get_review_config` |
 | Investigation | `query_investigation_records`, `get_investigation_record`, `create_investigation_record`, `append_build_history`, `link_jira_ticket`, `close_investigation_record` |
 | Gathering context | `submit_gathering_context_result` |
 | Synthesis | `submit_synthesis_result` |
 | Retrospective | `get_transcript_analysis` |
-| Infrastructure | `set_ssh_context`, `check_host`, `write_remote_file`, `read_remote_file`, `read_remote_dir`, `get_ethtool_info`, `get_sysctl_values`, `get_hardware_topology`, `get_cache_topology`, `verify_ssh_path`, `list_interfaces`, `get_interface_inventory`, `list_controller_userenvs`, `run_crucible_command`, `deploy_secret`, `transfer_file`, `check_hosts`, `test_port_connectivity` |
+| Infrastructure | `set_ssh_context`, `check_host`, `write_remote_file`, `read_remote_file`, `read_remote_dir`, `get_ethtool_info`, `get_sysctl_values`, `get_hardware_topology`, `get_cache_topology`, `verify_ssh_path`, `list_interfaces`, `get_interface_inventory`, `list_controller_userenvs`, `deploy_secret`, `transfer_file`, `check_hosts`, `test_port_connectivity` |
 
 Agent-specific filtering is assembled when the dispatcher creates the agent
 MCP client. A tool in this table is not evidence that every agent can call it.

@@ -222,6 +222,7 @@ class AgentMCPClient:
         self._tool_owner_overrides: dict[tuple[str, str], str] = {}
         self._hidden_owned_tools: set[tuple[str, str]] = set()
         self._ownership_required_servers: set[str] = set()
+        self._resource_uri_prefixes: dict[str, tuple[str, ...]] = {}
         self._selected_harness: str | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._disconnect_lock = asyncio.Lock()
@@ -289,6 +290,25 @@ class AgentMCPClient:
         if not server_name:
             raise ValueError("server_name is required")
         self._ownership_required_servers.add(server_name)
+
+    def register_resource_scope(
+        self,
+        server_name: str,
+        allowed_prefixes: set[str] | tuple[str, ...] | list[str],
+    ) -> None:
+        """Restrict resource reads for one server to approved URI prefixes."""
+        if not server_name:
+            raise ValueError("server_name is required")
+        normalized = tuple(
+            dict.fromkeys(
+                prefix
+                for prefix in allowed_prefixes
+                if isinstance(prefix, str) and prefix
+            )
+        )
+        if not normalized:
+            raise ValueError("at least one allowed resource URI prefix is required")
+        self._resource_uri_prefixes[server_name] = normalized
 
     def _tool_owner(self, server_name: str, tool: Any) -> str | None:
         declared = owner_harness_from_tool(tool)
@@ -959,6 +979,153 @@ class AgentMCPClient:
                     )
                 )
         return tools
+
+    def _resource_connection(self, server_name: str) -> _ServerConnection:
+        conn = self._servers.get(server_name)
+        if conn is None or conn.session is None or not conn.connected:
+            raise MCPToolCallError(
+                f"No active MCP resource server {server_name!r}",
+                "transport_before_send",
+            )
+        return conn
+
+    @staticmethod
+    def _serialize_resource(resource: Any) -> dict[str, Any]:
+        if hasattr(resource, "model_dump"):
+            serialized = resource.model_dump(mode="json", exclude_none=True)
+            return serialized if isinstance(serialized, dict) else {"value": serialized}
+        if isinstance(resource, dict):
+            return dict(resource)
+        return {
+            "uri": str(getattr(resource, "uri", "")),
+            "name": getattr(resource, "name", None),
+            "description": getattr(resource, "description", None),
+            "mime_type": getattr(resource, "mime_type", None),
+        }
+
+    @staticmethod
+    def _valid_resource_uri(uri: str) -> bool:
+        return (
+            bool(uri)
+            and ".." not in uri.split("/")
+            and all(ord(character) >= 32 for character in uri)
+        )
+
+    async def list_resources(self, server_name: str) -> list[dict[str, Any]]:
+        """List resources from one connected MCP server."""
+        conn = self._resource_connection(server_name)
+        context = current_trace_context() or TraceContext(
+            ticket_id=conn.ticket_id,
+            agent_id=conn.agent_id,
+        )
+        self._record_boundary(
+            conn,
+            LifecycleState.REQUEST_SENT,
+            context=context,
+            tool_name="list_resources",
+        )
+        try:
+            result = await conn.session.list_resources()
+        except asyncio.CancelledError as exc:
+            self._record_boundary(
+                conn,
+                LifecycleState.CANCELLED,
+                context=context,
+                tool_name="list_resources",
+                outcome=OperationOutcome.CANCELLED,
+                error=exc,
+            )
+            raise
+        except Exception as exc:
+            self._record_boundary(
+                conn,
+                LifecycleState.FAILED,
+                context=context,
+                tool_name="list_resources",
+                outcome=OperationOutcome.FAILURE,
+                error=exc,
+            )
+            raise
+        resources = [
+            self._serialize_resource(resource)
+            for resource in getattr(result, "resources", [])
+        ]
+        self._record_boundary(
+            conn,
+            LifecycleState.RESPONSE_RECEIVED,
+            context=context,
+            tool_name="list_resources",
+            outcome=OperationOutcome.SUCCESS,
+        )
+        return resources
+
+    async def read_resource(self, server_name: str, uri: str) -> str:
+        """Read one resource from an approved, connected MCP server."""
+        conn = self._resource_connection(server_name)
+        allowed_prefixes = self._resource_uri_prefixes.get(server_name, ())
+        if not allowed_prefixes:
+            raise MCPToolCallError(
+                f"Resource reads are not enabled for MCP server {server_name!r}",
+                "validation",
+            )
+        if (
+            not isinstance(uri, str)
+            or not self._valid_resource_uri(uri)
+            or not uri.startswith(allowed_prefixes)
+        ):
+            raise MCPToolCallError(
+                f"Resource URI is not allowed for MCP server {server_name!r}",
+                "validation",
+            )
+        context = current_trace_context() or TraceContext(
+            ticket_id=conn.ticket_id,
+            agent_id=conn.agent_id,
+        )
+        self._record_boundary(
+            conn,
+            LifecycleState.REQUEST_SENT,
+            context=context,
+            tool_name="read_resource",
+        )
+        try:
+            result = await conn.session.read_resource(uri)
+        except asyncio.CancelledError as exc:
+            self._record_boundary(
+                conn,
+                LifecycleState.CANCELLED,
+                context=context,
+                tool_name="read_resource",
+                outcome=OperationOutcome.CANCELLED,
+                error=exc,
+            )
+            raise
+        except Exception as exc:
+            self._record_boundary(
+                conn,
+                LifecycleState.FAILED,
+                context=context,
+                tool_name="read_resource",
+                outcome=OperationOutcome.FAILURE,
+                error=exc,
+            )
+            raise
+        contents = [
+            self._serialize_resource(content)
+            for content in getattr(result, "contents", [])
+        ]
+        self._record_boundary(
+            conn,
+            LifecycleState.RESPONSE_RECEIVED,
+            context=context,
+            tool_name="read_resource",
+            outcome=OperationOutcome.SUCCESS,
+        )
+        return json.dumps(
+            {"contents": contents},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
 
     @staticmethod
     def _mcp_metadata(

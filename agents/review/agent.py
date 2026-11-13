@@ -295,16 +295,15 @@ class ReviewAgent(AgentBase):
             await mcp.disconnect()
             self._mcp = None
 
-    # Crucible-specific tools that require a controller with Crucible
-    # installed and fail with SSH/file errors on other harnesses.
+    # Crucible-specific tools require a controller with MCP contract v3.
     _CRUCIBLE_ONLY_TOOLS: frozenset[str] = frozenset(
         {
             "get_crucible_benchmark_context",
             "read_run_results",
             "get_run_summary",
-            "cdm_api_requests",
+            "list_cdm_periods",
+            "get_cdm_metric",
             "compare_results",
-            "run_crucible_command",
         }
     )
 
@@ -565,9 +564,7 @@ class ReviewAgent(AgentBase):
         ssh_ips = cf.get("ssh_hardware_ips") or cf.get("assigned_hardware_ips") or {}
         if ssh_ips.get("controller"):
             content += "\n## Connection Details\n"
-            content += f"**Controller (SSH):** {ssh_ips['controller']}\n"
-            if cf.get("ssh_key_path"):
-                content += f"**SSH Key:** {cf['ssh_key_path']}\n"
+            content += f"**Assigned controller:** {ssh_ips['controller']}\n"
 
         host_inventory = cf.get("host_inventory")
         if host_inventory:

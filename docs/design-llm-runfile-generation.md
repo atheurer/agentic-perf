@@ -20,8 +20,8 @@ Remove `generate_run_file` as an abstraction layer. The LLM constructs the compl
 
 ```
 User → natural language → Benchmark LLM → complete run.json
-    → validate_runfile (schema) → present to user for approval
-    → execute_benchmark (blockbreaker + crucible run)
+→ validate_benchmark (controller MCP validate_run) → present to user
+→ execute_benchmark (controller MCP prepare_run + start_run)
 ```
 
 ### New Tools for the Benchmark Agent
@@ -52,10 +52,10 @@ User → natural language → Benchmark LLM → complete run.json
    - Called automatically by execute_benchmark, but also available as a standalone tool
      so the LLM can check its work before presenting to the user
 
-6. **`execute_benchmark`** (keep existing) — runs blockbreaker + crucible run on the controller
-   - Already does schema validation (line 354-364)
-   - Blockbreaker (`rickshaw/util/blockbreaker.py`) does deeper semantic validation
-     when crucible invokes it during `crucible run`
+6. **`execute_benchmark`** (keep existing) — plans and starts the exact
+   validated document through controller MCP contract v3
+   - Controller-side schema and semantic validation happen through
+     `validate_run` and `prepare_run`
 
 ### Keep `generate_run_file` as a Fallback
 
@@ -72,7 +72,8 @@ The prompt should guide the LLM through:
 5. Call `validate_runfile(run_file)` — check schema compliance
 6. If validation fails, fix the run-file and re-validate
 7. Call `present_runfile_for_approval(run_file)` — user reviews
-8. Call `execute_benchmark(controller, run_file)` — send to controller
+8. Call `execute_benchmark(controller, validation_id)` — send the exact
+   validated document to controller MCP
 
 The prompt should also teach the LLM:
 - The endpoint structure (remotehosts type, remotes array, engines with roles)
@@ -201,12 +202,14 @@ Available examples:
 
 **Location:** `/opt/crucible/subprojects/core/rickshaw/util/blockbreaker.py`
 
-Blockbreaker is a **post-generation** utility invoked by `crucible run`. It:
+Blockbreaker is a **post-generation** utility invoked by Crucible's controller
+execution pipeline. It:
 1. Validates the run-file against the JSON schema
 2. Expands the run-file into CLI argument streams for rickshaw-run
 3. Converts `benchmarks`, `endpoints`, `tags`, `run-params` into positional/flag arguments
 
-It does NOT generate run-files — it consumes them. Validation errors from blockbreaker surface as `crucible run` failures.
+It does NOT generate run-files — it consumes them. Validation errors from
+blockbreaker surface through MCP `validate_run` and `prepare_run` failures.
 
 ### Current Code to Modify
 
@@ -220,7 +223,8 @@ It does NOT generate run-files — it consumes them. Validation errors from bloc
 ### Existing Safeguards to Preserve
 
 1. **Schema validation** before execution (`execute_benchmark` line 354-364)
-2. **Blockbreaker validation** during `crucible run` (catches semantic errors beyond schema)
+2. **Controller semantic validation** through MCP `validate_run` and
+   `prepare_run` (catches errors beyond schema)
 3. **Run-file stash** (`_last_generated_runfile`) — may no longer be needed if the LLM constructs directly, but keep until the transition is complete
 4. **Hostname → IP resolution** — move into a utility tool the LLM can call explicitly, or keep as part of execute_benchmark
 

@@ -1412,9 +1412,9 @@ repositories; detailed metadata is read from a cached checkout of the
 individual repository when available. Set `CRUCIBLE_SOURCE_REPO` to an
 explicit core checkout when the default skill-cache location is not suitable.
 This source checkout is used during triage and does not imply that the
-benchmark is installed on the eventual Crucible controller. Controller-side
-availability must be verified later with the installed Crucible state and,
-when supported, `crucible benchmark list` and `crucible tools list`.
+benchmark is installed on the eventual Crucible controller. After controller
+assignment, benchmark and tool availability are read through controller MCP
+contract v3.
 
 ---
 

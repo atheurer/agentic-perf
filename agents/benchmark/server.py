@@ -30,17 +30,19 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from agents.benchmark.harnesses.boot_time import BootTimeContext, run_boot_time_test
+from agents.crucible_mcp import CrucibleMCPAdapter
 from agents.mcp_audit import create_ticket_mcp
+from agents.mcp_client import MCPToolCallError
 from agents.server_utils import (
     FORBIDDEN_REBOOT_HOSTS,
     _emit_context_audit_event,
-    _public_context_document,
     _public_context_result,
     build_crucible_context_gateway,
     build_repo_cache,
     build_skill_provider_async,
     build_ssh_from_ticket,
     controller_context_gateway,
+    crucible_context_gateway,
     is_self_host,
     read_skill_documents,
     ticket_controller_host,
@@ -82,6 +84,22 @@ CONTROLLER_KEY_COMMENT = "agentic-perf-controller-key"
 _CRUCIBLE_ROOT = "/opt/crucible"
 _OPERATION_INLINE_RESULT_BYTES = 3000
 _OPERATION_RESULT_BLOB_MAX_BYTES = 1_048_576
+
+
+def _is_expired_plan_handle(exc: MCPToolCallError) -> bool:
+    try:
+        payload = json.loads(str(exc))
+    except json.JSONDecodeError:
+        return "expired_plan_handle" in str(exc)
+    return isinstance(payload, dict) and payload.get("code") == "expired_plan_handle"
+
+
+def _is_run_document_too_large(exc: MCPToolCallError) -> bool:
+    try:
+        payload = json.loads(str(exc))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and payload.get("code") == "too_large"
 
 
 def _execution_result_blob_store(ticket_id: str):
@@ -314,6 +332,8 @@ async def _persist_validated_runfile(
     validator_command: str,
     validation_output: str,
     validator_version: str,
+    execution_transport: str = "",
+    mcp_contract_version: str = "",
 ) -> str | None:
     """Persist a runfile validation record and return its opaque ID.
 
@@ -349,6 +369,16 @@ async def _persist_validated_runfile(
             ticket_id, validation_output
         ),
     }
+    if execution_transport == "crucible_mcp":
+        record.update(
+            {
+                "execution_transport": execution_transport,
+                "mcp_contract_version": mcp_contract_version or "3",
+                "crucible_idempotency_key": (
+                    f"{ticket_id or 'external'}:crucible:{validation_id}"
+                ),
+            }
+        )
     creator = _validation_creator()
     _validation_records[validation_id] = record | {
         "state": "executable",
@@ -495,6 +525,7 @@ SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 
 # Module-level globals — lazily initialized by _ensure_init()
 _initialized = False
+_crucible_mcp: CrucibleMCPAdapter | None = None
 
 
 def _truncated_output_guidance(
@@ -911,7 +942,14 @@ class _BenchmarkOperation:
 
 async def _ensure_init():
     """Lazily initialize providers and SSH from env vars on first tool call."""
-    global _initialized, _ssh, _skill_provider, _crucible_context, _repo_cache, _ticket
+    global \
+        _initialized, \
+        _ssh, \
+        _skill_provider, \
+        _crucible_context, \
+        _repo_cache, \
+        _ticket, \
+        _crucible_mcp
     if _initialized:
         return
     _ssh, _ticket = await build_ssh_from_ticket()
@@ -921,6 +959,14 @@ async def _ensure_init():
         _repo_cache = await build_repo_cache()
     except Exception:
         _repo_cache = None
+    controller = ticket_controller_host(_ticket)
+    ticket_id = str(_ticket.get("id") or os.environ.get("TICKET_ID", ""))
+    if controller and ticket_id:
+        _crucible_mcp = CrucibleMCPAdapter.from_config(
+            controller=controller,
+            ticket_id=ticket_id,
+            agent_id="benchmark-agent",
+        )
     _initialized = True
 
 
@@ -1016,443 +1062,93 @@ def _get_validated_runfile(
     return run_file, None
 
 
+async def _resolve_legacy_crucible_validation(
+    *,
+    ticket_id: str,
+    validation_id: str,
+    record: dict[str, Any],
+    controller: str,
+    harness: str,
+) -> str:
+    intent_key, intent_hash, _ = _benchmark_intent_identity(
+        ticket_id,
+        validation_id,
+        record,
+        controller,
+        harness,
+        record.get("run_command", "crucible run"),
+    )
+    operation_guard = _BenchmarkOperation(
+        intent_key,
+        intent_hash,
+        os.environ.get("AGENTIC_PERF_INSTANCE_NAME", socket.gethostname()),
+    )
+    operation_record, acquisition = await operation_guard.acquire()
+    if acquisition == "terminal":
+        cached = (operation_record.get("result_descriptor") or {}).get(
+            "benchmark_result"
+        )
+        result = (
+            _replay_operation_result(ticket_id, cached)
+            if isinstance(cached, dict)
+            else {"status": operation_record.get("terminal_outcome", "indeterminate")}
+        )
+        await operation_guard.close()
+        return json.dumps(
+            {
+                **result,
+                "operation_id": intent_key,
+                "existing_operation": True,
+                "legacy_execution": True,
+            }
+        )
+    if acquisition == "in_progress":
+        await operation_guard.close()
+        return json.dumps(
+            {
+                "status": "existing_operation",
+                "operation_id": intent_key,
+                "operation": operation_record,
+                "legacy_execution": True,
+                "message": (
+                    "The legacy CLI run is already in flight and was not "
+                    "relaunched under MCP."
+                ),
+            }
+        )
+    if acquisition != "acquired":
+        await operation_guard.close()
+        return json.dumps(
+            {
+                "status": "rejected",
+                "reason_code": "operation_registry_unavailable",
+                "message": "Benchmark operation registry unavailable",
+            }
+        )
+    rejection = {
+        "status": "rejected",
+        "harness": harness,
+        "validation_id": validation_id,
+        "reason_code": "mcp_revalidation_required",
+        "message": (
+            "This validation predates Crucible MCP contract v3. Revalidate "
+            "the exact run document before execution."
+        ),
+    }
+    await operation_guard.terminalize(
+        operation_record,
+        "fail",
+        {"benchmark_result": rejection},
+    )
+    await operation_guard.close()
+    return json.dumps(rejection)
+
+
 def _controller_host() -> str | None:
     """Return the ticket's explicit Crucible controller host."""
     return ticket_controller_host(_ticket)
 
 
-async def _read_controller_file(host: str, path: str) -> str | None:
-    """Read one allowlisted controller context file through the ticket SSH."""
-    if _ssh is None:
-        return None
-    result = await _ssh.run(
-        host,
-        f"head -c 262144 {shlex.quote(path)}",
-        timeout=30,
-    )
-    if result.exit_code != 0:
-        return None
-    return result.stdout
-
-
-async def _find_controller_path(
-    host: str, candidates: list[str], *, directory: bool = False
-) -> str | None:
-    """Return the first existing path from a bounded controller candidate list."""
-    test_flag = "-d" if directory else "-f"
-    quoted = " ".join(shlex.quote(path) for path in candidates)
-    result = await _ssh.run(
-        host,
-        f"""for path in {quoted}; do if test {test_flag} "$path"; then printf '%s\\n' "$path"; break; fi; done""",
-        timeout=30,
-    )
-    if result.exit_code != 0:
-        return None
-    value = result.stdout.strip().splitlines()
-    return value[0].strip() if value else None
-
-
-async def _find_controller_repository(
-    host: str, entry: dict[str, Any], *, root: str = _CRUCIBLE_ROOT
-) -> str | None:
-    """Resolve a catalog entry against the installed controller tree.
-
-    Crucible installs a graph of repositories and does not guarantee one
-    directory naming convention.  The catalog gives us the repository name;
-    the bounded filesystem search handles the installation-specific layout.
-    """
-    name = str(entry.get("name", ""))
-    repository = str(entry.get("repository", ""))
-    repo_name = repository.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-    repo_type = str(entry.get("type", "core"))
-    if not name or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-        return None
-    candidates = [
-        f"{root}/subprojects/{repo_type}s/{repo_name}",
-        f"{root}/subprojects/{repo_type}/{repo_name}",
-        f"{root}/subprojects/{repo_type}s/{name}",
-        f"{root}/subprojects/{repo_type}/{name}",
-        f"{root}/subprojects/benchmarks/bench-{name}",
-        f"{root}/subprojects/benchmarks/{name}",
-        f"{root}/repos/{repo_name}",
-        f"{root}/repos/{name}",
-        f"{root}/repos/{repo_type}-{name}",
-    ]
-    found = await _find_controller_path(host, candidates, directory=True)
-    if found:
-        return found
-    # The catalog determines the names we search for; this does not expose a
-    # general arbitrary-path reader to the agent.
-    names = [value for value in (repo_name, name, f"{repo_type}-{name}") if value]
-    # Crucible stores clones below repos/ using the full remote URL as the
-    # directory name (for example
-    # ``https:github.com:perftool-incubator/bench-perftest``).  The basename
-    # therefore does not equal repo_name; match a bounded suffix as well.
-    patterns = list(dict.fromkeys(names + ([f"*{repo_name}"] if repo_name else [])))
-    quoted = " ".join(shlex.quote(value) for value in patterns)
-    result = await _ssh.run(
-        host,
-        f"find {shlex.quote(root)}/subprojects {shlex.quote(root)}/repos "
-        f"-maxdepth 6 -type d \\\\( -name {quoted.replace(' ', ' -o -name ')} \\\\) "
-        "-print -quit 2>/dev/null",
-        timeout=30,
-    )
-    value = result.stdout.strip().splitlines() if result.exit_code == 0 else []
-    return value[0].strip() if value else None
-
-
-async def _refresh_controller_bootstrap(manager: Any) -> dict[str, Any]:
-    """Read the single controller document needed to bootstrap discovery."""
-    host = _controller_host()
-    if not host or _ssh is None:
-        return {"available": False, "reason": "controller_not_identified"}
-
-    bootstrap_path = await _find_controller_path(
-        host,
-        [
-            f"{_CRUCIBLE_ROOT}/AGENTS.md",
-            f"{_CRUCIBLE_ROOT}/subprojects/core/AGENTS.md",
-        ],
-    )
-    if not bootstrap_path:
-        return {
-            "available": False,
-            "reason": "controller_bootstrap_document_unavailable",
-            "host": host,
-        }
-    content = await _read_controller_file(host, bootstrap_path)
-    if content is None:
-        return {
-            "available": False,
-            "reason": "controller_bootstrap_document_unreadable",
-            "host": host,
-            "path": bootstrap_path,
-        }
-
-    provenance = {
-        "effective_source": "controller",
-        "source_reason": "controller_bootstrap_document",
-        "controller": host,
-        "crucible_root": _CRUCIBLE_ROOT,
-        "bootstrap_path": bootstrap_path,
-    }
-    saved = manager.save_source_snapshot(
-        "controller", provenance, {"AGENTS.md": content}
-    )
-    document = {
-        "namespace": "core",
-        "path": "core/AGENTS.md",
-        "ref": "core/AGENTS.md",
-        "uri": "crucible://core/AGENTS.md",
-        "source_path": "AGENTS.md",
-        "source": "controller",
-        "authority": "effective",
-        "provenance": provenance,
-        "entrypoint": True,
-        "content": content,
-        "workspace_ref": saved.get("files", {}).get("AGENTS.md"),
-    }
-    manager.index_context_documents([document])
-    return {
-        "available": True,
-        "reason": "controller_bootstrap_succeeded",
-        "host": host,
-        "provenance": provenance,
-        "document": document,
-    }
-
-
-async def _refresh_controller_context(
-    benchmark: str, manager: Any, *, namespace: str = "all"
-) -> dict[str, Any]:
-    """Snapshot Crucible context from the designated controller.
-
-    The context gateway owns this refresh so source selection is based on the
-    same controller that will execute the run.  Only documentation, catalog,
-    and benchmark metadata paths are read; no arbitrary controller command is
-    exposed through the gateway.
-    """
-    host = _controller_host()
-    if not host or _ssh is None:
-        return {"available": False, "reason": "controller_not_identified"}
-
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", benchmark or ""):
-        return {"available": False, "reason": "invalid_benchmark_name", "host": host}
-
-    catalog_path = await _find_controller_path(
-        host,
-        [
-            f"{_CRUCIBLE_ROOT}/config/repos.json",
-            f"{_CRUCIBLE_ROOT}/subprojects/core/config/repos.json",
-        ],
-    )
-    if not catalog_path:
-        return {"available": False, "reason": "crucible_not_installed", "host": host}
-
-    # The top-level catalog describes the repository graph; it is not
-    # necessarily the root of the active core repository.  Discover core docs
-    # and schemas independently from the catalog location.
-    core_root = f"{_CRUCIBLE_ROOT}/subprojects/core"
-    core_docs_root = await _find_controller_path(
-        host,
-        [f"{_CRUCIBLE_ROOT}/docs", f"{core_root}/docs"],
-        directory=True,
-    )
-    listing = await _ssh.run(
-        host,
-        f"find {shlex.quote(core_docs_root or core_root)} -type f "
-        "\\( -name '*.md' -o -name '*.markdown' -o -name '*.rst' "
-        "-o -name '*.txt' -o -name '*.json' -o -name '*.yaml' "
-        "-o -name '*.yml' -o -name '*.toml' \\) -print",
-        timeout=30,
-    )
-    core_paths: list[tuple[str, str]] = [(catalog_path, "config/repos.json")]
-    bootstrap_path = await _find_controller_path(
-        host,
-        [f"{_CRUCIBLE_ROOT}/AGENTS.md", f"{core_root}/AGENTS.md"],
-    )
-    if bootstrap_path:
-        core_paths.append((bootstrap_path, "AGENTS.md"))
-    # Run-file and tool schemas are controller runtime metadata, not static
-    # agentic-perf skills.  Snapshot the installed controller copies so the
-    # context gateway can serve them to benchmark and review agents.
-    for name in ("run-file.json", "tool-params.json", "remotehosts.json"):
-        schema_path = await _find_controller_path(
-            host,
-            [
-                f"{core_root}/rickshaw/schema/{name}",
-                f"{_CRUCIBLE_ROOT}/rickshaw/schema/{name}",
-            ],
-        )
-        if schema_path:
-            core_paths.append((schema_path, f"rickshaw/schema/{name}"))
-    docs_root = core_docs_root or core_root
-    if listing.exit_code == 0:
-        core_paths.extend(
-            (line.strip(), f"docs/{Path(line.strip()).relative_to(docs_root)}")
-            for line in listing.stdout.splitlines()
-            if line.strip().startswith(docs_root + "/")
-        )
-    core_files: dict[str, str] = {}
-    # Keep controller reads sequential. A Crucible controller commonly has a
-    # conservative SSH MaxStartups setting; a bulk gather here can cause the
-    # controller to reset handshakes and make an otherwise healthy context
-    # source appear empty.
-    for path, relative in core_paths:
-        content = await _read_controller_file(host, path)
-        if content is None:
-            continue
-        core_files[relative] = content
-
-    try:
-        catalog = json.loads(core_files["config/repos.json"])
-    except (KeyError, TypeError, json.JSONDecodeError):
-        catalog = {}
-    catalog_entries = {
-        entry.get("name"): entry
-        for group in ("official", "unofficial")
-        for entry in catalog.get(group, [])
-        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
-    }
-    needs_benchmark = namespace == "all" or namespace.startswith("benchmark/")
-    benchmark_entry = catalog_entries.get(benchmark)
-    benchmark_root = None
-    if needs_benchmark:
-        if not benchmark_entry or benchmark_entry.get("type") != "benchmark":
-            return {
-                "available": False,
-                "reason": "benchmark_not_in_controller_catalog",
-                "host": host,
-                "benchmark": benchmark,
-            }
-        benchmark_root = await _find_controller_repository(host, benchmark_entry)
-        if not benchmark_root:
-            return {
-                "available": False,
-                "reason": "controller_benchmark_checkout_unavailable",
-                "host": host,
-                "benchmark": benchmark,
-                "catalog_path": catalog_path,
-            }
-
-    from providers.skills.crucible import CrucibleContextGateway
-
-    # Discovery is intentionally lazy. The bootstrap AGENTS.md tells the
-    # caller how to ask for other namespaces; a request for one benchmark must
-    # not trigger SSH probes and file reads for every repo in repos.json.
-    repository_roots: dict[str, str] = {}
-    if benchmark_root:
-        repository_roots[f"benchmark/{benchmark}"] = benchmark_root
-
-    async def read_repository(namespace: str, repository_root: str) -> dict[str, str]:
-        listing = await _ssh.run(
-            host,
-            f"find {shlex.quote(repository_root)} -type f "
-            "\\( -name '*.md' -o -name '*.markdown' -o -name '*.rst' "
-            "-o -name '*.txt' -o -name '*.json' -o -name '*.yaml' "
-            "-o -name '*.yml' -o -name '*.toml' \\) -print",
-            timeout=30,
-        )
-        paths: list[str] = []
-        if listing.exit_code == 0:
-            for value in listing.stdout.splitlines():
-                path = value.strip()
-                if not path.startswith(repository_root + "/"):
-                    continue
-                relative = Path(path.removeprefix(repository_root + "/"))
-                if CrucibleContextGateway._safe_context_file(
-                    Path(repository_root),
-                    relative,
-                    benchmark_namespace=namespace.startswith("benchmark/"),
-                ):
-                    paths.append(path)
-        files: dict[str, str] = {}
-        for path in paths:
-            content = await _read_controller_file(host, path)
-            if content is not None:
-                files[
-                    f"repositories/{namespace}/{path.removeprefix(repository_root + '/')}"
-                ] = content
-        return files
-
-    repository_results = []
-    for repository_namespace, repository_root in repository_roots.items():
-        repository_results.append(
-            await read_repository(repository_namespace, repository_root)
-        )
-    repository_files = {
-        key: value for result in repository_results for key, value in result.items()
-    }
-    benchmark_files = {
-        key.removeprefix(f"repositories/benchmark/{benchmark}/"): value
-        for key, value in repository_files.items()
-        if key.startswith(f"repositories/benchmark/{benchmark}/")
-    }
-
-    if not core_files or (needs_benchmark and not benchmark_files):
-        return {
-            "available": False,
-            "reason": "controller_context_incomplete",
-            "host": host,
-            "core_files": len(core_files),
-            "benchmark_files": len(benchmark_files),
-            "repositories": sorted(repository_roots),
-        }
-
-    provenance = {
-        "effective_source": "controller",
-        "source_reason": "controller_refresh_succeeded",
-        "controller": host,
-        "crucible_root": _CRUCIBLE_ROOT,
-        "catalog_path": catalog_path,
-        "core_docs_root": core_docs_root,
-        "benchmark_root": benchmark_root,
-        "repository_roots": repository_roots,
-    }
-    manager.save_source_snapshot(
-        "controller", provenance, {**core_files, **repository_files}
-    )
-    if benchmark_files:
-        manager.save_source_snapshot(
-            "controller", provenance, benchmark_files, benchmark=benchmark
-        )
-    return {
-        "available": True,
-        "reason": "controller_refresh_succeeded",
-        "host": host,
-        "core_files": len(core_files),
-        "benchmark_files": len(benchmark_files),
-        "provenance": provenance,
-    }
-
-
-def _controller_snapshot_documents(
-    manager: Any,
-    *,
-    benchmark: str,
-    namespace: str,
-    subject_area: str | list[str],
-    provenance: dict[str, Any],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Build the effective inventory from the remote controller snapshot."""
-    from providers.skills.crucible import CrucibleContextGateway
-
-    documents: list[dict[str, Any]] = []
-    missing_namespaces: list[str] = []
-    snapshot = manager.load_source_snapshot("controller")
-    if snapshot and snapshot.get("files"):
-        owners: dict[str, dict[str, str]] = {}
-        for relative, content in snapshot.get("files", {}).items():
-            if relative.startswith("repositories/"):
-                parts = relative.split("/", 3)
-                if len(parts) < 4:
-                    continue
-                owner = f"{parts[1]}/{parts[2]}"
-                source_path = parts[3]
-            else:
-                owner, source_path = "core", relative
-            owners.setdefault(owner, {})[relative] = content
-        requested_owners = set(owners)
-        if namespace == "core":
-            requested_owners = {"core"}
-        elif namespace != "all":
-            requested_owners = {namespace}
-        elif benchmark:
-            requested_owners = {
-                owner
-                for owner in requested_owners
-                if owner == "core"
-                or owner == f"benchmark/{benchmark}"
-                or owner.startswith(("core/", "tool/", "doc/"))
-            }
-        for owner in sorted(requested_owners):
-            files = owners.get(owner, {})
-            if not files:
-                missing_namespaces.append(owner)
-                continue
-            for snapshot_path, content in sorted(files.items()):
-                source_path = (
-                    snapshot_path.split("/", 3)[3]
-                    if snapshot_path.startswith("repositories/")
-                    else snapshot_path
-                )
-                logical_ref = f"{owner}/{source_path}"
-                documents.append(
-                    {
-                        "namespace": owner,
-                        "path": logical_ref,
-                        "ref": logical_ref,
-                        "uri": f"crucible://{logical_ref}",
-                        "source_path": snapshot_path,
-                        "source": "controller",
-                        "authority": "effective",
-                        "provenance": provenance,
-                        "entrypoint": source_path
-                        in CrucibleContextGateway._REPOSITORY_ENTRYPOINT_FILES,
-                        "subject_areas": CrucibleContextGateway._subject_tags(
-                            source_path
-                        ),
-                        "subject_match": CrucibleContextGateway._subject_matches(
-                            source_path, subject_area
-                        ),
-                        "content": content,
-                    }
-                )
-    else:
-        missing_namespaces.append("core")
-    documents.sort(key=lambda item: item["path"])
-    return documents, {
-        "complete": not missing_namespaces,
-        "discovered": len(documents),
-        "returned": len(documents),
-        "subject_matches": sum(bool(item.get("subject_match")) for item in documents),
-        "excluded": 0,
-        "exclusions": [],
-        "missing_namespaces": missing_namespaces,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Skill / Doc tools (no SSH)
 # ---------------------------------------------------------------------------
 
@@ -1494,6 +1190,7 @@ async def get_skill_context(
         phase="benchmark",
         ssh=_ssh,
         controller_host=_controller_host(),
+        mcp_adapter=_crucible_mcp,
         subject=subject,
         operation=operation,
         ref=ref,
@@ -1799,6 +1496,7 @@ async def _get_crucible_benchmark_context_tool(
         await controller_context_gateway(
             ssh=_ssh,
             controller_host=controller_host,
+            mcp_adapter=_crucible_mcp,
             ticket_id=os.environ.get("TICKET_ID", ""),
             agent_name="benchmark-agent",
             phase="benchmark",
@@ -1844,15 +1542,32 @@ async def _legacy_get_crucible_benchmark_context(
 ) -> str:
     """Compatibility implementation for pre-gateway internal callers."""
     await _ensure_init()
-    if (
-        operation in {"bootstrap", "list", "read", "search"}
-        and _ssh is not None
-        and _controller_host()
-    ):
+    provider = _crucible_context
+    if provider is None or not hasattr(provider, "get_benchmark_context"):
+        return json.dumps(
+            {
+                "found": False,
+                "benchmark": benchmark,
+                "reason": "crucible_provider_unavailable",
+            }
+        )
+
+    controller_host = _controller_host()
+    if controller_host:
+        if operation not in {"bootstrap", "list", "read", "search"}:
+            return json.dumps(
+                {
+                    "found": False,
+                    "operation": operation,
+                    "reason": "unsupported_operation",
+                    "guidance": "Use bootstrap, read, list, or search.",
+                }
+            )
         gateway_operation = "manifest" if operation == "list" else operation
         return await controller_context_gateway(
             ssh=_ssh,
-            controller_host=_controller_host(),
+            controller_host=controller_host,
+            mcp_adapter=_crucible_mcp,
             ticket_id=os.environ.get("TICKET_ID", ""),
             agent_name="benchmark-agent",
             phase=phase,
@@ -1864,411 +1579,41 @@ async def _legacy_get_crucible_benchmark_context(
             max_bytes=max_bytes,
             offset_bytes=offset_bytes,
         )
-    if operation == "context" and _ssh is not None and _controller_host():
+
+    if operation not in {"context", "bootstrap", "list", "read", "search"}:
         return json.dumps(
             {
                 "found": False,
                 "operation": operation,
-                "reason": "unsupported_operation_use_bootstrap_read_or_search",
-                "guidance": (
-                    "Read controller AGENTS.md first, then request the documented "
-                    "controller-relative paths with operation=read."
-                ),
+                "reason": "unsupported_operation",
+                "guidance": "Use context, bootstrap, read, list, or search.",
             }
         )
-    if operation == "bootstrap":
-        ticket_id = os.environ.get("TICKET_ID", "")
-        if not ticket_id:
-            return json.dumps(
-                {
-                    "found": False,
-                    "operation": "bootstrap",
-                    "reason": "ticket_required_for_controller_context",
-                }
-            )
-        from providers.workspace.manager import WorkspaceManager
-
-        manager = WorkspaceManager(
-            ticket_id=ticket_id, agent_name="benchmark-agent", phase=phase
-        )
-        bootstrap = await _refresh_controller_bootstrap(manager)
-        if not bootstrap.get("available"):
-            return json.dumps(
-                {
-                    "found": False,
-                    "operation": "bootstrap",
-                    **{
-                        key: value
-                        for key, value in bootstrap.items()
-                        if key != "document"
-                    },
-                }
-            )
-        document = bootstrap["document"]
-        result = {
-            "found": True,
-            "operation": "bootstrap",
-            "documents": [document],
-            "document": document,
-            "workspace": {
-                "effective_context": manager.save_effective_context(
-                    {
-                        "schema_version": 1,
-                        "policy": "controller_bootstrap",
-                        "namespace": "core",
-                        "subject_area": "all",
-                        "documents": [_public_context_document(document)],
-                    }
-                )
-            },
-        }
-        _emit_context_audit_event(
-            ticket_id,
+    if operation != "context":
+        return await crucible_context_gateway(
+            provider,
+            ticket_id=os.environ.get("TICKET_ID", ""),
             agent_name="benchmark-agent",
             phase=phase,
-            benchmark="",
-            operation="bootstrap",
-            namespace="core",
-            result=result,
-        )
-        return json.dumps(
-            _public_context_result(
-                result,
-                phase=phase,
-                audience="benchmark-agent",
-                benchmark="",
-                namespace="core",
-                subject_area="all",
-            )
-        )
-    provider = _crucible_context
-    if provider is None or not hasattr(provider, "get_benchmark_context"):
-        return json.dumps(
-            {
-                "found": False,
-                "benchmark": benchmark,
-                "reason": "crucible_provider_unavailable",
-            }
-        )
-    if operation in {"list", "read", "search"} and hasattr(
-        provider, "get_crucible_context"
-    ):
-        requested_operation = operation
-        provider_operation = "list" if operation == "search" else operation
-        cf = _ticket.get("custom_fields", {}) if _ticket else {}
-        controller = cf.get("crucible_controller_context", {})
-        controller = dict(controller) if isinstance(controller, dict) else {}
-        ticket_id = os.environ.get("TICKET_ID", "")
-        manager = None
-        refresh = {"available": False, "reason": "workspace_unavailable"}
-        if ticket_id:
-            from providers.workspace.manager import WorkspaceManager
-
-            manager = WorkspaceManager(
-                ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark"
-            )
-            if operation == "read" and path:
-                cached = manager.read_document(
-                    path, include_alternates=include_alternates
-                )
-                if cached.get("status") == "ok":
-                    return json.dumps(
-                        _public_context_result(
-                            {
-                                "found": True,
-                                "operation": "read",
-                                "document": cached,
-                                "documents": [cached],
-                            },
-                            phase=phase,
-                            audience=manager.audience,
-                            benchmark=benchmark,
-                            namespace=namespace,
-                            subject_area=subject_area,
-                            manifest_documents=manager.context_manifest(namespace).get(
-                                "documents", []
-                            ),
-                        )
-                    )
-            if operation == "search" and manager.context_scope_indexed(namespace):
-                return json.dumps(
-                    _public_context_result(
-                        manager.search_documents(
-                            query,
-                            namespace=namespace if namespace != "all" else "",
-                            include_alternates=include_alternates,
-                        ),
-                        phase=phase,
-                        audience=manager.audience,
-                        benchmark=benchmark,
-                        namespace=namespace,
-                        subject_area=subject_area,
-                        manifest_documents=manager.context_manifest(namespace).get(
-                            "documents", []
-                        ),
-                    )
-                )
-            refresh = await _refresh_controller_context(
-                benchmark, manager, namespace=namespace
-            )
-            existing = manager.load_source_snapshot("controller", benchmark)
-            if existing and not refresh.get("available"):
-                refresh = {
-                    "available": True,
-                    "reason": "controller_snapshot_already_present",
-                    "provenance": existing.get("provenance", {}),
-                }
-            controller.update(
-                {
-                    "identified": controller.get("identified") is True
-                    or bool(_controller_host()),
-                    "reachable": controller.get("reachable") is True
-                    or refresh.get("reason") != "controller_not_identified",
-                    "crucible_installed": controller.get("crucible_installed") is True
-                    or refresh.get("reason")
-                    not in {"controller_not_identified", "crucible_not_installed"},
-                    "snapshot_available": refresh.get("available", False),
-                }
-            )
-        policy = cf.get("crucible_update_policy")
-        if not policy:
-            policy = cf.get("directives", {}).get("update_harness")
-        from providers.skills.crucible import select_crucible_context
-
-        policy_selection = select_crucible_context(
-            phase=phase, controller=controller, update_policy=policy
-        )
-        result = await provider.get_crucible_context(
-            benchmark or None,
-            operation=provider_operation,
+            benchmark=benchmark,
+            operation=operation,
             namespace=namespace,
             path=path,
             subject_area=subject_area,
             include_alternates=include_alternates,
             query=query,
-            phase=phase,
-            controller=controller,
-            update_policy=policy,
-            agent="benchmark-agent",
-            include_content=True,
+            max_bytes=max_bytes,
+            offset_bytes=offset_bytes,
         )
-        # A controller snapshot is authoritative even when the agentic-perf
-        # host has no matching Crucible checkout.  Do not require the local
-        # provider to find a document before using the successfully refreshed
-        # controller source.
-        if (
-            manager
-            and not result.get("found")
-            and refresh.get("available")
-            and controller.get("snapshot_available")
-            and policy_selection["effective_source"] == "controller"
-        ):
-            controller_documents, controller_inventory = _controller_snapshot_documents(
-                manager,
-                benchmark=benchmark,
-                namespace=namespace,
-                subject_area=subject_area,
-                provenance=refresh["provenance"],
-            )
-            result.update(
-                {
-                    "found": bool(controller_documents),
-                    "effective_source": "controller",
-                    "source": "controller",
-                    "selection": policy_selection,
-                    "documents": controller_documents,
-                    "inventory": controller_inventory,
-                }
-            )
-        if manager and result.get("found"):
-            if (
-                refresh.get("available")
-                and controller.get("snapshot_available")
-                and policy_selection["effective_source"] == "controller"
-            ):
-                result["effective_source"] = "controller"
-                result["source"] = "controller"
-                result["selection"] = policy_selection
-                controller_documents, controller_inventory = (
-                    _controller_snapshot_documents(
-                        manager,
-                        benchmark=benchmark,
-                        namespace=namespace,
-                        subject_area=subject_area,
-                        provenance=refresh["provenance"],
-                    )
-                )
-                local_documents = [
-                    item
-                    for item in result.get("documents", [])
-                    if item.get("source") == "local"
-                ]
-                result["documents"] = sorted(
-                    controller_documents + local_documents,
-                    key=lambda item: item["path"],
-                )
-                result["found"] = bool(result["documents"])
-                result["inventory"] = controller_inventory
-            indexed_documents: list[dict[str, Any]] = []
-            grouped_files: dict[tuple[str, str | None], dict[str, str]] = {}
-            for document in result.get("documents", []):
-                content = document.get("content")
-                if content is None:
-                    read_result = await provider.get_crucible_context(
-                        benchmark or None,
-                        operation="read",
-                        namespace=document["namespace"],
-                        path=document.get("ref", document["path"]),
-                        subject_area="all",
-                        include_alternates=include_alternates,
-                        phase=phase,
-                        controller=controller,
-                        update_policy=policy,
-                        agent="benchmark-agent",
-                    )
-                    read_document = read_result.get("document")
-                    if isinstance(read_document, dict):
-                        content = read_document.get("content")
-                if content is None:
-                    continue
-                doc_namespace = document["namespace"]
-                doc_benchmark = None
-                if doc_namespace.startswith("benchmark/"):
-                    _, doc_benchmark = doc_namespace.split("/", 1)
-                elif document.get("source") == "local" and document.get("benchmark"):
-                    doc_benchmark = document["benchmark"]
-                source = document.get(
-                    "source", result.get("effective_source", "github")
-                )
-                grouped_files.setdefault((source, doc_benchmark), {})[
-                    document["source_path"]
-                ] = content
 
-            refs: list[str] = []
-            saved_groups: dict[tuple[str, str | None], dict[str, Any]] = {}
-            for (source, doc_benchmark), files in grouped_files.items():
-                provenance = next(
-                    (
-                        item.get("provenance", {})
-                        for item in result.get("documents", [])
-                        if item.get("source", result.get("effective_source")) == source
-                    ),
-                    {},
-                )
-                snapshot = manager.save_source_snapshot(
-                    source, provenance, files, benchmark=doc_benchmark
-                )
-                saved_groups[(source, doc_benchmark)] = snapshot
-                refs.extend(snapshot["files"].values())
-
-            for document in result.get("documents", []):
-                doc_benchmark = None
-                if document["namespace"].startswith("benchmark/"):
-                    _, doc_benchmark = document["namespace"].split("/", 1)
-                elif document.get("source") == "local":
-                    doc_benchmark = document.get("benchmark")
-                source = document.get(
-                    "source", result.get("effective_source", "github")
-                )
-                snapshot = saved_groups.get((source, doc_benchmark), {})
-                workspace_ref = snapshot.get("files", {}).get(document["source_path"])
-                if not workspace_ref:
-                    continue
-                document["workspace_ref"] = workspace_ref
-                indexed_documents.append(dict(document))
-
-            index_ref = manager.index_context_documents(indexed_documents)
-            previous = manager.read_effective_context() or {}
-            if previous.get("phase") == phase and previous.get(
-                "effective_source"
-            ) == result.get("effective_source"):
-                refs = list(dict.fromkeys(previous.get("workspace_refs", []) + refs))
-            manifest = {
-                "schema_version": 1,
-                "policy": "phase_owned_source_with_local_supplements",
-                "namespace": namespace,
-                "subject_area": subject_area,
-                "documents": [
-                    {
-                        key: value
-                        for key, value in document.items()
-                        if key
-                        not in {
-                            "source",
-                            "provenance",
-                            "workspace_ref",
-                            "source_path",
-                            "content",
-                        }
-                    }
-                    for document in result.get("documents", [])
-                ],
-            }
-            result["workspace"] = {
-                "effective_context": manager.save_effective_context(manifest),
-                "effective_source": result.get("effective_source"),
-                "document_index": index_ref,
-            }
-            if requested_operation == "read":
-                workspace_document = manager.read_document(
-                    path, include_alternates=include_alternates
-                )
-                if workspace_document.get("status") == "ok":
-                    metadata = next(
-                        (
-                            item
-                            for item in result.get("documents", [])
-                            if item.get("workspace_ref")
-                            == workspace_document.get("workspace_ref")
-                        ),
-                        {},
-                    )
-                    result["document"] = {
-                        **metadata,
-                        "content": workspace_document["content"],
-                    }
-            elif requested_operation == "search":
-                result = {
-                    **manager.search_documents(
-                        query,
-                        namespace=namespace if namespace != "all" else "",
-                        include_alternates=include_alternates,
-                    ),
-                    "workspace": result["workspace"],
-                    "effective_source": result.get("effective_source"),
-                }
-            elif requested_operation == "list":
-                for document in result.get("documents", []):
-                    document.pop("content", None)
-        _emit_context_audit_event(
-            ticket_id,
-            agent_name="benchmark-agent",
-            phase=phase,
-            benchmark=benchmark,
-            operation=requested_operation,
-            namespace=namespace,
-            result=result,
-        )
-        return json.dumps(
-            _public_context_result(
-                result,
-                phase=phase,
-                audience="benchmark-agent",
-                benchmark=benchmark,
-                namespace=namespace,
-                subject_area=subject_area,
-            )
-        )
     result = await provider.get_benchmark_context(benchmark)
     ticket_id = os.environ.get("TICKET_ID", "")
     if result.get("found") and ticket_id:
-        from providers.skills.crucible import select_crucible_context
         from providers.workspace.manager import WorkspaceManager
 
         manager = WorkspaceManager(
-            ticket_id=ticket_id, agent_name="benchmark-agent", phase="benchmark"
+            ticket_id=ticket_id, agent_name="benchmark-agent", phase=phase
         )
-        refresh = await _refresh_controller_context(benchmark, manager)
         github_provenance = {
             key: result.get(key)
             for key in (
@@ -2290,49 +1635,15 @@ async def _legacy_get_crucible_benchmark_context(
             "context/sources/github/harnesses/crucible/source.json",
             json.dumps(github_provenance, indent=2) + "\n",
         )
-        controller_snapshot = manager.load_source_snapshot("controller", benchmark)
-        controller_snapshot_available = controller_snapshot is not None
-        if controller_snapshot_available and not refresh.get("available"):
-            refresh = {
-                "available": True,
-                "reason": "controller_snapshot_already_present",
-                "provenance": controller_snapshot.get("provenance", {}),
-            }
-        cf = _ticket.get("custom_fields", {}) if _ticket else {}
-        controller = cf.get("crucible_controller_context", {})
-        controller = dict(controller) if isinstance(controller, dict) else {}
-        controller.update(
-            {
-                "identified": controller.get("identified") is True
-                or bool(_controller_host()),
-                "reachable": controller.get("reachable") is True
-                or refresh.get("reason") != "controller_not_identified",
-                "crucible_installed": controller.get("crucible_installed") is True
-                or refresh.get("reason")
-                not in {"controller_not_identified", "crucible_not_installed"},
-                "snapshot_available": controller_snapshot_available,
-            }
-        )
-        controller["snapshot_available"] = controller_snapshot_available
-        policy = cf.get("crucible_update_policy")
-        if not policy:
-            policy = cf.get("directives", {}).get("update_harness")
-        selection = select_crucible_context(
-            phase=phase, controller=controller, update_policy=policy
-        )
-        if selection["effective_source"] == "controller" and controller_snapshot:
-            result["context"] = controller_snapshot["files"]
-            result["files"] = list(controller_snapshot["files"])
-            result["effective_source"] = "controller"
         manifest = {
             "schema_version": 1,
-            "phase": "benchmark",
-            "policy": "phase_owned_source_with_local_supplements",
+            "phase": phase,
+            "policy": "github_before_controller_assignment",
             "documents": [],
         }
         result["workspace"] = {
             "effective_context": manager.save_effective_context(manifest),
-            "effective_source": selection["effective_source"],
+            "effective_source": "github",
         }
     _emit_context_audit_event(
         ticket_id,
@@ -3385,6 +2696,45 @@ async def execute_benchmark(
                 }
             )
         run_command = stored_command
+        ticket_id = str(active_check.get("id") or os.environ.get("TICKET_ID", ""))
+        if record.get("execution_transport") != "crucible_mcp":
+            return await _resolve_legacy_crucible_validation(
+                ticket_id=ticket_id or "external",
+                validation_id=validation_id,
+                record=record,
+                controller=controller,
+                harness=harness_name,
+            )
+        if _crucible_mcp is None:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "harness": harness_name,
+                    "validation_id": validation_id,
+                    "reason_code": "unsupported_controller",
+                    "message": (
+                        "The assigned Crucible controller does not support "
+                        "MCP contract v3 execution."
+                    ),
+                }
+            )
+        expected_idempotency_key = f"{ticket_id or 'external'}:crucible:{validation_id}"
+        if (
+            record.get("mcp_contract_version") != "3"
+            or record.get("crucible_idempotency_key") != expected_idempotency_key
+        ):
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "harness": harness_name,
+                    "validation_id": validation_id,
+                    "reason_code": "mcp_revalidation_required",
+                    "message": (
+                        "This validation predates Crucible MCP contract v3. "
+                        "Revalidate the exact run document before execution."
+                    ),
+                }
+            )
     elif _skill_provider:
         if run_file is None:
             return json.dumps(
@@ -3429,7 +2779,10 @@ async def execute_benchmark(
                 }
             )
 
-    if run_command is not None:
+    if run_command is not None and (
+        harness_name != "crucible"
+        or record.get("execution_transport") != "crucible_mcp"
+    ):
         valid, reason = _validate_run_command(run_command, harness_name)
         if not valid:
             logger.warning("[benchmark] run_command rejected: %s", reason)
@@ -5012,39 +4365,69 @@ async def execute_benchmark(
                 }
             )
 
-    remote_path = f"/tmp/run-file-{run_uuid}.json"
+    idempotency_key = str(record.get("crucible_idempotency_key"))
+    launch_attempted = False
 
-    async def guarded_maintenance(command: str, **kwargs: Any) -> Any:
-        """Convert any post-boundary controller failure into indeterminate."""
+    def decode_mcp_result(raw: str) -> dict[str, Any]:
         try:
-            return await _ssh.run(controller, command, **kwargs)
-        except Exception as exc:
-            if operation_guard and operation_owned:
+            decoded = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("Crucible MCP returned an invalid response") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError("Crucible MCP returned an invalid response")
+        return decoded
+
+    async def finish_execution(
+        response: dict[str, Any],
+        outcome: str,
+        *,
+        reconcile: bool = False,
+    ) -> str:
+        if operation_guard and operation_owned:
+            assert operation_record is not None
+            try:
+                persisted_result, response = _prepare_operation_result(
+                    ticket_id, response
+                )
+            except Exception:
+                logger.exception("Could not persist benchmark result payload")
                 await operation_guard.terminalize(
                     operation_record,
                     "indeterminate",
-                    {"outcome": "indeterminate", "error_type": type(exc).__name__},
+                    {"outcome": "result_payload_unavailable"},
                 )
                 await operation_guard.close()
-            return None
+                if reconcile:
+                    await pause_for_reconciliation(
+                        "benchmark result could not be stored"
+                    )
+                return json.dumps(
+                    {
+                        "status": "indeterminate",
+                        "operation_id": intent_key,
+                        "reason_code": "result_payload_unavailable",
+                    }
+                )
+            terminal_ok = await operation_guard.terminalize(
+                operation_record, outcome, {"benchmark_result": persisted_result}
+            )
+            await operation_guard.close()
+            response["operation_id"] = intent_key
+            if not terminal_ok:
+                response["status"] = "indeterminate"
+                response["message"] = (
+                    "Operation result could not be durably recorded; "
+                    "reconciliation required"
+                )
+        if reconcile:
+            await pause_for_reconciliation(
+                response.get("message", "execution is ambiguous")
+            )
+        return json.dumps(response)
 
-    async def maintenance_failure() -> str:
-        await pause_for_reconciliation("controller maintenance outcome is ambiguous")
-        return json.dumps(
-            {
-                "status": "indeterminate",
-                "operation_id": intent_key if operation_guard else None,
-                "message": "Controller maintenance outcome is ambiguous; reconciliation required",
-            }
-        )
-
-    staging, staging_name, local_path = _write_ticket_staging_file(
-        ticket_id, json.dumps(run_file, indent=2)
-    )
-
-    logger.info(f"[benchmark] SCP run-file to {controller}:{remote_path}")
     try:
         if operation_guard and operation_owned:
+            assert operation_record is not None
             try:
                 await operation_guard.transition(
                     "side-effect-started", operation_record
@@ -5058,273 +4441,493 @@ async def execute_benchmark(
                 return json.dumps(
                     {
                         "status": "indeterminate",
-                        "message": "Operation launch boundary could not be persisted",
+                        "operation_id": intent_key,
+                        "reason_code": "launch_boundary_persistence_failed",
                     }
                 )
-        try:
-            scp_result = await _ssh.copy_to(
-                controller, local_path, remote_path, mutating=True
-            )
-        except Exception as exc:
+
+        persisted_plan_handle = (
+            (operation_record or {}).get("external_ids") or {}
+        ).get("crucible_plan_handle")
+        if isinstance(persisted_plan_handle, str) and persisted_plan_handle:
+            plan_handle = persisted_plan_handle
+        else:
+            try:
+                raw_plan = await _crucible_mcp.call_tool(
+                    "prepare_run",
+                    {"document": run_file, "persist": True},
+                )
+                plan = decode_mcp_result(raw_plan)
+                plan_validation = plan.get("validation")
+                plan_handle = plan.get("plan_handle")
+            except MCPToolCallError as exc:
+                if not _is_run_document_too_large(exc):
+                    raise
+                return await finish_execution(
+                    {
+                        "status": "failed",
+                        "validation_id": validation_id,
+                        "execution_transport": "crucible_mcp",
+                        "mcp_contract_version": "3",
+                        "reason_code": "run_document_too_large",
+                        "message": (
+                            "The exact validated run document exceeds the "
+                            "controller's inline MCP document limit."
+                        ),
+                    },
+                    "fail",
+                )
+            if (
+                not isinstance(plan_validation, dict)
+                or plan_validation.get("valid") is not True
+                or not isinstance(plan_handle, str)
+                or not plan_handle
+            ):
+                return await finish_execution(
+                    {
+                        "status": "failed",
+                        "harness": "crucible",
+                        "validation_id": validation_id,
+                        "reason_code": "invalid_run_document",
+                        "message": (
+                            "The validated run document was rejected during "
+                            "MCP planning."
+                        ),
+                    },
+                    "fail",
+                )
+
             if operation_guard and operation_owned:
+                assert operation_record is not None
+                try:
+                    operation_record = await operation_guard.transition(
+                        "external-id",
+                        operation_record,
+                        external_ids={
+                            **(operation_record.get("external_ids") or {}),
+                            "crucible_plan_handle": plan_handle,
+                            "crucible_idempotency_key": idempotency_key,
+                        },
+                    )
+                except Exception:
+                    await operation_guard.terminalize(
+                        operation_record,
+                        "indeterminate",
+                        {
+                            "outcome": "indeterminate",
+                            "external_id_persist_failed": True,
+                            "known_external_ids": {
+                                "crucible_plan_handle": plan_handle,
+                                "crucible_idempotency_key": idempotency_key,
+                            },
+                        },
+                    )
+                    await operation_guard.close()
+                    await pause_for_reconciliation(
+                        "MCP plan identity could not be persisted"
+                    )
+                    return json.dumps(
+                        {
+                            "status": "indeterminate",
+                            "operation_id": intent_key,
+                            "reason_code": "external_id_persistence_failed",
+                        }
+                    )
+
+        launch_attempted = True
+        try:
+            raw_start = await _crucible_mcp.call_tool(
+                "start_run",
+                {
+                    "idempotency_key": idempotency_key,
+                    "document": run_file,
+                    "plan_handle": plan_handle,
+                },
+            )
+        except MCPToolCallError as exc:
+            if not _is_expired_plan_handle(exc):
+                raise
+            raw_plan = await _crucible_mcp.call_tool(
+                "prepare_run",
+                {"document": run_file, "persist": True},
+            )
+            plan = decode_mcp_result(raw_plan)
+            plan_validation = plan.get("validation")
+            retry_handle = plan.get("plan_handle")
+            if (
+                not isinstance(plan_validation, dict)
+                or plan_validation.get("valid") is not True
+                or not isinstance(retry_handle, str)
+                or not retry_handle
+            ):
+                raise
+            if operation_guard and operation_owned:
+                assert operation_record is not None
+                operation_record = await operation_guard.transition(
+                    "external-id",
+                    operation_record,
+                    external_ids={
+                        **(operation_record.get("external_ids") or {}),
+                        "crucible_plan_handle": retry_handle,
+                        "crucible_idempotency_key": idempotency_key,
+                    },
+                )
+            plan_handle = retry_handle
+            raw_start = await _crucible_mcp.call_tool(
+                "start_run",
+                {
+                    "idempotency_key": idempotency_key,
+                    "document": run_file,
+                    "plan_handle": plan_handle,
+                },
+            )
+        start_result = decode_mcp_result(raw_start)
+        job = start_result.get("job")
+        mcp_job_id = job.get("mcp_job_id") if isinstance(job, dict) else ""
+        if not isinstance(mcp_job_id, str) or not mcp_job_id:
+            await pause_for_reconciliation("MCP job identity was not returned")
+            return await finish_execution(
+                {
+                    "status": "indeterminate",
+                    "harness": "crucible",
+                    "validation_id": validation_id,
+                    "crucible_idempotency_key": idempotency_key,
+                    "reason_code": "mcp_job_id_missing",
+                    "message": "MCP start succeeded but did not return a job identity.",
+                },
+                "indeterminate",
+                reconcile=False,
+            )
+
+        external_ids = {
+            **((operation_record or {}).get("external_ids") or {}),
+            "crucible_mcp_job_id": mcp_job_id,
+            "crucible_idempotency_key": idempotency_key,
+        }
+
+        if operation_guard and operation_owned:
+            assert operation_record is not None
+            try:
+                operation_record = await operation_guard.transition(
+                    "external-id", operation_record, external_ids=external_ids
+                )
+            except Exception:
                 await operation_guard.terminalize(
                     operation_record,
                     "indeterminate",
-                    {"outcome": "indeterminate", "error_type": type(exc).__name__},
+                    {
+                        "outcome": "indeterminate",
+                        "external_id_persist_failed": True,
+                        "known_external_ids": external_ids,
+                    },
                 )
                 await operation_guard.close()
-            await pause_for_reconciliation("run-file copy outcome is ambiguous")
-            return json.dumps(
-                {
-                    "status": "indeterminate",
-                    "operation_id": intent_key if operation_guard else None,
-                    "message": "Run-file copy outcome is ambiguous; reconciliation required",
-                }
-            )
-    finally:
-        staging.unlink(staging_name, missing_ok=True)
+                await pause_for_reconciliation(
+                    "MCP job identity could not be persisted"
+                )
+                return json.dumps(
+                    {
+                        "status": "indeterminate",
+                        "operation_id": intent_key,
+                        "crucible_mcp_job_id": mcp_job_id,
+                        "reason_code": "external_id_persistence_failed",
+                    }
+                )
 
-    if scp_result.exit_code != 0:
-        response = {
-            "status": "failed",
-            "message": f"Failed to copy run-file: {scp_result.stderr}",
-        }
-        if operation_guard and operation_owned:
-            await operation_guard.terminalize(
-                operation_record,
-                "fail",
-                {"benchmark_result": response},
-            )
-            await operation_guard.close()
-            response["operation_id"] = intent_key
-        return json.dumps(response)
-
-    # Stop stale valkey container if no run is active (crucible issue #607)
-    valkey_check = await guarded_maintenance(
-        "podman ps --format '{{.Names}}' 2>/dev/null | grep -q crucible-valkey"
-        " && ! podman ps --format '{{.Names}}' 2>/dev/null | grep -q crucible-rickshaw-run"
-        " && podman stop crucible-valkey 2>/dev/null && echo STOPPED || echo OK",
-    )
-    if valkey_check is None:
-        return await maintenance_failure()
-    if "STOPPED" in (valkey_check.stdout or ""):
-        logger.info(
-            f"[benchmark] Stopped stale crucible-valkey container on {controller}"
-        )
-
-    # Restart OpenSearch before every run to ensure the CDM server (and its
-    # node_modules) is freshly started alongside it. crucible's start_opensearch
-    # only calls start_cdm_server when OpenSearch is not already running; if a
-    # previous run left OpenSearch up, the CDM server may be absent, causing
-    # add-run.sh to fail with "node_modules not found" at indexing time.
-    # Stopping first guarantees a clean start_opensearch → start_cdm_server sequence.
-    logger.info(
-        f"[benchmark] Cycling OpenSearch on {controller} to ensure CDM server is fresh"
-    )
-    if (
-        await guarded_maintenance(
-            "crucible stop opensearch 2>/dev/null || true", timeout=60
-        )
-        is None
-    ):
-        return await maintenance_failure()
-    # Wait up to 30s for the container to be fully gone
-    for _ in range(6):
-        gone = await guarded_maintenance(
-            "podman ps --format '{{.Names}}' 2>/dev/null | grep -q crucible-opensearch"
-            " && echo RUNNING || echo GONE",
-        )
-        if gone is None:
-            return await maintenance_failure()
-        if "GONE" in (gone.stdout or ""):
-            break
-        import asyncio as _asyncio
-
-        await _asyncio.sleep(5)
-    start_result = await guarded_maintenance(
-        "crucible start opensearch 2>&1", timeout=180
-    )
-    if start_result is None:
-        return await maintenance_failure()
-    if "Successfully started OpenSearch" not in (start_result.stdout or ""):
-        logger.warning(
-            f"[benchmark] OpenSearch may not have started cleanly: "
-            f"{(start_result.stdout or '')[-200:]}"
-        )
-    else:
-        logger.info(f"[benchmark] OpenSearch and CDM server started on {controller}")
-
-    cmd = f"{run_command or 'crucible run'} {remote_path}"
-    logger.info(f"[benchmark] Executing: {cmd}")
-    try:
-        result = await _ssh.run_with_progress(
-            controller,
-            cmd,
-            progress_callback=_benchmark_progress,
-        )
-    except Exception as exc:
-        if operation_guard and operation_owned:
-            await operation_guard.terminalize(
-                operation_record,
-                "indeterminate",
-                descriptor={
-                    "outcome": "indeterminate",
-                    "error_type": type(exc).__name__,
-                },
-            )
-            await operation_guard.close()
-        await pause_for_reconciliation("launch response was lost")
-        raise
-
-    run_dir = ""
-    run_dir_re = re.compile(r"(/var/lib/crucible/run/[^/\s]+)")
-    for line in result.stdout.split("\n"):
-        m = run_dir_re.search(line)
-        if m:
-            run_dir = m.group(1)
-            break
-
-    run_id = ""
-    if run_dir:
-        dirname = run_dir.rstrip("/").split("/")[-1]
-        uuid_match = re.search(r"--([0-9a-f-]{36})$", dirname)
-        run_id = uuid_match.group(1) if uuid_match else dirname
-
-    if not run_dir or not run_id:
-        response = {
-            "status": "indeterminate",
-            "exit_code": result.exit_code,
+        response: dict[str, Any] = {
+            "status": "running",
+            "validation_id": validation_id,
+            "execution_transport": "crucible_mcp",
+            "mcp_contract_version": "3",
+            "crucible_mcp_job_id": mcp_job_id,
+            "crucible_idempotency_key": idempotency_key,
             "harness": "crucible",
-            "operation_id": intent_key if operation_guard else None,
-            "message": "Crucible launch completed without a parseable external run identity; reconciliation required",
         }
-        if operation_guard and operation_owned:
-            await operation_guard.terminalize(
-                operation_record,
-                "indeterminate",
-                {"benchmark_result": response, "external_id_missing": True},
-            )
-            await operation_guard.close()
-        await pause_for_reconciliation("Crucible run identity was not returned")
-        return json.dumps(response)
+        log_offset = 0
+        poll_count = 0
+        readiness_deadline: float | None = None
 
-    # Persist the external identity before reading summaries or logs.  A lost
-    # response after this point is therefore reconciled by identity rather
-    # than replaying the launch command.
-    if operation_guard and operation_owned and (run_id or run_dir):
-        try:
-            operation_record = await operation_guard.transition(
-                "external-id",
-                operation_record,
-                external_ids={
-                    **(operation_record.get("external_ids") or {}),
-                    "run_id": run_id,
-                    "run_dir": run_dir,
+        async def fetch_logs() -> str:
+            nonlocal log_offset
+            raw_logs = await _crucible_mcp.call_tool(
+                "get_run_logs",
+                {
+                    "mcp_job_id": mcp_job_id,
+                    "offset": log_offset,
+                    "limit": 65_536,
                 },
             )
-        except Exception as exc:
-            await operation_guard.terminalize(
-                operation_record,
-                "indeterminate",
-                {
-                    "outcome": "indeterminate",
-                    "external_id_persist_failed": True,
-                    "error_type": type(exc).__name__,
-                    "known_external_ids": {"run_id": run_id, "run_dir": run_dir},
-                },
-            )
-            await operation_guard.close()
-            await pause_for_reconciliation(
-                "external run identity could not be persisted"
-            )
-            return json.dumps(
-                {
-                    "status": "indeterminate",
-                    "operation_id": intent_key,
-                    "message": "External benchmark identity could not be persisted; reconciliation required",
-                }
-            )
+            logs = decode_mcp_result(raw_logs)
+            text = logs.get("text")
+            next_offset = logs.get("next_offset")
+            if isinstance(next_offset, int):
+                log_offset = next_offset
+            return text if isinstance(text, str) else ""
 
-    response = {
-        "status": "completed" if result.exit_code == 0 else "failed",
-        "exit_code": result.exit_code,
-        "validation_id": validation_id,
-        "run_dir": run_dir,
-        "run_id": run_id or f"unknown-{run_uuid}",
-        "harness": "crucible",
-        "message": "Benchmark completed"
-        if result.exit_code == 0
-        else f"Benchmark failed (exit {result.exit_code})",
-    }
-    if result.exit_code == 0 and run_dir:
-        summary_result = await guarded_maintenance(
-            f"cat {run_dir}/run/result-summary.json",
-            timeout=30,
-        )
-        if summary_result is None:
-            return await maintenance_failure()
-        if summary_result.exit_code == 0 and summary_result.stdout:
+        async def persist_status_identifiers(current_status: dict[str, Any]) -> bool:
+            nonlocal operation_record
+            values = {
+                key: current_status.get(key)
+                for key in ("cdm_run_id", "rickshaw_run_id", "run_directory")
+            }
+            if not any(isinstance(value, str) and value for value in values.values()):
+                return True
+
+            cdm_run_id = values["cdm_run_id"]
+            rickshaw_run_id = values["rickshaw_run_id"]
+            run_path = values["run_directory"]
+            if isinstance(cdm_run_id, str) and cdm_run_id:
+                response["run_id"] = cdm_run_id
+                response["cdm_run_id"] = cdm_run_id
+            if isinstance(rickshaw_run_id, str) and rickshaw_run_id:
+                response["rickshaw_run_id"] = rickshaw_run_id
+            if isinstance(run_path, str) and run_path:
+                response["run_path"] = run_path
+
+            if not (operation_guard and operation_owned):
+                return True
+            assert operation_record is not None
+            status_external_ids = {
+                **(operation_record.get("external_ids") or {}),
+                "crucible_mcp_job_id": mcp_job_id,
+                "crucible_idempotency_key": idempotency_key,
+            }
+            if isinstance(cdm_run_id, str) and cdm_run_id:
+                status_external_ids["cdm_run_id"] = cdm_run_id
+                status_external_ids["run_id"] = cdm_run_id
+            if isinstance(rickshaw_run_id, str) and rickshaw_run_id:
+                status_external_ids["rickshaw_run_id"] = rickshaw_run_id
+            if isinstance(run_path, str) and run_path:
+                status_external_ids["run_path"] = run_path
+
+            existing_external_ids = operation_record.get("external_ids") or {}
+            if all(
+                existing_external_ids.get(key) == value
+                for key, value in status_external_ids.items()
+            ):
+                return True
+
             try:
-                response["result_summary"] = json.loads(summary_result.stdout)
-            except json.JSONDecodeError:
-                pass
-        if "result_summary" not in response:
-            response["status"] = "failed"
-            response["message"] = (
-                "Crucible exited with code 0 but result-summary.json "
-                "is missing — the run did not produce results. "
-                "Read the run logs with get_run_logs to diagnose."
+                operation_record = await operation_guard.transition(
+                    "external-id",
+                    operation_record,
+                    external_ids=status_external_ids,
+                )
+            except Exception:
+                await operation_guard.terminalize(
+                    operation_record,
+                    "indeterminate",
+                    {
+                        "outcome": "indeterminate",
+                        "external_id_persistence_failed": True,
+                        "known_external_ids": status_external_ids,
+                    },
+                )
+                await operation_guard.close()
+                await pause_for_reconciliation(
+                    "Crucible run identifiers could not be persisted"
+                )
+                response.update(
+                    {
+                        "status": "indeterminate",
+                        "reason_code": "external_id_persistence_failed",
+                        "message": (
+                            "The run identifiers returned by get_run_status "
+                            "could not be persisted."
+                        ),
+                    }
+                )
+                return False
+            return True
+
+        while True:
+            raw_status = await _crucible_mcp.call_tool(
+                "get_run_status", {"mcp_job_id": mcp_job_id}
             )
-            log_result = await guarded_maintenance(
-                f"test -f {run_dir}/crucible.log.xz"
-                f" && xzcat {run_dir}/crucible.log.xz | tail -c 50000"
-                f" || cat {run_dir}/crucible.log 2>/dev/null | tail -c 50000",
-                timeout=60,
+            status = decode_mcp_result(raw_status)
+            state = str(status.get("state", ""))
+            result_status = str(status.get("result_status", ""))
+            if not await persist_status_identifiers(status):
+                return json.dumps(response)
+
+            if state in {
+                "queued",
+                "starting",
+                "running",
+                "postprocessing",
+                "indexing",
+            }:
+                poll_count += 1
+                if poll_count % 5 == 1:
+                    try:
+                        logs = await fetch_logs()
+                        if logs:
+                            await _benchmark_progress(logs[-2000:], poll_count * 2)
+                    except Exception:
+                        logger.debug("Crucible progress logs were unavailable")
+                await asyncio.sleep(2)
+                continue
+
+            if state in {"recovery_required", "unknown_after_crash"}:
+                response.update(
+                    {
+                        "status": "indeterminate",
+                        "reason_code": state,
+                        "message": (
+                            "Crucible reported a recovery-required state; "
+                            "the run was not relaunched."
+                        ),
+                    }
+                )
+                try:
+                    response["run_log"] = (await fetch_logs())[-50_000:]
+                except Exception:
+                    response["log_status"] = "unavailable"
+                return await finish_execution(response, "indeterminate", reconcile=True)
+
+            if state == "failed":
+                response.update(
+                    {
+                        "status": "failed",
+                        "reason_code": status.get("error_category", "crucible_failed"),
+                        "exit_code": status.get("exit_code"),
+                        "message": (
+                            status.get("error_message")
+                            or "Crucible reported a failed run."
+                        ),
+                    }
+                )
+                try:
+                    response["run_log"] = (await fetch_logs())[-50_000:]
+                except Exception:
+                    response["log_status"] = "unavailable"
+                return await finish_execution(response, "fail")
+
+            if state != "completed":
+                response.update(
+                    {
+                        "status": "indeterminate",
+                        "reason_code": "unknown_run_state",
+                        "message": f"Crucible returned unknown run state {state!r}.",
+                    }
+                )
+                return await finish_execution(response, "indeterminate", reconcile=True)
+
+            if result_status in {"pending", "not_available"}:
+                if readiness_deadline is None:
+                    readiness_deadline = (
+                        asyncio.get_running_loop().time()
+                        + _crucible_mcp.settings.result_readiness_timeout_seconds
+                    )
+                if asyncio.get_running_loop().time() < readiness_deadline:
+                    await asyncio.sleep(2)
+                    continue
+                response.update(
+                    {
+                        "status": "indeterminate",
+                        "reason_code": "result_readiness_timeout",
+                        "message": (
+                            "Crucible completed the run but results remained "
+                            "pending beyond the configured readiness timeout."
+                        ),
+                    }
+                )
+                return await finish_execution(response, "indeterminate", reconcile=True)
+
+            if result_status in {"partial", "unavailable"}:
+                response.update(
+                    {
+                        "status": result_status,
+                        "reason_code": f"result_{result_status}",
+                        "message": f"Crucible reported {result_status} results.",
+                        "indexed_query_status": status.get("indexed_query_status"),
+                    }
+                )
+                return await finish_execution(response, "fail")
+
+            if result_status != "available":
+                response.update(
+                    {
+                        "status": "indeterminate",
+                        "reason_code": "unknown_result_status",
+                        "message": (
+                            f"Crucible returned unknown result status {result_status!r}."
+                        ),
+                    }
+                )
+                return await finish_execution(response, "indeterminate", reconcile=True)
+
+            raw_summary = await _crucible_mcp.call_tool(
+                "get_run_summary", {"mcp_job_id": mcp_job_id}
             )
-            if log_result is None:
-                return await maintenance_failure()
-            if log_result.exit_code == 0 and log_result.stdout:
-                response["run_log"] = log_result.stdout
-    if result.exit_code != 0:
-        response.update(
-            _truncated_output_guidance(
-                result.stdout or "",
-                result.stderr or "",
-                controller=controller,
-            )
-        )
-    if operation_guard and operation_owned:
-        try:
-            persisted_result, response = _prepare_operation_result(ticket_id, response)
-        except Exception:
-            logger.exception("Could not persist benchmark result payload")
-            await operation_guard.terminalize(
-                operation_record,
-                "indeterminate",
-                {"outcome": "result_payload_unavailable"},
-            )
-            await operation_guard.close()
-            await pause_for_reconciliation("benchmark result could not be stored")
-            return json.dumps(
+            summary_result = decode_mcp_result(raw_summary)
+            summary = summary_result.get("summary")
+            if not isinstance(summary, dict):
+                return await finish_execution(
+                    {
+                        **response,
+                        "status": "failed",
+                        "reason_code": "result_summary_invalid",
+                        "message": "Crucible returned an invalid result summary.",
+                    },
+                    "fail",
+                )
+            response.update(
                 {
-                    "status": "indeterminate",
-                    "operation_id": intent_key,
-                    "reason_code": "result_payload_unavailable",
+                    "status": "completed",
+                    "result_summary": summary,
+                    "indexed_query_status": status.get("indexed_query_status"),
+                    "message": "Benchmark completed",
                 }
             )
-        terminal_ok = await operation_guard.terminalize(
-            operation_record,
-            "complete" if response["status"] == "completed" else "fail",
-            {"benchmark_result": persisted_result},
-        )
-        await operation_guard.close()
-        response["operation_id"] = intent_key
-        if not terminal_ok:
-            response["status"] = "indeterminate"
-            response["message"] = (
-                "Operation result could not be durably recorded; reconciliation required"
+            return await finish_execution(response, "complete")
+    except Exception:
+        logger.warning("[benchmark] Crucible MCP execution failed", exc_info=True)
+        if launch_attempted:
+            return await finish_execution(
+                {
+                    "status": "indeterminate",
+                    "validation_id": validation_id,
+                    "execution_transport": "crucible_mcp",
+                    "mcp_contract_version": "3",
+                    "crucible_idempotency_key": idempotency_key,
+                    "reason_code": "mcp_execution_outcome_unknown",
+                    "message": (
+                        "The MCP run launch or polling outcome is ambiguous; "
+                        "reconciliation is required and the run was not relaunched."
+                    ),
+                },
+                "indeterminate",
+                reconcile=True,
             )
-    return json.dumps(response)
+        return await finish_execution(
+            {
+                "status": "failed",
+                "validation_id": validation_id,
+                "execution_transport": "crucible_mcp",
+                "mcp_contract_version": "3",
+                "reason_code": "mcp_execution_failed",
+                "message": "The Crucible MCP execution request failed before launch.",
+            },
+            "fail",
+        )
+
+    except asyncio.CancelledError:
+        if operation_guard and operation_owned:
+            try:
+                await operation_guard.terminalize(
+                    operation_record,
+                    "indeterminate",
+                    {
+                        "outcome": "indeterminate",
+                        "reason_code": "ticket_cancelled_during_polling",
+                        "polling_stopped": True,
+                        "crucible_stopped": False,
+                    },
+                )
+            finally:
+                await operation_guard.close()
+        raise
 
 
 @mcp.tool(meta=ownership_metadata(_CRUCIBLE_TOOL_OWNER))
@@ -5335,10 +4938,10 @@ async def validate_benchmark(
 ) -> str:
     """Validate a benchmark run-file on its controller without executing it.
 
-    For Crucible, the run-file is copied to the configured controller and
-    ``crucible validate`` performs the controller-side schema, endpoint,
-    benchmark-parameter, and tool-parameter validation.  This tool never
-    starts a benchmark, deploys endpoints, or starts supporting services.
+    For Crucible, the controller MCP ``validate_run`` tool performs
+    controller-side schema, endpoint, benchmark-parameter, and tool-parameter
+    validation. This tool never starts a benchmark, deploys endpoints, or
+    starts supporting services.
     """
     await _require_tool_owner(_CRUCIBLE_TOOL_OWNER)
     run_file = _apply_runfile_safety_directives(run_file)
@@ -5368,81 +4971,80 @@ async def validate_benchmark(
             }
         )
 
-    execution = {}
-    if _skill_provider:
-        execution = (await _skill_provider.get_all_private_config(harness_name)).get(
-            "execution", {}
-        )
-    validation_command = execution.get("validation_command", "crucible validate")
-    command_valid, command_reason = _validate_run_command(
-        validation_command, harness_name
-    )
-    if not command_valid:
+    assigned_controller = _controller_host()
+    if not assigned_controller or controller != assigned_controller:
         return json.dumps(
             {
                 "status": "failed",
                 "valid": False,
                 "harness": harness_name,
-                "errors": [f"Configured validation command rejected: {command_reason}"],
+                "controller": controller,
+                "errors": [
+                    "Validation controller does not match the ticket's assigned controller"
+                ],
+            }
+        )
+    if _crucible_mcp is None:
+        return json.dumps(
+            {
+                "status": "failed",
+                "valid": False,
+                "harness": harness_name,
+                "controller": controller,
+                "errors": ["Crucible MCP contract v3 is unavailable"],
             }
         )
 
-    validation_uuid = uuid.uuid4().hex[:8]
-    remote_path = f"/tmp/validate-run-file-{validation_uuid}.json"
-    local_path = ""
     try:
         ticket_id = os.environ.get("TICKET_ID", "")
-        staging = None
-        staging_name = ""
-        staging, staging_name, local_path = _write_ticket_staging_file(
-            ticket_id, json.dumps(run_file, indent=2)
+        raw_result = await _crucible_mcp.call_tool(
+            "validate_run",
+            {"document": run_file},
         )
-
-        copied = await _ssh.copy_to(controller, local_path, remote_path, mutating=True)
-        if copied.exit_code != 0:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "valid": False,
-                    "harness": harness_name,
-                    "controller": controller,
-                    "errors": [
-                        f"Failed to copy run-file to controller: "
-                        f"{copied.stderr or 'unknown error'}"
-                    ],
-                }
-            )
-
-        result = await _ssh.run(
-            controller,
-            f"{validation_command} {remote_path} 2>&1",
-            timeout=180,
+        try:
+            result = json.loads(raw_result)
+        except (TypeError, json.JSONDecodeError):
+            result = {
+                "status": "failed",
+                "valid": False,
+                "errors": ["Crucible returned an invalid validation response"],
+            }
+        if not isinstance(result, dict):
+            result = {
+                "status": "failed",
+                "valid": False,
+                "errors": ["Crucible returned an invalid validation response"],
+            }
+        errors = result.get("errors", [])
+        if not isinstance(errors, list):
+            errors = [str(errors)] if errors else []
+        output = (
+            result.get("output")
+            or result.get("message")
+            or json.dumps(result, sort_keys=True)
         )
-        output = (result.stdout or "").strip()
-        if result.exit_code == 0:
+        valid = result.get("valid") is True or result.get("status") == "valid"
+        if valid:
             fields = _ticket.get("custom_fields", {}) if _ticket else {}
             params_fingerprint = _compute_params_fingerprint(fields)
             execution_plan_fingerprint = _execution_plan_fingerprint(fields)
-            run_command = execution.get("run_command", "crucible run")
-            command_valid, _ = _validate_run_command(run_command, harness_name)
-            if not command_valid:
-                return json.dumps(
-                    {
-                        "status": "failed",
-                        "valid": False,
-                        "errors": ["Configured execution command rejected"],
-                    }
-                )
             validation_id = await _persist_validated_runfile(
                 run_file,
                 harness_name,
                 controller,
                 params_fingerprint,
                 execution_plan_fingerprint,
-                run_command,
-                validation_command,
+                "crucible_mcp:start_run",
+                "crucible_mcp:validate_run",
                 output,
-                str(execution.get("validator_version", "unknown")),
+                str(
+                    result.get(
+                        "validator_version",
+                        _crucible_mcp.contract_info.get("version", "unknown"),
+                    )
+                ),
+                execution_transport="crucible_mcp",
+                mcp_contract_version="3",
             )
             if validation_id is None:
                 return json.dumps(
@@ -5471,7 +5073,9 @@ async def validate_benchmark(
                 }
             )
 
-        details = output or (result.stderr or "Validation failed").strip()
+        details = (
+            "; ".join(str(error) for error in errors) or output or ("Validation failed")
+        )
         return json.dumps(
             {
                 "status": "invalid",
@@ -5480,7 +5084,22 @@ async def validate_benchmark(
                 "controller": controller,
                 "validation_output": _validation_output_descriptor(ticket_id, output),
                 "errors": [details],
-                "exit_code": result.exit_code,
+                "exit_code": result.get("exit_code"),
+            }
+        )
+    except MCPToolCallError as exc:
+        if not _is_run_document_too_large(exc):
+            raise
+        return json.dumps(
+            {
+                "status": "failed",
+                "valid": False,
+                "harness": harness_name,
+                "controller": controller,
+                "reason_code": "run_document_too_large",
+                "errors": [
+                    "The run document exceeds the controller's inline MCP document limit."
+                ],
             }
         )
     except Exception as exc:
@@ -5494,14 +5113,6 @@ async def validate_benchmark(
                 "errors": [f"Controller validation request failed: {exc}"],
             }
         )
-    finally:
-        if local_path:
-            if staging:
-                staging.unlink(staging_name, missing_ok=True)
-        try:
-            await _ssh.run(controller, f"rm -f {remote_path}", timeout=10)
-        except Exception:
-            logger.debug("Failed to remove temporary validation file", exc_info=True)
 
 
 @mcp.tool()
@@ -5511,11 +5122,90 @@ async def get_run_logs(
     harness: str | None = None,
     results_dir_pattern: str | None = None,
     max_kb: int = 50,
+    offset: int = 0,
 ) -> str:
-    """Retrieve logs from a benchmark run on the controller. Use this to diagnose failures — especially when execute_benchmark reports a missing result-summary. max_kb controls how much log to return (default 50 KB, max 200 KB)."""
+    """Retrieve logs from a benchmark run on the controller.
+
+    Use this to diagnose failures — especially when execute_benchmark reports a
+    missing result-summary. max_kb controls how much log to return (default
+    50 KB, max 200 KB). Pass a returned next_offset as offset to continue a
+    truncated result.
+    """
     await _ensure_init()
 
+    if type(offset) is not int or offset < 0:
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "invalid_offset",
+                "message": "offset must be a nonnegative integer.",
+            }
+        )
+
     byte_limit = min(max_kb, 200) * 1024
+
+    if harness in {None, "crucible"}:
+        assigned_controller = _controller_host()
+        if not assigned_controller or controller != assigned_controller:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "reason": "controller_mismatch",
+                    "message": (
+                        "The controller must match the ticket's assigned "
+                        "Crucible controller."
+                    ),
+                }
+            )
+        if run_id.startswith("/"):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "reason": "invalid_run_id",
+                    "message": (
+                        "Crucible logs require the MCP job ID; controller "
+                        "run paths are not accepted."
+                    ),
+                }
+            )
+        if _crucible_mcp is None:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "reason": "unsupported_controller",
+                    "message": (
+                        "The assigned Crucible controller does not support "
+                        "MCP contract v3."
+                    ),
+                }
+            )
+        try:
+            raw_logs = await _crucible_mcp.call_tool(
+                "get_run_logs",
+                {"mcp_job_id": run_id, "offset": offset, "limit": byte_limit},
+            )
+            logs = json.loads(raw_logs)
+            if not isinstance(logs, dict):
+                raise ValueError("invalid log response")
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "crucible_mcp_job_id": run_id,
+                    "offset": offset,
+                    "log_lines": logs.get("text", ""),
+                    "next_offset": logs.get("next_offset"),
+                    "complete": logs.get("complete") is True,
+                    "redacted": logs.get("redacted") is True,
+                }
+            )
+        except Exception:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "reason": "mcp_transport_error",
+                    "message": "The Crucible MCP log request failed.",
+                }
+            )
 
     if run_id.startswith("/") and harness == "kube-burner":
         match = re.fullmatch(r"/tmp/kb-([0-9a-f]{8})", run_id)
