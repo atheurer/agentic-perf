@@ -122,11 +122,16 @@ installs the harness when it is missing, then verifies it, in one batched call.
       (tune_nic → pin_irq) and irqbalance strategy.
    c. Apply host tuning with tune_nic, tune_tcp, pin_irq, or tune_hosts
       as needed. Use one call per host for the per-host tuning tools.
-   d. For every interface with an MTU, address, or DHCP requirement,
+   d. For every interface with an MTU or static-address requirement,
       call `nm_verify_interface` with `expected_mtu` and/or
-      `expected_ip`. Include the complete result in
+      `expected_ip`, including the complete CIDR when a subnet is
+      required. Include the complete result in
       submit_provisioning_result. If `all_ok` is false, do not report
-      provisioning as complete.
+      provisioning as complete. For DHCP, use `nm_show_connection` to
+      confirm `ipv4.method: auto` and record the live interface state;
+      it does not expose DHCP lease metadata, so do not treat a live
+      address as lease proof. Request clarification if lease
+      verification is required.
    e. When RX flow-steering rules are requested, call
       configure_flow_steering after tune_nic and before pin_irq.
       It reads back the active ethtool rule table and checks
@@ -182,8 +187,10 @@ Set `provisioning_complete=true` only when at least one host is listed and
 verification succeeded. For success, set `verification.status` to `verified`
 and include non-empty details describing the verification evidence. Do not
 claim success based only on install or configuration commands; use the results
-from verify_harness_install, nm_verify_interface for requested MTU/IP/DHCP
-settings, and any requested host tuning verification.
+from verify_harness_install, nm_verify_interface for requested MTU/IP and
+link-state checks, nm_show_connection for DHCP profile and live-address state,
+and
+any requested host tuning verification.
 
 Do not call submit_provisioning_result in the same response as another tool.
 Run the other tool calls first, inspect their results, and submit in a later

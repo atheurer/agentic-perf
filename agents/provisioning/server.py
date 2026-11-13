@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import ipaddress
 import json
 import logging
 import os
@@ -124,6 +125,27 @@ def _summarize(results: dict[str, dict]) -> dict:
         "results": results,
         "summary": f"{total} host(s): {success} success, {failed} failed",
     }
+
+
+def _ipv4_interface_matches(expected: object, actual: object) -> bool:
+    """Match a live IPv4 interface against an exact CIDR or address expectation."""
+    expected_text = str(expected).strip()
+    actual_text = str(actual).strip()
+    try:
+        if "/" in expected_text:
+            expected_interface = ipaddress.IPv4Interface(expected_text)
+            if "/" not in actual_text:
+                return False
+            actual_interface = ipaddress.IPv4Interface(actual_text)
+            return (
+                actual_interface.ip == expected_interface.ip
+                and actual_interface.network.prefixlen
+                == expected_interface.network.prefixlen
+            )
+        actual_address = ipaddress.IPv4Address(actual_text.split("/", 1)[0])
+        return actual_address == ipaddress.IPv4Address(expected_text)
+    except ValueError:
+        return False
 
 
 async def _gather_for_hosts(
@@ -2817,8 +2839,8 @@ async def _verify_host_tuning_one(
     }
 
     # MTU and IPv4 address are part of the required interface gate when the
-    # ticket asks for either. Read the live interface rather than the NM
-    # profile so an effective-but-not-persistent change cannot pass.
+    # ticket asks for either. Compare live kernel state and preserve CIDRs so a
+    # prefix mismatch cannot pass. Profile persistence is audited separately.
     expected_mtu = exp.get("mtu")
     if expected_mtu is not None:
         r_link = await _ssh.run(
@@ -2844,16 +2866,20 @@ async def _verify_host_tuning_one(
             host,
             f"ip addr show {shlex.quote(interface)} 2>/dev/null | grep 'inet '",
         )
-        actual_ips = [
-            line.strip().split()[1].split("/")[0]
+        actual_interfaces = [
+            fields[1]
             for line in r_addr.stdout.splitlines()
-            if "inet " in line
+            if (fields := line.split()) and fields[0] == "inet" and len(fields) > 1
         ]
-        expected_ip_value = str(expected_ip).split("/")[0]
-        ip_ok = expected_ip_value in actual_ips
+        actual_ips = [interface.split("/", 1)[0] for interface in actual_interfaces]
+        ip_ok = any(
+            _ipv4_interface_matches(expected_ip, interface)
+            for interface in actual_interfaces
+        )
         all_ok = all_ok and ip_ok
         checks["ip"] = {
             "actual": actual_ips,
+            "actual_interfaces": actual_interfaces,
             "expected": expected_ip,
             "ok": ip_ok,
         }
@@ -3224,14 +3250,23 @@ async def nm_verify_interface(
     r_addr = await _ssh.run(
         host, f"ip addr show {interface} 2>/dev/null | grep 'inet '"
     )
-    actual_ips = [
-        line.strip().split()[1].split("/")[0]
+    actual_interfaces = [
+        fields[1]
         for line in r_addr.stdout.splitlines()
-        if "inet " in line
+        if (fields := line.split()) and fields[0] == "inet" and len(fields) > 1
     ]
-    ip_ok = (expected_ip is None) or (expected_ip in actual_ips)
+    actual_ips = [interface.split("/", 1)[0] for interface in actual_interfaces]
+    ip_ok = expected_ip is None or any(
+        _ipv4_interface_matches(expected_ip, interface)
+        for interface in actual_interfaces
+    )
     all_ok = all_ok and ip_ok
-    checks["ip"] = {"actual": actual_ips, "expected": expected_ip, "ok": ip_ok}
+    checks["ip"] = {
+        "actual": actual_ips,
+        "actual_interfaces": actual_interfaces,
+        "expected": expected_ip,
+        "ok": ip_ok,
+    }
 
     state_ok = "UP" in link_output and "state UP" in link_output
     checks["state"] = {"up": state_ok, "ok": state_ok}

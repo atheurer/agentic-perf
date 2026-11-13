@@ -81,6 +81,11 @@ nm_set_ip(host, interface="eno16695np0",
 ```
 nm_set_dhcp(host, interface="eno16695np0")
 ```
+Confirm `ipv4.method: auto` with `nm_show_connection` and record the observed
+live address. `nm_verify_interface` checks link state, but does not by itself
+prove that a DHCP lease was acquired. `nm_show_connection` also does not expose
+lease metadata, so do not treat any live address as lease proof; request
+clarification when lease verification is required.
 
 ### Private test network pattern
 
@@ -88,7 +93,8 @@ When a ticket requests a dedicated test network for benchmark traffic
 (e.g., "configure a private 172.16.x.x network on eno16695np0"):
 
 1. Call `nm_set_ip` on each endpoint with addresses in the same subnet
-2. Call `nm_verify_interface` to confirm the IP is live and the interface is UP
+2. Call `nm_verify_interface` with the full CIDR to confirm the IP and prefix
+   are live and the interface is UP
 3. Optionally call `nm_set_mtu` if a specific MTU is requested
 4. Include the IP and MTU in the provisioning report so the benchmark agent
    knows which address to use for test traffic
@@ -98,9 +104,9 @@ Example for two endpoints:
 nm_set_ip(host=client, interface="eno16695np0", ip_cidr="172.16.0.1/24")
 nm_set_ip(host=server, interface="eno16695np0", ip_cidr="172.16.0.2/24")
 nm_verify_interface(host=client, interface="eno16695np0",
-                    expected_ip="172.16.0.1")
+                    expected_ip="172.16.0.1/24")
 nm_verify_interface(host=server, interface="eno16695np0",
-                    expected_ip="172.16.0.2")
+                    expected_ip="172.16.0.2/24")
 ```
 
 ## Auditing interface state

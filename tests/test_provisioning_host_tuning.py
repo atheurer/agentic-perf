@@ -761,6 +761,7 @@ class TestVerifyHostTuning:
         }
         assert result["checks"]["ip"] == {
             "actual": ["192.168.131.9"],
+            "actual_interfaces": ["192.168.131.9/24"],
             "expected": "192.168.131.9/24",
             "ok": True,
         }
@@ -795,7 +796,76 @@ class TestVerifyHostTuning:
         assert result["checks"]["mtu"]["actual"] == 9000
         assert result["checks"]["mtu"]["ok"] is False
         assert result["checks"]["ip"]["actual"] == ["192.168.131.10"]
+        assert result["checks"]["ip"]["actual_interfaces"] == ["192.168.131.10/24"]
         assert result["checks"]["ip"]["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_ip_prefix_mismatch_fails_live_interface_gate(self):
+        ssh = MockSSHExecutor(
+            results={
+                "net.ipv4.tcp_congestion_control": SSHResult(stdout="bbr"),
+                "tc qdisc show": SSHResult(stdout="qdisc fq 8001: root refcnt 2"),
+                "ethtool -l": SSHResult(stdout=ETHTOOL_L_ONE_QUEUE),
+                "ip link show": SSHResult(
+                    stdout="4: eno16695np0: <BROADCAST,MULTICAST,UP,LOWER_UP> "
+                    "mtu 1500 qdisc fq state UP"
+                ),
+                "ip addr show": SSHResult(
+                    stdout="    inet 192.168.131.9/32 brd 192.168.131.9 scope global eno16695np0"
+                ),
+                "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_ONE_QUEUE),
+                "smp_affinity_list": SSHResult(stdout="194"),
+                "is-active irqbalance": SSHResult(stdout="inactive"),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["verify_host_tuning"](
+            host="10.0.0.1",
+            interface="eno16695np0",
+            expected={"ip": "192.168.131.9/24"},
+        )
+
+        assert result["all_ok"] is False
+        assert result["checks"]["ip"] == {
+            "actual": ["192.168.131.9"],
+            "actual_interfaces": ["192.168.131.9/32"],
+            "expected": "192.168.131.9/24",
+            "ok": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_tune_hosts_fails_on_ip_prefix_mismatch(self):
+        ssh = MockSSHExecutor(
+            results={
+                "net.ipv4.tcp_congestion_control": SSHResult(stdout="bbr"),
+                "tc qdisc show": SSHResult(stdout="qdisc fq 8001: root refcnt 2"),
+                "ethtool -l": SSHResult(stdout=ETHTOOL_L_ONE_QUEUE),
+                "ip link show": SSHResult(
+                    stdout="4: eno16695np0: <BROADCAST,MULTICAST,UP,LOWER_UP> "
+                    "mtu 1500 qdisc fq state UP"
+                ),
+                "ip addr show": SSHResult(
+                    stdout="    inet 192.168.131.9/32 brd 192.168.131.9 scope global eno16695np0"
+                ),
+                "/proc/interrupts": SSHResult(stdout=PROC_INTERRUPTS_ONE_QUEUE),
+                "smp_affinity_list": SSHResult(stdout="194"),
+                "is-active irqbalance": SSHResult(stdout="inactive"),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["tune_hosts"](
+            targets=[
+                {
+                    "host": "10.0.0.1",
+                    "interface": "eno16695np0",
+                    "expected_ip": "192.168.131.9/24",
+                }
+            ]
+        )
+
+        host_result = result["results"]["10.0.0.1"]
+        assert host_result["status"] == "error"
+        assert host_result["steps"][0]["verify"]["checks"]["ip"]["ok"] is False
 
     @pytest.mark.asyncio
     async def test_wrong_qdisc_detected(self):

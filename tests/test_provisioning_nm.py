@@ -225,6 +225,111 @@ class TestNmVerifyInterface:
         assert result["checks"]["mtu"]["actual"] == 1500
 
     @pytest.mark.asyncio
+    async def test_ip_prefix_mismatch_detected(self):
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="4: eno16695np0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq state UP"
+                ),
+                "ip addr show": SSHResult(stdout="    inet 172.16.0.1/32\n"),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="eno16695np0",
+            expected_ip="172.16.0.1/24",
+        )
+        assert result["all_ok"] is False
+        assert result["checks"]["ip"]["actual"] == ["172.16.0.1"]
+        assert result["checks"]["ip"]["actual_interfaces"] == ["172.16.0.1/32"]
+        assert result["checks"]["ip"]["ok"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("expected_ip", "expected_ok"),
+        [
+            ("192.0.2.9/32", False),
+            ("192.0.2.9/24", False),
+            ("192.0.2.9", True),
+        ],
+    )
+    async def test_point_to_point_bare_address_has_no_local_prefix(
+        self, expected_ip, expected_ok
+    ):
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="4: tun0: <POINTOPOINT,UP,LOWER_UP> mtu 1500 state UP"
+                ),
+                "ip addr show": SSHResult(
+                    stdout="    inet 192.0.2.9 peer 192.0.2.10/24 scope global tun0\n"
+                ),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="tun0",
+            expected_ip=expected_ip,
+        )
+
+        assert result["all_ok"] is expected_ok
+        assert result["checks"]["ip"] == {
+            "actual": ["192.0.2.9"],
+            "actual_interfaces": ["192.0.2.9"],
+            "expected": expected_ip,
+            "ok": expected_ok,
+        }
+
+    @pytest.mark.asyncio
+    async def test_multiple_live_addresses_match_any_interface(self):
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="4: eno16695np0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP"
+                ),
+                "ip addr show": SSHResult(
+                    stdout="    inet 172.16.0.1/32 scope global eno16695np0\n"
+                    "    inet 172.16.0.1/24 scope global secondary eno16695np0\n"
+                ),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="eno16695np0",
+            expected_ip="172.16.0.1/24",
+        )
+
+        assert result["all_ok"] is True
+        assert result["checks"]["ip"]["actual_interfaces"] == [
+            "172.16.0.1/32",
+            "172.16.0.1/24",
+        ]
+        assert result["checks"]["ip"]["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_malformed_cidr_expectation_fails_closed(self):
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="4: eno16695np0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP"
+                ),
+                "ip addr show": SSHResult(stdout="    inet 172.16.0.1/24\n"),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="eno16695np0",
+            expected_ip="172.16.0.1/33",
+        )
+
+        assert result["all_ok"] is False
+        assert result["checks"]["ip"]["ok"] is False
+
+    @pytest.mark.asyncio
     async def test_interface_down_detected(self):
         ssh = MockSSHExecutor(
             results={
