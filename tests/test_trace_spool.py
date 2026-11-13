@@ -385,6 +385,119 @@ def test_slow_trickle_response_honors_total_flush_deadline(tmp_path) -> None:
     assert [item.event_id for _, item in client.spool.pending()] == [expected.event_id]
 
 
+def test_stalled_batch_send_does_not_block_new_records(tmp_path) -> None:
+    expected = [event() for _ in range(100)]
+    send_started = threading.Event()
+    release_send = threading.Event()
+
+    def stalled(request: httpx.Request) -> httpx.Response:
+        send_started.set()
+        release_send.wait(2)
+        body = json.loads(request.read())
+        return httpx.Response(
+            200,
+            json={
+                "acknowledgements": [
+                    {
+                        "event_id": item["event_id"],
+                        "accepted": True,
+                        "status": "stored",
+                    }
+                    for item in body["events"]
+                ]
+            },
+        )
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(stalled)),
+    )
+    for item in expected:
+        client.record(item)
+
+    started = time.monotonic()
+    assert client.flush(deadline=started + 0.05) == 0
+    assert send_started.wait(1)
+    appended = event()
+    record_thread = threading.Thread(target=client.record, args=(appended,))
+    record_thread.start()
+    record_thread.join(0.2)
+    assert not record_thread.is_alive()
+    assert appended.event_id in [item.event_id for _, item in client.spool.pending()]
+
+    release_send.set()
+    record_thread.join(2)
+    active = client._flush_thread
+    if active is not None:
+        active.join(2)
+    client.close(flush_timeout=0)
+
+
+def test_plain_flush_waits_for_timed_flush_worker(tmp_path) -> None:
+    expected = event()
+    send_started = threading.Event()
+    release_send = threading.Event()
+    calls = 0
+    in_flight = 0
+    max_in_flight = 0
+
+    def stalled(request: httpx.Request) -> httpx.Response:
+        nonlocal calls, in_flight, max_in_flight
+        calls += 1
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        send_started.set()
+        try:
+            release_send.wait(2)
+            event_id = json.loads(request.read())["events"][0]["event_id"]
+            return httpx.Response(
+                200,
+                json={
+                    "acknowledgements": [
+                        {
+                            "event_id": event_id,
+                            "accepted": True,
+                            "status": "stored",
+                        }
+                    ]
+                },
+            )
+        finally:
+            in_flight -= 1
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(stalled)),
+    )
+    client.record(expected)
+
+    started = time.monotonic()
+    assert client.flush(deadline=started + 0.05) == 0
+    assert send_started.wait(1)
+    plain_result: list[int] = []
+    plain = threading.Thread(target=lambda: plain_result.append(client.flush()))
+    plain.start()
+    time.sleep(0.1)
+    assert plain.is_alive()
+    assert calls == 1
+
+    release_send.set()
+    plain.join(2)
+    active = client._flush_thread
+    if active is not None:
+        active.join(2)
+    assert not plain.is_alive()
+    assert plain_result == [1]
+    assert calls == 2
+    assert max_in_flight == 1
+    assert list(client.spool.pending()) == []
+    client.close(flush_timeout=0)
+
+
 def test_slow_spool_compaction_honors_flush_deadline(tmp_path, monkeypatch) -> None:
     expected = event()
 
@@ -484,12 +597,12 @@ def test_blocked_spool_io_cannot_exceed_flush_or_close_deadline(
     )
     client.record(expected)
 
-    def blocked_pending(*, check_cancelled=None):
+    def blocked_pending_batch(*_args, check_cancelled=None):
         release.wait(2)
         completed.set()
-        return iter(())
+        return []
 
-    monkeypatch.setattr(client.spool, "pending", blocked_pending)
+    monkeypatch.setattr(client.spool, "pending_batch", blocked_pending_batch)
     started = time.monotonic()
     assert client.flush(deadline=started + 0.05) == 0
     flush_elapsed = time.monotonic() - started

@@ -183,6 +183,17 @@ def test_query_events_uses_bound_filters_and_causal_cap(
             )
 
 
+def test_query_events_enforces_serialized_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        store.insert_event(event(attributes={"payload": "\u00e9" * 600}))
+        monkeypatch.setattr(store, "MAX_QUERY_RAW_BYTES", 1024)
+
+        with pytest.raises(TraceQueryTooBroad, match="query budget"):
+            store.query_events(TraceQuery(limit=10))
+
+
 def test_multiprocess_cold_start_has_gap_free_sequences(tmp_path: Path) -> None:
     path = tmp_path / "trace.db"
     context = get_context("spawn")

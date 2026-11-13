@@ -651,10 +651,10 @@ class Dispatcher:
             finally:
                 if self._renewal_tasks.get(ticket_id) is renewal:
                     self._renewal_tasks.pop(ticket_id)
-        if self._claim_lost:
+        if getattr(self, "_claim_lost", False):
             logger.warning(
                 "Retaining stale claim %s for next-leader reconciliation",
-                self._claim_ids.get(ticket_id, "unknown"),
+                getattr(self, "_claim_ids", {}).get(ticket_id, "unknown"),
             )
         else:
             await self.release_claim(ticket_id)

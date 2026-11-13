@@ -88,6 +88,7 @@ class TraceStore:
     DEFAULT_RETENTION_DAYS = 14
     MAX_CAUSAL_EVENTS = 50_000
     MAX_CAUSAL_SCOPES = 100
+    MAX_QUERY_RAW_BYTES = 64 * 1024 * 1024
 
     def __init__(
         self,
@@ -805,12 +806,15 @@ class TraceStore:
     ) -> tuple[list[TraceEventV1], list[TraceEventV1] | None]:
         predicates, values = self._query_predicates(query)
         direct_limit = self.MAX_CAUSAL_EVENTS + 1 if query.causal else query.limit
-        direct = self._query_rows(
+        remaining_bytes = self.MAX_QUERY_RAW_BYTES
+        direct, direct_bytes = self._query_rows(
             predicates,
             values,
             direct_limit,
             cancelled=cancelled,
+            byte_limit=remaining_bytes,
         )
+        remaining_bytes -= direct_bytes
         if not query.causal or not direct:
             return direct[: query.limit], None
         if len(direct) > self.MAX_CAUSAL_EVENTS:
@@ -833,17 +837,18 @@ class TraceStore:
                     "trace query is too broad; narrow it with ticket, trace, "
                     "action, or time filters"
                 )
-            scoped.extend(
-                self._query_rows(
-                    [
-                        "ticket_id = ?",
-                        "trace_id = ?",
-                    ],
-                    [ticket_id, trace_id],
-                    remaining,
-                    cancelled=cancelled,
-                )
+            scoped_rows, scoped_bytes = self._query_rows(
+                [
+                    "ticket_id = ?",
+                    "trace_id = ?",
+                ],
+                [ticket_id, trace_id],
+                remaining,
+                cancelled=cancelled,
+                byte_limit=remaining_bytes,
             )
+            scoped.extend(scoped_rows)
+            remaining_bytes -= scoped_bytes
             if len(scoped) > self.MAX_CAUSAL_EVENTS:
                 raise TraceQueryTooBroad(
                     "trace query is too broad; causal expansion exceeded "
@@ -916,7 +921,8 @@ class TraceStore:
         limit: int,
         *,
         cancelled: Callable[[], bool] | None = None,
-    ) -> list[TraceEventV1]:
+        byte_limit: int = MAX_QUERY_RAW_BYTES,
+    ) -> tuple[list[TraceEventV1], int]:
         where_clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
         sql = (
             "SELECT global_seq, event_json FROM trace_events"
@@ -941,6 +947,7 @@ class TraceStore:
                 if history_connection is not None:
                     connections.append(history_connection)
                 rows: list[tuple[int, str]] = []
+                raw_bytes = 0
                 for connection in connections:
                     connection.set_progress_handler(interrupted, 1000)
                     try:
@@ -949,11 +956,19 @@ class TraceStore:
                         check_cancelled()
                         for row in cursor:
                             check_cancelled()
+                            raw_bytes += len(row["event_json"].encode("utf-8"))
+                            if raw_bytes > byte_limit:
+                                raise TraceQueryTooBroad(
+                                    "trace query is too broad; serialized events "
+                                    f"exceed the {byte_limit}-byte query budget"
+                                )
                             rows.append((row["global_seq"], row["event_json"]))
                         check_cancelled()
                     finally:
                         connection.set_progress_handler(None, 0)
             except TraceQueryCancelled:
+                raise
+            except TraceQueryTooBroad:
                 raise
             except sqlite3.OperationalError as exc:
                 if cancelled is not None and cancelled():
@@ -982,7 +997,7 @@ class TraceStore:
             raise
         except (TypeError, ValueError) as exc:
             raise TraceStoreWriteError("could not query trace events") from exc
-        return events[:limit]
+        return events[:limit], raw_bytes
 
     def migrate_ticket_traces(self, ticket_id: str) -> int:
         """Migrate all trace events for ticket_id from active store to history store.

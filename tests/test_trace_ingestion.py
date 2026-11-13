@@ -14,6 +14,7 @@ import httpx
 import pytest
 from fastapi import Depends, FastAPI, HTTPException, Response
 
+import state_store.api.traces as traces_api
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -22,15 +23,17 @@ from providers.tracing import (
     ProducerIdentity,
     TraceEventV1,
 )
-from providers.tracing.query import TraceQuery, TraceQueryCancelled
+from providers.tracing.query import TraceQuery, TraceQueryCancelled, TraceQueryTooBroad
 from state_store.api.executors import run_lease_worker
 from state_store.api.health import health as health_endpoint
 from state_store.api.router import api_router
 from state_store.api.traces import (
     _authorize_query,
     _event_json,
+    _json_dumps,
     _query_store,
     _record_query_audit,
+    _render_export_response,
     _TraceAuditResponse,
 )
 from state_store.api.traces import (
@@ -39,6 +42,7 @@ from state_store.api.traces import (
 from state_store.api.traces import (
     query as query_trace,
 )
+from state_store.audit import get_actor, set_actor
 from state_store.auth import Principal, make_auth_dependency
 from state_store.identity import UserStore
 from state_store.main import (
@@ -52,6 +56,28 @@ from state_store.trace_store import TraceStore
 
 def payload(event: TraceEventV1) -> dict:
     return event.model_dump(mode="json")
+
+
+def test_json_rendering_enforces_response_size_budget(monkeypatch) -> None:
+    monkeypatch.setattr(traces_api, "MAX_TRACE_RESPONSE_BYTES", 64)
+
+    with pytest.raises(TraceQueryTooBroad, match="response is too broad"):
+        _json_dumps({"payload": "x" * 256})
+
+
+def test_export_rendering_enforces_aggregate_response_size_budget(monkeypatch) -> None:
+    monkeypatch.setattr(traces_api, "MAX_TRACE_RESPONSE_BYTES", 2048)
+    exported = event().model_copy(update={"attributes": {"payload": "x" * 4096}})
+
+    with pytest.raises(TraceQueryTooBroad, match="response is too broad"):
+        _render_export_response(
+            [exported],
+            format="jsonl",
+            cursor=None,
+            limit=1,
+            detailed=True,
+            include_payloads=True,
+        )
 
 
 def make_app(tmp_path, user_store: UserStore | None = None) -> FastAPI:
@@ -450,6 +476,28 @@ async def test_lease_executor_survives_blocked_health_workers() -> None:
         blocker.result(timeout=2)
         control_executor.shutdown(wait=True)
         lease_executor.shutdown(wait=True)
+
+
+async def test_lease_executor_preserves_audit_actor() -> None:
+    lease_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lease")
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(lease_executor=lease_executor),
+        )
+    )
+    set_actor("service", "lease-owner", "127.0.0.1")
+    try:
+        actor = await asyncio.wait_for(
+            run_lease_worker(request, get_actor), timeout=0.5
+        )
+    finally:
+        lease_executor.shutdown(wait=True)
+
+    assert actor == {
+        "kind": "service",
+        "username": "lease-owner",
+        "ip": "127.0.0.1",
+    }
 
 
 @pytest.mark.parametrize(
@@ -907,6 +955,69 @@ async def test_trace_cancellation_during_terminal_audit_is_recorded_once(
     assert len(audits) == 1
     assert audits[0][0] == operation
     assert audits[0][2]["outcome"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["trace_query", "trace_export"])
+async def test_cancellation_during_response_success_audit_is_recorded_once(
+    operation,
+) -> None:
+    audit_started = threading.Event()
+    release = threading.Event()
+    audit_done = threading.Event()
+    audits: list[tuple] = []
+
+    def log(*args) -> None:
+        audit_started.set()
+        if not release.wait(1):
+            raise RuntimeError("success audit was not released")
+        audits.append(args)
+        audit_done.set()
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(audit_log=SimpleNamespace(log=log)))
+    )
+    response = _TraceAuditResponse(
+        Response(content=b"ok"),
+        request=request,
+        operation=operation,
+        ticket_id="PERF-1",
+    )
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message):
+        pass
+
+    task = asyncio.create_task(
+        response(
+            {"type": "http", "method": "GET", "path": "/", "headers": []},
+            receive,
+            send,
+        )
+    )
+    try:
+        await asyncio.wait_for(asyncio.to_thread(audit_started.wait, 1), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+        await asyncio.to_thread(audit_done.wait, 1)
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert audits == [
+        (
+            operation,
+            "PERF-1",
+            {
+                "outcome": "success",
+                "error": None,
+                "ticket_scoped": True,
+            },
+        )
+    ]
 
 
 @pytest.mark.parametrize("operation", ["trace_query", "trace_export"])

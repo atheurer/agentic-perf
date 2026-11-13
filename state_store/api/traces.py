@@ -9,7 +9,7 @@ import threading
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Callable, Literal, TypeVar
+from typing import Annotated, Callable, Iterable, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
@@ -37,6 +37,7 @@ from .events import invalidate_closed_ticket_usage_cache
 router = APIRouter(prefix="/traces/events", tags=["traces"])
 query_router = APIRouter(prefix="/traces", tags=["traces"])
 _WorkerResult = TypeVar("_WorkerResult")
+MAX_TRACE_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
 class TraceBatch(BaseModel):
@@ -265,12 +266,37 @@ def _json_dumps(
     indent: int | None = None,
     separators: tuple[str, str] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    max_bytes: int | None = None,
 ) -> str:
+    if max_bytes is None:
+        max_bytes = MAX_TRACE_RESPONSE_BYTES
     encoder = json.JSONEncoder(indent=indent, separators=separators)
     fragments: list[str] = []
+    total_bytes = 0
     for fragment in encoder.iterencode(value):
         _check_render_cancelled(cancelled)
+        total_bytes += len(fragment.encode("utf-8"))
+        if total_bytes > max_bytes:
+            raise TraceQueryTooBroad(
+                "trace response is too broad; narrow the query or reduce its limit"
+            )
         fragments.append(fragment)
+    return "".join(fragments)
+
+
+def _join_trace_response(
+    parts: Iterable[str], *, cancelled: Callable[[], bool] | None = None
+) -> str:
+    fragments: list[str] = []
+    total_bytes = 0
+    for part in parts:
+        _check_render_cancelled(cancelled)
+        total_bytes += len(part.encode("utf-8"))
+        if total_bytes > MAX_TRACE_RESPONSE_BYTES:
+            raise TraceQueryTooBroad(
+                "trace response is too broad; narrow the query or reduce its limit"
+            )
+        fragments.append(part)
     return "".join(fragments)
 
 
@@ -400,7 +426,12 @@ def _render_export_response(
             event_rows.append(event.model_dump(mode="json"))
         content = _json_dumps(event_rows, indent=2, cancelled=cancelled)
     else:
-        content = export_events(selected, format, cancelled=cancelled)
+        content = export_events(
+            selected,
+            format,
+            cancelled=cancelled,
+            max_bytes=MAX_TRACE_RESPONSE_BYTES,
+        )
     export_meta = export_manifest(
         selected,
         content,
@@ -416,20 +447,27 @@ def _render_export_response(
             cancelled=cancelled,
         )
     elif format == "jsonl":
-        content += (
-            _json_dumps(
-                {"_manifest": export_meta},
-                separators=(",", ":"),
-                cancelled=cancelled,
-            )
-            + "\n"
+        content = _join_trace_response(
+            (
+                content,
+                _json_dumps(
+                    {"_manifest": export_meta},
+                    separators=(",", ":"),
+                    cancelled=cancelled,
+                ),
+                "\n",
+            ),
+            cancelled=cancelled,
         )
     else:
-        content = (
-            "# trace-export-manifest: "
-            + _json_dumps(export_meta, separators=(",", ":"), cancelled=cancelled)
-            + "\n"
-            + content
+        content = _join_trace_response(
+            (
+                "# trace-export-manifest: ",
+                _json_dumps(export_meta, separators=(",", ":"), cancelled=cancelled),
+                "\n",
+                content,
+            ),
+            cancelled=cancelled,
         )
     response = Response(content, media_type=media)
     response.headers["X-Trace-Manifest"] = _json_dumps(
