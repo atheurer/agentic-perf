@@ -408,6 +408,26 @@ async def test_transient_lease_failure_retries_at_backoff_and_recovers():
     assert lease.released == 1
 
 
+@pytest.mark.asyncio
+async def test_local_renewal_timeout_consumes_retry_budget(caplog):
+    lease = _RenewalLease(["hang"], ttl_seconds=1.0)
+    lost = []
+    task = asyncio.create_task(
+        _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
+    )
+
+    await asyncio.wait_for(lease.recovered.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(lease.attempts) == 2
+    assert lost == []
+    assert lease.released == 1
+    assert "transient failure 1/3" in caplog.text
+    assert "TimeoutError" in caplog.text
+
+
 @pytest.mark.parametrize(
     "error_type",
     [
@@ -485,7 +505,7 @@ async def test_retry_exhaustion_marks_lease_lost_once():
 
 @pytest.mark.asyncio
 async def test_hung_renewal_is_cancelled_before_confirmed_deadline():
-    lease = _RenewalLease(["hang"], ttl_seconds=1.0)
+    lease = _RenewalLease(["hang"] * 4, ttl_seconds=1.0)
     deadline = lease.confirmed_deadline
     lost_at = []
 
@@ -496,7 +516,7 @@ async def test_hung_renewal_is_cancelled_before_confirmed_deadline():
             on_lost=lambda: lost_at.append(asyncio.get_running_loop().time()),
         )
 
-    assert len(lease.attempts) == 1
+    assert len(lease.attempts) == 3
     assert lease.cancelled
     assert lost_at[0] < deadline
     assert lease.released == 1

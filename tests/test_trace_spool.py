@@ -291,3 +291,61 @@ def test_outage_during_close_leaves_durable_spool_for_sweeper(tmp_path) -> None:
         == 1
     )
     assert delivered == [str(expected.event_id)]
+
+
+def test_close_flush_budget_does_not_send_when_exhausted(tmp_path) -> None:
+    calls = 0
+
+    def accepted(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("expired flush budget attempted delivery")
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(accepted)),
+    )
+    client.record(event())
+    client.close(flush_timeout=0)
+
+    assert calls == 0
+    assert list(tmp_path.glob("*.spool"))
+
+
+def test_plain_flush_preserves_configured_http_timeout(tmp_path) -> None:
+    expected = event()
+    observed_timeouts: list[dict[str, float] | None] = []
+
+    def accepted(request: httpx.Request) -> httpx.Response:
+        observed_timeouts.append(request.extensions.get("timeout"))
+        return httpx.Response(
+            200,
+            json={
+                "acknowledgements": [
+                    {
+                        "event_id": str(expected.event_id),
+                        "accepted": True,
+                        "status": "stored",
+                    }
+                ]
+            },
+        )
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(
+            timeout=10.0,
+            transport=httpx.MockTransport(accepted),
+        ),
+    )
+    client.record(expected)
+    client.flush()
+    client.close(flush_timeout=0)
+
+    assert observed_timeouts == [
+        {"connect": 10.0, "read": 10.0, "write": 10.0, "pool": 10.0}
+    ]

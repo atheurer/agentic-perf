@@ -416,7 +416,7 @@ class Dispatcher:
         client = self._trace.client
         if client is not None:
             try:
-                client.close()
+                await asyncio.to_thread(client.close)
             except Exception:
                 logger.exception("Failed to close dispatcher trace client")
             self._trace.client = None

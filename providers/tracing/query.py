@@ -11,7 +11,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .models import TraceEventV1
 
@@ -36,6 +36,37 @@ class TraceQuery:
     causal: bool = False
     limit: int = 1000
     cursor: int = 0
+
+    def __post_init__(self) -> None:
+        """Normalize request timestamps so naive CLI values are UTC-safe."""
+        object.__setattr__(self, "since", _as_utc(self.since))
+        object.__setattr__(self, "until", _as_utc(self.until))
+
+
+class TraceQueryTooBroad(ValueError):
+    """A trace query would require materializing an unsafe amount of data."""
+
+
+class TraceQueryCancelled(RuntimeError):
+    """The caller abandoned a trace query before it completed."""
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return datetime(
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            tzinfo=timezone.utc,
+            fold=value.fold,
+        )
+    return value.astimezone(timezone.utc)
 
 
 def _ordering_key(event: TraceEventV1) -> tuple[int, int | str, str]:
@@ -109,68 +140,74 @@ def query_events(
     values = list(events)
     direct = [event for event in values if _matches(event, query)]
     if query.causal and direct:
-        selected = {event.action_id for event in direct}
-        scope_tickets = {event.ticket_id for event in direct}
-        scope_traces = {event.trace_id for event in direct}
+        scopes = {(event.ticket_id, event.trace_id) for event in direct}
         scoped = [
-            event
-            for event in values
-            if event.ticket_id in scope_tickets and event.trace_id in scope_traces
+            event for event in values if (event.ticket_id, event.trace_id) in scopes
         ]
-        changed = True
-        while changed:
-            changed = False
-            for event in scoped:
-                if (
-                    event.parent_action_id in selected
-                    and event.action_id not in selected
-                ):
-                    selected.add(event.action_id)
-                    changed = True
-                if (
-                    any(item.parent_action_id == event.action_id for item in values)
-                    and event.action_id in selected
-                ):
-                    continue
-            for event in scoped:
-                if event.action_id in selected and event.parent_action_id:
-                    if event.parent_action_id not in selected:
-                        selected.add(event.parent_action_id)
-                        changed = True
-        direct = [event for event in scoped if event.action_id in selected]
+        direct = expand_causal_events(
+            direct,
+            scoped,
+            limit=query.limit,
+            cursor=query.cursor,
+        )
     direct.sort(key=lambda event: (event.global_seq is None, event.global_seq or 0))
-    if query.cursor:
+    if query.cursor and not query.causal:
         direct = [event for event in direct if (event.global_seq or 0) > query.cursor]
     return direct[: query.limit]
+
+
+def expand_causal_events(
+    direct: Iterable[TraceEventV1],
+    scoped: Iterable[TraceEventV1],
+    *,
+    limit: int,
+    cursor: int = 0,
+    cancelled: Callable[[], bool] | None = None,
+) -> list[TraceEventV1]:
+    """Expand selected actions to their ancestors and descendants in linear time."""
+    direct_values = list(direct)
+    if not direct_values:
+        return []
+
+    parents: dict[str, set[str]] = {}
+    children: dict[str, set[str]] = {}
+    selected = {event.action_id for event in direct_values}
+    scoped_values = list(scoped)
+    for event in scoped_values:
+        if cancelled is not None and cancelled():
+            raise TraceQueryCancelled("trace query cancelled")
+        if event.parent_action_id:
+            parents.setdefault(event.action_id, set()).add(event.parent_action_id)
+            children.setdefault(event.parent_action_id, set()).add(event.action_id)
+
+    pending = list(selected)
+    while pending:
+        if cancelled is not None and cancelled():
+            raise TraceQueryCancelled("trace query cancelled")
+        action_id = pending.pop()
+        related = parents.get(action_id, set()) | children.get(action_id, set())
+        for related_id in related:
+            if related_id not in selected:
+                selected.add(related_id)
+                pending.append(related_id)
+
+    expanded = [event for event in scoped_values if event.action_id in selected]
+    if cursor:
+        expanded = [event for event in expanded if (event.global_seq or 0) > cursor]
+    expanded.sort(key=lambda event: (event.global_seq is None, event.global_seq or 0))
+    return expanded[:limit]
 
 
 def diagnostics(events: Iterable[TraceEventV1]) -> dict[str, object]:
     """Report incomplete causal data without inventing relationships."""
     values = list(events)
     ids = {event.action_id for event in values}
-    missing = sorted(
-        {
-            event.parent_action_id
-            for event in values
-            if event.parent_action_id and event.parent_action_id not in ids
-        }
-    )
-    cycles: list[str] = []
-    for event in values:
-        seen: set[str] = set()
-        current = event
-        while current.parent_action_id:
-            if current.action_id in seen:
-                cycles.append(event.action_id)
-                break
-            seen.add(current.action_id)
-            parent = next(
-                (item for item in values if item.action_id == current.parent_action_id),
-                None,
-            )
-            if parent is None:
-                break
-            current = parent
+    parents = {
+        event.action_id: event.parent_action_id
+        for event in values
+        if event.parent_action_id
+    }
+    missing = sorted({parent for parent in parents.values() if parent not in ids})
     seqs = sorted(item.ticket_seq for item in values if item.ticket_seq is not None)
     gaps = [
         number
@@ -179,7 +216,7 @@ def diagnostics(events: Iterable[TraceEventV1]) -> dict[str, object]:
     ]
     return {
         "missing_parents": missing,
-        "cycles": sorted(set(cycles)),
+        "cycles": _causal_cycles(parents),
         "sequence_gaps": gaps,
         "unmatched_lifecycle_pairs": _unmatched_pairs(values),
         "indeterminate_operations": sorted(
@@ -190,6 +227,28 @@ def diagnostics(events: Iterable[TraceEventV1]) -> dict[str, object]:
             and event.outcome.value == "indeterminate"
         ),
     }
+
+
+def _causal_cycles(parents: dict[str, str]) -> list[str]:
+    """Return every action in a parent cycle using one pass over the graph."""
+    state: dict[str, int] = {}
+    cycles: set[str] = set()
+    for start in parents:
+        if state.get(start) is not None:
+            continue
+        path: list[str] = []
+        positions: dict[str, int] = {}
+        current = start
+        while current in parents and state.get(current) is None:
+            state[current] = 1
+            positions[current] = len(path)
+            path.append(current)
+            current = parents[current]
+        if current in positions:
+            cycles.update(path[positions[current] :])
+        for action_id in path:
+            state[action_id] = 2
+    return sorted(cycles)
 
 
 def _unmatched_pairs(values: list[TraceEventV1]) -> list[str]:

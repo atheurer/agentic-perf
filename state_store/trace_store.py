@@ -13,7 +13,7 @@ from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from paths import TRACE_HISTORY_DB_PATH
 from providers.tracing import (
@@ -24,6 +24,12 @@ from providers.tracing import (
     OperationOutcome,
     PayloadDescriptor,
     TraceEventV1,
+)
+from providers.tracing.query import (
+    TraceQuery,
+    TraceQueryCancelled,
+    TraceQueryTooBroad,
+    expand_causal_events,
 )
 
 from .trace_migrations import migrate
@@ -80,6 +86,8 @@ class TraceStore:
     """The authoritative SQLite store, with one connection per store instance."""
 
     DEFAULT_RETENTION_DAYS = 14
+    MAX_CAUSAL_EVENTS = 50_000
+    MAX_CAUSAL_SCOPES = 100
 
     def __init__(
         self,
@@ -768,6 +776,203 @@ class TraceStore:
                 return events
             except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
                 raise TraceStoreWriteError("could not read trace events") from exc
+
+    def query_events(
+        self,
+        query: TraceQuery,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> list[TraceEventV1]:
+        """Query trace events with indexed predicates and a bounded causal scope."""
+        events, _ = self._query_events(query, cancelled=cancelled)
+        return events
+
+    def query_events_with_diagnostics(
+        self,
+        query: TraceQuery,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[list[TraceEventV1], list[TraceEventV1] | None]:
+        """Return paged events plus the complete bounded causal diagnostic scope."""
+        return self._query_events(query, cancelled=cancelled, include_scope=True)
+
+    def _query_events(
+        self,
+        query: TraceQuery,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+        include_scope: bool = False,
+    ) -> tuple[list[TraceEventV1], list[TraceEventV1] | None]:
+        predicates, values = self._query_predicates(query)
+        direct_limit = self.MAX_CAUSAL_EVENTS + 1 if query.causal else query.limit
+        direct = self._query_rows(
+            predicates,
+            values,
+            direct_limit,
+            cancelled=cancelled,
+        )
+        if not query.causal or not direct:
+            return direct[: query.limit], None
+        if len(direct) > self.MAX_CAUSAL_EVENTS:
+            raise TraceQueryTooBroad(
+                "trace query is too broad; narrow it with ticket, trace, "
+                "action, or time filters"
+            )
+
+        scopes = {(event.ticket_id, event.trace_id) for event in direct}
+        if len(scopes) > self.MAX_CAUSAL_SCOPES:
+            raise TraceQueryTooBroad(
+                "trace query is too broad; causal expansion spans "
+                f"{len(scopes)} ticket/trace scopes"
+            )
+        scoped: list[TraceEventV1] = []
+        for ticket_id, trace_id in scopes:
+            remaining = self.MAX_CAUSAL_EVENTS + 1 - len(scoped)
+            if remaining <= 0:
+                raise TraceQueryTooBroad(
+                    "trace query is too broad; narrow it with ticket, trace, "
+                    "action, or time filters"
+                )
+            scoped.extend(
+                self._query_rows(
+                    ["ticket_id = ?", "trace_id = ?"],
+                    [ticket_id, trace_id],
+                    remaining,
+                    cancelled=cancelled,
+                )
+            )
+            if len(scoped) > self.MAX_CAUSAL_EVENTS:
+                raise TraceQueryTooBroad(
+                    "trace query is too broad; causal expansion exceeded "
+                    f"{self.MAX_CAUSAL_EVENTS} events"
+                )
+        expanded = expand_causal_events(
+            direct,
+            scoped,
+            limit=self.MAX_CAUSAL_EVENTS + 1,
+            cancelled=cancelled,
+        )
+        if len(expanded) > self.MAX_CAUSAL_EVENTS:
+            raise TraceQueryTooBroad(
+                "trace query is too broad; causal expansion exceeded "
+                f"{self.MAX_CAUSAL_EVENTS} events"
+            )
+        if query.cursor:
+            expanded_page = [
+                event for event in expanded if (event.global_seq or 0) > query.cursor
+            ]
+        else:
+            expanded_page = expanded
+        return (
+            expanded_page[: query.limit],
+            expanded if include_scope else None,
+        )
+
+    @staticmethod
+    def _query_predicates(query: TraceQuery) -> tuple[list[str], list[object]]:
+        predicates: list[str] = []
+        values: list[object] = []
+        columns = (
+            ("ticket_id", query.ticket_id),
+            ("trace_id", query.trace_id),
+            ("invocation_id", query.invocation_id),
+            ("action_id", query.action_id),
+            ("parent_action_id", query.parent_action_id),
+            ("action_type", query.action_type),
+            ("lifecycle_state", query.lifecycle_state),
+            ("outcome", query.outcome),
+            ("producer_component", query.producer_component),
+        )
+        for column, value in columns:
+            if value is not None:
+                predicates.append(f"{column} = ?")
+                values.append(value)
+        json_fields = (
+            ("$.lifecycle.retry_kind", query.retry_kind),
+            ("$.idempotency.outcome", query.idempotency_outcome),
+        )
+        for path, value in json_fields:
+            if value is not None:
+                predicates.append(f"json_extract(event_json, '{path}') = ?")
+                values.append(value)
+        if query.since is not None:
+            predicates.append("occurred_at >= ?")
+            values.append(query.since.isoformat())
+        if query.until is not None:
+            predicates.append("occurred_at <= ?")
+            values.append(query.until.isoformat())
+        if query.cursor and not query.causal:
+            predicates.append("global_seq > ?")
+            values.append(query.cursor)
+        return predicates, values
+
+    def _query_rows(
+        self,
+        predicates: list[str],
+        values: list[object],
+        limit: int,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> list[TraceEventV1]:
+        where_clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
+        sql = (
+            "SELECT global_seq, event_json FROM trace_events"
+            f"{where_clause} ORDER BY global_seq LIMIT ?"
+        )
+
+        def interrupted() -> int:
+            return int(cancelled is not None and cancelled())
+
+        def check_cancelled() -> None:
+            if cancelled is not None and cancelled():
+                raise TraceQueryCancelled("trace query cancelled")
+
+        with self._lock:
+            try:
+                connections = [self._open_connection()]
+                history_connection = self._open_history_connection()
+                if history_connection is not None:
+                    connections.append(history_connection)
+                rows: list[tuple[int, str]] = []
+                for connection in connections:
+                    connection.set_progress_handler(interrupted, 1000)
+                    try:
+                        check_cancelled()
+                        cursor = connection.execute(sql, (*values, limit))
+                        check_cancelled()
+                        for row in cursor:
+                            check_cancelled()
+                            rows.append((row["global_seq"], row["event_json"]))
+                        check_cancelled()
+                    finally:
+                        connection.set_progress_handler(None, 0)
+            except TraceQueryCancelled:
+                raise
+            except sqlite3.OperationalError as exc:
+                if cancelled is not None and cancelled():
+                    raise TraceQueryCancelled("trace query cancelled") from exc
+                raise
+            except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+                raise TraceStoreWriteError("could not query trace events") from exc
+
+        rows.sort(key=lambda item: item[0])
+        events: list[TraceEventV1] = []
+        seen_event_ids: set[str] = set()
+        try:
+            for _, event_json in rows:
+                if cancelled is not None and cancelled():
+                    raise TraceQueryCancelled("trace query cancelled")
+                event = TraceEventV1.model_validate_json(event_json)
+                event_id = str(event.event_id)
+                if event_id in seen_event_ids:
+                    continue
+                seen_event_ids.add(event_id)
+                events.append(event)
+        except TraceQueryCancelled:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise TraceStoreWriteError("could not query trace events") from exc
+        return events[:limit]
 
     def migrate_ticket_traces(self, ticket_id: str) -> int:
         """Migrate all trace events for ticket_id from active store to history store.

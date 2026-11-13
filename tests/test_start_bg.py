@@ -80,6 +80,36 @@ time.sleep(600)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def _stubborn_store_holder(path: Path, *, lock_path: Path, store_id: str) -> None:
+    code = """
+import fcntl, json, os, signal, sys, time
+lock_path, store_id = sys.argv[1:]
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+fields = open(f'/proc/{os.getpid()}/stat').read().rsplit(') ', 1)[1].split()
+metadata = {
+    'pid': os.getpid(),
+    'process_start_identity': f'{os.getpid()}:{fields[19]}',
+    'configured_port': 18903,
+    'store_id': store_id,
+}
+os.ftruncate(fd, 0)
+os.write(fd, json.dumps(metadata).encode())
+os.fsync(fd)
+time.sleep(600)
+"""
+    script = textwrap.dedent(
+        f"""\
+        #!/usr/bin/env bash
+        exec -a {shlex.quote("python3 -m uvicorn state_store.main:app")} \\
+            /usr/bin/python3 -c {shlex.quote(code)} "$@"
+        """
+    ).lstrip()
+    path.write_text(script)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
 def test_start_repairs_metadata_and_stop_uses_lock_owner(tmp_path: Path) -> None:
     home = tmp_path / "home"
     (home / "logs").mkdir(parents=True)
@@ -194,6 +224,137 @@ def test_stop_reports_already_stopped_services(tmp_path: Path) -> None:
     assert "Orchestrator already stopped" in result.stdout
     assert "State store already stopped" in result.stdout
     assert "Services stopped" in result.stdout
+
+
+def test_log_rotation_keeps_bounded_history(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_LOG_BACKUPS": "5",
+        }
+    )
+    script = f"""
+source {shlex.quote(str(SCRIPT))} status
+for index in 1 2 3 4 5 6 7; do
+    printf 'content-%s\\n' "$index" > "$AGENTIC_PERF_HOME/logs/orchestrator.log"
+    rotate_log "$AGENTIC_PERF_HOME/logs/orchestrator.log"
+done
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (home / "logs" / "orchestrator.log.1").read_text() == "content-7\n"
+    assert (home / "logs" / "orchestrator.log.5").read_text() == "content-3\n"
+    assert not (home / "logs" / "orchestrator.log.6").exists()
+
+
+def test_stop_reclaims_lock_metadata_after_launcher_kills_process(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    store_id = str(uuid.uuid4())
+    holder = tmp_path / "stubborn-store-holder"
+    _stubborn_store_holder(
+        holder,
+        lock_path=home / "state-store.lock",
+        store_id=store_id,
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_STOP_TIMEOUT": "1",
+        }
+    )
+    process = subprocess.Popen(
+        [str(holder), str(home / "state-store.lock"), store_id],
+        cwd=REPO,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if (home / "state-store.lock").exists():
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("stubborn store holder did not acquire its lock")
+        lock_inode = (home / "state-store.lock").stat().st_ino
+
+        result = subprocess.run(
+            [str(SCRIPT), "stop"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "sending SIGKILL" in result.stdout
+        assert "Cleared stale state store lock metadata" in result.stdout
+        assert (home / "state-store.lock").read_text() == ""
+        assert (home / "state-store.lock").stat().st_ino == lock_inode
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
+def test_lock_cleanup_refuses_live_replacement_owner(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    store_id = str(uuid.uuid4())
+    lock_path = home / "state-store.lock"
+    holder = tmp_path / "stubborn-store-holder"
+    _stubborn_store_holder(holder, lock_path=lock_path, store_id=store_id)
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+    process = subprocess.Popen(
+        [str(holder), str(lock_path), store_id],
+        cwd=REPO,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if lock_path.exists() and lock_path.stat().st_size:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("replacement store holder did not acquire its lock")
+        inode = lock_path.stat().st_ino
+        contents = lock_path.read_text()
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"source {shlex.quote(str(SCRIPT))} status; "
+                f"clear_lock_metadata {shlex.quote(str(lock_path))}",
+            ],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert lock_path.stat().st_ino == inode
+        assert lock_path.read_text() == contents
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
 
 
 def test_fresh_start_waits_for_lock_creation(tmp_path: Path) -> None:

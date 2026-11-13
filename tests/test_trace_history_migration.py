@@ -13,6 +13,7 @@ from providers.tracing import (
     LifecycleState,
     TraceEventV1,
 )
+from providers.tracing.query import TraceQuery
 from state_store.audit import AuditLog
 from state_store.models import CreateTicketRequest, TicketStatus, TransitionRequest
 from state_store.store import TicketStore
@@ -129,6 +130,44 @@ def test_active_history_overlap_is_deduplicated_and_sequence_continues(
         assert second.ticket_seq == first.ticket_seq + 1
         assert store.count_events("PERF-OVERLAP") == 2
         assert len(store.list_events("PERF-OVERLAP")) == 2
+
+
+def test_query_pages_mixed_history_active_and_overlapping_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "trace.db"
+    history_db_path = tmp_path / "trace-history.db"
+
+    with TraceStore(db_path, history_db_path=history_db_path) as store:
+        first = store.insert_event(make_event("PERF-MIXED"))
+        second = store.insert_event(make_event("PERF-MIXED"))
+        active = store._open_connection()
+        history = store._open_history_connection()
+        row = active.execute(
+            "SELECT * FROM trace_events WHERE event_id = ?",
+            (str(first.event_id),),
+        ).fetchone()
+        history.execute(
+            "INSERT OR IGNORE INTO trace_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            tuple(row),
+        )
+        history.commit()
+
+        store.migrate_ticket_traces("PERF-MIXED")
+        third = store.insert_event(make_event("PERF-MIXED"))
+
+        first_page = store.query_events(TraceQuery(ticket_id="PERF-MIXED", limit=2))
+        second_page = store.query_events(
+            TraceQuery(
+                ticket_id="PERF-MIXED",
+                cursor=second.global_seq or 0,
+                limit=2,
+            )
+        )
+
+        assert [event.event_id for event in first_page] == [
+            first.event_id,
+            second.event_id,
+        ]
+        assert [event.event_id for event in second_page] == [third.event_id]
 
 
 def test_event_bus_snapshot_cursors_match_merged_legacy_and_trace_events(

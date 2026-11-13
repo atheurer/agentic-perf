@@ -37,8 +37,24 @@ ORCH_START_TIMEOUT="${START_BG_ORCH_TIMEOUT:-45}"
 STOP_TIMEOUT="${START_BG_STOP_TIMEOUT:-10}"
 INACTIVITY_TIMEOUT="${START_BG_INACTIVITY_TIMEOUT:-20}"
 MAX_START_TIMEOUT="${START_BG_MAX_START_TIMEOUT:-180}"
+LOG_BACKUPS="${START_BG_LOG_BACKUPS:-5}"
 
 mkdir -p "$LOG_DIR"
+[[ "$LOG_BACKUPS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: START_BG_LOG_BACKUPS must be a positive integer" >&2
+    exit 2
+}
+
+rotate_log() {
+    local path="$1" index
+    [ -s "$path" ] || return 0
+    for ((index = LOG_BACKUPS; index > 1; index--)); do
+        if [ -f "$path.$((index - 1))" ]; then
+            mv -f "$path.$((index - 1))" "$path.$index"
+        fi
+    done
+    mv -f "$path" "$path.1"
+}
 
 revision() {
     local sha dirty
@@ -158,6 +174,35 @@ try:
 except BlockingIOError:
     raise SystemExit(0)
 raise SystemExit(1)
+PY
+}
+
+clear_lock_metadata() {
+    local path="$1"
+    python3 - "$path" <<'PY'
+import fcntl
+import os
+import sys
+
+path = sys.argv[1]
+try:
+    fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+except FileNotFoundError:
+    raise SystemExit(0)
+except OSError:
+    raise SystemExit(2)
+try:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(3)
+    try:
+        os.ftruncate(fd, 0)
+        os.fsync(fd)
+    except OSError:
+        raise SystemExit(4)
+finally:
+    os.close(fd)
 PY
 }
 
@@ -432,6 +477,7 @@ cleanup_failed_orchestrator_start() {
 
 terminate_process() {
     local pid="$1" kind="$2" deadline lock_path="" label="state store" port_detail="port $STORE_PORT"
+    local forced=0 lock_wait_deadline owner=""
     [ "$kind" = store ] && lock_path="$STORE_LOCK"
     if [ "$kind" = orchestrator ]; then
         lock_path="$ORCH_LOCK"
@@ -445,11 +491,37 @@ terminate_process() {
     if process_alive "$pid"; then
         echo "$label did not stop after ${STOP_TIMEOUT}s; sending SIGKILL (PID $pid; $port_detail)."
         kill -KILL "$pid" 2>/dev/null || true
+        forced=1
     fi
-    sleep 0.2
-    if [ -n "$lock_path" ] && lock_is_held "$lock_path"; then
-        error "$label PID $pid was signalled but still owns its lock"
+    deadline=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$deadline" ] && process_alive "$pid"; do sleep 0.1; done
+    if process_alive "$pid"; then
+        error "$label PID $pid did not exit after SIGKILL; refusing to continue while it may hold $lock_path"
         return 1
+    fi
+    if [ -n "$lock_path" ] && lock_is_held "$lock_path"; then
+        lock_wait_deadline=$((SECONDS + 5))
+        while [ "$SECONDS" -lt "$lock_wait_deadline" ] && lock_is_held "$lock_path"; do
+            sleep 0.1
+        done
+        if lock_is_held "$lock_path"; then
+            if [ "$kind" = store ]; then
+                owner="$(store_lock_pid || true)"
+            else
+                owner="$(orchestrator_pid || true)"
+            fi
+            error "$label PID $pid exited but $lock_path is still held by live PID ${owner:-unknown}; refusing unsafe removal"
+            return 1
+        fi
+    fi
+    if [ -n "$lock_path" ] && [ -f "$lock_path" ]; then
+        if ! clear_lock_metadata "$lock_path"; then
+            error "$label lock $lock_path changed ownership; refusing unsafe removal"
+            return 1
+        fi
+        if [ "$forced" -eq 1 ]; then
+            echo "Cleared stale $label lock metadata after confirmed process exit."
+        fi
     fi
     echo "$label stopped (PID $pid; $port_detail)."
 }
@@ -534,6 +606,7 @@ start_store() {
     esac
     echo "Starting state store on port $STORE_PORT..."
     rm -f "$STORE_STATUS_FILE"
+    rotate_log "$STORE_LOG"
     STORE_PORT="$STORE_PORT" nohup python3 -m uvicorn state_store.main:app \
         --host 0.0.0.0 --port "$STORE_PORT" --log-level warning > "$STORE_LOG" 2>&1 &
     pid=$!
@@ -580,6 +653,7 @@ start_orchestrator() {
         fi
         echo "Starting orchestrator..."
         rm -f "$ORCH_STATUS_FILE"
+        rotate_log "$ORCH_LOG"
         nohup python3 -m orchestrator.main > "$ORCH_LOG" 2>&1 &
         pid=$!
         for attempt in 1 2 3 4 5; do
