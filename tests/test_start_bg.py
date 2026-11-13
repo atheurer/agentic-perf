@@ -694,6 +694,7 @@ fcntl.flock(fd, fcntl.LOCK_EX)
 os.ftruncate(fd, 0)
 os.write(fd, str(os.getpid()).encode())
 os.fsync(fd)
+(folder / "orchestrator-ready").write_text(str(os.getpid()))
 time.sleep(30)
 '
             fi
@@ -723,17 +724,18 @@ time.sleep(30)
     )
     second: subprocess.Popen | None = None
     child_pid = 0
+    child_ready = home / "orchestrator-ready"
     status_path = home / "orchestrator-supervisor.status"
     try:
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             try:
+                launched_pid = int(child_ready.read_text())
                 child_pid = int((home / "orchestrator.pid").read_text())
-                status = json.loads(status_path.read_text())
             except (OSError, ValueError, json.JSONDecodeError):
                 time.sleep(0.05)
                 continue
-            if status.get("phase") == "running" and child_pid:
+            if launched_pid == child_pid:
                 break
             time.sleep(0.05)
         else:
@@ -751,7 +753,7 @@ time.sleep(30)
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if second.poll() is not None:
                 raise AssertionError("replacement supervisor exited")
@@ -765,9 +767,10 @@ time.sleep(30)
         else:
             raise AssertionError("replacement supervisor did not acquire its lock")
     finally:
-        if second is not None and second.poll() is None:
-            second.send_signal(signal.SIGTERM)
-            second.wait(timeout=5)
+        for process in (first, second):
+            if process is not None and process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=5)
         if child_pid:
             try:
                 os.kill(child_pid, signal.SIGTERM)
