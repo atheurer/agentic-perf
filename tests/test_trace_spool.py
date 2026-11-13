@@ -216,7 +216,11 @@ def test_outage_and_partial_batch_leave_unacknowledged_events_for_replay(
     client.spool.close()
 
 
-def test_critical_fails_closed_and_clean_close_drains(tmp_path) -> None:
+def test_critical_spools_and_proceeds_when_delivery_fails(tmp_path) -> None:
+    """record_critical spools and proceeds on delivery failure: the caller's
+    SSH mutation must not be treated as failed when only the audit trail
+    cannot be delivered (the #1336 fail-closed regression)."""
+
     def unavailable(_: httpx.Request) -> httpx.Response:
         return httpx.Response(503)
 
@@ -226,9 +230,14 @@ def test_critical_fails_closed_and_clean_close_drains(tmp_path) -> None:
         spool_dir=tmp_path,
         client=httpx.Client(transport=httpx.MockTransport(unavailable)),
     )
+    # Spools instead of raising — the mutation itself is unaffected.
+    client.record_critical(event())
+    # The spooled event survives on disk for later delivery.
+    assert len(list(client.spool.pending())) == 1
+    # close() attempts one final delivery; with the endpoint still down it
+    # raises, but the spooled event is retained for the next producer.
     with pytest.raises(TraceDeliveryError):
-        client.record_critical(event())
-    client.close()
+        client.close()
 
     delivered: list[str] = []
 

@@ -605,8 +605,23 @@ class ProvisioningAgent(AgentBase):
         if not isinstance(records, dict):
             records = {}
         lines = [f"**{labels.get(action, 'Kernel change')} result**"]
+        # The tool keys results by canonical host (an IP when the ticket
+        # maps FQDNs); the ticket lists FQDNs. Bridge via the requested_as
+        # map returned alongside the results (canonical -> caller string).
+        by_caller: dict[str, str] = {}
+        raw_map = result.get("requested_as")
+        if isinstance(raw_map, dict):
+            by_caller = {
+                caller: canonical
+                for canonical, caller in raw_map.items()
+                if isinstance(caller, str)
+            }
         for host in hosts:
             record = records.get(host)
+            if not isinstance(record, dict):
+                canonical = by_caller.get(host)
+                if canonical is not None:
+                    record = records.get(canonical)
             if not isinstance(record, dict):
                 outcome = "outcome not confirmed (no host result was returned)"
             else:
@@ -675,8 +690,15 @@ class ProvisioningAgent(AgentBase):
             else "**Temporary repository cleanup not confirmed**"
         )
         lines = [title]
+        # Cleanup records carry a per-record requested_as (canonical -> caller
+        # string); use it to bridge canonical-keyed results to FQDN hosts.
         for host in hosts:
             record = records.get(host)
+            if not isinstance(record, dict):
+                for val in records.values():
+                    if isinstance(val, dict) and val.get("requested_as", "") == host:
+                        record = val
+                        break
             if host in not_attempted_hosts:
                 outcome = (
                     "cleanup not attempted because an SSH write or reboot may "

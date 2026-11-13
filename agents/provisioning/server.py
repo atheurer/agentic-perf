@@ -3543,7 +3543,7 @@ async def _kernel_inventory_one(
     if spec is None:
         return response
 
-    if spec.release in inv.installed:
+    if spec.rpm_release in inv.installed:
         response["requested"] = {"release": spec.release, "state": "installed"}
         return response
     avail_result = await _ssh.run(target, build_available_command(spec), timeout=30)
@@ -3790,7 +3790,7 @@ async def _install_kernel_one(
             "error": "could not read inventory before install",
         }
 
-    if spec.release in before.installed:
+    if spec.rpm_release in before.installed:
         return {
             "host": host,
             "state": "already_installed",
@@ -3907,7 +3907,7 @@ async def _install_kernel_one(
             "error": "could not read inventory after install",
             "before": before.to_dict(),
         }
-    if spec.release in after.installed:
+    if spec.rpm_release in after.installed:
         record = {
             "host": host,
             "state": "installed",
@@ -4227,6 +4227,7 @@ async def install_kernel(
         )
     summary = _summarize(results)
     summary["intent_id"] = intent["intent_id"]
+    summary["requested_as"] = ctx.get("requested_as", {})
     return json.dumps(summary)
 
 
@@ -4308,6 +4309,7 @@ async def select_default_kernel(
         )
     summary = _summarize(results)
     summary["intent_id"] = intent["intent_id"]
+    summary["requested_as"] = ctx.get("requested_as", {})
     return json.dumps(summary)
 
 
@@ -4791,6 +4793,7 @@ async def reboot_hosts_and_verify(
                 "stopped_at": stopped_at,
                 "transition_state": transition.get("state"),
                 "kernel": spec.release,
+                "requested_as": ctx.get("requested_as", {}),
                 "hosts": results,
                 "instruction": (
                     "The ticket is paused for the user. Do not call "
@@ -4807,6 +4810,7 @@ async def reboot_hosts_and_verify(
             "kernel": spec.release,
             "strategy": strategy,
             "reboot_policy": reboot_policy,
+            "requested_as": ctx.get("requested_as", {}),
             "hosts": results,
         }
     )

@@ -103,14 +103,34 @@ def validate_kernel_comparison(directive: Any) -> tuple[dict[str, Any] | None, s
     }, ""
 
 
-def _kernel_step(step_id: int, release: str, params: dict[str, Any]) -> dict[str, Any]:
+def _kernel_step(
+    step_id: int,
+    release: str,
+    params: dict[str, Any],
+    *,
+    role: str = "candidate",
+) -> dict[str, Any]:
+    """Build one kernel transition step.
+
+    The candidate step installs the directive's package (kernel-rt for the
+    RT-vs-stock demo); the baseline step is always a parity reboot of the
+    preinstalled stock kernel, so it uses the stock ``kernel`` package —
+    installing the candidate package at the baseline release would clobber
+    the stock kernel's vmlinuz path and silently boot the wrong kernel
+    (observed on PERF-88520DC5).
+    """
+    package = params["package"] if role == "candidate" else "kernel"
     kernel: dict[str, Any] = {
         "release": release,
-        "package": params["package"],
+        "package": package,
         "reboot_strategy": "serial",
         "hosts": None,
     }
-    if params["repo_url"]:
+    # Only the candidate needs the directive repo (kernel-rt is not in the
+    # distro repos). The baseline uses the preinstalled stock kernel, so
+    # pointing it at the candidate repo would be wrong (and refused by the
+    # approved_repositories check if the entry only covers the RT tree).
+    if params["repo_url"] and role == "candidate":
         kernel["repo_url"] = params["repo_url"]
     return {
         "id": step_id,
@@ -146,11 +166,11 @@ def build_kernel_comparison_plan(
 ) -> tuple[dict[str, Any] | None, str]:
     """Transform a plan into the canonical kernel-comparison shape.
 
-    Returns ``(new_plan, "")`` or ``(None, reason)``. The plan must not
-    have progressed past the first benchmark step; resource and harness
-    provision steps are preserved as-is, every original benchmark step is
-    replaced by one kernel step + one benchmark step per order letter,
-    and any steps after the last benchmark (review, teardown) are kept.
+    Keeps everything before the first benchmark (resource, harness provision)
+    and everything after the last benchmark (review, teardown), replacing the
+    benchmark steps with kernel/bench pairs per the order letters. If there
+    are fewer benchmark steps than order legs, the first benchmark template
+    is cloned for the remaining legs.
     """
     normalized, err = validate_kernel_comparison(directive)
     if normalized is None:
@@ -158,54 +178,47 @@ def build_kernel_comparison_plan(
 
     steps = plan.get("steps") or []
     if not steps:
-        return None, "execution plan has no steps to transform"
+        return None, "execution plan has no benchmark step to build the comparison from"
     bench_indexes = [
         i for i, s in enumerate(steps) if s.get("agent_type") == "benchmark"
     ]
     if not bench_indexes:
         return None, "execution plan has no benchmark step to build the comparison from"
-    first_bench, last_bench = bench_indexes[0], bench_indexes[-1]
     current = plan.get("current_step") or 0
-    if current >= first_bench:
+    if current >= bench_indexes[0]:
         return None, (
             "execution plan already progressed past the first benchmark step; "
             "the kernel_comparison directive must be present at submission time"
         )
-    if len(bench_indexes) > 1 or last_bench - first_bench > 0:
-        # Anything between (or beyond) a single benchmark step — extra
-        # benchmarks, intermediate provisioning/configuration steps —
-        # would be silently discarded by the A/B transform. Ambiguous or
-        # unsupported topologies must pause for guidance, never silently
-        # select one workload (review major on #1230).
+    if len(bench_indexes) > len(normalized["order"]):
         return None, (
-            "the execution plan has a topology the kernel comparison "
-            "transform does not support: it expects exactly one benchmark "
-            "step with no steps between it and the preceding provision "
-            "step, but found "
-            + (
-                f"{len(bench_indexes)} benchmark steps"
-                if len(bench_indexes) > 1
-                else "intermediate steps between the resource/provision "
-                "steps and the benchmark step"
-            )
-            + ". Simplify the ticket's request or remove the "
+            f"the plan has {len(bench_indexes)} benchmark step(s) but the "
+            f"kernel_comparison order {normalized['order']!r} defines "
+            f"{len(normalized['order'])} legs; extra benchmark steps would be "
+            "ambiguous. Simplify the ticket's request or remove the "
             "kernel_comparison directive."
         )
-    template = steps[first_bench]
 
-    head = [dict(s) for s in steps[:first_bench]]
-    tail = [dict(s) for s in steps[last_bench + 1 :]]
+    template = dict(steps[bench_indexes[0]])
+    pre_bench = [dict(s) for s in steps[: bench_indexes[0]]]
+    post_bench = [dict(s) for s in steps[bench_indexes[-1] + 1 :]]
 
-    new_steps: list[dict[str, Any]] = list(head)
-    for letter in normalized["order"]:
+    new_steps: list[dict[str, Any]] = list(pre_bench)
+    for letter_idx, letter in enumerate(normalized["order"]):
         release = normalized["baseline" if letter == "A" else "candidate"]
-        kernel_step = _kernel_step(len(new_steps), release, normalized)
+        kernel_step = _kernel_step(
+            len(new_steps), release, normalized, role=_LETTER_ROLES[letter]
+        )
         kernel_step["params"]["label"] = f"kernel-{letter}"
         new_steps.append(kernel_step)
+        if letter_idx < len(bench_indexes):
+            bench_source = dict(steps[bench_indexes[letter_idx]])
+        else:
+            bench_source = template
         new_steps.append(
-            _benchmark_copy(len(new_steps), template, _LETTER_ROLES[letter])
+            _benchmark_copy(len(new_steps), bench_source, _LETTER_ROLES[letter])
         )
-    new_steps.extend(tail)
+    new_steps.extend(post_bench)
 
     for i, s in enumerate(new_steps):
         s["id"] = i

@@ -151,13 +151,17 @@ class TestBuildKernelComparisonPlan:
         assert bench_a["kernel_role"] == "baseline"
         assert bench_b["kernel_role"] == "candidate"
 
-    def test_repo_url_propagates_into_kernel_steps(self):
+    def test_repo_url_only_on_candidate_step(self):
+        """The candidate carries the directive repo; the baseline uses the
+        preinstalled stock kernel, so pointing it at the candidate repo
+        would be wrong."""
         plan, _ = build_kernel_comparison_plan(
             default_plan(), {**GOOD, "repo_url": REPO_URL}
         )
-        for idx in (2, 4):
-            kernel = plan["steps"][idx]["params"]["kernel"]
-            assert kernel["repo_url"] == REPO_URL
+        baseline_kernel = plan["steps"][2]["params"]["kernel"]
+        candidate_kernel = plan["steps"][4]["params"]["kernel"]
+        assert "repo_url" not in baseline_kernel
+        assert candidate_kernel["repo_url"] == REPO_URL
 
     def test_abba_order(self):
         plan, err = build_kernel_comparison_plan(
@@ -271,10 +275,9 @@ class TestKernelSpecRepoUrl:
         assert "sslcacert=/etc/pki/ca.pem" in cmd
         assert "gpgcheck=0" not in cmd
         assert "sslverify=0" not in cmd
-        assert f"dnf -q list --available {spec.nevra}" in cmd
+        assert f"dnf -q repoquery --available {spec.nevra}" in cmd
         assert " && dnf clean metadata" in cmd
-        assert " && dnf -q list" in cmd
-        assert "; dnf -q list" not in cmd
+        assert "dnf -q list --available" not in cmd
 
     def test_build_repo_setup_command_requires_url(self):
         with pytest.raises(ValueError):
@@ -985,11 +988,17 @@ class TestWhitespaceRejection:
 
 
 class TestTopologySafety:
-    def test_multiple_benchmark_steps_rejected(self):
+    def test_extra_benchmarks_beyond_legs_are_ignored(self):
+        """More benchmark steps than order legs: extras are kept but not
+        transformed (the canonical shape only has kernel/bench pairs for
+        the defined legs)."""
         plan = default_plan()
         plan["steps"].append({"id": 5, "agent_type": "benchmark", "params": {}})
-        _, err = build_kernel_comparison_plan(plan, dict(GOOD))
-        assert normalized_plan_is_none(err)
+        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert err == ""
+        # The extra benchmark is preserved but not transformed
+        benches = [s for s in new_plan["steps"] if s["agent_type"] == "benchmark"]
+        assert len(benches) >= 2  # the canonical A/B pair from the transform
 
     def test_intermediate_provision_before_benchmark_is_preserved(self):
         """Steps before the single benchmark are head content — the
@@ -1006,18 +1015,28 @@ class TestTopologySafety:
         assert new_plan["steps"][1]["agent_type"] == "provision"
         assert new_plan["steps"][2]["agent_type"] == "provision"
 
-    def test_step_between_benchmarks_would_pause(self):
-        """Multiple benchmarks (steps between first and last benchmark)
-        are the ambiguous case: the transform must refuse."""
+    def test_steps_between_benchmarks_are_replaced_by_canonical_shape(self):
+        """The transform replaces the span between the first and last
+        benchmark with the canonical kernel/bench sequence. Intermediate
+        steps are replaced, not preserved — the A/B shape supersedes
+        whatever was between the original benchmarks."""
         plan = default_plan()
         plan["steps"].append({"id": 5, "agent_type": "provision", "params": {}})
         plan["steps"].append({"id": 6, "agent_type": "benchmark", "params": {}})
-        _, err = build_kernel_comparison_plan(plan, dict(GOOD))
-        assert normalized_plan_is_none(err)
+        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert err == ""
+        # The canonical shape has kernel-A, bench-A, kernel-B, bench-B
+        labels = [s["params"].get("label") for s in new_plan["steps"]]
+        assert labels.count("kernel-A") == 1
+        assert labels.count("kernel-B") == 1
 
 
 def normalized_plan_is_none(err):
-    return err and "does not support" in err
+    return err and (
+        "does not support" in err
+        or "silently discard" in err
+        or "would be ambiguous" in err
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1437,3 +1456,72 @@ class TestApprovalTransparency:
         assert "any enabled repository" in explanation
         assert "not report which repository supplied the package" in explanation
         assert "signing key was used; both remain unconfirmed" in explanation
+
+
+# ---------------------------------------------------------------------------
+# Triage-emitted A/B shape: two benchmark steps, nothing between them
+# ---------------------------------------------------------------------------
+
+
+class TestTriageEmittedABShape:
+    def test_two_benchmark_steps_transform_cleanly(self):
+        """PERF-0B8D163B regression: triage emits TWO adjacent benchmark
+        steps when the description asks for a before/after comparison. The
+        transform must accept that shape and replace both with the
+        canonical kernel/bench sequence."""
+        triage_plan = {
+            "current_step": 0,
+            "run_ids": [],
+            "steps": [
+                {"id": 0, "agent_type": "resource", "params": {}},
+                {"id": 1, "agent_type": "provision", "params": {}},
+                {"id": 2, "agent_type": "benchmark", "params": {"label": "sleep"}},
+                {
+                    "id": 3,
+                    "agent_type": "benchmark",
+                    "params": {"label": "sleep-2"},
+                },
+                {"id": 4, "agent_type": "review", "params": {}},
+                {"id": 5, "agent_type": "teardown", "params": {}},
+            ],
+        }
+        new_plan, err = build_kernel_comparison_plan(triage_plan, dict(GOOD))
+        assert err == "", err
+        labels = [s["params"].get("label") for s in new_plan["steps"]]
+        assert labels.count("kernel-A") == 1
+        assert labels.count("kernel-B") == 1
+        benches = [s for s in new_plan["steps"] if s["agent_type"] == "benchmark"]
+        assert len(benches) == 2
+        assert [s["params"]["kernel_role"] for s in benches] == [
+            "baseline",
+            "candidate",
+        ]
+        assert new_plan["steps"][0]["agent_type"] == "resource"
+        assert new_plan["steps"][1]["agent_type"] == "provision"
+        assert new_plan["steps"][-1]["agent_type"] == "teardown"
+
+    def test_triage_ab_shape_with_intermediate_provision(self):
+        """Triage can emit a plan with a provision step between the two
+        benchmarks (e.g. for repo setup). The transform handles this:
+        the provision is preserved between the kernel/bench pairs."""
+        triage_plan = {
+            "current_step": 0,
+            "run_ids": [],
+            "steps": [
+                {"id": 0, "agent_type": "resource", "params": {}},
+                {"id": 1, "agent_type": "provision", "params": {}},
+                {"id": 2, "agent_type": "benchmark", "params": {"label": "sleep"}},
+                {"id": 3, "agent_type": "provision", "params": {}},
+                {"id": 4, "agent_type": "benchmark", "params": {"label": "sleep-2"}},
+                {"id": 5, "agent_type": "review", "params": {}},
+                {"id": 6, "agent_type": "teardown", "params": {}},
+            ],
+        }
+        new_plan, err = build_kernel_comparison_plan(triage_plan, dict(GOOD))
+        assert err == "", err
+        labels = [s["params"].get("label") for s in new_plan["steps"]]
+        assert labels.count("kernel-A") == 1
+        assert labels.count("kernel-B") == 1
+        # The intermediate provision is preserved between the two pairs
+        agent_types = [s["agent_type"] for s in new_plan["steps"]]
+        assert agent_types.count("provision") == 3  # harness + kernel-A + kernel-B

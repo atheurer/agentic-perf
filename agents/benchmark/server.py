@@ -411,6 +411,16 @@ async def _persist_validated_runfile(
                     },
                 )
                 if response.status_code != 409:
+                    if response.status_code >= 400:
+                        # Surface the store's rejection reason: a silent
+                        # raise_for_status here cost hours of debugging
+                        # (the 422 'execution plan fingerprint does not
+                        # match' rejection was invisible in the logs).
+                        logger.warning(
+                            "[benchmark] validation persist rejected with %s: %s",
+                            response.status_code,
+                            response.text[:300],
+                        )
                     response.raise_for_status()
                     break
                 ticket_response = await client.get(
@@ -427,7 +437,7 @@ async def _persist_validated_runfile(
         )
         return validation_id
     except Exception:
-        logger.debug(
+        logger.warning(
             "Failed to persist benchmark validation for %s",
             ticket_id,
             exc_info=True,
@@ -2930,6 +2940,26 @@ def plan_step_params(ticket: dict[str, Any]) -> dict[str, Any] | None:
     return (step or {}).get("params") or None
 
 
+def _normalize_plan_mv_params(plan_mv_params):
+    """Normalize the plan step's mv_params to the {arg: vals} dict form.
+
+    Triage emits mv_params as a list of {arg, vals} objects (the run-file
+    shape); the drift check compares them as a dict. Accept both — the
+    list form crashed the drift check with "'list' object has no attribute
+    'items'" and blocked every comparison run driven by triage-emitted
+    plans (PERF-265B06A2).
+    """
+    if isinstance(plan_mv_params, dict):
+        return plan_mv_params
+    if isinstance(plan_mv_params, list):
+        normalized = {}
+        for entry in plan_mv_params:
+            if isinstance(entry, dict) and entry.get("arg"):
+                normalized[str(entry["arg"])] = entry.get("vals")
+        return normalized
+    return {}
+
+
 def _check_plan_mv_params(
     ticket: dict[str, Any],
     run_file: dict[str, Any] | None,
@@ -2949,7 +2979,7 @@ def _check_plan_mv_params(
     # Harness-neutral: the run file under execution is passed in
     # directly (from the validation record for crucible, or the
     # caller-supplied file for generic adapters).
-    plan_mv_params = plan_mv_params or {}
+    plan_mv_params = _normalize_plan_mv_params(plan_mv_params)
     if not plan_mv_params and not enforce_no_extras:
         return ""
     run_file = run_file or {}
@@ -5420,6 +5450,33 @@ async def validate_benchmark(
         )
         output = (result.stdout or "").strip()
         if result.exit_code == 0:
+            # Re-read the ticket: the plan may have been corrected since this
+            # MCP server process started (e.g. an operator fixing an interface
+            # override). Computing the fingerprint from a cached _ticket would
+            # mint a validation bound to a stale plan and fail persistence
+            # forever (observed on PERF-8C8B42B6).
+            global _ticket
+            try:
+                _tid = ticket_id or os.environ.get("TICKET_ID", "")
+                if _tid:
+                    from agents.server_utils import ticket_state_headers
+                    from providers.execution.http import AuditedAsyncHTTPClient
+
+                    async with AuditedAsyncHTTPClient(
+                        timeout=15.0, headers=ticket_state_headers()
+                    ) as _client:
+                        _store = os.environ.get(
+                            "STATE_STORE_URL", "http://localhost:8090"
+                        )
+                        _resp = await _client.get(f"{_store}/api/v1/tickets/{_tid}")
+                        _resp.raise_for_status()
+                        _ticket = _resp.json()
+            except Exception:
+                logger.warning(
+                    "[benchmark] could not refresh the ticket before "
+                    "validation persist; using the cached copy",
+                    exc_info=True,
+                )
             fields = _ticket.get("custom_fields", {}) if _ticket else {}
             params_fingerprint = _compute_params_fingerprint(fields)
             execution_plan_fingerprint = _execution_plan_fingerprint(fields)

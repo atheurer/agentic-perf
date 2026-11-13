@@ -358,6 +358,13 @@ class AgentMCPClient:
             "STATE_STORE_URL": state_store_url,
             "AGENT_NAME": agent_name,
         }
+        # The API token is required for mutating-audit paths inside the
+        # server (the SSH executor builds its trace recorder from it) —
+        # without it, every mutating SSH command in ticket MCP servers
+        # fails closed (#1336).
+        api_token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        if api_token:
+            required["AGENTIC_PERF_API_TOKEN"] = api_token
         if agent_name == "benchmark-agent":
             from state_store.auth import read_validator_token_from_file
 
