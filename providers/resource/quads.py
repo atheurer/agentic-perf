@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from .base import ResourceProvider
+from .quads_progress import QuadsProgressReporter
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +389,15 @@ class QuadsResourceProvider(ResourceProvider):
             f"cloud={assignment['cloud_name']}"
         )
 
+        reporter = QuadsProgressReporter(
+            self._client,
+            ticket_key,
+            assignment["id"],
+            assignment["cloud_name"],
+            hostnames,
+        )
+        await reporter.assignment_created()
+
         scheduled = []
         for hostname in hostnames:
             logger.info(
@@ -401,7 +411,9 @@ class QuadsResourceProvider(ResourceProvider):
         logger.info(
             f"[quads-provider] Waiting for validation of assignment {assignment['id']}..."
         )
-        await self._client.poll_until_validated(assignment["id"])
+        await self._client.poll_until_validated(
+            assignment["id"], progress_callback=reporter
+        )
         logger.info(f"[quads-provider] Assignment {assignment['id']} validated")
 
         logger.info(f"[quads-provider] Setting up SSH access to {len(hostnames)} hosts")
@@ -433,7 +445,7 @@ class QuadsResourceProvider(ResourceProvider):
         return {
             "provider": self.provider_name,
             "reservation_id": reservation_id,
-            "ready": status.get("validated", False),
+            "ready": status.get("validated") is True,
             "details": status,
         }
 

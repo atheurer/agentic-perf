@@ -215,6 +215,12 @@ class TestResourceProviderRegistry:
 
 
 class TestQuadsResourceProvider:
+    @pytest.fixture(autouse=True)
+    def isolate_ticket_progress(self, monkeypatch):
+        monkeypatch.setattr(
+            "providers.resource.quads_progress.tool_progress", AsyncMock()
+        )
+
     @pytest.mark.asyncio
     async def test_check_available(self):
         from providers.resource.quads import QuadsResourceProvider
