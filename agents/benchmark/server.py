@@ -2940,6 +2940,26 @@ def plan_step_params(ticket: dict[str, Any]) -> dict[str, Any] | None:
     return (step or {}).get("params") or None
 
 
+def _normalize_plan_mv_params(plan_mv_params):
+    """Normalize the plan step's mv_params to the {arg: vals} dict form.
+
+    Triage emits mv_params as a list of {arg, vals} objects (the run-file
+    shape); the drift check compares them as a dict. Accept both — the
+    list form crashed the drift check with "'list' object has no attribute
+    'items'" and blocked every comparison run driven by triage-emitted
+    plans (PERF-265B06A2).
+    """
+    if isinstance(plan_mv_params, dict):
+        return plan_mv_params
+    if isinstance(plan_mv_params, list):
+        normalized = {}
+        for entry in plan_mv_params:
+            if isinstance(entry, dict) and entry.get("arg"):
+                normalized[str(entry["arg"])] = entry.get("vals")
+        return normalized
+    return {}
+
+
 def _check_plan_mv_params(
     ticket: dict[str, Any],
     run_file: dict[str, Any] | None,
@@ -2959,7 +2979,7 @@ def _check_plan_mv_params(
     # Harness-neutral: the run file under execution is passed in
     # directly (from the validation record for crucible, or the
     # caller-supplied file for generic adapters).
-    plan_mv_params = plan_mv_params or {}
+    plan_mv_params = _normalize_plan_mv_params(plan_mv_params)
     if not plan_mv_params and not enforce_no_extras:
         return ""
     run_file = run_file or {}
