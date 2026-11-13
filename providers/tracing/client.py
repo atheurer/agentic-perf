@@ -56,6 +56,7 @@ class TraceClient:
         }
         self._closed = False
         self._flush_state_lock = threading.Lock()
+        self._flush_run_lock = threading.Lock()
         self._flush_thread: threading.Thread | None = None
         self._resources_closed = False
         self._resource_close_lock = threading.Lock()
@@ -140,20 +141,20 @@ class TraceClient:
         return int(value)
 
     def _flush_until_deadline(self, deadline: float | None) -> int:
+        with self._flush_run_lock:
+            return self._flush_locked(deadline)
+
+    def _flush_locked(self, deadline: float | None) -> int:
         delivered = 0
 
         def check_cancelled() -> None:
             _check_deadline(deadline)
 
         try:
-            batch: list[tuple[int, TraceEventV1]] = []
-            for item in self.spool.pending(check_cancelled=check_cancelled):
-                batch.append(item)
-                if len(batch) == 100:
-                    check_cancelled()
-                    delivered += self._send_batch(batch, deadline=deadline)
-                    batch = []
-            if batch:
+            while True:
+                batch = self.spool.pending_batch(100, check_cancelled=check_cancelled)
+                if not batch:
+                    break
                 check_cancelled()
                 delivered += self._send_batch(batch, deadline=deadline)
             self.spool.compact(check_cancelled=check_cancelled)

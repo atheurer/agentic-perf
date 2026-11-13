@@ -15,6 +15,8 @@ from typing import Callable, Iterable
 
 from .models import TraceEventV1
 
+MAX_SEQUENCE_GAPS = 10_000
+
 
 @dataclass(frozen=True)
 class TraceQuery:
@@ -66,11 +68,18 @@ def _json_dumps(
     indent: int | None = None,
     separators: tuple[str, str] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    max_bytes: int | None = None,
 ) -> str:
     encoder = json.JSONEncoder(indent=indent, separators=separators)
     fragments: list[str] = []
+    total_bytes = 0
     for fragment in encoder.iterencode(value):
         _check_cancelled(cancelled)
+        total_bytes += len(fragment.encode("utf-8"))
+        if max_bytes is not None and total_bytes > max_bytes:
+            raise TraceQueryTooBroad(
+                "trace response is too broad; narrow the query or reduce its limit"
+            )
         fragments.append(fragment)
     return "".join(fragments)
 
@@ -242,8 +251,11 @@ def diagnostics(
     events: Iterable[TraceEventV1],
     *,
     cancelled: Callable[[], bool] | None = None,
+    max_sequence_gaps: int = MAX_SEQUENCE_GAPS,
 ) -> dict[str, object]:
     """Report incomplete causal data without inventing relationships."""
+    if max_sequence_gaps < 0:
+        raise ValueError("max_sequence_gaps must be non-negative")
     values: list[TraceEventV1] = []
     for event in events:
         _check_cancelled(cancelled)
@@ -260,15 +272,14 @@ def diagnostics(
             seqs.append(event.ticket_seq)
     missing = sorted({parent for parent in parents.values() if parent not in ids})
     seqs.sort()
-    gaps = [
-        number
-        for left, right in zip(seqs, seqs[1:])
-        for number in range(left + 1, right)
-    ]
+    gaps, gaps_truncated = _sequence_gaps(
+        seqs, max_gaps=max_sequence_gaps, cancelled=cancelled
+    )
     return {
         "missing_parents": missing,
         "cycles": _causal_cycles(parents, cancelled=cancelled),
         "sequence_gaps": gaps,
+        "sequence_gaps_truncated": gaps_truncated,
         "unmatched_lifecycle_pairs": _unmatched_pairs(values, cancelled=cancelled),
         "indeterminate_operations": sorted(
             event.action_id
@@ -278,6 +289,22 @@ def diagnostics(
             and event.outcome.value == "indeterminate"
         ),
     }
+
+
+def _sequence_gaps(
+    seqs: list[int],
+    *,
+    max_gaps: int,
+    cancelled: Callable[[], bool] | None = None,
+) -> tuple[list[int], bool]:
+    gaps: list[int] = []
+    for left, right in zip(seqs, seqs[1:]):
+        _check_cancelled(cancelled)
+        for number in range(left + 1, right):
+            if len(gaps) >= max_gaps:
+                return gaps, True
+            gaps.append(number)
+    return gaps, False
 
 
 def _causal_cycles(
@@ -357,24 +384,36 @@ def export_events(
     format: str = "json",
     *,
     cancelled: Callable[[], bool] | None = None,
+    max_bytes: int | None = None,
 ) -> str:
     """Serialize events as JSON, newline-delimited JSON, or a compact CSV."""
-    rows: list[dict[str, object]] = []
-    for event in events:
-        _check_cancelled(cancelled)
-        rows.append(event.model_dump(mode="json"))
     if format == "json":
-        return _json_dumps(rows, indent=2, cancelled=cancelled)
-    if format == "jsonl":
-        output: list[str] = []
-        for row in rows:
+        rows: list[dict[str, object]] = []
+        for event in events:
             _check_cancelled(cancelled)
-            output.append(
-                _json_dumps(row, separators=(",", ":"), cancelled=cancelled) + "\n"
+            rows.append(event.model_dump(mode="json"))
+        return _json_dumps(rows, indent=2, cancelled=cancelled, max_bytes=max_bytes)
+    if format == "jsonl":
+        fragments: list[str] = []
+        total_bytes = 0
+        for event in events:
+            _check_cancelled(cancelled)
+            row = event.model_dump(mode="json")
+            remaining = None if max_bytes is None else max_bytes - total_bytes
+            encoded = _json_dumps(
+                row,
+                separators=(",", ":"),
+                cancelled=cancelled,
+                max_bytes=remaining,
             )
-        return "".join(output)
+            total_bytes = _append_export_fragment(
+                fragments, encoded, total_bytes, max_bytes, cancelled=cancelled
+            )
+            total_bytes = _append_export_fragment(
+                fragments, "\n", total_bytes, max_bytes, cancelled=cancelled
+            )
+        return "".join(fragments)
     if format == "csv":
-        output = io.StringIO()
         fields = [
             "global_seq",
             "ticket_id",
@@ -386,10 +425,18 @@ def export_events(
             "outcome",
             "occurred_at",
         ]
-        writer = csv.DictWriter(output, fieldnames=fields)
+        fragments: list[str] = []
+        header = io.StringIO()
+        writer = csv.DictWriter(header, fieldnames=fields)
         writer.writeheader()
-        for row in rows:
+        total_bytes = _append_export_fragment(
+            fragments, header.getvalue(), 0, max_bytes, cancelled=cancelled
+        )
+        for event in events:
             _check_cancelled(cancelled)
+            row = event.model_dump(mode="json")
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=fields)
             writer.writerow(
                 {
                     "global_seq": row.get("global_seq"),
@@ -403,8 +450,33 @@ def export_events(
                     "occurred_at": row.get("occurred_at"),
                 }
             )
-        return output.getvalue()
+            total_bytes = _append_export_fragment(
+                fragments,
+                output.getvalue(),
+                total_bytes,
+                max_bytes,
+                cancelled=cancelled,
+            )
+        return "".join(fragments)
     raise ValueError("format must be json, jsonl, or csv")
+
+
+def _append_export_fragment(
+    fragments: list[str],
+    fragment: str,
+    total_bytes: int,
+    max_bytes: int | None,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> int:
+    _check_cancelled(cancelled)
+    next_total = total_bytes + len(fragment.encode("utf-8"))
+    if max_bytes is not None and next_total > max_bytes:
+        raise TraceQueryTooBroad(
+            "trace export is too broad; narrow the query or reduce its limit"
+        )
+    fragments.append(fragment)
+    return next_total
 
 
 def export_manifest(

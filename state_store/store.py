@@ -2599,9 +2599,9 @@ class TicketStore:
             if expires.tzinfo is None:
                 expires = expires.replace(tzinfo=timezone.utc)
         except (KeyError, TypeError, ValueError):
-            self.reject_claim_fence(
-                ticket_id, "claim_malformed", "ticket claim expiry is malformed"
-            )
+            # A malformed claim cannot authorize an agent mutation. Let the
+            # active leader clear it instead of blocking the ticket forever.
+            return
         if expires <= self._lease_now():
             return
         if any(key in claim for key in ("session_id", "epoch", "claim_id")) and (
@@ -2613,9 +2613,7 @@ class TicketStore:
             or not isinstance(claim.get("claim_id"), str)
             or not claim["claim_id"]
         ):
-            self.reject_claim_fence(
-                ticket_id, "claim_malformed", "ticket claim identity is malformed"
-            )
+            return
         # A claim from a deposed session is already fenced by the lease. A live
         # current claim (including legacy claims without identity) must finish
         # before recovery can change its ticket.

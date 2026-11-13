@@ -439,7 +439,7 @@ def test_sigterm_uses_asyncio_shutdown_path():
 
 
 @pytest.mark.asyncio
-async def test_cancelled_lease_renewal_releases_leader_lease():
+async def test_cancelled_lease_renewal_leaves_release_to_dispatcher_cleanup():
     lease = _RenewalLease(["hang"])
     lost = []
     task = asyncio.create_task(
@@ -451,19 +451,19 @@ async def test_cancelled_lease_renewal_releases_leader_lease():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert lease.cancelled
-    assert lease.released == 1
+    assert lease.released == 0
     assert lost == []
 
 
 @pytest.mark.asyncio
-async def test_failed_lease_renewal_deposes_and_releases_immediately():
+async def test_failed_lease_renewal_deposes_without_releasing_first():
     lease = _RenewalLease([RuntimeError("programming error")])
     lost = []
     with pytest.raises(RuntimeError, match="orchestrator leader lease lost"):
         await _renew_leader_lease(lease, 0, on_lost=lambda: lost.append(True))
 
     assert len(lease.attempts) == 1
-    assert lease.released == 1
+    assert lease.released == 0
     assert lost == [True]
 
 
@@ -485,7 +485,7 @@ async def test_transient_lease_failure_retries_at_backoff_and_recovers():
     assert 0.05 <= retry_delay < 0.3
     assert len(lease.attempts) == 2
     assert lost == []
-    assert lease.released == 1
+    assert lease.released == 0
 
 
 @pytest.mark.asyncio
@@ -503,7 +503,7 @@ async def test_transient_failures_do_not_lose_lease_before_ttl():
         await task
 
     assert len(lease.attempts) == 5
-    assert lease.released == 1
+    assert lease.released == 0
 
 
 @pytest.mark.asyncio
@@ -596,9 +596,10 @@ async def test_deposed_claim_is_reconciled_to_explicit_guidance(
         },
     ]
 
-    blocked = await _reconcile_deposed_claims("http://store", tickets)
+    blocked, failed = await _reconcile_deposed_claims("http://store", tickets)
 
     assert blocked == {"PERF-old"}
+    assert failed == set()
     assert [call[0] for call in calls] == ["patch", "post", "patch"]
     assert calls[0][2]["fields"][DEPOSED_CLAIM_RECONCILIATION_FIELD]["status"] == (
         "pending"
@@ -663,14 +664,226 @@ async def test_closed_ticket_clears_deposed_claim_without_guidance_transition(
         },
     }
 
-    blocked = await _reconcile_deposed_claims("http://store", [ticket])
+    blocked, failed = await _reconcile_deposed_claims("http://store", [ticket])
 
     assert blocked == {"PERF-closed"}
+    assert failed == set()
     assert [call[0] for call in calls] == ["patch"]
     assert calls[0][2]["fields"]["claim"] is None
     assert calls[0][2]["fields"][DEPOSED_CLAIM_RECONCILIATION_FIELD]["status"] == (
         "reconciled"
     )
+
+
+@pytest.mark.asyncio
+async def test_deposed_retrospective_claim_is_closed_before_claim_clear(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", str(uuid4()))
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "10")
+    calls: list[tuple[str, str, dict]] = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            calls.append(("patch", url, json))
+            return Response()
+
+        async def post(self, url, *, json):
+            calls.append(("post", url, json))
+            return Response()
+
+    monkeypatch.setattr("orchestrator.main.AuditedAsyncHTTPClient", Client)
+    ticket = {
+        "id": "PERF-retro",
+        "status": "retrospective_pending",
+        "custom_fields": {
+            "claim": {
+                "claim_id": "claim-old",
+                "session_id": str(uuid4()),
+                "epoch": 4,
+                "expires": (
+                    datetime.now(timezone.utc) - timedelta(minutes=1)
+                ).isoformat(),
+            }
+        },
+    }
+
+    blocked, failed = await _reconcile_deposed_claims("http://store", [ticket])
+
+    assert blocked == {"PERF-retro"}
+    assert failed == set()
+    assert [call[0] for call in calls] == ["post", "patch"]
+    assert calls[0][2]["status"] == "closed"
+    assert calls[1][2]["fields"]["claim"] is None
+    assert calls[1][2]["fields"][DEPOSED_CLAIM_RECONCILIATION_FIELD]["status"] == (
+        "reconciled"
+    )
+
+
+@pytest.mark.asyncio
+async def test_retrospective_claim_clear_failure_remains_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", str(uuid4()))
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "10")
+
+    class Response:
+        def __init__(self, status_code: int = 200):
+            self.status_code = status_code
+            self.text = "unavailable" if status_code >= 400 else ""
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, _url, *, json):
+            return Response(503)
+
+        async def post(self, _url, *, json):
+            return Response()
+
+    monkeypatch.setattr("orchestrator.main.AuditedAsyncHTTPClient", Client)
+    ticket = {
+        "id": "PERF-retro",
+        "status": "retrospective_pending",
+        "custom_fields": {
+            "claim": {
+                "claim_id": "claim-old",
+                "session_id": str(uuid4()),
+                "epoch": 4,
+                "expires": (
+                    datetime.now(timezone.utc) - timedelta(minutes=1)
+                ).isoformat(),
+            }
+        },
+    }
+
+    blocked, failed = await _reconcile_deposed_claims("http://store", [ticket])
+
+    assert blocked == {"PERF-retro"}
+    assert failed == {"PERF-retro"}
+
+
+@pytest.mark.asyncio
+async def test_closed_ticket_reconciliation_failure_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", str(uuid4()))
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "10")
+
+    class Response:
+        status_code = 503
+        text = "temporarily unavailable"
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, _url, *, json):
+            return Response()
+
+    monkeypatch.setattr("orchestrator.main.AuditedAsyncHTTPClient", Client)
+    ticket = {
+        "id": "PERF-closed",
+        "status": "closed",
+        "custom_fields": {
+            "claim": {
+                "claim_id": "claim-old",
+                "session_id": str(uuid4()),
+                "epoch": 4,
+                "expires": (
+                    datetime.now(timezone.utc) - timedelta(minutes=1)
+                ).isoformat(),
+            }
+        },
+    }
+
+    blocked, failed = await _reconcile_deposed_claims("http://store", [ticket])
+
+    assert blocked == {"PERF-closed"}
+    assert failed == {"PERF-closed"}
+
+
+@pytest.mark.parametrize("claim_kind", ["bad_expiry", "bad_epoch", "string", "list"])
+@pytest.mark.asyncio
+async def test_closed_ticket_reconciles_malformed_claim(
+    monkeypatch: pytest.MonkeyPatch, claim_kind: str
+):
+    session_id = str(uuid4())
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", session_id)
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "10")
+    calls = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def patch(self, url, *, json):
+            calls.append((url, json))
+            return Response()
+
+    monkeypatch.setattr("orchestrator.main.AuditedAsyncHTTPClient", Client)
+    if claim_kind == "string":
+        claim = "corrupt"
+    elif claim_kind == "list":
+        claim = ["corrupt"]
+    else:
+        claim = {
+            "claim_id": "claim-old",
+            "session_id": session_id,
+            "epoch": 10,
+            "expires": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        }
+        claim["expires" if claim_kind == "bad_expiry" else "epoch"] = (
+            "unknown" if claim_kind == "bad_expiry" else "bad"
+        )
+    ticket = {
+        "id": "PERF-closed",
+        "status": "closed",
+        "custom_fields": {"claim": claim},
+    }
+
+    blocked, failed = await _reconcile_deposed_claims("http://store", [ticket])
+
+    assert blocked == {"PERF-closed"}
+    assert failed == set()
+    assert len(calls) == 1
+    assert calls[0][1]["fields"]["claim"] is None
 
 
 def test_reconciliation_marker_is_not_agent_progress():
@@ -709,7 +922,7 @@ async def test_local_renewal_timeout_consumes_retry_budget(caplog):
 
     assert len(lease.attempts) == 2
     assert lost == []
-    assert lease.released == 1
+    assert lease.released == 0
     assert "transient failure 1" in caplog.text
     assert "TimeoutError" in caplog.text
 
@@ -739,7 +952,7 @@ async def test_httpx_transport_errors_are_retryable(error_type):
 
     assert len(lease.attempts) == 2
     assert lost == []
-    assert lease.released == 1
+    assert lease.released == 0
 
 
 @pytest.mark.parametrize("status_code", [408, 425, 429, 500, 503])
@@ -758,7 +971,7 @@ async def test_http_transient_status_lease_renewal_is_retryable(status_code: int
 
     assert len(lease.attempts) == 2
     assert lost == []
-    assert lease.released == 1
+    assert lease.released == 0
 
 
 @pytest.mark.parametrize("status_code", [401, 403, 409, 410])
@@ -772,7 +985,7 @@ async def test_http_rejection_lease_renewal_fails_immediately(status_code: int):
 
     assert len(lease.attempts) == 1
     assert lost == [True]
-    assert lease.released == 1
+    assert lease.released == 0
 
 
 @pytest.mark.asyncio
@@ -789,7 +1002,7 @@ async def test_transient_failures_retry_until_confirmed_deadline():
 
     assert len(lease.attempts) > 3
     assert lost == [True]
-    assert lease.released == 1
+    assert lease.released == 0
 
 
 @pytest.mark.asyncio
@@ -808,7 +1021,7 @@ async def test_hung_renewal_is_cancelled_before_confirmed_deadline():
     assert len(lease.attempts) > 1
     assert lease.cancelled
     assert lost_at[0] < deadline
-    assert lease.released == 1
+    assert lease.released == 0
 
 
 @pytest.mark.asyncio
@@ -867,7 +1080,7 @@ async def test_slow_success_schedules_another_attempt_before_confirmed_deadline(
     assert delayed_recovery_logs == [True]
     assert lease.cancelled
     assert lost == []
-    assert lease.released == 1
+    assert lease.released == 0
 
 
 class _PollLoopLease:
@@ -931,7 +1144,7 @@ async def test_dispatcher_receives_lease_before_first_poll_request(
     phases = []
     closed_ticket = {"id": "PERF-closed", "status": "closed", "custom_fields": {}}
     fetch_closed = AsyncMock(return_value=[closed_ticket])
-    reconcile_claims = AsyncMock(return_value=set())
+    reconcile_claims = AsyncMock(return_value=(set(), set()))
 
     class Lease(_PollLoopLease):
         async def renew(self):
@@ -1148,6 +1361,137 @@ async def test_poll_loop_repeated_cancellation_finishes_teardown(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_lease_loss_drains_dispatcher_before_releasing_lease(monkeypatch):
+    import orchestrator.main as orchestrator_main
+
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_SESSION_ID", "")
+    monkeypatch.setenv("AGENTIC_PERF_ORCHESTRATOR_EPOCH", "")
+    config = _poll_config()
+    config.poll_interval = 0.02
+    config.leader_lease_recovery_delay_seconds = 60
+    config.stale_task_timeout = 0
+    drain_started = asyncio.Event()
+    allow_drain = asyncio.Event()
+    release_called = asyncio.Event()
+    order = []
+
+    class Lease(_PollLoopLease):
+        async def release(self):
+            order.append("release")
+            await super().release()
+            release_called.set()
+
+    class Events:
+        def __init__(self, **_kwargs):
+            pass
+
+        def close(self):
+            order.append("events")
+
+    class Dispatcher:
+        def __init__(self, *_args, **kwargs):
+            self._session_id = kwargs["session_id"]
+            self._fencing_epoch = kwargs["fencing_epoch"]
+            self._deposed = False
+
+        def reconcile_handoff_blocked(self, _tickets):
+            pass
+
+        def mark_deposed(self):
+            self._deposed = True
+            order.append("deposed")
+
+        def is_deposed(self):
+            return self._deposed
+
+        async def drain_for_lease_loss(self, _timeout):
+            order.append("drain-started")
+            drain_started.set()
+            await allow_drain.wait()
+            order.append("drain-finished")
+
+        async def shutdown(self):
+            order.append("dispatcher-shutdown")
+
+    async def fetch_tickets(_url):
+        return []
+
+    async def lose_lease(_lease, _interval, on_loss, started):
+        started.set()
+        try:
+            await asyncio.sleep(0.02)
+            on_loss()
+            raise LeaderLeaseLost("lease lost")
+        finally:
+            order.append("renewer-stopped")
+
+    async def no_op(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(
+        "orchestrator.leader_lease.LeaderLeaseClient", lambda *_a, **_k: Lease()
+    )
+    monkeypatch.setattr("orchestrator.config.write_effective_config", lambda *_a: None)
+    monkeypatch.setattr(
+        orchestrator_main, "_ensure_state_store_environment", lambda *_a: None
+    )
+    monkeypatch.setattr(orchestrator_main, "RepoCache", lambda: object())
+    monkeypatch.setattr(
+        orchestrator_main,
+        "build_skill_provider_async",
+        AsyncMock(return_value=object()),
+    )
+    monkeypatch.setattr(orchestrator_main, "LocalSecretsProvider", lambda: object())
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_make_llm_provider",
+        lambda _config: SimpleNamespace(
+            default_timeout=None, reasoning_effort=None, max_tokens=None
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator_main, "_make_llm_factory", lambda _config: object()
+    )
+    monkeypatch.setattr(orchestrator_main, "_validate_models", AsyncMock())
+    monkeypatch.setattr(orchestrator_main, "EventBus", Events)
+    monkeypatch.setattr(orchestrator_main, "Dispatcher", Dispatcher)
+    monkeypatch.setattr(
+        orchestrator_main, "record_orchestrator_status", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(orchestrator_main, "_process_stop_requests", AsyncMock())
+    monkeypatch.setattr(orchestrator_main, "_sweep_orphaned_leases", no_op)
+    monkeypatch.setattr(orchestrator_main, "_sweep_trace_spools", lambda: None)
+    monkeypatch.setattr(orchestrator_main, "fetch_all_tickets", fetch_tickets)
+    monkeypatch.setattr(
+        orchestrator_main, "fetch_tickets_by_status", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        orchestrator_main,
+        "_reconcile_deposed_claims",
+        AsyncMock(return_value=(set(), set())),
+    )
+    monkeypatch.setattr(orchestrator_main, "_renew_leader_lease", lose_lease)
+    telemetry_module = ModuleType("providers.telemetry")
+    telemetry_module.setup_telemetry = lambda **_kwargs: None
+    monkeypatch.setitem(sys.modules, "providers.telemetry", telemetry_module)
+    monkeypatch.setattr("providers.redaction.get_shared_redactor", lambda: object())
+
+    task = asyncio.create_task(poll_loop(config))
+    await asyncio.wait_for(drain_started.wait(), 5)
+    assert "release" not in order
+
+    task.cancel()
+    await asyncio.sleep(0)
+    allow_drain.set()
+    await asyncio.wait_for(release_called.wait(), 5)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert order.index("drain-finished") < order.index("release")
+    assert order.index("dispatcher-shutdown") < order.index("release")
+
+
+@pytest.mark.asyncio
 async def test_poll_loop_repeated_cancellation_finishes_leader_release(monkeypatch):
     import orchestrator.main as orchestrator_main
 
@@ -1241,6 +1585,39 @@ async def test_poll_loop_reacquires_after_lease_loss(monkeypatch):
 
     assert attempts == 2
     assert lease.release_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_uses_fresh_lease_session_after_recovery(monkeypatch):
+    config = _poll_config()
+    config.leader_lease_recovery_delay_seconds = 0
+    leases = []
+    sessions = []
+    reacquired = asyncio.Event()
+
+    def make_lease(*_args, **_kwargs):
+        lease = _PollLoopLease()
+        leases.append(lease)
+        return lease
+
+    async def run_attempt(_config, lease, _gate, _state):
+        sessions.append(lease.session_id)
+        if len(sessions) == 1:
+            raise LeaderLeaseLost("lease lost")
+        reacquired.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("orchestrator.leader_lease.LeaderLeaseClient", make_lease)
+    monkeypatch.setattr("orchestrator.main._poll_loop_after_lease", run_attempt)
+    task = asyncio.create_task(poll_loop(config))
+    await asyncio.wait_for(reacquired.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(leases) == 2
+    assert sessions[0] != sessions[1]
+    assert leases[0].release_count == 1
 
 
 @pytest.mark.asyncio

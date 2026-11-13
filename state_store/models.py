@@ -124,7 +124,6 @@ VALID_TRANSITIONS: dict[TicketStatus, list[TicketStatus]] = {
     TicketStatus.AWAITING_CUSTOMER_GUIDANCE: [],  # filled dynamically
     TicketStatus.RETROSPECTIVE_PENDING: [
         TicketStatus.CLOSED,
-        TicketStatus.AWAITING_CUSTOMER_GUIDANCE,
     ],
     TicketStatus.CLOSED: [],
     # --- Data analysis path ---

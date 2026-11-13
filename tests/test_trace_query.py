@@ -4,6 +4,8 @@ import base64
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from providers.tracing import (
     ActionDescriptor,
     ActionType,
@@ -14,6 +16,7 @@ from providers.tracing import (
 from providers.tracing.models import PayloadDescriptor
 from providers.tracing.query import (
     TraceQuery,
+    TraceQueryTooBroad,
     decode_cursor,
     diagnostics,
     export_events,
@@ -55,6 +58,26 @@ def test_export_formats_are_stable() -> None:
     manifest = export_manifest([event], content)
     assert manifest["count"] == 1
     assert len(manifest["event_content_digest"]) == 64
+
+
+@pytest.mark.parametrize("format", ["jsonl", "csv"])
+def test_export_events_stops_at_byte_budget(format: str) -> None:
+    consumed = 0
+
+    def events():
+        nonlocal consumed
+        for _ in range(100):
+            consumed += 1
+            yield TraceEventV1(
+                ticket_id="PERF-budget",
+                action=ActionDescriptor(type=ActionType.API),
+                lifecycle=LifecycleDescriptor(state=LifecycleState.REQUESTED),
+            )
+
+    with pytest.raises(TraceQueryTooBroad, match="too broad"):
+        export_events(events(), format, max_bytes=1024)
+
+    assert 0 < consumed < 100
 
 
 def test_manifest_only_lists_resolvable_blob_references() -> None:
@@ -197,3 +220,23 @@ def test_diagnostics_reports_cycles_and_missing_parents() -> None:
 
     assert result["cycles"] == [first.action_id, second.action_id]
     assert result["missing_parents"] == [orphan.parent_action_id]
+
+
+def test_diagnostics_bounds_sequence_gap_expansion() -> None:
+    first = TraceEventV1(
+        ticket_id="PERF-gap",
+        ticket_seq=1,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+    second = TraceEventV1(
+        ticket_id="PERF-gap",
+        ticket_seq=1_000_000,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+
+    result = diagnostics([first, second], max_sequence_gaps=3)
+
+    assert result["sequence_gaps"] == [2, 3, 4]
+    assert result["sequence_gaps_truncated"] is True

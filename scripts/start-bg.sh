@@ -49,20 +49,23 @@ RESTART_STABLE_SECONDS="${START_BG_RESTART_STABLE_SECONDS:-60}"
 CRASH_LOOP_THRESHOLD="${START_BG_CRASH_LOOP_THRESHOLD:-3}"
 
 mkdir -p "$LOG_DIR"
-[[ "$LOG_BACKUPS" =~ ^[1-9][0-9]*$ ]] || {
-    echo "ERROR: START_BG_LOG_BACKUPS must be a positive integer" >&2
-    exit 2
-}
-for setting in \
-    "START_BG_RESTART_BACKOFF=$RESTART_BACKOFF" \
-    "START_BG_RESTART_BACKOFF_MAX=$RESTART_BACKOFF_MAX" \
-    "START_BG_RESTART_STABLE_SECONDS=$RESTART_STABLE_SECONDS" \
-    "START_BG_CRASH_LOOP_THRESHOLD=$CRASH_LOOP_THRESHOLD"; do
-    [[ "${setting#*=}" =~ ^[1-9][0-9]*$ ]] || {
-        echo "ERROR: ${setting%%=*} must be a positive integer" >&2
-        exit 2
+
+validate_launch_settings() {
+    [[ "$LOG_BACKUPS" =~ ^[1-9][0-9]*$ ]] || {
+        echo "ERROR: START_BG_LOG_BACKUPS must be a positive integer" >&2
+        return 2
     }
-done
+    for setting in \
+        "START_BG_RESTART_BACKOFF=$RESTART_BACKOFF" \
+        "START_BG_RESTART_BACKOFF_MAX=$RESTART_BACKOFF_MAX" \
+        "START_BG_RESTART_STABLE_SECONDS=$RESTART_STABLE_SECONDS" \
+        "START_BG_CRASH_LOOP_THRESHOLD=$CRASH_LOOP_THRESHOLD"; do
+        [[ "${setting#*=}" =~ ^[1-9][0-9]*$ ]] || {
+            echo "ERROR: ${setting%%=*} must be a positive integer" >&2
+            return 2
+        }
+    done
+}
 
 rotate_log() {
     local path="$1" index
@@ -268,6 +271,10 @@ orchestrator_owner_valid() {
 
 supervisor_pid() {
     tr -d '[:space:]' < "$ORCH_SUPERVISOR_PID_FILE" 2>/dev/null || true
+}
+
+supervisor_lock_pid() {
+    tr -d '[:space:]' < "$ORCH_SUPERVISOR_LOCK" 2>/dev/null || true
 }
 
 supervisor_owner_valid() {
@@ -844,6 +851,13 @@ stop_orchestrator_supervisor() {
     local pid="" deadline
     pid="$(supervisor_pid)"
     if ! supervisor_owner_valid "$pid"; then
+        pid="$(supervisor_lock_pid)"
+    fi
+    if ! supervisor_owner_valid "$pid"; then
+        if lock_is_held "$ORCH_SUPERVISOR_LOCK"; then
+            error "orchestrator supervisor lock is held by an unverifiable process (PID ${pid:-unknown}); refusing to stop"
+            return 1
+        fi
         rm -f "$ORCH_SUPERVISOR_PID_FILE" "$ORCH_SUPERVISOR_STATUS_FILE"
         return 0
     fi
@@ -861,14 +875,28 @@ stop_orchestrator_supervisor() {
         error "orchestrator supervisor PID $pid did not exit"
         return 1
     fi
+    deadline=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$deadline" ] && lock_is_held "$ORCH_SUPERVISOR_LOCK"; do
+        sleep 0.1
+    done
+    if lock_is_held "$ORCH_SUPERVISOR_LOCK"; then
+        error "orchestrator supervisor PID $pid exited but its lock is still held"
+        return 1
+    fi
+    clear_lock_metadata "$ORCH_SUPERVISOR_LOCK" || {
+        error "orchestrator supervisor lock changed ownership while stopping"
+        return 1
+    }
     rm -f "$ORCH_SUPERVISOR_PID_FILE" "$ORCH_SUPERVISOR_STATUS_FILE"
 }
 
 cmd_supervise_orchestrator() {
     local child="" stopping=0 failures=0 exit_status=0 delay=0
     local started_at=0 now=0 elapsed=0 next_restart=0 sleep_pid=""
-    exec {supervisor_fd}>"$ORCH_SUPERVISOR_LOCK"
+    validate_launch_settings || exit $?
+    exec {supervisor_fd}<>"$ORCH_SUPERVISOR_LOCK"
     flock -n "$supervisor_fd" || exit 0
+    printf '%s\n' "$$" > "$ORCH_SUPERVISOR_LOCK"
     trap 'stopping=1; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null || true; fi; if [ -n "$sleep_pid" ]; then kill -TERM "$sleep_pid" 2>/dev/null || true; fi' TERM INT
     write_pid_file "$ORCH_SUPERVISOR_PID_FILE" "$$"
     write_supervisor_status "starting" "waiting for an orchestrator process" 0 0
@@ -878,7 +906,7 @@ cmd_supervise_orchestrator() {
             write_supervisor_status \
                 "monitoring" "orchestrator PID $(orchestrator_pid || echo unknown)" \
                 "$failures" 0
-            sleep 2 &
+            sleep 2 {supervisor_fd}>&- &
             sleep_pid=$!
             if [ "$stopping" -ne 0 ]; then
                 kill -TERM "$sleep_pid" 2>/dev/null || true
@@ -891,7 +919,7 @@ cmd_supervise_orchestrator() {
         if ! clear_lock_metadata "$ORCH_LOCK"; then
             echo "$(date -Is) orchestrator lock changed ownership before launch; retrying" \
                 >> "$ORCH_SUPERVISOR_LOG"
-            sleep 2
+            sleep 2 {supervisor_fd}>&-
             continue
         fi
         rm -f "$ORCH_STATUS_FILE"
@@ -945,7 +973,7 @@ cmd_supervise_orchestrator() {
                 "orchestrator exited with status $exit_status; retrying in ${delay}s" \
                 "$failures" "$next_restart"
         fi
-        sleep "$delay" &
+        sleep "$delay" {supervisor_fd}>&- &
         sleep_pid=$!
         if [ "$stopping" -ne 0 ]; then
             kill -TERM "$sleep_pid" 2>/dev/null || true
@@ -958,6 +986,7 @@ cmd_supervise_orchestrator() {
 }
 
 cmd_start() {
+    validate_launch_settings || return $?
     [ -f "$CONFIG" ] || { error "config file not found: $CONFIG"; return 1; }
     echo "Launcher checkout revision: $(revision)"
     exec {launch_fd}>"$LAUNCH_LOCK"
