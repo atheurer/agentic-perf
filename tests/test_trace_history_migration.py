@@ -101,7 +101,9 @@ def test_active_history_overlap_is_deduplicated_and_sequence_continues(
     db_path = tmp_path / "trace.db"
     history_db_path = tmp_path / "trace-history.db"
 
-    with TraceStore(db_path, history_db_path=history_db_path) as store:
+    with TraceStore(
+        db_path, history_db_path=history_db_path, trace_retention_days=0
+    ) as store:
         first = store.insert_event(make_event("PERF-OVERLAP"))
         active = store._open_connection()
         history = store._open_history_connection()
@@ -136,7 +138,9 @@ def test_query_pages_mixed_history_active_and_overlapping_rows(tmp_path: Path) -
     db_path = tmp_path / "trace.db"
     history_db_path = tmp_path / "trace-history.db"
 
-    with TraceStore(db_path, history_db_path=history_db_path) as store:
+    with TraceStore(
+        db_path, history_db_path=history_db_path, trace_retention_days=0
+    ) as store:
         first = store.insert_event(make_event("PERF-MIXED"))
         second = store.insert_event(make_event("PERF-MIXED"))
         active = store._open_connection()

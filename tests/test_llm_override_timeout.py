@@ -76,6 +76,7 @@ async def _run_override(
     dispatcher.store_url = "http://localhost:9999"
     dispatcher.create_agent.return_value = mock_agent
     dispatcher.mark_done = AsyncMock()
+    dispatcher.is_deposed.return_value = False
 
     mock_response = MagicMock()
     mock_response.status_code = 200

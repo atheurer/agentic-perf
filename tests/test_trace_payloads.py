@@ -141,6 +141,19 @@ def test_corrupt_blob_is_replaced_and_permissions_are_repaired(tmp_path) -> None
     assert os.stat(target).st_mode & 0o777 == 0o600
 
 
+def test_blob_get_rejects_oversized_file_before_reading(tmp_path, monkeypatch) -> None:
+    store = PayloadBlobStore(tmp_path / "blobs")
+    ref = store.put(b"x" * 128)
+
+    def unexpected_read(_fd: int, _size: int) -> bytes:
+        raise AssertionError("oversized payload was read")
+
+    monkeypatch.setattr("providers.tracing.payloads.os.read", unexpected_read)
+
+    with pytest.raises(PayloadStorageError, match="exceeds byte limit"):
+        store.get(ref, max_bytes=64)
+
+
 def test_concurrent_first_key_creation_returns_one_stable_key(tmp_path) -> None:
     key_path = tmp_path / "secrets" / "trace-audit-key"
     with ThreadPoolExecutor(max_workers=8) as executor:

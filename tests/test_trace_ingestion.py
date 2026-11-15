@@ -20,21 +20,24 @@ from providers.tracing import (
     ActionType,
     LifecycleDescriptor,
     LifecycleState,
+    PayloadDescriptor,
     ProducerIdentity,
     TraceEventV1,
 )
 from providers.tracing.query import TraceQuery, TraceQueryCancelled, TraceQueryTooBroad
-from state_store.api.executors import run_lease_worker
+from state_store.api.executors import run_control_worker, run_lease_worker
 from state_store.api.health import health as health_endpoint
 from state_store.api.router import api_router
 from state_store.api.traces import (
     _authorize_query,
     _event_json,
     _json_dumps,
+    _PayloadAuditResponse,
     _query_store,
     _record_query_audit,
     _render_export_response,
     _TraceAuditResponse,
+    _verified_blob_refs,
 )
 from state_store.api.traces import (
     export as export_trace,
@@ -80,6 +83,94 @@ def test_export_rendering_enforces_aggregate_response_size_budget(monkeypatch) -
         )
 
 
+def test_export_skips_blob_verification_when_payloads_are_omitted(monkeypatch) -> None:
+    def unexpected_verification(*_args, **_kwargs):
+        raise AssertionError("verified payloads even though export omitted them")
+
+    monkeypatch.setattr(traces_api, "_verified_blob_refs", unexpected_verification)
+    response = _render_export_response(
+        [event()],
+        format="json",
+        cursor=None,
+        limit=1,
+        detailed=True,
+        include_payloads=False,
+    )
+
+    assert response.status_code == 200
+
+
+def test_export_blob_verification_deduplicates_and_budgets_reads(monkeypatch) -> None:
+    refs = [f"sha256:{index:064x}" for index in range(1, 6)]
+    calls: list[tuple[str, int]] = []
+
+    class Store:
+        def __init__(self, *, ticket_id: str) -> None:
+            self.ticket_id = ticket_id
+
+        def get(self, ref: str, *, max_bytes: int) -> bytes:
+            calls.append((f"{self.ticket_id}:{ref}", max_bytes))
+            return b"x" * 5
+
+    monkeypatch.setattr(traces_api, "PayloadBlobStore", Store)
+    first = event().model_copy(
+        update={
+            "input": PayloadDescriptor(blob_ref=refs[0]),
+            "output": PayloadDescriptor(blob_ref=refs[0]),
+        }
+    )
+    other_ticket = event().model_copy(
+        update={
+            "ticket_id": "PERF-2",
+            "input": PayloadDescriptor(blob_ref=refs[0]),
+        }
+    )
+    remaining = [
+        event().model_copy(update={"input": PayloadDescriptor(blob_ref=ref)})
+        for ref in refs[1:]
+    ]
+
+    verified = _verified_blob_refs(
+        [first, other_ticket, *remaining],
+        max_bytes=20,
+    )
+
+    assert verified == set(refs[:3])
+    assert [budget for _, budget in calls] == [20, 15, 10, 5]
+    assert calls[0][0] == f"PERF-1:{refs[0]}"
+    assert calls[1][0] == f"PERF-2:{refs[0]}"
+
+
+def test_export_blob_verification_charges_failed_read_to_full_budget(
+    monkeypatch,
+) -> None:
+    refs = [f"sha256:{index:064x}" for index in range(1, 3)]
+    calls: list[int] = []
+
+    class Store:
+        def __init__(self, *, ticket_id: str) -> None:
+            self.ticket_id = ticket_id
+
+        def get(self, ref: str, *, max_bytes: int) -> bytes:
+            calls.append(max_bytes)
+            if ref == refs[0]:
+                raise traces_api.PayloadStorageError("unreadable payload")
+            return b"x" * 5
+
+    monkeypatch.setattr(traces_api, "PayloadBlobStore", Store)
+    events = [
+        event().model_copy(update={"input": PayloadDescriptor(blob_ref=ref)})
+        for ref in refs
+    ]
+
+    verified = _verified_blob_refs(events, max_bytes=11)
+
+    # The failed read may have inspected its entire allowance, so it must not
+    # let a later corrupt or oversized blob borrow aggregate verification budget.
+    assert verified == set()
+    assert calls == [11]
+
+
 def make_app(tmp_path, user_store: UserStore | None = None) -> FastAPI:
     app = FastAPI()
     app.state.trace_store = TraceStore(tmp_path / "trace.db")
@@ -89,7 +180,11 @@ def make_app(tmp_path, user_store: UserStore | None = None) -> FastAPI:
         "ingestion_failures": 0,
         "schema_rejections": 0,
         "quarantined_frames": 0,
+        "audit_queue_rejections": 0,
+        "ingestion_queue_rejections": 0,
+        "ingestion_body_rejections": 0,
     }
+    app.add_middleware(traces_api.TraceIngestBodyLimitMiddleware)
     app.include_router(
         api_router,
         dependencies=[
@@ -149,6 +244,77 @@ async def test_service_ingests_and_server_binds_identity(tmp_path) -> None:
         response.json()["event"]["attributes"]["authenticated_principal"]
         == "deployment"
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/v1/traces/events", "/api/v1/traces/events/batch"],
+)
+async def test_oversized_trace_body_is_rejected_before_validation(
+    tmp_path, monkeypatch, path: str
+) -> None:
+    app = make_app(tmp_path)
+    monkeypatch.setattr(traces_api, "MAX_TRACE_INGEST_BODY_BYTES", 128)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+
+    response = await client.post(
+        path,
+        content=b'{"broken": "' + b"x" * 256,
+        headers={
+            "Authorization": "Bearer service",
+            "Content-Type": "application/json",
+        },
+    )
+    await client.aclose()
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "trace ingestion request body is too large"
+    assert app.state.trace_health["ingestion_body_rejections"] == 1
+    assert app.state.trace_health["schema_rejections"] == 0
+
+
+async def test_trace_body_limit_counts_streamed_chunks_without_content_length(
+    tmp_path, monkeypatch
+) -> None:
+    app = make_app(tmp_path)
+    monkeypatch.setattr(traces_api, "MAX_TRACE_INGEST_BODY_BYTES", 8)
+    downstream_called = False
+
+    async def downstream(_scope, _receive, _send) -> None:
+        nonlocal downstream_called
+        downstream_called = True
+
+    middleware = traces_api.TraceIngestBodyLimitMiddleware(downstream)
+    messages = [
+        {"type": "http.request", "body": b"12345", "more_body": True},
+        {"type": "http.request", "body": b"6789", "more_body": True},
+    ]
+
+    async def receive():
+        return messages.pop(0)
+
+    sent = []
+
+    async def send(message) -> None:
+        sent.append(message)
+
+    await middleware(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v1/traces/events",
+            "headers": [],
+            "app": app,
+        },
+        receive,
+        send,
+    )
+
+    assert downstream_called is False
+    assert sent[0]["status"] == 413
+    assert app.state.trace_health["ingestion_body_rejections"] == 1
 
 
 async def test_query_and_export_continuations_are_exposed(tmp_path) -> None:
@@ -423,6 +589,49 @@ async def test_cancelled_queries_do_not_consume_shared_executor(tmp_path) -> Non
         store.close()
 
 
+async def test_cancelled_trace_worker_keeps_admission_until_thread_finishes() -> None:
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trace-query")
+    slots = threading.BoundedSemaphore(1)
+    entered = threading.Event()
+    release = threading.Event()
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                trace_query_executor=executor,
+                trace_query_slots=slots,
+            )
+        )
+    )
+
+    def blocking_worker() -> None:
+        entered.set()
+        release.wait(2)
+
+    task = asyncio.create_task(traces_api._run_trace_worker(request, blocking_worker))
+    try:
+        deadline = asyncio.get_running_loop().time() + 1
+        while not entered.is_set() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.001)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert not slots.acquire(blocking=False)
+        release.set()
+        deadline = asyncio.get_running_loop().time() + 1
+        while asyncio.get_running_loop().time() < deadline:
+            if slots.acquire(blocking=False):
+                slots.release()
+                break
+            await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("completed worker did not release admission")
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
+
+
 async def test_control_executor_survives_blocked_trace_workers() -> None:
     query_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trace-query")
     control_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="control")
@@ -498,6 +707,42 @@ async def test_lease_executor_preserves_audit_actor() -> None:
         "username": "lease-owner",
         "ip": "127.0.0.1",
     }
+
+
+@pytest.mark.parametrize(
+    ("worker", "executor_name", "slots_name", "detail"),
+    [
+        (run_control_worker, "control_executor", "control_slots", "control worker"),
+        (run_lease_worker, "lease_executor", "lease_slots", "lease worker"),
+    ],
+)
+async def test_reserved_worker_rejects_saturated_admission(
+    worker, executor_name, slots_name, detail
+) -> None:
+    class ObservedExecutor(ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=1)
+            self.submissions = 0
+
+        def submit(self, *args, **kwargs):
+            self.submissions += 1
+            return super().submit(*args, **kwargs)
+
+    executor = ObservedExecutor()
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    state = SimpleNamespace(**{executor_name: executor, slots_name: slots})
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    try:
+        with pytest.raises(HTTPException) as caught:
+            await worker(request, lambda: "unexpected")
+    finally:
+        slots.release()
+        executor.shutdown(wait=True)
+
+    assert caught.value.status_code == 503
+    assert caught.value.detail == f"{detail} queue is full"
+    assert executor.submissions == 0
 
 
 @pytest.mark.parametrize(
@@ -605,6 +850,50 @@ async def test_trace_audit_response_records_once_after_delivery(
 
 
 @pytest.mark.parametrize(
+    ("send_error", "outcome", "error"),
+    [
+        (None, "success", ""),
+        (RuntimeError("ASGI send failed"), "failed", "trace payload read failed"),
+        (asyncio.CancelledError(), "cancelled", "request cancelled"),
+    ],
+)
+async def test_payload_audit_response_records_once_after_delivery(
+    send_error, outcome, error
+) -> None:
+    audits: list[tuple[str, str]] = []
+
+    async def audit(audit_outcome: str, audit_error: str) -> None:
+        audits.append((audit_outcome, audit_error))
+
+    response = _PayloadAuditResponse(
+        Response(b"payload", media_type="application/octet-stream"), audit=audit
+    )
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+        if message["type"] == "http.response.body" and send_error is not None:
+            raise send_error
+
+    if send_error is None:
+        await response({"type": "http"}, receive, send)
+        assert [message["type"] for message in sent] == [
+            "http.response.start",
+            "http.response.body",
+        ]
+    else:
+        with pytest.raises(type(send_error)):
+            await response({"type": "http"}, receive, send)
+
+    assert len(audits) == 1
+    assert audits[0][0] == outcome
+    assert audits[0][1].startswith(error)
+
+
+@pytest.mark.parametrize(
     ("path", "operation"),
     [
         ("/api/v1/traces/query", "trace_query"),
@@ -612,6 +901,7 @@ async def test_trace_audit_response_records_once_after_delivery(
         ("/api/v1/traces/tickets/PERF-1", "trace_query"),
         ("/api/v1/traces/invocations/invocation-1", "trace_query"),
         ("/api/v1/traces/actions/action-1", "trace_query"),
+        ("/api/v1/traces/PERF-1/payloads/" + "a" * 64, "trace_payload_read"),
     ],
 )
 def test_trace_read_operation_covers_alias_routes(path, operation) -> None:
@@ -624,8 +914,14 @@ async def test_pre_route_trace_validation_is_audited_for_alias_routes(
     monkeypatch.setattr("state_store.main.TRACE_DB_PATH", tmp_path / "trace.db")
     app = create_app(initialize_immediately=True)
     audits: list[tuple] = []
+    audit_threads: list[str] = []
     original_audit_log = app.state.audit_log
-    app.state.audit_log = SimpleNamespace(log=lambda *args: audits.append(args))
+
+    def audit(*args) -> None:
+        audits.append(args)
+        audit_threads.append(threading.current_thread().name)
+
+    app.state.audit_log = SimpleNamespace(log=audit)
     client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     )
@@ -640,6 +936,7 @@ async def test_pre_route_trace_validation_is_audited_for_alias_routes(
             params={"limit": 0},
             headers={"Authorization": f"Bearer {app.state.api_token}"},
         )
+        payload_read = await client.get("/api/v1/traces/PERF-1/payloads/" + "a" * 64)
     finally:
         await client.aclose()
         app.state.audit_log = original_audit_log
@@ -647,6 +944,7 @@ async def test_pre_route_trace_validation_is_audited_for_alias_routes(
 
     assert query.status_code == 422
     assert alias.status_code == 422
+    assert payload_read.status_code == 401
     assert audits == [
         (
             "trace_query",
@@ -664,7 +962,16 @@ async def test_pre_route_trace_validation_is_audited_for_alias_routes(
                 "error": "request validation rejected",
             },
         ),
+        (
+            "trace_payload_read",
+            "PERF-1",
+            {
+                "outcome": "denied",
+                "error": "authentication rejected",
+            },
+        ),
     ]
+    assert all("trace-query-audit" in name for name in audit_threads)
 
 
 async def test_memory_guard_returns_audited_503(tmp_path) -> None:
@@ -696,6 +1003,345 @@ async def test_memory_guard_returns_audited_503(tmp_path) -> None:
                     "trace queries are temporarily unavailable while the state "
                     "store memory limit is exceeded"
                 ),
+                "ticket_scoped": True,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "operation"),
+    [
+        ("/api/v1/traces/query", "trace_query"),
+        ("/api/v1/traces/export", "trace_export"),
+    ],
+)
+async def test_full_query_queue_returns_audited_503(
+    path, operation, tmp_path, monkeypatch
+) -> None:
+    authorization_attempts = 0
+
+    def unexpected_authorization(*_args, **_kwargs):
+        nonlocal authorization_attempts
+        authorization_attempts += 1
+        return True
+
+    class ObservedExecutor(ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=1)
+            self.submissions = 0
+
+        def submit(self, *args, **kwargs):
+            self.submissions += 1
+            return super().submit(*args, **kwargs)
+
+    monkeypatch.setattr(traces_api, "_authorize_query", unexpected_authorization)
+    app = make_app(tmp_path)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trace-query")
+    audit_executor = ObservedExecutor()
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    app.state.trace_query_executor = executor
+    app.state.trace_query_slots = slots
+    app.state.trace_query_audit_executor = audit_executor
+    app.state.trace_query_audit_slots = threading.BoundedSemaphore(1)
+    app.state.trace_query_shutdown = threading.Event()
+    app.state.trace_query_max_rss_bytes = 0
+    audits: list[tuple] = []
+    app.state.audit_log = SimpleNamespace(log=lambda *args: audits.append(args))
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            path,
+            params={"ticket_id": "PERF-1"},
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        slots.release()
+        await client.aclose()
+        executor.shutdown(wait=True)
+        audit_executor.shutdown(wait=True)
+        app.state.trace_store.close()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "trace query queue is full"
+    assert authorization_attempts == 0
+    assert audit_executor.submissions == 1
+    assert audits == [
+        (
+            operation,
+            "PERF-1",
+            {
+                "outcome": "failed",
+                "error": "trace query queue is full",
+                "ticket_scoped": True,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "operation"),
+    [
+        ("/api/v1/traces/query", "trace_query"),
+        ("/api/v1/traces/export", "trace_export"),
+    ],
+)
+async def test_render_queue_saturation_returns_audited_503(
+    path, operation, tmp_path, monkeypatch
+) -> None:
+    app = make_app(tmp_path)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trace-query")
+    audit_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="audit")
+    slots = threading.BoundedSemaphore(1)
+    slot_held = False
+
+    async def saturate_after_store(*_args, **_kwargs):
+        nonlocal slot_held
+        slot_held = slots.acquire(blocking=False)
+        assert slot_held
+        return [], []
+
+    monkeypatch.setattr(traces_api, "_query_store", saturate_after_store)
+    app.state.trace_query_executor = executor
+    app.state.trace_query_slots = slots
+    app.state.trace_query_audit_executor = audit_executor
+    app.state.trace_query_audit_slots = threading.BoundedSemaphore(1)
+    app.state.trace_query_shutdown = threading.Event()
+    app.state.trace_query_max_rss_bytes = 0
+    audits: list[tuple] = []
+    app.state.audit_log = SimpleNamespace(log=lambda *args: audits.append(args))
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            path,
+            params={"ticket_id": "PERF-1"},
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        if slot_held:
+            slots.release()
+        await client.aclose()
+        executor.shutdown(wait=True)
+        audit_executor.shutdown(wait=True)
+        app.state.trace_store.close()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "trace query queue is full"
+    assert audits == [
+        (
+            operation,
+            "PERF-1",
+            {
+                "outcome": "failed",
+                "error": "trace query queue is full",
+                "ticket_scoped": True,
+            },
+        )
+    ]
+
+
+async def test_payload_lookup_uses_bounded_trace_worker(tmp_path, monkeypatch) -> None:
+    app = make_app(tmp_path)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trace-query")
+    slots = threading.BoundedSemaphore(1)
+    worker_threads: list[str] = []
+    digest = "a" * 64
+
+    def payload_is_referenced(_ticket_id, _blob_ref, *, cancelled):
+        assert not cancelled()
+        worker_threads.append(threading.current_thread().name)
+        return True
+
+    def unexpected_list_events(*_args, **_kwargs):
+        raise AssertionError("payload lookup materialized ticket history")
+
+    app.state.trace_query_executor = executor
+    app.state.trace_query_slots = slots
+    app.state.trace_query_shutdown = threading.Event()
+    app.state.trace_store.payload_is_referenced = payload_is_referenced
+    app.state.trace_store.list_events = unexpected_list_events
+    app.state.audit_log = SimpleNamespace(log=lambda *_args: None)
+    monkeypatch.setattr(
+        traces_api,
+        "PayloadBlobStore",
+        lambda **_kwargs: SimpleNamespace(get=lambda *_args, **_kwargs: b"payload"),
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            f"/api/v1/traces/PERF-1/payloads/{digest}",
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        await client.aclose()
+        executor.shutdown(wait=True)
+        app.state.trace_store.close()
+
+    assert response.status_code == 200
+    assert response.content == b"payload"
+    assert worker_threads
+    assert worker_threads[0].startswith("trace-query")
+
+
+async def test_full_payload_queue_returns_audited_503(tmp_path, monkeypatch) -> None:
+    app = make_app(tmp_path)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trace-query")
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    digest = "a" * 64
+    audits: list[tuple] = []
+
+    async def authorize(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(traces_api, "_authorize_query_off_loop", authorize)
+    app.state.trace_query_executor = executor
+    app.state.trace_query_slots = slots
+    app.state.trace_query_shutdown = threading.Event()
+    app.state.audit_log = SimpleNamespace(log=lambda *args: audits.append(args))
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            f"/api/v1/traces/PERF-1/payloads/{digest}",
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        slots.release()
+        await client.aclose()
+        executor.shutdown(wait=True)
+        app.state.trace_store.close()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "trace query queue is full"
+    assert audits == [
+        (
+            "trace_payload_read",
+            "PERF-1",
+            {
+                "digest": digest,
+                "outcome": "failed",
+                "error": "trace query queue is full",
+            },
+        )
+    ]
+
+
+async def test_payload_cancellation_records_audit(tmp_path) -> None:
+    app = make_app(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    worker_done = threading.Event()
+    audits: list[tuple] = []
+    digest = "a" * 64
+
+    def payload_is_referenced(_ticket_id, _blob_ref, *, cancelled):
+        entered.set()
+        if not release.wait(1):
+            raise RuntimeError("payload worker was not released")
+        worker_done.set()
+        return True
+
+    app.state.trace_store.payload_is_referenced = payload_is_referenced
+    app.state.audit_log = SimpleNamespace(log=lambda *args: audits.append(args))
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    task = asyncio.create_task(
+        client.get(
+            f"/api/v1/traces/PERF-1/payloads/{digest}",
+            headers={"Authorization": "Bearer service"},
+        )
+    )
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+        await asyncio.to_thread(worker_done.wait, 1)
+        await client.aclose()
+        app.state.trace_store.close()
+
+    assert audits == [
+        (
+            "trace_payload_read",
+            "PERF-1",
+            {
+                "digest": digest,
+                "outcome": "cancelled",
+                "error": "request cancelled",
+            },
+        )
+    ]
+
+
+async def test_full_audit_queue_drops_without_waiting_or_queueing(
+    tmp_path, caplog
+) -> None:
+    class ObservedExecutor(ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=1)
+            self.submissions = 0
+
+        def submit(self, *args, **kwargs):
+            self.submissions += 1
+            return super().submit(*args, **kwargs)
+
+    app = make_app(tmp_path)
+    audit_executor = ObservedExecutor()
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    app.state.trace_query_audit_executor = audit_executor
+    app.state.trace_query_audit_slots = slots
+    app.state.audit_log = SimpleNamespace(log=lambda *_args: None)
+    request = SimpleNamespace(app=SimpleNamespace(state=app.state))
+    try:
+        await asyncio.wait_for(
+            _record_query_audit(request, "trace_query", "PERF-1", "failed"),
+            timeout=0.5,
+        )
+    finally:
+        slots.release()
+        audit_executor.shutdown(wait=True)
+        app.state.trace_store.close()
+
+    assert audit_executor.submissions == 0
+    assert app.state.trace_health["audit_queue_rejections"] == 1
+    assert "Trace audit queue is full" in caplog.text
+
+
+async def test_audit_fallback_writes_exactly_once_without_dedicated_executor() -> None:
+    audits: list[tuple] = []
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                audit_log=SimpleNamespace(log=lambda *args: audits.append(args))
+            )
+        )
+    )
+
+    await _record_query_audit(
+        request, "trace_query", "PERF-1", "failed", "store failure"
+    )
+
+    assert audits == [
+        (
+            "trace_query",
+            "PERF-1",
+            {
+                "outcome": "failed",
+                "error": "store failure",
                 "ticket_scoped": True,
             },
         )
@@ -1251,12 +1897,137 @@ async def test_partial_duplicate_batch_has_stable_acknowledgements(tmp_path) -> 
     await client.aclose()
     assert response.status_code == 200
     acknowledgements = response.json()["acknowledgements"]
-    assert [ack["accepted"] for ack in acknowledgements] == [True, True]
-    assert [ack["status"] for ack in acknowledgements] == ["duplicate", "stored"]
-    assert (
-        acknowledgements[0]["event"]["global_seq"]
-        == first.json()["event"]["global_seq"]
+    assert acknowledgements == [
+        {
+            "event_id": str(one.event_id),
+            "accepted": True,
+            "status": "duplicate",
+        },
+        {
+            "event_id": str(two.event_id),
+            "accepted": True,
+            "status": "stored",
+        },
+    ]
+
+
+async def test_batch_ingest_returns_compact_bounded_acknowledgements(tmp_path) -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_app(tmp_path)), base_url="http://test"
     )
+    large = event().model_copy(update={"attributes": {"payload": "x" * 1_000_000}})
+    response = await client.post(
+        "/api/v1/traces/events/batch",
+        json={"events": [payload(event()), payload(large)]},
+        headers={"Authorization": "Bearer service"},
+    )
+    await client.aclose()
+
+    assert response.status_code == 200
+    assert len(response.content) < 2_048
+    acknowledgements = response.json()["acknowledgements"]
+    assert len(acknowledgements) == 2
+    assert all("event" not in acknowledgement for acknowledgement in acknowledgements)
+
+
+async def test_batch_ingest_enforces_acknowledgement_response_budget(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(traces_api, "MAX_TRACE_BATCH_ACK_BYTES", 64)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_app(tmp_path)), base_url="http://test"
+    )
+    response = await client.post(
+        "/api/v1/traces/events/batch",
+        json={"events": [payload(event())]},
+        headers={"Authorization": "Bearer service"},
+    )
+    await client.aclose()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "trace batch acknowledgement is too large"
+
+
+async def test_ingest_queue_saturation_returns_audited_503(tmp_path) -> None:
+    app = make_app(tmp_path)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ingestion")
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    audits: list[tuple] = []
+    app.state.trace_ingestion_executor = executor
+    app.state.trace_ingestion_slots = slots
+    app.state.audit_log = SimpleNamespace(log=lambda *args: audits.append(args))
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.post(
+            "/api/v1/traces/events",
+            json=payload(event()),
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        slots.release()
+        await client.aclose()
+        executor.shutdown(wait=True)
+        app.state.trace_store.close()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "trace ingestion queue is full"
+    assert app.state.trace_health["ingestion_queue_rejections"] == 1
+    assert audits == [
+        (
+            "trace_ingest",
+            "PERF-1",
+            {
+                "outcome": "failed",
+                "error": "trace ingestion queue is full",
+                "ticket_scoped": True,
+            },
+        )
+    ]
+
+
+async def test_batch_ingest_saturation_preserves_per_event_acknowledgements(
+    tmp_path,
+) -> None:
+    app = make_app(tmp_path)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ingestion")
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    audits: list[tuple] = []
+    app.state.trace_ingestion_executor = executor
+    app.state.trace_ingestion_slots = slots
+    app.state.audit_log = SimpleNamespace(log=lambda *args: audits.append(args))
+    one, two = event(), event()
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.post(
+            "/api/v1/traces/events/batch",
+            json={"events": [payload(one), payload(two)]},
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        slots.release()
+        await client.aclose()
+        executor.shutdown(wait=True)
+        app.state.trace_store.close()
+
+    assert response.status_code == 200
+    acknowledgements = response.json()["acknowledgements"]
+    assert [
+        (ack["event_id"], ack["accepted"], ack["status"]) for ack in acknowledgements
+    ] == [
+        (str(one.event_id), False, 503),
+        (str(two.event_id), False, 503),
+    ]
+    assert app.state.trace_health["ingestion_queue_rejections"] == 2
+    assert [audit[0] for audit in audits] == [
+        "trace_ingest_batch",
+        "trace_ingest_batch",
+    ]
 
 
 async def test_invalid_trace_schema_increments_health_counter() -> None:

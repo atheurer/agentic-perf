@@ -89,6 +89,19 @@ class TraceStore:
     MAX_CAUSAL_EVENTS = 50_000
     MAX_CAUSAL_SCOPES = 100
     MAX_QUERY_RAW_BYTES = 64 * 1024 * 1024
+    MAX_QUERY_PROGRESS_STEPS = 10_000
+    _QUERY_PROGRESS_HANDLER_INTERVAL = 1000
+    _PAYLOAD_REFERENCE_SQL = (
+        "SELECT 1 FROM trace_events "
+        "INDEXED BY trace_events_ticket_input_blob_idx "
+        "WHERE ticket_id = ? AND "
+        "json_extract(event_json, '$.input.blob_ref') = ? "
+        "UNION ALL "
+        "SELECT 1 FROM trace_events "
+        "INDEXED BY trace_events_ticket_output_blob_idx "
+        "WHERE ticket_id = ? AND "
+        "json_extract(event_json, '$.output.blob_ref') = ? LIMIT 1"
+    )
 
     def __init__(
         self,
@@ -797,6 +810,62 @@ class TraceStore:
         """Return paged events plus the complete bounded causal diagnostic scope."""
         return self._query_events(query, cancelled=cancelled, include_scope=True)
 
+    def payload_is_referenced(
+        self,
+        ticket_id: str,
+        blob_ref: str,
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Check a payload reference without materializing ticket event history."""
+
+        def interrupted() -> int:
+            return int(cancelled is not None and cancelled())
+
+        def check_cancelled() -> None:
+            if cancelled is not None and cancelled():
+                raise TraceQueryCancelled("trace query cancelled")
+
+        lock_held = False
+        try:
+            while not self._lock.acquire(timeout=0.1):
+                check_cancelled()
+            lock_held = True
+            try:
+                connections = [self._open_connection()]
+                history_connection = self._open_history_connection()
+                if history_connection is not None:
+                    connections.append(history_connection)
+                for connection in connections:
+                    connection.set_progress_handler(interrupted, 1000)
+                    try:
+                        check_cancelled()
+                        if (
+                            connection.execute(
+                                self._PAYLOAD_REFERENCE_SQL,
+                                (ticket_id, blob_ref, ticket_id, blob_ref),
+                            ).fetchone()
+                            is not None
+                        ):
+                            return True
+                        check_cancelled()
+                    finally:
+                        connection.set_progress_handler(None, 0)
+                return False
+            except TraceQueryCancelled:
+                raise
+            except sqlite3.OperationalError as exc:
+                if cancelled is not None and cancelled():
+                    raise TraceQueryCancelled("trace query cancelled") from exc
+                raise
+            except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+                raise TraceStoreWriteError(
+                    "could not verify payload reference"
+                ) from exc
+        finally:
+            if lock_held:
+                self._lock.release()
+
     def _query_events(
         self,
         query: TraceQuery,
@@ -807,14 +876,17 @@ class TraceStore:
         predicates, values = self._query_predicates(query)
         direct_limit = self.MAX_CAUSAL_EVENTS + 1 if query.causal else query.limit
         remaining_bytes = self.MAX_QUERY_RAW_BYTES
-        direct, direct_bytes = self._query_rows(
+        remaining_steps = self.MAX_QUERY_PROGRESS_STEPS
+        direct, direct_bytes, direct_steps = self._query_rows(
             predicates,
             values,
             direct_limit,
             cancelled=cancelled,
             byte_limit=remaining_bytes,
+            scan_step_limit=remaining_steps,
         )
         remaining_bytes -= direct_bytes
+        remaining_steps -= direct_steps
         if not query.causal or not direct:
             return direct[: query.limit], None
         if len(direct) > self.MAX_CAUSAL_EVENTS:
@@ -837,7 +909,7 @@ class TraceStore:
                     "trace query is too broad; narrow it with ticket, trace, "
                     "action, or time filters"
                 )
-            scoped_rows, scoped_bytes = self._query_rows(
+            scoped_rows, scoped_bytes, scoped_steps = self._query_rows(
                 [
                     "ticket_id = ?",
                     "trace_id = ?",
@@ -846,9 +918,11 @@ class TraceStore:
                 remaining,
                 cancelled=cancelled,
                 byte_limit=remaining_bytes,
+                scan_step_limit=remaining_steps,
             )
             scoped.extend(scoped_rows)
             remaining_bytes -= scoped_bytes
+            remaining_steps -= scoped_steps
             if len(scoped) > self.MAX_CAUSAL_EVENTS:
                 raise TraceQueryTooBroad(
                     "trace query is too broad; causal expansion exceeded "
@@ -922,15 +996,28 @@ class TraceStore:
         *,
         cancelled: Callable[[], bool] | None = None,
         byte_limit: int = MAX_QUERY_RAW_BYTES,
-    ) -> tuple[list[TraceEventV1], int]:
+        scan_step_limit: int = MAX_QUERY_PROGRESS_STEPS,
+    ) -> tuple[list[TraceEventV1], int, int]:
         where_clause = f" WHERE {' AND '.join(predicates)}" if predicates else ""
-        sql = (
-            "SELECT global_seq, event_json FROM trace_events"
+        size_sql = (
+            "SELECT global_seq, length(CAST(event_json AS BLOB)) AS event_bytes "
+            "FROM trace_events"
             f"{where_clause} ORDER BY global_seq LIMIT ?"
         )
+        row_sql = "SELECT event_json FROM trace_events WHERE global_seq = ?"
+
+        progress_steps = 0
+        budget_exhausted = False
 
         def interrupted() -> int:
-            return int(cancelled is not None and cancelled())
+            nonlocal budget_exhausted, progress_steps
+            if cancelled is not None and cancelled():
+                return 1
+            progress_steps += 1
+            if progress_steps > scan_step_limit:
+                budget_exhausted = True
+                return 1
+            return 0
 
         def check_cancelled() -> None:
             if cancelled is not None and cancelled():
@@ -946,31 +1033,58 @@ class TraceStore:
                 history_connection = self._open_history_connection()
                 if history_connection is not None:
                     connections.append(history_connection)
-                rows: list[tuple[int, str]] = []
+                sized_rows: list[tuple[int, sqlite3.Connection, int]] = []
                 raw_bytes = 0
                 for connection in connections:
-                    connection.set_progress_handler(interrupted, 1000)
+                    connection.set_progress_handler(
+                        interrupted, self._QUERY_PROGRESS_HANDLER_INTERVAL
+                    )
                     try:
                         check_cancelled()
-                        cursor = connection.execute(sql, (*values, limit))
+                        cursor = connection.execute(size_sql, (*values, limit))
                         check_cancelled()
                         for row in cursor:
                             check_cancelled()
-                            raw_bytes += len(row["event_json"].encode("utf-8"))
+                            event_bytes = row["event_bytes"]
+                            if (
+                                isinstance(event_bytes, bool)
+                                or not isinstance(event_bytes, int)
+                                or event_bytes < 0
+                            ):
+                                raise TraceStoreWriteError(
+                                    "trace row has invalid serialized size"
+                                )
+                            raw_bytes += event_bytes
                             if raw_bytes > byte_limit:
                                 raise TraceQueryTooBroad(
                                     "trace query is too broad; serialized events "
                                     f"exceed the {byte_limit}-byte query budget"
                                 )
-                            rows.append((row["global_seq"], row["event_json"]))
+                            sized_rows.append(
+                                (row["global_seq"], connection, event_bytes)
+                            )
                         check_cancelled()
                     finally:
                         connection.set_progress_handler(None, 0)
+                rows: list[tuple[int, str]] = []
+                for global_seq, connection, _event_bytes in sized_rows:
+                    check_cancelled()
+                    row = connection.execute(row_sql, (global_seq,)).fetchone()
+                    if row is None:
+                        raise TraceStoreWriteError(
+                            "trace row changed while query was running"
+                        )
+                    rows.append((global_seq, row["event_json"]))
+                    check_cancelled()
             except TraceQueryCancelled:
                 raise
             except TraceQueryTooBroad:
                 raise
             except sqlite3.OperationalError as exc:
+                if budget_exhausted:
+                    raise TraceQueryTooBroad(
+                        "trace query is too broad; database execution budget exhausted"
+                    ) from exc
                 if cancelled is not None and cancelled():
                     raise TraceQueryCancelled("trace query cancelled") from exc
                 raise
@@ -997,7 +1111,7 @@ class TraceStore:
             raise
         except (TypeError, ValueError) as exc:
             raise TraceStoreWriteError("could not query trace events") from exc
-        return events[:limit], raw_bytes
+        return events[:limit], raw_bytes, progress_steps
 
     def migrate_ticket_traces(self, ticket_id: str) -> int:
         """Migrate all trace events for ticket_id from active store to history store.

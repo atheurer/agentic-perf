@@ -707,7 +707,11 @@ async def test_retry_failures_do_not_stop_polling_other_tickets(
         return deepcopy(tickets)
 
     monkeypatch.setattr(main, "fetch_all_tickets", fetch)
-    monkeypatch.setattr(main, "fetch_tickets_by_status", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        main,
+        "fetch_ticket_claim_reconciliation_page",
+        AsyncMock(return_value={"tickets": [], "next_cursor": None}),
+    )
     lease = SimpleNamespace(
         session_id=uuid4(),
         epoch=None,
@@ -913,7 +917,11 @@ async def test_directive_normalization_feedback_is_ticket_traced_and_idempotent(
         return [deepcopy(ticket)]
 
     monkeypatch.setattr(main, "fetch_all_tickets", fetch)
-    monkeypatch.setattr(main, "fetch_tickets_by_status", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        main,
+        "fetch_ticket_claim_reconciliation_page",
+        AsyncMock(return_value={"tickets": [], "next_cursor": None}),
+    )
     lease = SimpleNamespace(
         session_id=uuid4(),
         epoch=None,

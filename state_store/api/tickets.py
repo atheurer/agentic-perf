@@ -259,6 +259,26 @@ def list_tickets(
     return [_strip_heavy_fields(t.model_dump(mode="json")) for t in tickets]
 
 
+@router.get("/claim-reconciliation", dependencies=[Depends(_require_claim_control)])
+def claim_reconciliation(
+    request: Request,
+    after: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+):
+    tickets, next_cursor, read_errors = (
+        request.app.state.store.list_ticket_claim_reconciliation_page(
+            after_id=after,
+            limit=limit,
+            scan_limit=1000,
+        )
+    )
+    return {
+        "tickets": tickets,
+        "next_cursor": next_cursor,
+        "read_errors": read_errors,
+    }
+
+
 @router.get("/{ticket_id}")
 def get_ticket(ticket_id: str, request: Request):
     store = _get_store(request)

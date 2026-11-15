@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -12,6 +13,11 @@ from fastapi.testclient import TestClient
 from state_store.auth import make_auth_dependency
 from state_store.identity import UserStore
 from state_store.main import create_app
+from state_store.models import (
+    AcquireOrchestratorLeaseRequest,
+    CreateTicketRequest,
+    TicketStatus,
+)
 
 
 @pytest.fixture
@@ -328,3 +334,72 @@ class TestTokenTTL:
             await dep(mock_request)
         user = user_store.get_user("alice")
         assert user.last_used_at is None
+
+
+def test_claim_reconciliation_is_bounded_and_requires_auth(
+    app, authed_client, unauthed_client
+) -> None:
+    store = app.state.store
+    ticket = store.create_ticket(
+        CreateTicketRequest(summary="closed with claim", description="d")
+    )
+    session_id = uuid4()
+    lease = store.acquire_orchestrator_lease(
+        AcquireOrchestratorLeaseRequest(
+            session_id=session_id,
+            instance_name="test-orchestrator",
+            host="host-a",
+            pid=123,
+            process_start_id="boot:123",
+            ttl_seconds=30,
+        )
+    )
+    store.claim_ticket(
+        ticket.id,
+        "owner",
+        session_id=session_id,
+        epoch=lease.epoch,
+        claim_id="claim-1",
+    )
+    with store._lock:
+        stored = store._tickets[ticket.id]
+        stored.status = TicketStatus.CLOSED
+        store._global_seq += 1
+        stored.transition_seq = store._global_seq
+        store._persist_ticket(stored)
+
+    assert (
+        unauthed_client.get("/api/v1/tickets/claim-reconciliation").status_code == 401
+    )
+    response = authed_client.get(
+        "/api/v1/tickets/claim-reconciliation",
+        params={"limit": 1},
+    )
+
+    claim = store.get_ticket(ticket.id).custom_fields["claim"]
+    projected_claim = {
+        field: claim[field]
+        for field in ("claim_id", "owner", "session_id", "epoch", "expires")
+        if field in claim
+    }
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tickets"] == [
+        {
+            "id": ticket.id,
+            "status": "closed",
+            "custom_fields": {"claim": projected_claim},
+        }
+    ]
+    assert body["read_errors"] is False
+    assert body["next_cursor"] in {None, ticket.id}
+    assert {key: value for key, value in body.items() if key != "next_cursor"} == {
+        "tickets": [
+            {
+                "id": ticket.id,
+                "status": "closed",
+                "custom_fields": {"claim": projected_claim},
+            }
+        ],
+        "read_errors": False,
+    }

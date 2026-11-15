@@ -73,6 +73,7 @@ class TraceSpool:
         self.max_bytes = max_bytes
         self._warned_percentages: set[int] = set()
         self._full_logged = False
+        self._verified_ack_offset: int | None = None
         created = not self.path.exists()
         if created and not create:
             raise FileNotFoundError(self.path)
@@ -177,9 +178,11 @@ class TraceSpool:
         *,
         check_cancelled: Callable[[], None] | None = None,
         limit: int | None = None,
+        max_payload_bytes: int | None = None,
     ) -> Iterator[tuple[int, TraceEventV1]]:
         stream.seek(offset)
         count = 0
+        payload_bytes = 0
         while limit is None or count < limit:
             if check_cancelled is not None:
                 check_cancelled()
@@ -208,8 +211,17 @@ class TraceSpool:
             except ValueError as exc:
                 self._quarantine("invalid-json")
                 raise SpoolCorruption("invalid spool event") from exc
+            if (
+                max_payload_bytes is not None
+                and count > 0
+                and payload_bytes + length > max_payload_bytes
+            ):
+                return
+            payload_bytes += length
             count += 1
-            yield stream.tell(), event
+            boundary = stream.tell()
+            self._verified_ack_offset = boundary
+            yield boundary, event
 
     def pending(
         self, *, check_cancelled: Callable[[], None] | None = None
@@ -217,7 +229,9 @@ class TraceSpool:
         with self._mutex, self.path.open("rb") as stream:
             if check_cancelled is not None:
                 check_cancelled()
-            offset = self._validate_ack_boundary(stream, self._ack_offset())
+            offset = self._validate_ack_boundary(
+                stream, self._ack_offset(), check_cancelled=check_cancelled
+            )
             yield from self._iter_pending(
                 stream, offset, check_cancelled=check_cancelled
             )
@@ -227,27 +241,37 @@ class TraceSpool:
         limit: int,
         *,
         check_cancelled: Callable[[], None] | None = None,
+        max_payload_bytes: int | None = None,
     ) -> list[tuple[int, TraceEventV1]]:
         """Read one bounded batch without holding the spool mutex during I/O."""
         if limit <= 0:
             raise ValueError("pending batch limit must be positive")
+        if max_payload_bytes is not None and max_payload_bytes <= 0:
+            raise ValueError("pending batch byte limit must be positive")
         with self._mutex, self.path.open("rb") as stream:
             if check_cancelled is not None:
                 check_cancelled()
-            offset = self._validate_ack_boundary(stream, self._ack_offset())
+            offset = self._validate_ack_boundary(
+                stream, self._ack_offset(), check_cancelled=check_cancelled
+            )
             return list(
                 self._iter_pending(
                     stream,
                     offset,
                     check_cancelled=check_cancelled,
                     limit=limit,
+                    max_payload_bytes=max_payload_bytes,
                 )
             )
 
-    def acknowledge(self, offset: int) -> None:
+    def acknowledge(
+        self, offset: int, *, check_cancelled: Callable[[], None] | None = None
+    ) -> None:
         with self._mutex:
             with self.path.open("rb") as stream:
-                self._validate_ack_boundary(stream, offset)
+                self._validate_ack_boundary(
+                    stream, offset, check_cancelled=check_cancelled
+                )
             self._write_ack(offset)
 
     def compact(self, *, check_cancelled: Callable[[], None] | None = None) -> None:
@@ -257,7 +281,9 @@ class TraceSpool:
             if not offset:
                 return
             with self.path.open("rb") as source:
-                self._validate_ack_boundary(source, offset)
+                self._validate_ack_boundary(
+                    source, offset, check_cancelled=check_cancelled
+                )
                 source.seek(offset)
                 temporary = self._filesystem.temporary_file(prefix=".spool-")
                 try:
@@ -273,6 +299,7 @@ class TraceSpool:
                     # or uses the compacted file from offset zero; neither loses data.
                     self._write_ack(0)
                     self._filesystem.rename(temporary, self.path.name)
+                    self._verified_ack_offset = 0
                     self._fsync_dir()
                     self._warned_percentages.clear()
                     self._full_logged = False
@@ -301,6 +328,7 @@ class TraceSpool:
             self._filesystem.rename(self.path.name, target.name)
             self._filesystem.touch(self.path.name, mode=0o600)
             self._filesystem.unlink(self.ack_path.name, missing_ok=True)
+            self._verified_ack_offset = None
             self._fsync_dir()
             self._warned_percentages.clear()
             self._full_logged = False
@@ -314,18 +342,32 @@ class TraceSpool:
         finally:
             os.close(fd)
 
-    def _validate_ack_boundary(self, stream: BinaryIO, offset: int) -> int:
+    def _validate_ack_boundary(
+        self,
+        stream: BinaryIO,
+        offset: int,
+        *,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> int:
         """Reject acknowledgement offsets that could skip a partial frame."""
         if offset < 0:
             raise SpoolCorruption("negative spool acknowledgement")
+        if check_cancelled is not None:
+            check_cancelled()
         stream.seek(0, os.SEEK_END)
         size = stream.tell()
         if offset > size:
             self._quarantine("invalid-ack")
             raise SpoolCorruption("spool acknowledgement exceeds spool length")
-        stream.seek(0)
-        position = 0
+        if self._verified_ack_offset == offset:
+            return offset
+        position = self._verified_ack_offset or 0
+        if position > offset:
+            position = 0
+        stream.seek(position)
         while position < offset:
+            if check_cancelled is not None:
+                check_cancelled()
             header = stream.read(_HEADER.size)
             if len(header) != _HEADER.size:
                 self._quarantine("invalid-ack")
@@ -339,6 +381,7 @@ class TraceSpool:
         if position != offset:
             self._quarantine("invalid-ack")
             raise SpoolCorruption("spool acknowledgement is not frame aligned")
+        self._verified_ack_offset = offset
         return offset
 
 

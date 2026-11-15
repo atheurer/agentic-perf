@@ -932,6 +932,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/store.py", "_write_orchestrator_lease", "filesystem"),
     ("state_store/store.py", "archive_ticket", "filesystem"),
     ("state_store/store.py", "create_approval_request", "filesystem"),
+    (
+        "state_store/store.py",
+        "list_ticket_claim_reconciliation_page",
+        "filesystem",
+    ),
     ("state_store/trace_store.py", "__init__", "filesystem"),
     ("state_store/trace_store.py", "latest_event_time", "filesystem"),
 )
@@ -5084,6 +5089,16 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/store.py:create_approval_request",
+        "2027-12-31",
+    ),
+    (
+        "state_store/store.py",
+        "list_ticket_claim_reconciliation_page",
+        "filesystem",
+    ): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/store.py:list_ticket_claim_reconciliation_page",
         "2027-12-31",
     ),
     ("state_store/trace_store.py", "__init__", "filesystem"): (

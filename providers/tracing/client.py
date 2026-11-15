@@ -13,6 +13,7 @@ import httpx
 
 from paths import TRACE_SPOOL_DIR
 
+from .limits import MAX_TRACE_INGEST_BODY_BYTES
 from .models import TraceEventV1
 from .spool import (
     DEFAULT_TRACE_SPOOL_MAX_BYTES,
@@ -152,11 +153,17 @@ class TraceClient:
 
         try:
             while True:
-                batch = self.spool.pending_batch(100, check_cancelled=check_cancelled)
+                batch = self.spool.pending_batch(
+                    100,
+                    check_cancelled=check_cancelled,
+                    max_payload_bytes=MAX_TRACE_INGEST_BODY_BYTES,
+                )
                 if not batch:
                     break
                 check_cancelled()
-                delivered += self._send_batch(batch, deadline=deadline)
+                while batch:
+                    sendable, batch = self._split_batch(batch)
+                    delivered += self._send_batch(sendable, deadline=deadline)
             self.spool.compact(check_cancelled=check_cancelled)
             return delivered
         except _TraceFlushDeadlineExceeded:
@@ -173,10 +180,15 @@ class TraceClient:
         deadline: float | None = None,
     ) -> int:
         _check_deadline(deadline)
-        body = {"events": [event.model_dump(mode="json") for _, event in batch]}
+
+        def check_cancelled() -> None:
+            _check_deadline(deadline)
+
+        body = self._encode_batch(batch)
+        headers = {**self._headers, "Content-Type": "application/json"}
         if deadline is None:
             response = self._client.post(
-                self.url + "/batch", headers=self._headers, json=body
+                self.url + "/batch", headers=headers, content=body
             )
             response.raise_for_status()
             payload = response.json()
@@ -186,8 +198,8 @@ class TraceClient:
             with self._client.stream(
                 "POST",
                 self.url + "/batch",
-                headers=self._headers,
-                json=body,
+                headers=headers,
+                content=body,
                 timeout=timeout,
             ) as response:
                 watchdog = threading.Timer(remaining, response.close)
@@ -215,9 +227,46 @@ class TraceClient:
                 or ack.get("status") not in {"stored", "duplicate"}
             ):
                 raise TraceDeliveryError("trace batch event was not acknowledged")
-            self.spool.acknowledge(offset)
+            self.spool.acknowledge(offset, check_cancelled=check_cancelled)
             delivered += 1
         return delivered
+
+    @staticmethod
+    def _encode_batch(batch: list[tuple[int, TraceEventV1]]) -> bytes:
+        body = json.dumps(
+            {"events": [event.model_dump(mode="json") for _, event in batch]},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(body) > MAX_TRACE_INGEST_BODY_BYTES:
+            raise TraceDeliveryError("trace batch exceeds ingestion body limit")
+        return body
+
+    @classmethod
+    def _split_batch(
+        cls, batch: list[tuple[int, TraceEventV1]]
+    ) -> tuple[list[tuple[int, TraceEventV1]], list[tuple[int, TraceEventV1]]]:
+        """Return a prefix whose serialized request body fits the server limit."""
+        empty_size = len(b'{"events":[]}')
+        size = empty_size
+        split = 0
+        for item in batch:
+            _, event = item
+            event_size = len(
+                json.dumps(
+                    event.model_dump(mode="json"),
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            )
+            addition = event_size + (1 if split else 0)
+            if size + addition > MAX_TRACE_INGEST_BODY_BYTES:
+                break
+            size += addition
+            split += 1
+        if split == 0:
+            raise TraceDeliveryError("trace event exceeds ingestion body limit")
+        return batch[:split], batch[split:]
 
     def close(self, *, flush_timeout: float | None = 5.0) -> None:
         if self._closed:

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,6 +18,7 @@ from cli import get_default_store_url
 from orchestrator.config import ConfigFileError, OrchestratorConfig, _load_config_file
 from orchestrator.main import _ensure_state_store_environment
 from paths import resolve_state_store
+from state_store.api.executors import BoundedThreadPoolExecutor
 
 
 def test_config_is_shared_by_components(monkeypatch):
@@ -132,6 +136,43 @@ def test_non_object_config_refuses_startup(
 
 
 @pytest.mark.parametrize(
+    ("config_text", "expected_error"),
+    [
+        ('{"trace": []}', "trace must be a JSON object"),
+        ('{"trace": {"query": []}}', "trace.query must be a JSON object"),
+        ('{"trace": {"ingestion": []}}', "trace.ingestion must be a JSON object"),
+        ('{"llm": []}', "llm must be a JSON object"),
+        ('{"agent_models": []}', "agent_models must be a JSON object"),
+        (
+            '{"agent_models": {"chat": []}}',
+            "agent_models.chat must be a JSON object",
+        ),
+        ('{"chat": []}', "chat must be a JSON object"),
+        ('{"chat": {"enabled": "yes"}}', "chat.enabled must be a boolean"),
+        (
+            '{"rate_limit": {"enabled": "yes"}}',
+            "rate_limit.enabled must be a boolean",
+        ),
+    ],
+)
+def test_invalid_startup_section_shapes_refuse_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_text: str,
+    expected_error: str,
+) -> None:
+    import orchestrator.config as config
+    import state_store.main as main
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(config_text, encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_PATH", config_path)
+
+    with pytest.raises(ConfigFileError, match=expected_error):
+        main.create_app(initialize_immediately=True)
+
+
+@pytest.mark.parametrize(
     "auth_config",
     [
         '"never-log-this-value"',
@@ -206,6 +247,131 @@ def test_valid_config_preserves_multi_user_and_dashboard_auth(
         headers = {"Authorization": f"Bearer {client.app.state.api_token}"}
         assert client.get("/api/v1/tickets", headers=headers).status_code == 200
         assert 'window.API_TOKEN=""' in client.get("/").text
+
+
+def test_trace_query_admission_bounds_running_and_queued_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import orchestrator.config as config
+    import state_store.main as main
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"trace": {"query": {"workers": 1, "queue_size": 1}}}')
+    monkeypatch.setattr(config, "CONFIG_PATH", config_path)
+    with TestClient(main.create_app()) as client:
+        slots = client.app.state.trace_query_slots
+        assert slots.acquire(blocking=False)
+        assert slots.acquire(blocking=False)
+        assert not slots.acquire(blocking=False)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "env_name", "value"),
+    [
+        (("trace", "query", "workers"), None, None),
+        (("trace", "query", "queue_size"), None, None),
+        (("trace", "ingestion", "workers"), None, None),
+        (("trace", "ingestion", "queue_size"), None, None),
+        (None, "STATE_STORE_CONTROL_WORKERS", None),
+        (None, "STATE_STORE_LEASE_WORKERS", None),
+        (None, "TRACE_QUERY_MAX_QUEUE", None),
+        (None, "TRACE_INGESTION_MAX_QUEUE", None),
+    ],
+)
+def test_executor_capacity_settings_reject_unbounded_values(
+    monkeypatch: pytest.MonkeyPatch,
+    field_path: tuple[str, str, str] | None,
+    env_name: str | None,
+    value: int | None,
+) -> None:
+    import state_store.main as main
+
+    for name in (
+        "STATE_STORE_CONTROL_WORKERS",
+        "STATE_STORE_LEASE_WORKERS",
+        "TRACE_QUERY_MAX_QUEUE",
+        "TRACE_INGESTION_MAX_QUEUE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    cfg = {"trace": {"query": {}, "ingestion": {}}}
+    if field_path is not None:
+        section, group, field = field_path
+        maximum = (
+            main.MAX_EXECUTOR_QUEUE_SIZE
+            if field == "queue_size"
+            else main.MAX_EXECUTOR_WORKERS
+        )
+        value = maximum + 1
+        cfg[section][group][field] = value
+    else:
+        assert env_name is not None
+        maximum = (
+            main.MAX_EXECUTOR_QUEUE_SIZE
+            if env_name in {"TRACE_QUERY_MAX_QUEUE", "TRACE_INGESTION_MAX_QUEUE"}
+            else main.MAX_EXECUTOR_WORKERS
+        )
+        value = maximum + 1
+        monkeypatch.setenv(env_name, str(value))
+
+    monkeypatch.setattr(main, "TraceStore", MagicMock())
+    monkeypatch.setattr(main, "get_instance_name", lambda: "test")
+    monkeypatch.setattr(main, "persistence_root_fingerprint", lambda: "test")
+    monkeypatch.setattr("state_store.status.record_store_status", MagicMock())
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    with pytest.raises(ValueError, match=rf"must be <= {maximum}, got {value}"):
+        main._initialize_runtime(app, 8090, cfg)
+
+
+def test_runtime_shutdown_keeps_stores_open_while_worker_is_blocked(monkeypatch):
+    import state_store.main as main
+
+    entered = threading.Event()
+    release = threading.Event()
+    executor = BoundedThreadPoolExecutor(
+        max_workers=1,
+        queue_size=0,
+        thread_name_prefix="blocked-shutdown",
+    )
+
+    def blocked() -> None:
+        entered.set()
+        release.wait(2)
+
+    executor.submit(blocked)
+    assert entered.wait(1)
+    trace_store = MagicMock()
+    event_bus = MagicMock()
+    audit_log = MagicMock()
+    state = SimpleNamespace(
+        runtime_initialized=True,
+        runtime_pid=os.getpid(),
+        trace_query_shutdown=threading.Event(),
+        trace_query_executor=executor,
+        trace_query_audit_executor=None,
+        control_executor=None,
+        lease_executor=None,
+        event_bus=event_bus,
+        audit_log=audit_log,
+        trace_store=trace_store,
+        process_lock=None,
+    )
+    app = SimpleNamespace(state=state)
+    monkeypatch.setattr(main, "_EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS", 0.02)
+    started = time.monotonic()
+
+    try:
+        main._close_runtime(app)
+        main._close_runtime(app)
+    finally:
+        release.set()
+        assert executor.wait_for_idle(1)
+
+    assert time.monotonic() - started < 0.5
+    assert state.runtime_initialized is True
+    trace_store.close.assert_not_called()
+    event_bus.close.assert_not_called()
+    audit_log.close.assert_not_called()
 
 
 def test_strict_loader_does_not_change_tolerant_callers(

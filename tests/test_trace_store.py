@@ -17,6 +17,7 @@ from providers.tracing import (
     ActionType,
     LifecycleDescriptor,
     LifecycleState,
+    PayloadDescriptor,
     TraceEventV1,
 )
 from providers.tracing.query import (
@@ -189,9 +190,100 @@ def test_query_events_enforces_serialized_byte_budget(
     with TraceStore(tmp_path / "trace.db") as store:
         store.insert_event(event(attributes={"payload": "\u00e9" * 600}))
         monkeypatch.setattr(store, "MAX_QUERY_RAW_BYTES", 1024)
+        statements: list[str] = []
+        connection = store._open_connection()
+        connection.set_trace_callback(statements.append)
 
-        with pytest.raises(TraceQueryTooBroad, match="query budget"):
+        try:
+            with pytest.raises(TraceQueryTooBroad, match="query budget"):
+                store.query_events(TraceQuery(limit=10))
+        finally:
+            connection.set_trace_callback(None)
+
+        assert any("length(CAST(event_json AS BLOB))" in sql for sql in statements)
+        assert not any(
+            sql.startswith("SELECT event_json FROM trace_events") for sql in statements
+        )
+
+
+def test_query_events_enforces_database_execution_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        store.insert_event(event())
+        monkeypatch.setattr(store, "MAX_QUERY_PROGRESS_STEPS", 1)
+        monkeypatch.setattr(store, "_QUERY_PROGRESS_HANDLER_INTERVAL", 1)
+
+        with pytest.raises(TraceQueryTooBroad, match="database execution budget"):
             store.query_events(TraceQuery(limit=10))
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_index"),
+    [
+        (
+            TraceQuery(lifecycle_state="started", limit=10),
+            "trace_events_lifecycle_state_global_seq_idx",
+        ),
+        (
+            TraceQuery(retry_kind="transport_replay", limit=10),
+            "trace_events_retry_kind_global_seq_idx",
+        ),
+        (
+            TraceQuery(idempotency_outcome="reused", limit=10),
+            "trace_events_idempotency_outcome_global_seq_idx",
+        ),
+    ],
+)
+def test_query_filter_indexes_bound_scan_work(
+    tmp_path: Path, query: TraceQuery, expected_index: str
+) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        predicates, values = store._query_predicates(query)
+        where_clause = " AND ".join(predicates)
+        plan = store._open_connection().execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT global_seq FROM trace_events "
+            f"WHERE {where_clause} ORDER BY global_seq LIMIT ?",
+            (*values, query.limit),
+        )
+        details = " ".join(row["detail"] for row in plan)
+
+        assert expected_index in details
+
+
+def test_payload_reference_lookup_checks_active_and_history_without_materializing(
+    tmp_path: Path,
+) -> None:
+    digest = "sha256:" + "a" * 64
+    with TraceStore(
+        tmp_path / "trace.db", history_db_path=tmp_path / "trace-history.db"
+    ) as store:
+        store.insert_event(event(input=PayloadDescriptor(blob_ref=digest)))
+        store.insert_event(
+            event(
+                ticket_id="PERF-other",
+                output=PayloadDescriptor(blob_ref="sha256:" + "b" * 64),
+            )
+        )
+
+        assert store.payload_is_referenced("PERF-1", digest)
+        assert not store.payload_is_referenced("PERF-other", digest)
+        with pytest.raises(TraceQueryCancelled):
+            store.payload_is_referenced("PERF-1", digest, cancelled=lambda: True)
+
+        plan_query = "EXPLAIN QUERY PLAN " + TraceStore._PAYLOAD_REFERENCE_SQL
+        plan = " ".join(
+            row["detail"]
+            for row in store._open_connection().execute(
+                plan_query, ("PERF-1", digest, "PERF-1", digest)
+            )
+        )
+        assert "trace_events_ticket_input_blob_idx" in plan
+        assert "trace_events_ticket_output_blob_idx" in plan
+
+        assert store.migrate_ticket_traces("PERF-1") == 1
+        assert store.payload_is_referenced("PERF-1", digest)
 
 
 def test_multiprocess_cold_start_has_gap_free_sequences(tmp_path: Path) -> None:

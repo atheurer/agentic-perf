@@ -684,6 +684,7 @@ class TestRunAgentTaskTimeout:
         dispatcher._trace_contexts = {}
         dispatcher.clear_agent = MagicMock()
         dispatcher.mark_done = AsyncMock()
+        dispatcher.is_deposed.return_value = False
 
         # Use a status not in PLAN_AGENT_STATUS to avoid
         # _advance_plan trying to reach the state store.
@@ -722,6 +723,7 @@ class TestRunAgentTaskTimeout:
         dispatcher._trace_contexts = {}
         dispatcher.clear_agent = MagicMock()
         dispatcher.mark_done = AsyncMock()
+        dispatcher.is_deposed.return_value = False
 
         async def transition(*_args, **_kwargs):
             ticket_events = events.get_events("SLOW-002", since=0, limit=100)
@@ -754,6 +756,7 @@ class TestRunAgentTaskTimeout:
         dispatcher.store_url = "http://localhost:9999"
         dispatcher.events = None
         dispatcher.mark_done = AsyncMock()
+        dispatcher.is_deposed.return_value = False
 
         response = MagicMock(status_code=200)
         response.json.return_value = {

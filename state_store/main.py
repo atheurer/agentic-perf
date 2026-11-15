@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,12 +29,25 @@ from paths import (
 from providers.events import EventBus
 from providers.tracing import TraceContext, bind_trace_context, reset_trace_context
 
+from .api.executors import BoundedThreadPoolExecutor
 from .api.router import api_router, chat_router, health_router, webhook_router
+from .api.traces import TraceIngestBodyLimitMiddleware
 from .audit import AuditLog, set_actor
 from .auth import (
     load_or_generate_token,
     load_or_generate_validator_token,
     make_auth_dependency,
+)
+from .config import (
+    MAX_EXECUTOR_QUEUE_SIZE,
+    MAX_EXECUTOR_WORKERS,
+    _auth_settings,
+    _executor_settings,
+    _rate_limit_settings,
+    validate_runtime_config,
+)
+from .config import (
+    _validate_positive_int as _validate_positive_int,
 )
 from .process_lock import PersistenceRootLock
 from .ratelimit import (
@@ -45,7 +58,10 @@ from .ratelimit import (
 from .store import TicketStore
 from .trace_store import TraceStore
 
+__all__ = ["MAX_EXECUTOR_QUEUE_SIZE", "MAX_EXECUTOR_WORKERS"]
+
 STATIC_DIR = Path(__file__).parent / "static"
+_EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 logger = logging.getLogger(__name__)
 # Ensure startup logs are visible even when uvicorn uses
@@ -58,19 +74,6 @@ if not logger.handlers and not logging.root.handlers:
 
 _runtime_locks: dict[Path, tuple[PersistenceRootLock, int]] = {}
 _runtime_locks_guard = threading.Lock()
-
-
-def _validate_positive_int(
-    value: Any,
-    name: str,
-    *,
-    allow_zero: bool = True,
-) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer")
-    if not allow_zero and value == 0:
-        raise ValueError(f"{name} must be > 0, got 0")
-    return value
 
 
 async def _set_audit_actor(request: Request) -> None:
@@ -105,6 +108,14 @@ def _trace_read_operation(path: str) -> str | None:
         return "trace_export"
     if path == "/api/v1/traces/query":
         return "trace_query"
+    trace_prefix = "/api/v1/traces/"
+    trace_parts = path[len(trace_prefix) :].split("/")
+    if (
+        path.startswith(trace_prefix)
+        and len(trace_parts) >= 3
+        and trace_parts[1] == "payloads"
+    ):
+        return "trace_payload_read"
     if path.startswith(
         (
             "/api/v1/traces/tickets/",
@@ -123,6 +134,14 @@ def _trace_read_ticket_id(request: Request) -> str | None:
     prefix = "/api/v1/traces/tickets/"
     if request.url.path.startswith(prefix):
         return unquote(request.url.path[len(prefix) :].split("/", 1)[0]) or None
+    prefix = "/api/v1/traces/"
+    parts = request.url.path[len(prefix) :].split("/")
+    if (
+        request.url.path.startswith(prefix)
+        and len(parts) >= 3
+        and parts[1] == "payloads"
+    ):
+        return unquote(parts[0]) or None
     return None
 
 
@@ -134,72 +153,47 @@ def _initialize_runtime(app: FastAPI, port: int, cfg: dict) -> None:
     record_store_status("initializing_trace_store")
     app.state.trace_store = TraceStore(TRACE_DB_PATH)
     app.state.trace_instance_id = get_instance_name()
-    trace_cfg = cfg.get("trace", {})
-    query_cfg = trace_cfg.get("query", {}) if isinstance(trace_cfg, dict) else {}
-    if not isinstance(query_cfg, dict):
-        raise ConfigFileError("trace.query must be a JSON object")
-    query_workers = _validate_positive_int(
-        query_cfg.get("workers", 2),
-        "trace.query.workers",
-        allow_zero=False,
-    )
-    max_rss_value = os.environ.get(
-        "TRACE_QUERY_MAX_RSS_MB", query_cfg.get("max_rss_mb", 4096)
-    )
-    if isinstance(max_rss_value, str):
-        try:
-            max_rss_value = int(max_rss_value)
-        except ValueError as exc:
-            raise ConfigFileError("trace.query.max_rss_mb must be an integer") from exc
-    max_rss_mb = _validate_positive_int(
-        max_rss_value,
-        "trace.query.max_rss_mb",
-    )
-    control_value = os.environ.get("STATE_STORE_CONTROL_WORKERS", 2)
-    if isinstance(control_value, str):
-        try:
-            control_value = int(control_value)
-        except ValueError as exc:
-            raise ConfigFileError(
-                "STATE_STORE_CONTROL_WORKERS must be an integer"
-            ) from exc
-    control_workers = _validate_positive_int(
-        control_value,
-        "STATE_STORE_CONTROL_WORKERS",
-        allow_zero=False,
-    )
-    lease_value = os.environ.get("STATE_STORE_LEASE_WORKERS", 1)
-    if isinstance(lease_value, str):
-        try:
-            lease_value = int(lease_value)
-        except ValueError as exc:
-            raise ConfigFileError(
-                "STATE_STORE_LEASE_WORKERS must be an integer"
-            ) from exc
-    lease_workers = _validate_positive_int(
-        lease_value,
-        "STATE_STORE_LEASE_WORKERS",
-        allow_zero=False,
-    )
+    executor_settings = _executor_settings(cfg)
     app.state.trace_query_shutdown = threading.Event()
-    app.state.trace_query_executor = ThreadPoolExecutor(
-        max_workers=query_workers,
+    app.state.trace_query_executor = BoundedThreadPoolExecutor(
+        max_workers=executor_settings["query_workers"],
+        queue_size=executor_settings["query_queue_size"],
         thread_name_prefix="trace-query",
     )
-    app.state.control_executor = ThreadPoolExecutor(
-        max_workers=control_workers,
+    app.state.trace_query_slots = app.state.trace_query_executor.slots
+    app.state.trace_ingestion_executor = BoundedThreadPoolExecutor(
+        max_workers=executor_settings["ingestion_workers"],
+        queue_size=executor_settings["ingestion_queue_size"],
+        thread_name_prefix="trace-ingestion",
+    )
+    app.state.trace_ingestion_slots = app.state.trace_ingestion_executor.slots
+    app.state.trace_query_audit_executor = BoundedThreadPoolExecutor(
+        max_workers=1,
+        queue_size=executor_settings["query_queue_size"],
+        thread_name_prefix="trace-query-audit",
+    )
+    app.state.trace_query_audit_slots = app.state.trace_query_audit_executor.slots
+    app.state.control_executor = BoundedThreadPoolExecutor(
+        max_workers=executor_settings["control_workers"],
+        queue_size=0,
         thread_name_prefix="state-store-control",
     )
-    app.state.lease_executor = ThreadPoolExecutor(
-        max_workers=lease_workers,
+    app.state.control_slots = app.state.control_executor.slots
+    app.state.lease_executor = BoundedThreadPoolExecutor(
+        max_workers=executor_settings["lease_workers"],
+        queue_size=0,
         thread_name_prefix="state-store-lease",
     )
-    app.state.trace_query_max_rss_bytes = max_rss_mb * 1024 * 1024
+    app.state.lease_slots = app.state.lease_executor.slots
+    app.state.trace_query_max_rss_bytes = executor_settings["max_rss_mb"] * 1024 * 1024
     app.state.trace_health = {
         "ingested": 0,
         "ingestion_failures": 0,
         "schema_rejections": 0,
         "quarantined_frames": 0,
+        "audit_queue_rejections": 0,
+        "ingestion_queue_rejections": 0,
+        "ingestion_body_rejections": 0,
     }
 
     token = load_or_generate_token()
@@ -207,13 +201,7 @@ def _initialize_runtime(app: FastAPI, port: int, cfg: dict) -> None:
     app.state.benchmark_validator_token = load_or_generate_validator_token()
     app.state.benchmark_validation_capabilities = {}
 
-    auth_cfg = cfg.get("auth", {})
-    multi_user = auth_cfg.get("multi_user", False)
-    anonymous_read = auth_cfg.get("anonymous_read", False)
-    token_ttl_days = _validate_positive_int(
-        auth_cfg.get("token_ttl_days", 0),
-        "auth.token_ttl_days",
-    )
+    multi_user, anonymous_read, token_ttl_days = _auth_settings(cfg)
     app.state.multi_user = multi_user
     app.state.anonymous_read = anonymous_read
     app.state.token_ttl_days = token_ttl_days
@@ -250,24 +238,13 @@ def _initialize_runtime(app: FastAPI, port: int, cfg: dict) -> None:
             )
 
     # ── Rate limiting ────────────────────────────────────────
-    rl_cfg = cfg.get("rate_limit", {})
-    rl_enabled = rl_cfg.get("enabled", True)
-    rl_per_user_rpm = _validate_positive_int(
-        rl_cfg.get("per_user_rpm", 600),
-        "rate_limit.per_user_rpm",
-        allow_zero=not rl_enabled,
-    )
-    rl_burst = _validate_positive_int(
-        rl_cfg.get("burst", 30),
-        "rate_limit.burst",
-        allow_zero=not rl_enabled,
-    )
-    rl_exempt_service = rl_cfg.get("exempt_service", True)
-    rl_auth_failures_per_min = _validate_positive_int(
-        rl_cfg.get("auth_failures_per_min", 30),
-        "rate_limit.auth_failures_per_min",
-        allow_zero=not rl_enabled,
-    )
+    (
+        rl_enabled,
+        rl_per_user_rpm,
+        rl_burst,
+        rl_exempt_service,
+        rl_auth_failures_per_min,
+    ) = _rate_limit_settings(cfg)
 
     auth_failure_limiter: AuthFailureLimiter | None = None
     rate_limiter: RateLimiter | None = None
@@ -425,13 +402,7 @@ def _start_runtime(app: FastAPI, port: int) -> None:
     # unreadable config must never silently replace the configured policy.
     try:
         cfg = _load_config_file(strict=True)
-        auth_cfg = cfg.get("auth", {})
-        if not isinstance(auth_cfg, dict):
-            raise ConfigFileError("auth must be a JSON object")
-        for name in ("multi_user", "anonymous_read"):
-            if not isinstance(auth_cfg.get(name, False), bool):
-                raise ConfigFileError(f"auth.{name} must be a boolean")
-        _validate_positive_int(auth_cfg.get("token_ttl_days", 0), "auth.token_ttl_days")
+        validate_runtime_config(cfg)
     except (ConfigFileError, ValueError) as exc:
         logger.error("State store refused startup: %s", exc)
         raise
@@ -483,17 +454,40 @@ def _close_runtime(app: FastAPI) -> None:
 
     if not getattr(app.state, "runtime_initialized", False):
         return
+    if getattr(app.state, "runtime_shutdown_blocked", False):
+        return
     if getattr(app.state, "runtime_pid", None) != os.getpid():
         _discard_inherited_runtime(app)
         return
     shutdown = getattr(app.state, "trace_query_shutdown", None)
     if shutdown is not None:
         shutdown.set()
-    for name in ("trace_query_executor", "control_executor", "lease_executor"):
+    executors = []
+    for name in (
+        "trace_query_executor",
+        "trace_ingestion_executor",
+        "control_executor",
+        "lease_executor",
+        "trace_query_audit_executor",
+    ):
         executor = getattr(app.state, name, None)
         if executor is not None:
-            executor.shutdown(wait=True, cancel_futures=True)
+            executor.shutdown(wait=False, cancel_futures=True)
             setattr(app.state, name, None)
+            executors.append(executor)
+    deadline = time.monotonic() + _EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS
+    for executor in executors:
+        wait_for_idle = getattr(executor, "wait_for_idle", None)
+        if wait_for_idle is None:
+            continue
+        if not wait_for_idle(max(0.0, deadline - time.monotonic())):
+            logger.error(
+                "State-store worker did not stop within %.1fs; leaving shared "
+                "stores open for forced process termination",
+                _EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+            app.state.runtime_shutdown_blocked = True
+            return
     for name in ("event_bus", "audit_log"):
         adapter = getattr(app.state, name, None)
         if adapter is not None:
@@ -501,6 +495,7 @@ def _close_runtime(app: FastAPI) -> None:
     app.state.trace_store.close()
     app.state.runtime_initialized = False
     app.state.runtime_pid = None
+    app.state.runtime_shutdown_blocked = False
     lock = getattr(app.state, "process_lock", None)
     if lock is not None:
         _release_runtime_lock(lock)
@@ -539,6 +534,8 @@ def create_app(*, initialize_immediately: bool = False) -> FastAPI:
         "ingestion_failures": 0,
         "schema_rejections": 0,
         "quarantined_frames": 0,
+        "ingestion_queue_rejections": 0,
+        "ingestion_body_rejections": 0,
     }
 
     @app.middleware("http")
@@ -596,7 +593,11 @@ def create_app(*, initialize_immediately: bool = False) -> FastAPI:
                     422: "request validation rejected",
                     429: "rate limit rejected",
                 }[response.status_code]
-                audit_log.log(
+                from .api.traces import _run_trace_audit_worker
+
+                await _run_trace_audit_worker(
+                    request,
+                    audit_log.log,
                     operation,
                     _trace_read_ticket_id(request) or "*",
                     {"outcome": "denied", "error": error},
@@ -611,6 +612,7 @@ def create_app(*, initialize_immediately: bool = False) -> FastAPI:
             app.state.trace_health["schema_rejections"] += 1
         return await request_validation_exception_handler(request, exc)
 
+    app.add_middleware(TraceIngestBodyLimitMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[

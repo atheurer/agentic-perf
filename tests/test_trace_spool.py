@@ -69,6 +69,88 @@ def test_ack_crash_window_replays_idempotently(tmp_path) -> None:
     spool.close()
 
 
+def test_ack_boundary_scan_honors_cancellation_after_restart(tmp_path) -> None:
+    spool = TraceSpool(tmp_path, name="producer")
+    for _ in range(5):
+        spool.append(event())
+    offsets = [offset for offset, _ in spool.pending()]
+    spool.acknowledge(offsets[-1])
+    spool.close()
+
+    reopened = TraceSpool(tmp_path, name="producer")
+    checks = 0
+
+    def cancel() -> None:
+        nonlocal checks
+        checks += 1
+        if checks >= 2:
+            raise RuntimeError("flush deadline exceeded")
+
+    with pytest.raises(RuntimeError, match="flush deadline exceeded"):
+        reopened.pending_batch(1, check_cancelled=cancel)
+    assert checks == 2
+    reopened.close()
+
+
+def test_pending_batch_stops_before_exceeding_payload_budget(tmp_path) -> None:
+    spool = TraceSpool(tmp_path, name="bounded-batch")
+    events = [
+        event().model_copy(update={"attributes": {"padding": "x" * 400}})
+        for _ in range(3)
+    ]
+    for item in events:
+        spool.append(item)
+
+    pending = list(spool.pending())
+    first_size = len(events[0].model_dump_json().encode("utf-8"))
+    batch = spool.pending_batch(10, max_payload_bytes=first_size)
+
+    assert [item.event_id for _, item in batch] == [events[0].event_id]
+    assert len(pending) == 3
+    spool.close()
+
+
+def test_client_splits_valid_events_within_ingestion_body_limit(
+    tmp_path, monkeypatch
+) -> None:
+    body_limit = 1_500
+    monkeypatch.setattr(
+        "providers.tracing.client.MAX_TRACE_INGEST_BODY_BYTES", body_limit
+    )
+    batch_sizes: list[int] = []
+
+    def accepted(request: httpx.Request) -> httpx.Response:
+        assert len(request.content) <= body_limit
+        events = json.loads(request.content)["events"]
+        batch_sizes.append(len(events))
+        return httpx.Response(
+            200,
+            json={
+                "acknowledgements": [
+                    {
+                        "event_id": item["event_id"],
+                        "accepted": True,
+                        "status": "stored",
+                    }
+                    for item in events
+                ]
+            },
+        )
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(accepted)),
+    )
+    for _ in range(4):
+        client.record(event().model_copy(update={"attributes": {"padding": "x" * 400}}))
+
+    assert client.flush() == 4
+    assert batch_sizes == [1, 1, 1, 1]
+    client.close(flush_timeout=0)
+
+
 def test_cap_and_corrupt_or_truncated_frames_are_not_silently_skipped(tmp_path) -> None:
     spool = TraceSpool(tmp_path, name="producer", max_bytes=1_500)
     spool.append(event())
@@ -385,10 +467,12 @@ def test_slow_trickle_response_honors_total_flush_deadline(tmp_path) -> None:
     assert [item.event_id for _, item in client.spool.pending()] == [expected.event_id]
 
 
-def test_stalled_batch_send_does_not_block_new_records(tmp_path) -> None:
+def test_stalled_batch_send_does_not_block_new_records(tmp_path, monkeypatch) -> None:
     expected = [event() for _ in range(100)]
     send_started = threading.Event()
     release_send = threading.Event()
+    clock = [0.0]
+    monkeypatch.setattr("providers.tracing.client.time.monotonic", lambda: clock[0])
 
     def stalled(request: httpx.Request) -> httpx.Response:
         send_started.set()
@@ -417,9 +501,8 @@ def test_stalled_batch_send_does_not_block_new_records(tmp_path) -> None:
     for item in expected:
         client.record(item)
 
-    started = time.monotonic()
-    assert client.flush(deadline=started + 0.05) == 0
-    assert send_started.wait(1)
+    assert client.flush(deadline=0.05) == 0
+    assert send_started.wait(5)
     appended = event()
     record_thread = threading.Thread(target=client.record, args=(appended,))
     record_thread.start()
@@ -427,6 +510,7 @@ def test_stalled_batch_send_does_not_block_new_records(tmp_path) -> None:
     assert not record_thread.is_alive()
     assert appended.event_id in [item.event_id for _, item in client.spool.pending()]
 
+    clock[0] = 1.0
     release_send.set()
     record_thread.join(2)
     active = client._flush_thread
@@ -435,10 +519,12 @@ def test_stalled_batch_send_does_not_block_new_records(tmp_path) -> None:
     client.close(flush_timeout=0)
 
 
-def test_plain_flush_waits_for_timed_flush_worker(tmp_path) -> None:
+def test_plain_flush_waits_for_timed_flush_worker(tmp_path, monkeypatch) -> None:
     expected = event()
     send_started = threading.Event()
     release_send = threading.Event()
+    clock = [0.0]
+    monkeypatch.setattr("providers.tracing.client.time.monotonic", lambda: clock[0])
     calls = 0
     in_flight = 0
     max_in_flight = 0
@@ -475,16 +561,23 @@ def test_plain_flush_waits_for_timed_flush_worker(tmp_path) -> None:
     )
     client.record(expected)
 
-    started = time.monotonic()
-    assert client.flush(deadline=started + 0.05) == 0
-    assert send_started.wait(1)
+    assert client.flush(deadline=0.05) == 0
+    assert send_started.wait(5)
     plain_result: list[int] = []
-    plain = threading.Thread(target=lambda: plain_result.append(client.flush()))
+    plain_entered = threading.Event()
+
+    def plain_flush() -> None:
+        plain_entered.set()
+        plain_result.append(client.flush())
+
+    plain = threading.Thread(target=plain_flush)
     plain.start()
+    assert plain_entered.wait(5)
     time.sleep(0.1)
     assert plain.is_alive()
     assert calls == 1
 
+    clock[0] = 1.0
     release_send.set()
     plain.join(2)
     active = client._flush_thread
@@ -597,7 +690,7 @@ def test_blocked_spool_io_cannot_exceed_flush_or_close_deadline(
     )
     client.record(expected)
 
-    def blocked_pending_batch(*_args, check_cancelled=None):
+    def blocked_pending_batch(*_args, check_cancelled=None, max_payload_bytes=None):
         release.wait(2)
         completed.set()
         return []

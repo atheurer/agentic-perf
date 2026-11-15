@@ -989,6 +989,165 @@ async def test_lease_loss_drains_agents_before_cancelling_remainder(caplog) -> N
     assert "PERF-finish" not in cancel_log
 
 
+def test_set_agent_stops_agent_registered_after_lease_loss() -> None:
+    dispatcher, _ = _dispatcher()
+    agent = MagicMock()
+
+    dispatcher.mark_deposed()
+    dispatcher.set_agent("PERF-late", agent)
+
+    assert dispatcher._agents["PERF-late"] is agent
+    agent.request_stop.assert_called_once_with()
+
+
+def test_start_introspection_rejects_deposed_dispatcher() -> None:
+    dispatcher, _ = _dispatcher()
+    dispatcher.mark_deposed()
+
+    assert not dispatcher.start_introspection("PERF-late")
+    assert "PERF-late" not in dispatcher._introspection_tasks
+    assert "PERF-late" not in dispatcher._introspection_agents
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_drain_cancels_introspection_setup() -> None:
+    dispatcher, _ = _dispatcher()
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def setup() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    task = asyncio.create_task(setup())
+    dispatcher.track_introspection_setup("PERF-setup", task)
+    await asyncio.wait_for(entered.wait(), 2)
+
+    dispatcher.mark_deposed()
+    assert await dispatcher.drain_for_lease_loss(0.2) == ()
+
+    assert cancelled.is_set()
+    assert task.cancelled()
+    assert "PERF-setup" not in dispatcher._introspection_setup_tasks
+
+
+@pytest.mark.asyncio
+async def test_run_agent_task_does_not_start_after_lease_loss_during_setup() -> None:
+    from orchestrator.main import run_agent_task
+
+    dispatcher, _ = _dispatcher()
+    agent = MagicMock()
+    agent.run = AsyncMock()
+    dispatcher._get_secrets_for_ticket = MagicMock(return_value=None)
+    dispatcher.get_skill_provider_for_ticket = AsyncMock(return_value=MagicMock())
+
+    def create_agent(*_args, **_kwargs):
+        dispatcher.mark_deposed()
+        return agent
+
+    dispatcher.create_agent = MagicMock(side_effect=create_agent)
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"custom_fields": {}}
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    client.get = AsyncMock(return_value=response)
+
+    with (
+        patch("orchestrator.main.AuditedAsyncHTTPClient", return_value=client),
+        patch(
+            "orchestrator.main._record_dispatch_retry_outcome",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "orchestrator.main._await_agent_dispatch_cleanup",
+            new_callable=AsyncMock,
+        ),
+    ):
+        await run_agent_task(dispatcher, "triage_pending", "PERF-late")
+
+    agent.run.assert_not_awaited()
+    agent.request_stop.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_drain_detaches_tasks_that_suppress_cancellation(
+    caplog,
+) -> None:
+    dispatcher, _ = _dispatcher()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stubborn() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            raise RuntimeError("late dispatcher failure")
+
+    task = asyncio.create_task(stubborn())
+    dispatcher.set_task("PERF-stuck", task, "executing_benchmark")
+    await entered.wait()
+
+    try:
+        survivors = await asyncio.wait_for(
+            dispatcher.drain_for_lease_loss(0.05), timeout=0.5
+        )
+        assert survivors == ("PERF-stuck",)
+        assert "PERF-stuck" not in dispatcher._tasks
+        assert not task.done()
+    finally:
+        release.set()
+        with pytest.raises(RuntimeError, match="late dispatcher failure"):
+            await asyncio.wait_for(task, timeout=1)
+
+    assert "detaching" in caplog.text
+    assert "PERF-stuck" in caplog.text
+    assert "Detached dispatcher task failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_drain_includes_introspection_survivors(caplog) -> None:
+    dispatcher, _ = _dispatcher()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stubborn() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            raise RuntimeError("late introspection failure")
+
+    task = asyncio.create_task(stubborn())
+    agent = MagicMock()
+    dispatcher._introspection_agents["PERF-intro"] = agent
+    dispatcher._introspection_tasks["PERF-intro"] = task
+    await entered.wait()
+
+    try:
+        survivors = await asyncio.wait_for(
+            dispatcher.drain_for_lease_loss(0.05), timeout=0.5
+        )
+        assert survivors == ("PERF-intro",)
+        assert agent.request_stop.called
+        assert "PERF-intro" not in dispatcher._introspection_tasks
+        assert not task.done()
+    finally:
+        release.set()
+        with pytest.raises(RuntimeError, match="late introspection failure"):
+            await asyncio.wait_for(task, timeout=1)
+
+    assert "PERF-intro" in caplog.text
+    assert "Detached dispatcher task failed" in caplog.text
+
+
 async def test_shutdown_excludes_its_registered_caller() -> None:
     dispatcher, _ = _dispatcher()
     dispatcher._claim_ids["PERF-1"] = "claim-1"

@@ -911,6 +911,7 @@ class TestIntrospectionAgent:
         }
         mock_response.raise_for_status = MagicMock()
         agent._client = AsyncMock()
+        agent._client.headers = {}
         agent._client.get = AsyncMock(return_value=mock_response)
         agent._client.patch = AsyncMock(return_value=mock_response)
         agent._client.aclose = AsyncMock()
@@ -937,6 +938,7 @@ class TestIntrospectionAgent:
         }
         mock_response.raise_for_status = MagicMock()
         agent._client = AsyncMock()
+        agent._client.headers = {}
         agent._client.get = AsyncMock(return_value=mock_response)
         agent._client.aclose = AsyncMock()
 
@@ -1218,6 +1220,7 @@ class TestMaybeStartIntrospection:
             }
         )
         dispatcher = MagicMock()
+        dispatcher.is_deposed.return_value = False
         dispatcher.is_introspection_active.return_value = False
         dispatcher._introspection_starting = set()
         dispatcher._introspection_llm = True
@@ -1235,6 +1238,7 @@ class TestMaybeStartIntrospection:
         config.introspection_enabled = True
         config.get_agent_llm_config.return_value = {}
         dispatcher = MagicMock()
+        dispatcher.is_deposed.return_value = False
         dispatcher.is_introspection_active.return_value = False
         dispatcher._introspection_llm = False
         dispatcher.start_introspection.return_value = True
@@ -1251,6 +1255,7 @@ class TestMaybeStartIntrospection:
         config = MagicMock(spec=OrchestratorConfig)
         config.introspection_enabled = False
         dispatcher = MagicMock()
+        dispatcher.is_deposed.return_value = False
         dispatcher.is_introspection_active.return_value = False
         ticket = {"custom_fields": {}}
 
@@ -1266,6 +1271,7 @@ class TestMaybeStartIntrospection:
         config.introspection_enabled = False
         config.get_agent_llm_config.return_value = {}
         dispatcher = MagicMock()
+        dispatcher.is_deposed.return_value = False
         dispatcher.is_introspection_active.return_value = False
         dispatcher._introspection_llm = False
         dispatcher.start_introspection.return_value = True
@@ -1282,6 +1288,7 @@ class TestMaybeStartIntrospection:
         config = MagicMock(spec=OrchestratorConfig)
         config.introspection_enabled = True
         dispatcher = MagicMock()
+        dispatcher.is_deposed.return_value = False
         dispatcher.is_introspection_active.return_value = False
         ticket = {"custom_fields": {"introspection_enabled": False}}
 
@@ -1296,12 +1303,47 @@ class TestMaybeStartIntrospection:
         config = MagicMock(spec=OrchestratorConfig)
         config.introspection_enabled = True
         dispatcher = MagicMock()
+        dispatcher.is_deposed.return_value = False
         dispatcher.is_introspection_active.return_value = True
         ticket = {"custom_fields": {}}
 
         _maybe_start_introspection(dispatcher, config, ticket, "PERF-1")
 
         dispatcher.start_introspection.assert_not_called()
+
+    async def test_secret_setup_is_cancelled_after_lease_loss(self, monkeypatch):
+        import orchestrator.main as main
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.dispatcher import Dispatcher
+
+        dispatcher = Dispatcher("http://store", MagicMock(), MagicMock())
+        dispatcher._introspection_llm = MagicMock()
+        config = MagicMock(spec=OrchestratorConfig)
+        config.introspection_enabled = True
+        config.get_agent_llm_config.return_value = {"api_key_secret": "secret"}
+        entered = asyncio.Event()
+
+        async def resolve(*_args, **_kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(main, "_resolve_api_key_secret", resolve)
+        main._maybe_start_introspection(
+            dispatcher,
+            config,
+            {"custom_fields": {}},
+            "PERF-1",
+        )
+        setup = dispatcher._introspection_setup_tasks["PERF-1"]
+        await asyncio.wait_for(entered.wait(), 2)
+
+        dispatcher.mark_deposed()
+        assert await dispatcher.drain_for_lease_loss(0.2) == ()
+
+        assert setup.cancelled()
+        assert "PERF-1" not in dispatcher._introspection_setup_tasks
+        assert "PERF-1" not in dispatcher._introspection_tasks
+        assert "PERF-1" not in dispatcher._introspection_starting
 
 
 # --- Interleaved tool detection ---

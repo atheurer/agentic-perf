@@ -229,6 +229,7 @@ class TestHardstopGuidanceIntegration:
         dispatcher.clear_agent = MagicMock()
         dispatcher.mark_done = AsyncMock()
         dispatcher._claim_ids = {}
+        dispatcher.is_deposed.return_value = False
         dispatcher.was_stopped_by_user.return_value = user_stop
         dispatcher.has_lost_claim.return_value = claim_lost
         dispatcher.has_lost_ticket_claim.return_value = ticket_claim_lost
@@ -310,6 +311,7 @@ class TestHardstopGuidanceIntegration:
         dispatcher.clear_agent = MagicMock()
         dispatcher.mark_done = AsyncMock()
         dispatcher._claim_ids = {}
+        dispatcher.is_deposed.return_value = False
         dispatcher.was_stopped_by_user.return_value = True
         dispatcher.has_lost_claim.return_value = False
 

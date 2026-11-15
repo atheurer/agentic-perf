@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shlex
@@ -13,6 +14,8 @@ import textwrap
 import time
 import uuid
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).parents[1]
 SCRIPT = REPO / "scripts" / "start-bg.sh"
@@ -110,6 +113,24 @@ time.sleep(600)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+def _wait_for_store_lock_metadata(
+    path: Path, *, expected_pid: int, store_id: str
+) -> int:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            metadata = json.loads(path.read_text())
+            if (
+                metadata.get("pid") == expected_pid
+                and metadata.get("store_id") == store_id
+            ):
+                return path.stat().st_ino
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        time.sleep(0.05)
+    raise AssertionError("store holder did not publish lock metadata")
+
+
 def _supervisor_lock_holder(path: Path, *, lock_path: Path, write_pid: bool) -> None:
     code = """
 import fcntl, os, sys, time
@@ -133,6 +154,28 @@ time.sleep(600)
             /usr/bin/python3 -c {shlex.quote(code)} "$@"
         """
     ).lstrip()
+    path.write_text(script)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _write_fake_orchestrator_python(
+    path: Path, code: str, *, invocations: Path | None = None
+) -> None:
+    child_code = textwrap.dedent(code).strip()
+    log_invocation = (
+        f"    printf 'start\\n' >> {shlex.quote(str(invocations))}\n"
+        if invocations is not None
+        else ""
+    )
+    script = (
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then\n'
+        f"{log_invocation}"
+        f'    exec -a "python3 -m orchestrator.main" {shlex.quote(sys.executable)} '
+        f"-c {shlex.quote(child_code)}\n"
+        "fi\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n'
+    )
     path.write_text(script)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
@@ -259,6 +302,112 @@ def test_stop_reports_already_stopped_services(tmp_path: Path) -> None:
     assert "Services stopped" in result.stdout
 
 
+def test_start_stop_and_restart_share_lifecycle_lock(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "config.json").write_text("{}")
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+
+    with (home / "state-store-launch.lock").open("a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            for action in ("start", "stop", "restart"):
+                result = subprocess.run(
+                    [str(SCRIPT), action],
+                    cwd=REPO,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
+                )
+
+                assert result.returncode == 1, result.stdout + result.stderr
+                assert (
+                    "another start-bg.sh invocation is starting or stopping"
+                    in result.stderr
+                )
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def test_restart_preflights_settings_before_stopping_services(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "config.json").write_text("{}")
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_RESTART_BACKOFF": "invalid",
+        }
+    )
+    script = f"""
+source {shlex.quote(str(SCRIPT))} status >/dev/null 2>&1
+cmd_stop_locked() {{ touch "$AGENTIC_PERF_HOME/stopped-services"; return 0; }}
+cmd_start_locked() {{ touch "$AGENTIC_PERF_HOME/started-services"; return 0; }}
+if cmd_restart; then status=0; else status=$?; fi
+[ "$status" -eq 2 ]
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "START_BG_RESTART_BACKOFF must be a positive integer" in result.stderr
+    assert not (home / "stopped-services").exists()
+    assert not (home / "started-services").exists()
+
+
+@pytest.mark.parametrize(
+    ("config_text", "expected_error"),
+    [
+        ("{", "line 1"),
+        (
+            '{"trace": {"query": {"workers": 0}}}',
+            "trace.query.workers must be > 0",
+        ),
+        ('{"chat": []}', "chat must be a JSON object"),
+    ],
+)
+def test_restart_preflights_application_config_before_stopping_services(
+    tmp_path: Path, config_text: str, expected_error: str
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "config.json").write_text(config_text, encoding="utf-8")
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+    script = f"""
+source {shlex.quote(str(SCRIPT))} status >/dev/null 2>&1
+cmd_stop_locked() {{ touch "$AGENTIC_PERF_HOME/stopped-services"; return 0; }}
+cmd_start_locked() {{ touch "$AGENTIC_PERF_HOME/started-services"; return 0; }}
+if cmd_restart; then status=0; else status=$?; fi
+[ "$status" -eq 1 ]
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert expected_error in result.stderr
+    assert not (home / "stopped-services").exists()
+    assert not (home / "started-services").exists()
+
+
 def test_start_rejects_invalid_launch_settings(tmp_path: Path) -> None:
     home = tmp_path / "home"
     env = os.environ.copy()
@@ -279,6 +428,74 @@ def test_start_rejects_invalid_launch_settings(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "START_BG_RESTART_BACKOFF must be a positive integer" in result.stderr
+
+
+def test_start_rejects_oversized_lease_timeout(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_ORCH_LEASE_TIMEOUT": "9" * 30,
+        }
+    )
+    result = subprocess.run(
+        [str(SCRIPT), "start"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "START_BG_ORCH_LEASE_TIMEOUT must be <= 86400" in result.stderr
+
+
+def test_start_rejects_oversized_restart_backoff(tmp_path: Path) -> None:
+    for setting in (
+        "START_BG_RESTART_BACKOFF",
+        "START_BG_RESTART_BACKOFF_MAX",
+    ):
+        env = os.environ.copy()
+        env.update(
+            {
+                "AGENTIC_PERF_HOME": str(tmp_path / setting.lower()),
+                setting: "9" * 30,
+            }
+        )
+        result = subprocess.run(
+            [str(SCRIPT), "start"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert result.returncode == 2
+        assert f"{setting} must be <= 86400" in result.stderr
+
+
+def test_start_rejects_oversized_log_backups(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(tmp_path / "home"),
+            "START_BG_LOG_BACKUPS": "101",
+        }
+    )
+    result = subprocess.run(
+        [str(SCRIPT), "start"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "START_BG_LOG_BACKUPS must be <= 100" in result.stderr
 
 
 def test_log_rotation_keeps_bounded_history(tmp_path: Path) -> None:
@@ -317,12 +534,9 @@ def test_supervisor_restarts_and_reports_crash_loop(tmp_path: Path) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     python = fake_bin / "python3"
-    python.write_text(
-        textwrap.dedent(
-            """\
-            #!/usr/bin/env bash
-            if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then
-                exec -a "python3 -m orchestrator.main" /usr/bin/python3 -c '
+    _write_fake_orchestrator_python(
+        python,
+        """
 import fcntl, os
 from pathlib import Path
 folder = Path(os.environ["AGENTIC_PERF_HOME"])
@@ -333,13 +547,8 @@ os.write(fd, str(os.getpid()).encode())
 os.fsync(fd)
 print("simulated orchestrator crash", flush=True)
 raise SystemExit(7)
-'
-            fi
-            exec /usr/bin/python3 "$@"
-            """
-        )
+""",
     )
-    python.chmod(python.stat().st_mode | stat.S_IXUSR)
     env = os.environ.copy()
     env.update(
         {
@@ -349,6 +558,7 @@ raise SystemExit(7)
             "START_BG_RESTART_BACKOFF_MAX": "1",
             "START_BG_RESTART_STABLE_SECONDS": "60",
             "START_BG_CRASH_LOOP_THRESHOLD": "2",
+            "START_BG_LOG_MAX_BYTES": "96",
         }
     )
     process = subprocess.Popen(
@@ -377,10 +587,18 @@ raise SystemExit(7)
 
         assert status["consecutive_failures"] >= 2
         assert status["next_restart_epoch"] > 0
+        assert "status 7" in status["detail"]
         assert (home / "logs" / "orchestrator.log.1").exists()
+        assert (
+            "simulated orchestrator crash"
+            in (home / "logs" / "orchestrator.log").read_text()
+        )
         assert (
             "CRASH LOOP" in (home / "logs" / "orchestrator-supervisor.log").read_text()
         )
+        supervisor_logs = list((home / "logs").glob("orchestrator-supervisor.log*"))
+        assert len(supervisor_logs) > 1
+        assert max(path.stat().st_size for path in supervisor_logs) < 512
     finally:
         if process.poll() is None:
             process.send_signal(signal.SIGTERM)
@@ -396,13 +614,9 @@ def test_supervisor_stop_during_backoff_does_not_restart_orchestrator(
     fake_bin.mkdir()
     invocations = home / "orchestrator-invocations"
     python = fake_bin / "python3"
-    python.write_text(
-        textwrap.dedent(
-            f"""\
-            #!/usr/bin/env bash
-            if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then
-                printf 'start\\n' >> {shlex.quote(str(invocations))}
-                exec -a "python3 -m orchestrator.main" /usr/bin/python3 -c '
+    _write_fake_orchestrator_python(
+        python,
+        """
 import fcntl, os
 from pathlib import Path
 folder = Path(os.environ["AGENTIC_PERF_HOME"])
@@ -412,13 +626,9 @@ os.ftruncate(fd, 0)
 os.write(fd, str(os.getpid()).encode())
 os.fsync(fd)
 raise SystemExit(7)
-'
-            fi
-            exec /usr/bin/python3 "$@"
-            """
-        )
+""",
+        invocations=invocations,
     )
-    python.chmod(python.stat().st_mode | stat.S_IXUSR)
     env = os.environ.copy()
     env.update(
         {
@@ -453,6 +663,7 @@ raise SystemExit(7)
         else:
             raise AssertionError("supervisor did not enter restart backoff")
 
+        assert "status 7" in status["detail"]
         process.send_signal(signal.SIGTERM)
         process.wait(timeout=5)
         time.sleep(0.1)
@@ -467,6 +678,374 @@ raise SystemExit(7)
         if process.poll() is None:
             process.send_signal(signal.SIGTERM)
             process.wait(timeout=5)
+
+
+def test_supervisor_startup_failure_preserves_store_when_cleanup_is_unconfirmed(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "config.json").write_text("{}")
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_ORCH_TIMEOUT": "1",
+            "START_BG_ORCH_LEASE_TIMEOUT": "1",
+            "START_BG_MAX_START_TIMEOUT": "1",
+        }
+    )
+    script = f"""
+source {shlex.quote(str(SCRIPT))} status >/dev/null 2>&1
+start_store() {{ return 0; }}
+stop_store() {{ touch "$AGENTIC_PERF_HOME/store-stopped"; return 0; }}
+wait_for_orchestrator() {{ return 0; }}
+process_start_identity() {{ printf '%s:test\\n' "$1"; }}
+start_orchestrator_supervisor() {{ return 1; }}
+terminate_process() {{
+    printf '%s\\n' "$1" > "$AGENTIC_PERF_HOME/cleanup-pid"
+    kill -KILL "$1" 2>/dev/null || true
+    return 1
+}}
+nohup() {{ sleep 30 >/dev/null 2>&1; }}
+if cmd_start; then status=0; else status=$?; fi
+[ "$status" -eq 1 ]
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "orchestrator startup did not reach a safe stopped state" in result.stderr
+    assert "leaving the state store running for safety" in result.stderr
+    assert not (home / "store-stopped").exists()
+    assert (home / "cleanup-pid").read_text().strip().isdigit()
+
+
+def test_existing_orchestrator_startup_failure_preserves_fresh_store(
+    tmp_path: Path,
+) -> None:
+    for failure_mode in ("supervisor", "lease"):
+        home = tmp_path / failure_mode
+        (home / "logs").mkdir(parents=True)
+        (home / "config.json").write_text("{}")
+        env = os.environ.copy()
+        env.update(
+            {
+                "AGENTIC_PERF_HOME": str(home),
+                "START_BG_ORCH_TIMEOUT": "1",
+                "START_BG_ORCH_LEASE_TIMEOUT": "1",
+            }
+        )
+        supervisor_result = "1" if failure_mode == "supervisor" else "0"
+        script = f"""
+source {shlex.quote(str(SCRIPT))} status >/dev/null 2>&1
+start_store() {{ return 0; }}
+stop_store() {{ touch "$AGENTIC_PERF_HOME/store-stopped"; return 0; }}
+lock_is_held() {{ [ "$1" = "$ORCH_LOCK" ]; }}
+orchestrator_pid() {{ printf '4242\\n'; }}
+orchestrator_owner_valid() {{ [ "$1" = 4242 ]; }}
+start_orchestrator_supervisor() {{ return {supervisor_result}; }}
+wait_for_orchestrator() {{ return 1; }}
+if cmd_start; then status=0; else status=$?; fi
+[ "$status" -eq 1 ]
+"""
+        result = subprocess.run(
+            ["bash", "-c", script],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (
+            "orchestrator startup did not reach a safe stopped state" in result.stderr
+        )
+        assert "leaving the state store running for safety" in result.stderr
+        assert not (home / "store-stopped").exists()
+
+
+def test_stale_supervisor_pid_without_lock_does_not_block_fresh_start(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "config.json").write_text("{}")
+    (home / "logs" / "orchestrator-supervisor.pid").write_text("1111\n")
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+    script = f"""
+source {shlex.quote(str(SCRIPT))} status >/dev/null 2>&1
+start_store() {{ return 0; }}
+stop_store() {{ touch "$AGENTIC_PERF_HOME/store-stopped"; return 0; }}
+lock_is_held() {{ return 1; }}
+supervisor_pid() {{ printf '1111\\n'; }}
+supervisor_owner_valid() {{ return 0; }}
+clear_lock_metadata() {{ return 0; }}
+process_start_identity() {{ printf '%s:test\\n' "$1"; }}
+wait_for_orchestrator() {{ return 0; }}
+start_orchestrator_supervisor() {{
+    touch "$AGENTIC_PERF_HOME/supervisor-started"
+    return 0
+}}
+nohup() {{ :; }}
+if cmd_start; then status=0; else status=$?; fi
+[ "$status" -eq 0 ]
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Starting orchestrator" in result.stdout
+    assert "supervisor is active" not in result.stdout
+    assert (home / "supervisor-started").exists()
+    assert not (home / "store-stopped").exists()
+
+
+def test_active_supervisor_startup_failure_preserves_fresh_store(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "config.json").write_text("{}")
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_ORCH_TIMEOUT": "1",
+            "START_BG_ORCH_LEASE_TIMEOUT": "1",
+        }
+    )
+    script = f"""
+source {shlex.quote(str(SCRIPT))} status >/dev/null 2>&1
+start_store() {{ return 0; }}
+stop_store() {{ touch "$AGENTIC_PERF_HOME/store-stopped"; return 0; }}
+lock_is_held() {{ [ "$1" = "$ORCH_SUPERVISOR_LOCK" ]; }}
+supervisor_pid() {{ printf '4343\\n'; }}
+supervisor_lock_pid() {{ printf '4343\\n'; }}
+supervisor_owner_valid() {{ [ "$1" = 4343 ]; }}
+sleep() {{ SECONDS=$((SECONDS + 10)); }}
+if cmd_start; then status=0; else status=$?; fi
+[ "$status" -eq 1 ]
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "orchestrator startup did not reach a safe stopped state" in result.stderr
+    assert "leaving the state store running for safety" in result.stderr
+    assert not (home / "store-stopped").exists()
+
+
+def test_active_supervisor_lock_without_pid_metadata_preserves_fresh_store(
+    tmp_path: Path,
+) -> None:
+    for metadata in ("missing", "stale"):
+        home = tmp_path / metadata
+        (home / "logs").mkdir(parents=True)
+        (home / "config.json").write_text("{}")
+        env = os.environ.copy()
+        env.update(
+            {
+                "AGENTIC_PERF_HOME": str(home),
+                "START_BG_ORCH_TIMEOUT": "1",
+                "START_BG_ORCH_LEASE_TIMEOUT": "1",
+            }
+        )
+        stale_pid = "1111" if metadata == "stale" else ""
+        script = f"""
+source {shlex.quote(str(SCRIPT))} status >/dev/null 2>&1
+start_store() {{ return 0; }}
+stop_store() {{ touch "$AGENTIC_PERF_HOME/store-stopped"; return 0; }}
+lock_is_held() {{ [ "$1" = "$ORCH_SUPERVISOR_LOCK" ]; }}
+supervisor_pid() {{ printf '{stale_pid}\\n'; }}
+supervisor_lock_pid() {{ printf '4343\\n'; }}
+supervisor_owner_valid() {{ [ "$1" = 4343 ]; }}
+sleep() {{ SECONDS=$((SECONDS + 10)); }}
+if cmd_start; then status=0; else status=$?; fi
+[ "$status" -eq 1 ]
+"""
+        result = subprocess.run(
+            ["bash", "-c", script],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Repaired orchestrator supervisor PID metadata" in result.stdout
+        assert "Starting orchestrator" not in result.stdout
+        assert (
+            "orchestrator startup did not reach a safe stopped state" in result.stderr
+        )
+        assert "leaving the state store running for safety" in result.stderr
+        assert not (home / "store-stopped").exists()
+        assert (home / "logs" / "orchestrator-supervisor.pid").read_text() == "4343\n"
+
+
+def test_supervisor_started_orchestrator_lease_failure_preserves_fresh_store(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "config.json").write_text("{}")
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "START_BG_ORCH_TIMEOUT": "1",
+            "START_BG_ORCH_LEASE_TIMEOUT": "1",
+        }
+    )
+    script = f"""
+source {shlex.quote(str(SCRIPT))} status >/dev/null 2>&1
+start_store() {{ return 0; }}
+stop_store() {{ touch "$AGENTIC_PERF_HOME/store-stopped"; return 0; }}
+orch_lock_checks=0
+lock_is_held() {{
+    if [ "$1" = "$ORCH_SUPERVISOR_LOCK" ]; then return 0; fi
+    if [ "$1" = "$ORCH_LOCK" ]; then
+        orch_lock_checks=$((orch_lock_checks + 1))
+        [ "$orch_lock_checks" -gt 1 ]
+        return
+    fi
+    return 1
+}}
+supervisor_pid() {{ printf '4343\\n'; }}
+supervisor_lock_pid() {{ printf '4343\\n'; }}
+supervisor_owner_valid() {{ [ "$1" = 4343 ]; }}
+orchestrator_pid() {{ printf '4242\\n'; }}
+orchestrator_owner_valid() {{ [ "$1" = 4242 ]; }}
+wait_for_orchestrator() {{ return 1; }}
+if cmd_start; then status=0; else status=$?; fi
+[ "$status" -eq 1 ]
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "supervisor-started orchestrator PID 4242" in result.stderr
+    assert "orchestrator startup did not reach a safe stopped state" in result.stderr
+    assert "leaving the state store running for safety" in result.stderr
+    assert not (home / "store-stopped").exists()
+
+
+def test_supervisor_stop_and_status_use_lock_owner_over_stale_pid(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "logs" / "orchestrator-supervisor.pid").write_text("1111\n")
+    env = os.environ.copy()
+    env["AGENTIC_PERF_HOME"] = str(home)
+    script = f"""
+source {shlex.quote(str(SCRIPT))} status >/dev/null 2>&1
+alive=1
+lock_is_held() {{ [ "$1" = "$ORCH_SUPERVISOR_LOCK" ] && [ "$alive" -eq 1 ]; }}
+supervisor_pid() {{ printf '1111\\n'; }}
+supervisor_lock_pid() {{ printf '4343\\n'; }}
+process_start_identity() {{ printf '%s:test\\n' "$1"; }}
+supervisor_owner_valid() {{ [ "$1" = 1111 ] || [ "$1" = 4343 ]; }}
+process_alive() {{ [ "$1" = 4343 ] && [ "$alive" -eq 1 ]; }}
+endpoint_identity() {{ return 1; }}
+clear_lock_metadata() {{ return 0; }}
+terminate_verified_process() {{
+    printf '%s %s\\n' "$1" "$2" >> "$AGENTIC_PERF_HOME/supervisor-signals"
+    alive=0
+    return 0
+}}
+cmd_status > "$AGENTIC_PERF_HOME/status-output"
+stop_orchestrator_supervisor
+status=$?
+[ "$status" -eq 0 ]
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    status_output = (home / "status-output").read_text()
+    assert "Orchestrator supervisor: RUNNING (PID 4343" in status_output
+    assert "1111" not in status_output
+    assert (home / "supervisor-signals").read_text().splitlines() == ["4343 4343:test"]
+
+
+def test_terminate_verified_process_refuses_pid_identity_change(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    env = os.environ.copy()
+    env.update({"AGENTIC_PERF_HOME": str(home), "START_BG_STOP_TIMEOUT": "1"})
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1" status >/dev/null 2>&1; '
+                'terminate_verified_process "$2" "$3"',
+                str(SCRIPT),
+                str(SCRIPT),
+                str(process.pid),
+                f"{process.pid}:0",
+            ],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+
+        assert result.returncode != 0
+        assert "changed identity; refusing to signal it" in result.stderr
+        assert process.poll() is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
 
 
 def test_replacement_supervisor_acquires_lock_after_forced_backoff_exit(
@@ -650,8 +1229,20 @@ def test_stop_refuses_unverifiable_live_supervisor_lock(tmp_path: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    store_id = str(uuid.uuid4())
+    store_lock = home / "state-store.lock"
+    store_holder = tmp_path / "store-holder"
+    _holder(store_holder, role="store", lock_path=store_lock, store_id=store_id)
+    store = subprocess.Popen(
+        [str(store_holder), str(store_lock), store_id],
+        cwd=REPO,
+        env=env,
+    )
     ready = Path(f"{lock_path}.ready")
     try:
+        store_lock_inode = _wait_for_store_lock_metadata(
+            store_lock, expected_pid=store.pid, store_id=store_id
+        )
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not ready.exists():
             time.sleep(0.05)
@@ -666,10 +1257,16 @@ def test_stop_refuses_unverifiable_live_supervisor_lock(tmp_path: Path) -> None:
             result.stdout + result.stderr
         )
         assert process.poll() is None
+        assert store.poll() is None
+        assert store_lock.stat().st_ino == store_lock_inode
+        assert "Stopping state store" not in result.stdout
     finally:
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
+        if store.poll() is None:
+            store.kill()
+            store.wait(timeout=5)
 
 
 def test_replacement_supervisor_acquires_lock_when_child_survives(
@@ -679,13 +1276,11 @@ def test_replacement_supervisor_acquires_lock_when_child_survives(
     (home / "logs").mkdir(parents=True)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    invocations = home / "orchestrator-invocations"
     python = fake_bin / "python3"
-    python.write_text(
-        textwrap.dedent(
-            """\
-            #!/usr/bin/env bash
-            if [ "$1" = "-m" ] && [ "$2" = "orchestrator.main" ]; then
-                exec -a "python3 -m orchestrator.main" /usr/bin/python3 -c '
+    _write_fake_orchestrator_python(
+        python,
+        """
 import fcntl, os, time
 from pathlib import Path
 folder = Path(os.environ["AGENTIC_PERF_HOME"])
@@ -696,13 +1291,9 @@ os.write(fd, str(os.getpid()).encode())
 os.fsync(fd)
 (folder / "orchestrator-ready").write_text(str(os.getpid()))
 time.sleep(30)
-'
-            fi
-            exec /usr/bin/python3 "$@"
-            """
-        )
+""",
+        invocations=invocations,
     )
-    python.chmod(python.stat().st_mode | stat.S_IXUSR)
     env = os.environ.copy()
     env.update(
         {
@@ -766,6 +1357,11 @@ time.sleep(30)
             time.sleep(0.05)
         else:
             raise AssertionError("replacement supervisor did not acquire its lock")
+
+        time.sleep(2.5)
+        assert invocations.read_text().splitlines() == ["start"]
+        assert (home / "orchestrator.pid").read_text() == str(child_pid)
+        os.kill(child_pid, 0)
     finally:
         for process in (first, second):
             if process is not None and process.poll() is None:
@@ -819,14 +1415,9 @@ def test_stop_reclaims_lock_metadata_after_launcher_kills_process(
         env=env,
     )
     try:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if (home / "state-store.lock").exists():
-                break
-            time.sleep(0.05)
-        else:
-            raise AssertionError("stubborn store holder did not acquire its lock")
-        lock_inode = (home / "state-store.lock").stat().st_ino
+        lock_inode = _wait_for_store_lock_metadata(
+            home / "state-store.lock", expected_pid=process.pid, store_id=store_id
+        )
 
         result = subprocess.run(
             [str(SCRIPT), "stop"],
@@ -863,14 +1454,9 @@ def test_lock_cleanup_refuses_live_replacement_owner(tmp_path: Path) -> None:
         env=env,
     )
     try:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if lock_path.exists() and lock_path.stat().st_size:
-                break
-            time.sleep(0.05)
-        else:
-            raise AssertionError("replacement store holder did not acquire its lock")
-        inode = lock_path.stat().st_ino
+        inode = _wait_for_store_lock_metadata(
+            lock_path, expected_pid=process.pid, store_id=store_id
+        )
         contents = lock_path.read_text()
         result = subprocess.run(
             [
@@ -1009,6 +1595,323 @@ exec \"$@\"
     assert "State store:  STOPPED" in result.stdout
     assert "Orchestrator: STOPPED" in result.stdout
     assert int((home / "lease-query-count").read_text()) >= 4
+
+
+def test_orchestrator_watchdog_waits_for_lease_acquisition(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    lease_ready = home / "orchestrator-lease-ready"
+    curl = fake_bin / "curl"
+    curl.write_text(
+        f"#!/usr/bin/env bash\n{_FAKE_LEASE_RESPONSE}"
+        'if [[ "$*" == *"/control/orchestrator-lease"* ]]; then\n'
+        f"  if [ -f {shlex.quote(str(lease_ready))} ]; then\n"
+        '    pid="$(tr -d \'[:space:]\' < "$AGENTIC_PERF_HOME/orchestrator.pid")"\n'
+        '    lease_response "$pid"\n'
+        "  else\n"
+        "    printf '{\"lease\":null}\\n'\n"
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+
+    holder = tmp_path / "orchestrator-holder"
+    code = textwrap.dedent(
+        f"""\
+        import fcntl, json, os, time
+        from pathlib import Path
+
+        home = Path({str(home)!r})
+        fd = os.open(home / "orchestrator.pid", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        os.fsync(fd)
+        (home / "orchestrator.status").write_text(
+            json.dumps({{
+                "pid": os.getpid(),
+                "phase": "initializing",
+                "detail": "loading runtime state",
+                "updated_at": time.time(),
+            }})
+        )
+        time.sleep(1.4)
+        (home / "orchestrator.status").write_text(
+            json.dumps({{
+                "pid": os.getpid(),
+                "phase": "acquiring_lease",
+                "detail": "waiting for the previous lease",
+                "updated_at": time.time(),
+            }})
+        )
+        time.sleep(1.2)
+        (home / "orchestrator-lease-ready").write_text("ready")
+        time.sleep(10)
+        """
+    )
+    holder.write_text(
+        "#!/usr/bin/env bash\n"
+        'exec -a "python3 -m orchestrator.main" '
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}\n"
+    )
+    holder.chmod(holder.stat().st_mode | stat.S_IXUSR)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_ORCH_TIMEOUT": "2",
+            "START_BG_ORCH_LEASE_TIMEOUT": "2",
+            "START_BG_MAX_START_TIMEOUT": "1",
+        }
+    )
+    process = subprocess.Popen([str(holder)], cwd=REPO, env=env)
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                ready = (home / "orchestrator.pid").stat().st_size > 0 and (
+                    home / "orchestrator.status"
+                ).exists()
+            except FileNotFoundError:
+                ready = False
+            if ready:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("fake orchestrator did not acquire its lock")
+
+        started = time.monotonic()
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1" status >/dev/null 2>&1; wait_for_orchestrator "$2"',
+                str(SCRIPT),
+                str(SCRIPT),
+                str(process.pid),
+            ],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=6,
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert elapsed >= 2.4
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def test_default_lease_wait_covers_acquisition_retry_budget(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.json").write_text(
+        json.dumps(
+            {
+                "orchestrator_lease": {
+                    "ttl_seconds": 1,
+                    "recovery_delay_seconds": 1,
+                    "max_attempts": 2,
+                }
+            }
+        )
+    )
+    env = os.environ.copy()
+    env.pop("START_BG_ORCH_LEASE_TIMEOUT", None)
+    env.pop("ORCHESTRATOR_LEASE_TTL_SECONDS", None)
+    env.pop("ORCHESTRATOR_LEASE_RECOVERY_DELAY_SECONDS", None)
+    env.pop("ORCHESTRATOR_LEASE_MAX_ATTEMPTS", None)
+    env["AGENTIC_PERF_HOME"] = str(home)
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1" status >/dev/null 2>&1; read_orchestrator_lease_wait_timeout',
+            str(SCRIPT),
+            str(SCRIPT),
+        ],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert int(result.stdout.strip()) >= 27
+
+
+def test_lease_wait_budget_handles_large_attempts_without_linear_loop(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.json").write_text(
+        json.dumps({"orchestrator_lease": {"max_attempts": 10**400}})
+    )
+    env = os.environ.copy()
+    env.pop("ORCHESTRATOR_LEASE_MAX_ATTEMPTS", None)
+    env["AGENTIC_PERF_HOME"] = str(home)
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1" status >/dev/null 2>&1; read_orchestrator_lease_wait_timeout',
+            str(SCRIPT),
+            str(SCRIPT),
+        ],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=2,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 1 <= int(result.stdout.strip()) <= 86_400
+
+
+def test_status_ignores_nonfinite_lease_settings(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "ORCHESTRATOR_LEASE_TTL_SECONDS": "nan",
+            "ORCHESTRATOR_LEASE_RECOVERY_DELAY_SECONDS": "inf",
+        }
+    )
+
+    result = subprocess.run(
+        [str(SCRIPT), "status"],
+        cwd=REPO,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_supervisor_handoff_waits_for_leader_lease(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    lease_ready = home / "orchestrator-lease-ready"
+    curl = fake_bin / "curl"
+    curl.write_text(
+        f"#!/usr/bin/env bash\n{_FAKE_LEASE_RESPONSE}"
+        'if [[ "$*" == *"/control/orchestrator-lease"* ]]; then\n'
+        f"  if [ -f {shlex.quote(str(lease_ready))} ]; then\n"
+        '    pid="$(tr -d \'[:space:]\' < "$AGENTIC_PERF_HOME/orchestrator.pid")"\n'
+        '    lease_response "$pid"\n'
+        "  else\n"
+        "    printf '{\"lease\":null}\\n'\n"
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+    python = fake_bin / "python3"
+    _write_fake_orchestrator_python(
+        python,
+        f"""
+import fcntl, json, os, time
+from pathlib import Path
+home = Path({str(home)!r})
+fd = os.open(home / "orchestrator.pid", os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.write(fd, str(os.getpid()).encode())
+os.fsync(fd)
+(home / "orchestrator.status").write_text(json.dumps({{
+    "pid": os.getpid(),
+    "phase": "acquiring_lease",
+    "detail": "waiting for the previous lease",
+    "updated_at": time.time(),
+}}))
+time.sleep(0.8)
+(home / "orchestrator-lease-ready").write_text("ready")
+time.sleep(5)
+""",
+    )
+
+    supervisor_holder = tmp_path / "supervisor-holder"
+    supervisor_lock = home / "orchestrator-supervisor.lock"
+    _supervisor_lock_holder(
+        supervisor_holder,
+        lock_path=supervisor_lock,
+        write_pid=True,
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "START_BG_ORCH_TIMEOUT": "2",
+            "START_BG_ORCH_LEASE_TIMEOUT": "2",
+        }
+    )
+    supervisor = subprocess.Popen(
+        [str(supervisor_holder), str(supervisor_lock), "1"],
+        cwd=REPO,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        ready = Path(f"{supervisor_lock}.ready")
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.05)
+        assert ready.exists()
+        (home / "logs" / "orchestrator-supervisor.pid").write_text(
+            f"{supervisor.pid}\n"
+        )
+
+        started = time.monotonic()
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1" status >/dev/null 2>&1; '
+                "(sleep 0.4; python3 -m orchestrator.main) & child=$!; "
+                'start_orchestrator; status=$?; kill "$child" 2>/dev/null || true; '
+                'wait "$child" 2>/dev/null || true; exit "$status"',
+                str(SCRIPT),
+                str(SCRIPT),
+            ],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=8,
+        )
+        elapsed = time.monotonic() - started
+
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert "Orchestrator started by supervisor" in result.stdout
+        assert elapsed >= 1.0
+    finally:
+        supervisor.kill()
+        supervisor.wait(timeout=5)
 
 
 def test_start_waits_for_unverifiable_lock_owner_to_release(tmp_path: Path) -> None:
