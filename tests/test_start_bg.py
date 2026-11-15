@@ -1566,34 +1566,48 @@ exec \"$@\"
             "START_BG_ORCH_TIMEOUT": "2",
         }
     )
-    result = subprocess.run(
-        [
-            "bash",
-            "-c",
-            f"{SCRIPT} start; "
-            '[ "$(cat "$AGENTIC_PERF_HOME/lease-query-count")" -ge 4 ] || exit 13; '
-            f"{SCRIPT} start; {SCRIPT} restart; {SCRIPT} stop; "
-            'touch "$AGENTIC_PERF_HOME/lease-force-mismatch"; '
-            f"if {SCRIPT} start; then exit 12; fi; {SCRIPT} status",
-        ],
-        cwd=REPO,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "State store started" in result.stdout
-    assert "Orchestrator started" in result.stdout
-    assert "Orchestrator already running" in result.stdout
-    assert "Restarting services" in result.stdout
-    assert "Services stopped" in result.stdout
-    assert "Cleaning up failed orchestrator startup" in result.stdout
-    assert "orchestrator failed to become ready" in result.stderr
-    assert "Traceback" not in result.stderr
-    assert "State store:  STOPPED" in result.stdout
-    assert "Orchestrator: STOPPED" in result.stdout
+
+    def run_launcher(command: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(SCRIPT), command],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+
+    first_start = run_launcher("start")
+    assert first_start.returncode == 0, first_start.stdout + first_start.stderr
+    assert "State store started" in first_start.stdout
+    assert "Orchestrator started" in first_start.stdout
+    assert int((home / "lease-query-count").read_text()) >= 4
+
+    second_start = run_launcher("start")
+    assert second_start.returncode == 0, second_start.stdout + second_start.stderr
+    assert "Orchestrator already running" in second_start.stdout
+
+    restarted = run_launcher("restart")
+    assert restarted.returncode == 0, restarted.stdout + restarted.stderr
+    assert "Restarting services" in restarted.stdout
+    assert "Services stopped" in restarted.stdout
+
+    stopped = run_launcher("stop")
+    assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+    assert "Services stopped" in stopped.stdout
+
+    (home / "lease-force-mismatch").touch()
+    failed_start = run_launcher("start")
+    assert failed_start.returncode != 0, failed_start.stdout + failed_start.stderr
+    assert "Cleaning up failed orchestrator startup" in failed_start.stdout
+    assert "orchestrator failed to become ready" in failed_start.stderr
+    assert "Traceback" not in failed_start.stderr
+
+    status = run_launcher("status")
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert "State store:  STOPPED" in status.stdout
+    assert "Orchestrator: STOPPED" in status.stdout
     assert int((home / "lease-query-count").read_text()) >= 4
 
 

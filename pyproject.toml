@@ -24,9 +24,14 @@ dependencies = [
     # Block empty JWS signatures: CVE-2026-96760 / GHSA-6v38-4h7w-rj9h.
     # FastMCP permits older Authlib; keep fresh installs on its fixed release.
     "authlib>=1.9.0",
-    # Bound DNS decompression CPU use: CVE-2026-114605 / GHSA-45c3-73f7-pv4m.
-    # email-validator permits older dnspython; require its patched release.
-    "dnspython>=2.9.0",
+    # Bound DNS decompression and WKS parsing resource use:
+    # CVE-2026-114605 / GHSA-45c3-73f7-pv4m and
+    # CVE-2026-128089 / GHSA-vvf4-9x63-8xvv.
+    "dnspython>=2.9.2",
+    # Reject oversized traceparent values before regex matching:
+    # CVE-2026-126360 / GHSA-mf5v-w3w3-f6cg. fastmcp-slim permits the
+    # vulnerable release; keep fresh installs on the patched API.
+    "opentelemetry-api>=1.45.2",
 ]
 
 [project.scripts]
