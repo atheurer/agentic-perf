@@ -12,7 +12,7 @@ from state_store.api.router import api_router
 from state_store.auth import make_auth_dependency
 from state_store.identity import UserStore
 from state_store.models import AcquireOrchestratorLeaseRequest, CreateTicketRequest
-from state_store.store import ClaimFenceError, TicketStore
+from state_store.store import TicketStore
 
 
 def _lease(session_id):
@@ -177,23 +177,12 @@ def test_leader_recovery_handles_stale_and_malformed_claims(tmp_path, claim_kind
         claim["expires"] = "unknown"
     else:
         claim["epoch"] = "bad"
-    if claim_kind in ("bad_expiry", "bad_epoch"):
-        with pytest.raises(ClaimFenceError) as error:
-            store.update_fields(
-                ticket.id,
-                {"note": "recovery"},
-                session_id=session,
-                epoch=lease.epoch,
-                leader_only=True,
-            )
-        assert error.value.reason == "claim_malformed"
-        assert "note" not in store.get_ticket(ticket.id).custom_fields
-    else:
-        updated = store.update_fields(
-            ticket.id,
-            {"note": "recovery"},
-            session_id=session,
-            epoch=lease.epoch,
-            leader_only=True,
-        )
-        assert updated.custom_fields["note"] == "recovery"
+    updated = store.update_fields(
+        ticket.id,
+        {"claim": None, "note": "recovery"},
+        session_id=session,
+        epoch=lease.epoch,
+        leader_only=True,
+    )
+    assert updated.custom_fields["note"] == "recovery"
+    assert updated.custom_fields["claim"] is None

@@ -660,6 +660,7 @@ class AuditedFilesystem:
         *,
         mode: int = 0o600,
         chunk_bytes: int = 64 * 1024,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> Path:
         """Copy a binary input stream to a file and durably flush it."""
         path, logical = self.root.resolve(relative, follow_final=True)
@@ -668,13 +669,22 @@ class AuditedFilesystem:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             with open(path, "wb") as destination:
                 os.chmod(path, mode)
-                while block := source.read(chunk_bytes):
+                while True:
+                    if check_cancelled is not None:
+                        check_cancelled()
+                    block = source.read(chunk_bytes)
+                    if not block:
+                        break
                     view = memoryview(block)
                     while view:
+                        if check_cancelled is not None:
+                            check_cancelled()
                         written = destination.write(view)
                         if written is None or written <= 0:
                             raise OSError("short filesystem stream write")
                         view = view[written:]
+                if check_cancelled is not None:
+                    check_cancelled()
                 destination.flush()
                 os.fsync(destination.fileno())
             return path

@@ -3,36 +3,220 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import hashlib
 import json
+import logging
+import os
 import threading
+from collections.abc import Awaitable
 from datetime import datetime
-from typing import Annotated, Literal
+from pathlib import Path
+from typing import Annotated, Callable, Iterable, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from paths import get_instance_name
-from providers.tracing import TraceEventV1
+from providers.tracing import MAX_TRACE_INGEST_BODY_BYTES, TraceEventV1
 from providers.tracing.payloads import PayloadBlobStore, PayloadStorageError
 from providers.tracing.query import (
     TraceQuery,
+    TraceQueryCancelled,
+    TraceQueryResourceExhausted,
+    TraceQueryTooBroad,
+    decode_cursor,
     diagnostics,
     export_events,
     export_manifest,
     page_events,
-    query_events,
 )
 
 from ..auth import Principal
-from ..trace_store import TraceEventConflictError, TraceStoreWriteError
+from ..store import TicketNotFound
+from ..trace_store import TraceEventConflictError, TraceStore, TraceStoreWriteError
 from .events import invalidate_closed_ticket_usage_cache
+from .executors import BoundedExecutorSaturated, run_bounded_executor
 
 router = APIRouter(prefix="/traces/events", tags=["traces"])
 query_router = APIRouter(prefix="/traces", tags=["traces"])
+_WorkerResult = TypeVar("_WorkerResult")
+MAX_TRACE_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_TRACE_BATCH_ACK_BYTES = 512 * 1024
+MAX_EXPORT_VERIFICATION_BYTES = 8 * 1024 * 1024
+MAX_VERIFIED_PAYLOAD_BYTES = 1024 * 1024
+MAX_TRACE_MANIFEST_HEADER_BYTES = 64 * 1024
+MAX_TRACE_INGEST_MESSAGES = 1024
+TRACE_AUDIT_RESPONSE_SEND_TIMEOUT_SECONDS = 5.0
+TRACE_INGEST_PATHS = frozenset({"/api/v1/traces/events", "/api/v1/traces/events/batch"})
+logger = logging.getLogger(__name__)
+MAX_TRACE_INGEST_BODY_BUFFERS = 8
 
 
 class TraceBatch(BaseModel):
     events: list[TraceEventV1] = Field(min_length=1, max_length=500)
+
+
+class TraceIngestBodyLimitMiddleware:
+    """Reject oversized trace ingestion bodies before FastAPI parses them."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_buffered_requests: int = MAX_TRACE_INGEST_BODY_BUFFERS,
+    ) -> None:
+        self.app = app
+        if max_buffered_requests < 1:
+            raise ValueError("max_buffered_requests must be positive")
+        self._buffer_slots = threading.BoundedSemaphore(max_buffered_requests)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") not in TRACE_INGEST_PATHS
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        limit = MAX_TRACE_INGEST_BODY_BYTES
+        for name, value in scope.get("headers", ()):
+            if name.lower() != b"content-length":
+                continue
+            try:
+                content_length = int(value)
+            except ValueError:
+                break
+            if content_length > limit:
+                await self._reject(scope, send)
+                return
+            break
+
+        auth = self._auth_dependency(scope)
+        if auth is None:
+            await self._send_error(
+                scope,
+                send,
+                status_code=503,
+                detail="trace ingestion authentication is unavailable",
+            )
+            return
+        try:
+            await auth(Request(scope, receive))
+        except HTTPException as exc:
+            await self._send_error(
+                scope,
+                send,
+                status_code=exc.status_code,
+                detail=str(exc.detail),
+                headers=exc.headers,
+            )
+            return
+
+        if not self._buffer_slots.acquire(blocking=False):
+            await self._reject(
+                scope,
+                send,
+                status_code=503,
+                detail="trace ingestion body buffer capacity is full",
+            )
+            return
+
+        body = bytearray()
+        message_count = 0
+        total = 0
+        try:
+            while True:
+                message = await receive()
+                message_count += 1
+                if message["type"] == "http.disconnect":
+                    return
+                if message_count > MAX_TRACE_INGEST_MESSAGES:
+                    await self._reject(scope, send)
+                    return
+                if message["type"] != "http.request":
+                    continue
+                chunk = message.get("body", b"")
+                total += len(chunk)
+                if total > limit:
+                    await self._reject(scope, send)
+                    return
+                body.extend(chunk)
+                if not message.get("more_body", False):
+                    break
+
+            replayed = False
+
+            async def replay() -> Message:
+                nonlocal replayed
+                if not replayed:
+                    replayed = True
+                    return {
+                        "type": "http.request",
+                        "body": bytes(body),
+                        "more_body": False,
+                    }
+                return {"type": "http.disconnect"}
+
+            await self.app(scope, replay, send)
+        finally:
+            self._buffer_slots.release()
+
+    @staticmethod
+    def _auth_dependency(scope: Scope):
+        app = scope.get("app")
+        return getattr(getattr(app, "state", None), "auth_dependency", None)
+
+    async def _reject(
+        self,
+        scope: Scope,
+        send: Send,
+        *,
+        status_code: int = 413,
+        detail: str = "trace ingestion request body is too large",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        app = scope.get("app")
+        _bump_trace_health_state(
+            getattr(app, "state", None), "ingestion_body_rejections"
+        )
+        await self._send_error(
+            scope, send, status_code=status_code, detail=detail, headers=headers
+        )
+
+    async def _send_error(
+        self,
+        scope: Scope,
+        send: Send,
+        *,
+        status_code: int,
+        detail: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        body = json.dumps({"detail": detail}, separators=(",", ":")).encode()
+        response_headers = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ]
+        if headers:
+            response_headers.extend(
+                (name.lower().encode("latin-1"), value.encode("latin-1"))
+                for name, value in headers.items()
+            )
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status_code,
+                "headers": response_headers,
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+class TraceAuditFallbackUnavailable(RuntimeError):
+    """The dedicated strict-audit fallback has no admission slot."""
 
 
 def _authorize_query(request: Request, ticket_id: str | None) -> bool:
@@ -52,7 +236,7 @@ def _authorize_query(request: Request, ticket_id: str | None) -> bool:
         return True
     try:
         ticket = request.app.state.store.get_ticket(ticket_id)
-    except Exception as exc:
+    except TicketNotFound as exc:
         # Do not reveal whether an inaccessible ticket exists.
         raise HTTPException(status_code=404, detail="ticket not found") from exc
     owners = getattr(ticket, "owners", [])
@@ -61,6 +245,82 @@ def _authorize_query(request: Request, ticket_id: str | None) -> bool:
             status_code=403, detail="trace access requires ticket ownership"
         )
     return False
+
+
+async def _authorize_query_off_loop(request: Request, ticket_id: str | None) -> bool:
+    """Keep ticket-store lock waits and deferred reads off the ASGI loop."""
+    return await _run_trace_worker(request, _authorize_query, request, ticket_id)
+
+
+async def _run_trace_worker(request: Request, function, /, *args, **kwargs):
+    """Run bounded query work outside both the ASGI loop and default executor."""
+    state = getattr(getattr(request, "app", None), "state", None)
+    executor = getattr(state, "trace_query_executor", None)
+    if executor is None:
+        return await asyncio.to_thread(function, *args, **kwargs)
+    slots = getattr(state, "trace_query_slots", None)
+    try:
+        return await run_bounded_executor(executor, slots, function, *args, **kwargs)
+    except BoundedExecutorSaturated as exc:
+        raise TraceQueryResourceExhausted("trace query queue is full") from exc
+
+
+async def _observe_trace_worker(
+    request: Request,
+    task: asyncio.Task[_WorkerResult],
+    cancelled: threading.Event,
+) -> _WorkerResult:
+    def consume_result(done: asyncio.Task[_WorkerResult]) -> None:
+        if not done.cancelled():
+            done.exception()
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=0.2)
+            if task in done:
+                return task.result()
+            if await request.is_disconnected():
+                cancelled.set()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+                except TimeoutError:
+                    pass
+                raise TraceQueryCancelled("trace query cancelled")
+    finally:
+        if task.done():
+            consume_result(task)
+        else:
+            cancelled.set()
+            task.add_done_callback(consume_result)
+
+
+async def _run_cancellable_trace_worker(
+    request: Request, function, /, *args, **kwargs
+) -> _WorkerResult:
+    cancelled = threading.Event()
+    state = getattr(getattr(request, "app", None), "state", None)
+    shutdown = getattr(state, "trace_query_shutdown", None)
+
+    def is_cancelled() -> bool:
+        return cancelled.is_set() or bool(shutdown is not None and shutdown.is_set())
+
+    kwargs["cancelled"] = is_cancelled
+    task = asyncio.create_task(_run_trace_worker(request, function, *args, **kwargs))
+    return await _observe_trace_worker(request, task, cancelled)
+
+
+def _resident_bytes() -> int:
+    try:
+        pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[1])
+    except (IndexError, OSError, ValueError):
+        return 0
+    return pages * int(os.sysconf("SC_PAGE_SIZE"))
+
+
+def _memory_guard_exceeded(request: Request) -> bool:
+    state = getattr(getattr(request, "app", None), "state", None)
+    limit = getattr(state, "trace_query_max_rss_bytes", 0)
+    return bool(limit and limit > 0 and _resident_bytes() >= limit)
 
 
 def _event_json(event: TraceEventV1, detailed: bool) -> dict[str, object]:
@@ -89,7 +349,7 @@ def _query_from_params(
     until: datetime | None,
     causal: bool,
     limit: int,
-    cursor: int,
+    cursor: int = 0,
 ) -> TraceQuery:
     return TraceQuery(
         ticket_id=ticket_id,
@@ -111,41 +371,676 @@ def _query_from_params(
     )
 
 
-def _record_query_audit(
+def _cursor_sequence(cursor: str | None) -> int:
+    """Return the SQLite sequence filter for a page cursor.
+
+    Legacy events without a global sequence use timestamp cursors. They sort
+    after sequenced events and are filtered again by ``page_events``, so the
+    SQL prefilter can safely start at zero for those cursors.
+    """
+    marker = decode_cursor(cursor)
+    if marker is None:
+        return 0
+    if marker[0] == 1:
+        return 0
+    if marker[0] != 0:
+        raise ValueError("invalid trace cursor for stored events")
+    value = int(marker[1])
+    if value < 0 or value > 2**63 - 1:
+        raise ValueError("invalid trace cursor for stored events")
+    return value
+
+
+async def _record_query_audit(
     request: Request,
     operation: str,
     ticket_id: str | None,
     outcome: str,
     error: str | None = None,
+    reservation: _TraceAuditReservation | None = None,
+    fail_closed: bool = True,
 ) -> None:
     audit_log = getattr(request.app.state, "audit_log", None)
-    if audit_log is not None:
-        audit_log.log(
+    if audit_log is None:
+        if reservation is not None:
+            reservation.release()
+        return
+
+    if reservation is None:
+        reservation = _reserve_trace_audit(request)
+        if reservation is None:
+            try:
+                await _write_trace_audit_with_fallback(
+                    request, audit_log, operation, ticket_id, outcome, error
+                )
+            except TraceAuditFallbackUnavailable:
+                if fail_closed:
+                    raise HTTPException(
+                        status_code=503, detail="trace audit capacity is full"
+                    ) from None
+                logger.warning("Dropping non-response trace audit after fallback loss")
+                return
+            if fail_closed:
+                raise HTTPException(
+                    status_code=503, detail="trace audit capacity is full"
+                )
+            return
+
+    task = asyncio.create_task(
+        _run_trace_audit_worker(
+            request,
+            _audit_write(audit_log),
             operation,
             ticket_id or "*",
-            {"outcome": outcome, "error": error, "ticket_scoped": bool(ticket_id)},
+            {
+                "outcome": outcome,
+                "error": error,
+                "ticket_scoped": bool(ticket_id),
+            },
+            reservation=reservation,
         )
+    )
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.add_done_callback(_consume_audit_result)
+        raise
+    except TraceAuditFallbackUnavailable:
+        if fail_closed:
+            raise HTTPException(
+                status_code=503, detail="trace audit capacity is full"
+            ) from None
+        logger.warning("Dropping non-response trace audit after fallback loss")
+    except TraceStoreWriteError:
+        if fail_closed:
+            raise
+        logger.warning("Dropping non-response trace audit after store failure")
 
 
-def _verified_blob_refs(events: list[TraceEventV1]) -> set[str]:
+async def _record_best_effort_query_audit(
+    request: Request,
+    operation: str,
+    ticket_id: str | None,
+    outcome: str,
+    error: str | None = None,
+    reservation: _TraceAuditReservation | None = None,
+) -> None:
+    """Record a terminal audit without replacing the route's real outcome."""
+    await _record_query_audit(
+        request,
+        operation,
+        ticket_id,
+        outcome,
+        error,
+        reservation=reservation,
+        fail_closed=False,
+    )
+
+
+class _TraceAuditReservation:
+    def __init__(self, slots=None) -> None:
+        self._slots = slots
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._slots is not None:
+            self._slots.release()
+
+
+def _audit_write(audit_log):
+    write = getattr(audit_log, "log_required", None)
+    return write if write is not None else audit_log.log
+
+
+async def _write_trace_audit_with_fallback(
+    request: Request,
+    audit_log,
+    operation: str,
+    ticket_id: str | None,
+    outcome: str,
+    error: str | None,
+) -> None:
+    await _run_trace_audit_fallback(
+        request,
+        _audit_write(audit_log),
+        operation,
+        ticket_id or "*",
+        {
+            "outcome": outcome,
+            "error": error,
+            "ticket_scoped": bool(ticket_id),
+        },
+    )
+
+
+async def _run_trace_audit_fallback(
+    request: Request,
+    function,
+    /,
+    *args,
+    **kwargs,
+) -> None:
+    """Attempt one strict write on a dedicated executor with no queue."""
+    state = getattr(getattr(request, "app", None), "state", None)
+    _bump_trace_health_state(state, "audit_queue_fallbacks")
+    logger.warning("Trace audit queue is full; using dedicated strict fallback")
+    executor = getattr(state, "trace_query_audit_fallback_executor", None)
+    slots = getattr(state, "trace_query_audit_fallback_slots", None)
+    if executor is None or slots is None:
+        raise TraceAuditFallbackUnavailable
+    try:
+        await run_bounded_executor(executor, slots, function, *args, **kwargs)
+    except BoundedExecutorSaturated as exc:
+        raise TraceAuditFallbackUnavailable from exc
+
+
+def _reserve_trace_audit(request: Request) -> _TraceAuditReservation | None:
+    state = getattr(getattr(request, "app", None), "state", None)
+    executor = getattr(state, "trace_query_audit_executor", None)
+    if executor is None:
+        return None
+    slots = getattr(state, "trace_query_audit_slots", None)
+    if slots is not None and slots.acquire(blocking=False):
+        return _TraceAuditReservation(slots)
+    return None
+
+
+async def _run_trace_audit_worker(
+    request: Request,
+    function,
+    /,
+    *args,
+    reservation: _TraceAuditReservation | None = None,
+    **kwargs,
+) -> bool:
+    """Bound audit writes independently from query and control work."""
+    state = getattr(getattr(request, "app", None), "state", None)
+    executor = getattr(state, "trace_query_audit_executor", None)
+    if reservation is not None:
+        if executor is None:
+            try:
+                await _run_trace_audit_fallback(request, function, *args, **kwargs)
+            finally:
+                reservation.release()
+            return True
+        context = contextvars.copy_context()
+        try:
+            future = executor.submit(context.run, function, *args, **kwargs)
+        except BaseException:
+            reservation.release()
+            raise
+        future.add_done_callback(lambda _future: reservation.release())
+        return await asyncio.wrap_future(future)
+    if executor is None:
+        await _run_trace_audit_fallback(request, function, *args, **kwargs)
+        return True
+    slots = getattr(state, "trace_query_audit_slots", None)
+    try:
+        await run_bounded_executor(executor, slots, function, *args, **kwargs)
+    except BoundedExecutorSaturated:
+        await _run_trace_audit_fallback(request, function, *args, **kwargs)
+        return True
+    return True
+
+
+def _consume_audit_result(task: asyncio.Task[None]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def _record_cancelled_query(
+    request: Request,
+    operation: str,
+    ticket_id: str | None,
+    reservation: _TraceAuditReservation | None = None,
+) -> None:
+    """Record cancellation best effort without replacing the cancellation."""
+    try:
+        await asyncio.shield(
+            _record_query_audit(
+                request,
+                operation,
+                ticket_id,
+                "cancelled",
+                "request cancelled",
+                reservation=reservation,
+                fail_closed=False,
+            )
+        )
+    except TraceStoreWriteError:
+        logger.exception("Failed to record cancelled %s", operation)
+
+
+def _check_render_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise TraceQueryCancelled("trace query cancelled")
+
+
+def _json_dumps(
+    value: object,
+    *,
+    indent: int | None = None,
+    separators: tuple[str, str] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    max_bytes: int | None = None,
+) -> str:
+    if max_bytes is None:
+        max_bytes = MAX_TRACE_RESPONSE_BYTES
+    encoder = json.JSONEncoder(indent=indent, separators=separators)
+    fragments: list[str] = []
+    total_bytes = 0
+    for fragment in encoder.iterencode(value):
+        _check_render_cancelled(cancelled)
+        total_bytes += len(fragment.encode("utf-8"))
+        if total_bytes > max_bytes:
+            raise TraceQueryTooBroad(
+                "trace response is too broad; narrow the query or reduce its limit"
+            )
+        fragments.append(fragment)
+    return "".join(fragments)
+
+
+def _join_trace_response(
+    parts: Iterable[str], *, cancelled: Callable[[], bool] | None = None
+) -> str:
+    fragments: list[str] = []
+    total_bytes = 0
+    for part in parts:
+        _check_render_cancelled(cancelled)
+        total_bytes += len(part.encode("utf-8"))
+        if total_bytes > MAX_TRACE_RESPONSE_BYTES:
+            raise TraceQueryTooBroad(
+                "trace response is too broad; narrow the query or reduce its limit"
+            )
+        fragments.append(part)
+    return "".join(fragments)
+
+
+def _verified_blob_refs(
+    events: list[TraceEventV1],
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    max_bytes: int = MAX_EXPORT_VERIFICATION_BYTES,
+) -> set[str]:
     refs: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    stores: dict[str, PayloadBlobStore] = {}
+    remaining = max(0, max_bytes)
     for event in events:
+        _check_render_cancelled(cancelled)
         if not event.ticket_id:
             continue
-        store = PayloadBlobStore(ticket_id=event.ticket_id)
         for descriptor in (event.input, event.output):
+            _check_render_cancelled(cancelled)
             if not descriptor or not descriptor.blob_ref:
                 continue
-            try:
-                store.get(descriptor.blob_ref, max_bytes=1_048_576)
-            except PayloadStorageError:
+            key = (event.ticket_id, descriptor.blob_ref)
+            if key in seen:
                 continue
+            seen.add(key)
+            if remaining <= 0:
+                logger.info(
+                    "Trace export payload verification budget exhausted after %d bytes",
+                    max_bytes,
+                )
+                return refs
+            store = stores.setdefault(
+                event.ticket_id, PayloadBlobStore(ticket_id=event.ticket_id)
+            )
+            budget = min(MAX_VERIFIED_PAYLOAD_BYTES, remaining)
+            try:
+                content = store.get(
+                    descriptor.blob_ref,
+                    max_bytes=budget,
+                )
+            except PayloadStorageError:
+                # Failed verification still consumes its allowance so distinct
+                # oversized or corrupt blobs cannot bypass the aggregate cap.
+                remaining -= budget
+                continue
+            remaining -= len(content)
             refs.add(descriptor.blob_ref)
     return refs
 
 
+async def _query_store(
+    request: Request,
+    store: TraceStore,
+    query: TraceQuery,
+    *,
+    include_diagnostics: bool = False,
+) -> tuple[list[TraceEventV1], list[TraceEventV1] | None]:
+    """Run a bounded trace scan off-loop and stop it when the client leaves."""
+
+    if _memory_guard_exceeded(request):
+        raise TraceQueryResourceExhausted(
+            "trace queries are temporarily unavailable while the state store "
+            "memory limit is exceeded"
+        )
+
+    method = (
+        store.query_events_with_diagnostics
+        if include_diagnostics
+        else store.query_events
+    )
+    result = await _run_cancellable_trace_worker(
+        request,
+        method,
+        query,
+    )
+    if include_diagnostics:
+        return result
+    return result, None
+
+
+def _render_query_response(
+    events: list[TraceEventV1],
+    diagnostics_events: list[TraceEventV1] | None,
+    *,
+    cursor: str | None,
+    limit: int,
+    detailed: bool,
+    include_payloads: bool,
+    causal: bool,
+    cancelled: Callable[[], bool] | None = None,
+) -> Response:
+    selected, has_more, next_cursor = page_events(
+        events, cursor=cursor, limit=limit, cancelled=cancelled
+    )
+    rendered_events: list[dict[str, object]] = []
+    for event in selected:
+        _check_render_cancelled(cancelled)
+        rendered_events.append(_event_json(event, detailed and include_payloads))
+    rendered_diagnostics = (
+        diagnostics(diagnostics_events or events, cancelled=cancelled) if causal else {}
+    )
+    payload = {
+        "events": rendered_events,
+        "count": len(selected),
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "diagnostics": rendered_diagnostics,
+    }
+    return Response(
+        content=_json_dumps(payload, separators=(",", ":"), cancelled=cancelled),
+        media_type="application/json",
+    )
+
+
+def _render_export_response(
+    events: list[TraceEventV1],
+    *,
+    format: str,
+    cursor: str | None,
+    limit: int,
+    detailed: bool,
+    include_payloads: bool,
+    cancelled: Callable[[], bool] | None = None,
+) -> Response:
+    selected, has_more, next_cursor = page_events(
+        events, cursor=cursor, limit=limit, cancelled=cancelled
+    )
+    verified_blob_refs = (
+        _verified_blob_refs(selected, cancelled=cancelled)
+        if detailed and include_payloads
+        else set()
+    )
+    media = (
+        "text/csv"
+        if format == "csv"
+        else ("application/x-ndjson" if format == "jsonl" else "application/json")
+    )
+    if not detailed or not include_payloads:
+        redacted: list[TraceEventV1] = []
+        for event in selected:
+            _check_render_cancelled(cancelled)
+            redacted.append(
+                event.model_copy(
+                    update={"input": None, "output": None, "attributes": None}
+                )
+            )
+        selected = redacted
+    event_rows: list[dict[str, object]] | None = None
+    if format == "json":
+        event_rows = []
+        for event in selected:
+            _check_render_cancelled(cancelled)
+            event_rows.append(event.model_dump(mode="json"))
+        content = _json_dumps(event_rows, indent=2, cancelled=cancelled)
+    else:
+        content = export_events(
+            selected,
+            format,
+            cancelled=cancelled,
+            max_bytes=MAX_TRACE_RESPONSE_BYTES,
+        )
+    export_meta = export_manifest(
+        selected,
+        content,
+        verified_blob_refs=verified_blob_refs,
+        cancelled=cancelled,
+    )
+    export_meta["has_more"] = has_more
+    export_meta["next_cursor"] = next_cursor
+    if format == "json":
+        content = _json_dumps(
+            {"manifest": export_meta, "events": event_rows},
+            indent=2,
+            cancelled=cancelled,
+        )
+    elif format == "jsonl":
+        content = _join_trace_response(
+            (
+                content,
+                _json_dumps(
+                    {"_manifest": export_meta},
+                    separators=(",", ":"),
+                    cancelled=cancelled,
+                ),
+                "\n",
+            ),
+            cancelled=cancelled,
+        )
+    else:
+        content = _join_trace_response(
+            (
+                "# trace-export-manifest: ",
+                _json_dumps(export_meta, separators=(",", ":"), cancelled=cancelled),
+                "\n",
+                content,
+            ),
+            cancelled=cancelled,
+        )
+    manifest_json = _json_dumps(export_meta, separators=(",", ":"), cancelled=cancelled)
+    if len(manifest_json.encode("utf-8")) > MAX_TRACE_MANIFEST_HEADER_BYTES:
+        manifest_json = _json_dumps(
+            {
+                "manifest_version": export_meta["manifest_version"],
+                "count": export_meta["count"],
+                "has_more": export_meta["has_more"],
+                "next_cursor": export_meta["next_cursor"],
+                "content_digest": export_meta["content_digest"],
+                "full_manifest_digest_algorithm": "sha256-utf8",
+                "full_manifest_digest": hashlib.sha256(
+                    manifest_json.encode("utf-8")
+                ).hexdigest(),
+            },
+            separators=(",", ":"),
+            cancelled=cancelled,
+        )
+    response = Response(content, media_type=media)
+    response.headers["X-Trace-Manifest"] = manifest_json
+    return response
+
+
+class _TraceAuditResponse(Response):
+    """Record the terminal audit after ASGI accepts the response body."""
+
+    def __init__(
+        self,
+        response: Response,
+        *,
+        request: Request,
+        operation: str,
+        ticket_id: str | None,
+    ) -> None:
+        super().__init__(
+            content=response.body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
+            background=response.background,
+        )
+        self._audit_request = request
+        self._audit_operation = operation
+        self._audit_ticket_id = ticket_id
+
+    async def __call__(self, scope, receive, send) -> None:
+        audit_log = getattr(self._audit_request.app.state, "audit_log", None)
+        if audit_log is None:
+            await super().__call__(scope, receive, send)
+            return
+        reservation = _reserve_trace_audit(self._audit_request)
+        if reservation is None:
+            try:
+                await _write_trace_audit_with_fallback(
+                    self._audit_request,
+                    audit_log,
+                    self._audit_operation,
+                    self._audit_ticket_id,
+                    "failed",
+                    "trace audit capacity is full",
+                )
+            except TraceAuditFallbackUnavailable:
+                pass
+            raise HTTPException(status_code=503, detail="trace audit capacity is full")
+        try:
+            send_timed_out = False
+            terminal_outcome: str | None = None
+            response_started = False
+
+            async def bounded_send(message: Message) -> None:
+                nonlocal response_started
+                await send(message)
+                if message["type"] == "http.response.start":
+                    response_started = True
+
+            send_task = asyncio.create_task(
+                super().__call__(scope, receive, bounded_send)
+            )
+            try:
+                await asyncio.wait_for(
+                    send_task,
+                    timeout=TRACE_AUDIT_RESPONSE_SEND_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                send_timed_out = True
+                terminal_outcome = "indeterminate" if response_started else "failed"
+                send_task.cancel()
+                try:
+                    await send_task
+                except asyncio.CancelledError:
+                    pass
+                await _record_query_audit(
+                    self._audit_request,
+                    self._audit_operation,
+                    self._audit_ticket_id,
+                    terminal_outcome,
+                    "trace audit response send timed out",
+                    reservation=reservation,
+                )
+                if not response_started:
+                    failure = Response(
+                        content='{"detail":"trace response send timed out"}',
+                        status_code=503,
+                        media_type="application/json",
+                    )
+                    await failure(scope, receive, send)
+                return
+        except asyncio.CancelledError:
+            if terminal_outcome is not None:
+                raise
+            await _record_cancelled_query(
+                self._audit_request,
+                self._audit_operation,
+                self._audit_ticket_id,
+                reservation=reservation,
+            )
+            raise
+        except Exception as exc:
+            if send_timed_out:
+                raise
+            terminal_outcome = "failed"
+            await _record_query_audit(
+                self._audit_request,
+                self._audit_operation,
+                self._audit_ticket_id,
+                "failed",
+                _unexpected_audit_error(self._audit_operation.replace("_", " "), exc),
+                reservation=reservation,
+            )
+            raise
+        else:
+            try:
+                await _record_best_effort_query_audit(
+                    self._audit_request,
+                    self._audit_operation,
+                    self._audit_ticket_id,
+                    "success",
+                    reservation=reservation,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Dropping post-delivery trace success audit",
+                    exc_info=True,
+                )
+
+
+class _PayloadAuditResponse(Response):
+    """Record payload success only after ASGI accepts the complete body."""
+
+    def __init__(
+        self,
+        response: Response,
+        *,
+        audit: Callable[[str, str], Awaitable[None]],
+    ) -> None:
+        super().__init__(
+            content=response.body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
+            background=response.background,
+        )
+        self._audit = audit
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        except asyncio.CancelledError:
+            await self._audit("cancelled", "request cancelled")
+            raise
+        except Exception as exc:
+            await self._audit(
+                "failed", _unexpected_audit_error("trace payload read", exc)
+            )
+            raise
+        else:
+            await self._audit("success", "")
+
+
+def _unexpected_audit_error(operation: str, exc: Exception) -> str:
+    """Keep unexpected audit details useful without persisting exception text."""
+    return f"{operation} failed ({type(exc).__name__})"
+
+
 @query_router.get("/query")
-def query(
+async def query(
     request: Request,
     ticket_id: str | None = None,
     trace_id: str | None = None,
@@ -164,55 +1059,109 @@ def query(
     limit: int = Query(default=1000, ge=1, le=10000),
     cursor: str | None = None,
     include_payloads: bool = False,
-) -> dict[str, object]:
+) -> Response:
+    terminal_audit_started = False
+
+    async def record_terminal(outcome: str, error: str | None = None) -> None:
+        nonlocal terminal_audit_started
+        terminal_audit_started = True
+        await _record_query_audit(request, "trace_query", ticket_id, outcome, error)
+
     try:
-        detailed = _authorize_query(request, ticket_id)
+        detailed = await _authorize_query_off_loop(request, ticket_id)
     except HTTPException as exc:
-        _record_query_audit(
+        await _record_best_effort_query_audit(
             request, "trace_query", ticket_id, "denied", str(exc.detail)
         )
         raise
-    raw_events = request.app.state.trace_store.list_events()
-    base_query = _query_from_params(
-        ticket_id=ticket_id,
-        trace_id=trace_id,
-        invocation_id=invocation_id,
-        action_id=action_id,
-        parent_action_id=parent_action_id,
-        action_type=action_type,
-        lifecycle_state=lifecycle_state,
-        outcome=outcome,
-        producer_component=producer_component,
-        retry_kind=retry_kind,
-        idempotency_outcome=idempotency_outcome,
-        since=since,
-        until=until,
-        causal=causal,
-        limit=max(len(raw_events), limit),
-        cursor=0,
-    )
-    all_selected = query_events(raw_events, base_query)
+    except TraceQueryResourceExhausted as exc:
+        await record_terminal("failed", str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        await _record_cancelled_query(request, "trace_query", ticket_id)
+        raise
+    except Exception as exc:
+        await record_terminal("failed", _unexpected_audit_error("trace query", exc))
+        raise
     try:
-        selected, has_more, next_cursor = page_events(
-            all_selected, cursor=cursor, limit=limit
+        try:
+            query_cursor = _cursor_sequence(cursor)
+        except ValueError as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        base_query = _query_from_params(
+            ticket_id=ticket_id,
+            trace_id=trace_id,
+            invocation_id=invocation_id,
+            action_id=action_id,
+            parent_action_id=parent_action_id,
+            action_type=action_type,
+            lifecycle_state=lifecycle_state,
+            outcome=outcome,
+            producer_component=producer_component,
+            retry_kind=retry_kind,
+            idempotency_outcome=idempotency_outcome,
+            since=since,
+            until=until,
+            causal=causal,
+            limit=limit + 1,
+            cursor=query_cursor,
         )
-    except ValueError as exc:
-        _record_query_audit(request, "trace_query", ticket_id, "failed", str(exc))
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    _record_query_audit(request, "trace_query", ticket_id, "success")
-    return {
-        "events": [
-            _event_json(event, detailed and include_payloads) for event in selected
-        ],
-        "count": len(selected),
-        "next_cursor": next_cursor,
-        "has_more": has_more,
-        "diagnostics": diagnostics(all_selected) if causal else {},
-    }
+        try:
+            all_selected, diagnostics_events = await _query_store(
+                request,
+                request.app.state.trace_store,
+                base_query,
+                include_diagnostics=causal,
+            )
+        except TraceQueryTooBroad as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TraceQueryResourceExhausted as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except TraceQueryCancelled as exc:
+            await record_terminal("cancelled", str(exc))
+            raise HTTPException(status_code=408, detail=str(exc)) from exc
+        try:
+            response = await _run_cancellable_trace_worker(
+                request,
+                _render_query_response,
+                all_selected,
+                diagnostics_events,
+                cursor=cursor,
+                limit=limit,
+                detailed=detailed,
+                include_payloads=include_payloads,
+                causal=causal,
+            )
+        except TraceQueryCancelled as exc:
+            await record_terminal("cancelled", str(exc))
+            raise HTTPException(status_code=408, detail=str(exc)) from exc
+        except TraceQueryResourceExhausted as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        if not terminal_audit_started:
+            await _record_cancelled_query(request, "trace_query", ticket_id)
+        raise
+    except Exception as exc:
+        if not terminal_audit_started:
+            await record_terminal("failed", _unexpected_audit_error("trace query", exc))
+        raise
+    return _TraceAuditResponse(
+        response,
+        request=request,
+        operation="trace_query",
+        ticket_id=ticket_id,
+    )
 
 
 @query_router.get("/export")
-def export(
+async def export(
     request: Request,
     format: Literal["json", "jsonl", "csv"] = "json",
     ticket_id: str | None = None,
@@ -234,17 +1183,36 @@ def export(
     include_payloads: bool = False,
     manifest: bool = False,
 ) -> Response:
+    terminal_audit_started = False
+
+    async def record_terminal(outcome: str, error: str | None = None) -> None:
+        nonlocal terminal_audit_started
+        terminal_audit_started = True
+        await _record_query_audit(request, "trace_export", ticket_id, outcome, error)
+
     try:
-        detailed = _authorize_query(request, ticket_id)
+        detailed = await _authorize_query_off_loop(request, ticket_id)
     except HTTPException as exc:
-        _record_query_audit(
+        await _record_best_effort_query_audit(
             request, "trace_export", ticket_id, "denied", str(exc.detail)
         )
         raise
-    raw_events = request.app.state.trace_store.list_events()
-    selected = query_events(
-        raw_events,
-        TraceQuery(
+    except TraceQueryResourceExhausted as exc:
+        await record_terminal("failed", str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        await _record_cancelled_query(request, "trace_export", ticket_id)
+        raise
+    except Exception as exc:
+        await record_terminal("failed", _unexpected_audit_error("trace export", exc))
+        raise
+    try:
+        try:
+            query_cursor = _cursor_sequence(cursor)
+        except ValueError as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        base_query = TraceQuery(
             ticket_id=ticket_id,
             trace_id=trace_id,
             invocation_id=invocation_id,
@@ -259,63 +1227,62 @@ def export(
             since=since,
             until=until,
             causal=causal,
-            limit=max(len(raw_events), limit),
-            cursor=0,
-        ),
-    )
-    try:
-        selected, has_more, next_cursor = page_events(
-            selected, cursor=cursor, limit=limit
+            limit=limit + 1,
+            cursor=query_cursor,
         )
-    except ValueError as exc:
-        _record_query_audit(request, "trace_export", ticket_id, "failed", str(exc))
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    verified_blob_refs = _verified_blob_refs(selected) if detailed else set()
-    media = (
-        "text/csv"
-        if format == "csv"
-        else ("application/x-ndjson" if format == "jsonl" else "application/json")
-    )
-    if not detailed or not include_payloads:
-        selected = [
-            event.model_copy(update={"input": None, "output": None, "attributes": None})
-            for event in selected
-        ]
-    content = export_events(selected, format)
-    export_meta = export_manifest(
-        selected, content, verified_blob_refs=verified_blob_refs
-    )
-    export_meta["has_more"] = has_more
-    export_meta["next_cursor"] = next_cursor
-    # Every artifact is self-describing; ``manifest`` remains accepted for
-    # compatibility but cannot disable integrity metadata.
-    manifest = True
-    if manifest:
-        if format == "json":
-            content = json.dumps(
-                {"manifest": export_meta, "events": json.loads(content)}, indent=2
+        try:
+            selected, _ = await _query_store(
+                request, request.app.state.trace_store, base_query
             )
-        elif format == "jsonl":
-            content += (
-                json.dumps({"_manifest": export_meta}, separators=(",", ":")) + "\n"
+        except TraceQueryTooBroad as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TraceQueryResourceExhausted as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except TraceQueryCancelled as exc:
+            await record_terminal("cancelled", str(exc))
+            raise HTTPException(status_code=408, detail=str(exc)) from exc
+        try:
+            response = await _run_cancellable_trace_worker(
+                request,
+                _render_export_response,
+                selected,
+                format=format,
+                cursor=cursor,
+                limit=limit,
+                detailed=detailed,
+                include_payloads=include_payloads,
             )
-        else:
-            content = (
-                "# trace-export-manifest: "
-                + json.dumps(export_meta, separators=(",", ":"))
-                + "\n"
-                + content
+        except TraceQueryCancelled as exc:
+            await record_terminal("cancelled", str(exc))
+            raise HTTPException(status_code=408, detail=str(exc)) from exc
+        except TraceQueryResourceExhausted as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            await record_terminal("failed", str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        if not terminal_audit_started:
+            await _record_cancelled_query(request, "trace_export", ticket_id)
+        raise
+    except Exception as exc:
+        if not terminal_audit_started:
+            await record_terminal(
+                "failed", _unexpected_audit_error("trace export", exc)
             )
-    response = Response(content, media_type=media)
-    response.headers["X-Trace-Manifest"] = json.dumps(
-        export_meta, separators=(",", ":")
+        raise
+    return _TraceAuditResponse(
+        response,
+        request=request,
+        operation="trace_export",
+        ticket_id=ticket_id,
     )
-    _record_query_audit(request, "trace_export", ticket_id, "success")
-    return response
 
 
 @query_router.get("/tickets/{ticket_id}")
-def ticket_trace(
+async def ticket_trace(
     ticket_id: str,
     request: Request,
     trace_id: str | None = None,
@@ -334,8 +1301,8 @@ def ticket_trace(
     cursor: str | None = None,
     include_payloads: bool = False,
     limit: int = Query(1000, ge=1, le=10000),
-) -> dict[str, object]:
-    return query(
+) -> Response:
+    return await query(
         request,
         ticket_id=ticket_id,
         trace_id=trace_id,
@@ -358,7 +1325,7 @@ def ticket_trace(
 
 
 @query_router.get("/invocations/{invocation_id}")
-def invocation_trace(
+async def invocation_trace(
     invocation_id: str,
     request: Request,
     ticket_id: str | None = None,
@@ -377,8 +1344,8 @@ def invocation_trace(
     cursor: str | None = None,
     include_payloads: bool = False,
     limit: int = Query(1000, ge=1, le=10000),
-) -> dict[str, object]:
-    return query(
+) -> Response:
+    return await query(
         request,
         invocation_id=invocation_id,
         ticket_id=ticket_id,
@@ -401,7 +1368,7 @@ def invocation_trace(
 
 
 @query_router.get("/actions/{action_id}")
-def action_trace(
+async def action_trace(
     action_id: str,
     request: Request,
     ticket_id: str | None = None,
@@ -420,8 +1387,8 @@ def action_trace(
     cursor: str | None = None,
     include_payloads: bool = False,
     limit: int = Query(1000, ge=1, le=10000),
-) -> dict[str, object]:
-    return query(
+) -> Response:
+    return await query(
         request,
         action_id=action_id,
         ticket_id=ticket_id,
@@ -443,47 +1410,91 @@ def action_trace(
     )
 
 
+def _read_referenced_payload(
+    request: Request,
+    ticket_id: str,
+    blob_ref: str,
+    *,
+    cancelled: Callable[[], bool],
+) -> bytes | None:
+    if cancelled():
+        raise TraceQueryCancelled("trace query cancelled")
+    if not request.app.state.trace_store.payload_is_referenced(
+        ticket_id, blob_ref, cancelled=cancelled
+    ):
+        return None
+    if cancelled():
+        raise TraceQueryCancelled("trace query cancelled")
+    return PayloadBlobStore(ticket_id=ticket_id).get(blob_ref, max_bytes=1_048_576)
+
+
 @query_router.get("/{ticket_id}/payloads/{digest}")
-def payload_content(ticket_id: str, digest: str, request: Request) -> Response:
+async def payload_content(ticket_id: str, digest: str, request: Request) -> Response:
     """Return a referenced redacted blob only to detailed trace principals."""
     audit_log = getattr(request.app.state, "audit_log", None)
 
-    def audit(outcome: str, error: str = "") -> None:
+    async def audit(outcome: str, error: str = "") -> None:
         if audit_log is not None:
-            audit_log.log(
-                "trace_payload_read",
-                ticket_id,
-                {"digest": digest[:80], "outcome": outcome, "error": error},
-            )
+            try:
+                await _run_trace_audit_worker(
+                    request,
+                    _audit_write(audit_log),
+                    "trace_payload_read",
+                    ticket_id,
+                    {"digest": digest[:80], "outcome": outcome, "error": error},
+                )
+            except (TraceAuditFallbackUnavailable, TraceStoreWriteError):
+                logger.exception("Failed to audit trace payload read")
 
     try:
-        detailed = _authorize_query(request, ticket_id)
+        detailed = await _authorize_query_off_loop(request, ticket_id)
     except HTTPException as exc:
-        audit("denied", str(exc.detail))
+        await audit("denied", str(exc.detail))
+        raise
+    except TraceQueryResourceExhausted as exc:
+        await audit("failed", str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        await asyncio.shield(audit("cancelled", "request cancelled"))
+        raise
+    except Exception as exc:
+        await audit("failed", _unexpected_audit_error("trace payload read", exc))
         raise
     if not detailed:
-        audit("denied", "owner redaction")
+        await audit("denied", "owner redaction")
         raise HTTPException(
             status_code=403, detail="payload access requires operator authentication"
         )
     ref = digest if digest.startswith("sha256:") else f"sha256:{digest}"
-    events = request.app.state.trace_store.list_events(ticket_id=ticket_id)
-    refs = {
-        descriptor.blob_ref
-        for event in events
-        for descriptor in (event.input, event.output)
-        if descriptor
-    }
-    if ref not in refs:
-        audit("missing", "unreferenced payload")
-        raise HTTPException(status_code=404, detail="payload not found")
     try:
-        content = PayloadBlobStore(ticket_id=ticket_id).get(ref, max_bytes=1_048_576)
+        content = await _run_cancellable_trace_worker(
+            request,
+            _read_referenced_payload,
+            request,
+            ticket_id,
+            ref,
+        )
+    except TraceQueryResourceExhausted as exc:
+        await audit("failed", str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except TraceQueryCancelled as exc:
+        await audit("cancelled", str(exc))
+        raise HTTPException(status_code=408, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        await asyncio.shield(audit("cancelled", "request cancelled"))
+        raise
     except PayloadStorageError as exc:
-        audit("unavailable", str(exc))
+        await audit("unavailable", str(exc))
         raise HTTPException(status_code=404, detail="payload unavailable") from exc
-    audit("success")
-    return Response(content, media_type="application/octet-stream")
+    except Exception as exc:
+        await audit("failed", _unexpected_audit_error("trace payload read", exc))
+        raise
+    if content is None:
+        await audit("missing", "unreferenced payload")
+        raise HTTPException(status_code=404, detail="payload not found")
+    return _PayloadAuditResponse(
+        Response(content, media_type="application/octet-stream"), audit=audit
+    )
 
 
 async def _service_principal(request: Request) -> Principal:
@@ -500,8 +1511,14 @@ _trace_health_lock = threading.Lock()
 
 def _bump_trace_health(request: Request, key: str) -> None:
     """Increment a trace health counter from any thread without racing."""
+    _bump_trace_health_state(request.app.state, key)
+
+
+def _bump_trace_health_state(state: object, key: str) -> None:
     with _trace_health_lock:
-        request.app.state.trace_health[key] += 1
+        health = getattr(state, "trace_health", None)
+        if isinstance(health, dict):
+            health[key] = health.get(key, 0) + 1
 
 
 def _bound(event: TraceEventV1, principal: Principal, request: Request) -> TraceEventV1:
@@ -545,6 +1562,31 @@ def _insert(
         raise HTTPException(status_code=503, detail="trace store unavailable") from exc
 
 
+async def _run_ingestion_worker(
+    request: Request,
+    event: TraceEventV1,
+    principal: Principal,
+    *,
+    operation: str,
+) -> tuple[TraceEventV1, bool]:
+    state = getattr(getattr(request, "app", None), "state", None)
+    executor = getattr(state, "trace_ingestion_executor", None)
+    if executor is None:
+        return await asyncio.to_thread(_insert, request, event, principal)
+    slots = getattr(state, "trace_ingestion_slots", None)
+    try:
+        return await run_bounded_executor(
+            executor, slots, _insert, request, event, principal
+        )
+    except BoundedExecutorSaturated as exc:
+        _bump_trace_health(request, "ingestion_queue_rejections")
+        detail = "trace ingestion queue is full"
+        await _record_best_effort_query_audit(
+            request, operation, event.ticket_id, "failed", detail
+        )
+        raise HTTPException(status_code=503, detail=detail) from exc
+
+
 @router.post("")
 async def ingest(
     event: TraceEventV1,
@@ -554,7 +1596,9 @@ async def ingest(
     # _insert() calls SQLite synchronously; run it in a thread so the event
     # loop remains free to serve health probes and claim renewals while the
     # write completes.  Exceptions (HTTPException) propagate normally.
-    stored, duplicate = await asyncio.to_thread(_insert, request, event, principal)
+    stored, duplicate = await _run_ingestion_worker(
+        request, event, principal, operation="trace_ingest"
+    )
     return {
         "event": stored.model_dump(mode="json"),
         "status": "duplicate" if duplicate else "stored",
@@ -566,20 +1610,22 @@ async def ingest_batch(
     batch: TraceBatch,
     request: Request,
     principal: Annotated[Principal, Depends(_service_principal)],
-) -> dict[str, list[dict[str, object]]]:
+) -> Response:
     # Per-event acknowledgements make retrying a partial HTTP response safe.
     acknowledgements: list[dict[str, object]] = []
     for event in batch.events:
         try:
-            stored, duplicate = await asyncio.to_thread(
-                _insert, request, event, principal
+            _, duplicate = await _run_ingestion_worker(
+                request,
+                event,
+                principal,
+                operation="trace_ingest_batch",
             )
             acknowledgements.append(
                 {
                     "event_id": str(event.event_id),
                     "accepted": True,
                     "status": "duplicate" if duplicate else "stored",
-                    "event": stored.model_dump(mode="json"),
                 }
             )
         except HTTPException as exc:
@@ -588,7 +1634,14 @@ async def ingest_batch(
                     "event_id": str(event.event_id),
                     "accepted": False,
                     "status": exc.status_code,
-                    "detail": exc.detail,
+                    "detail": str(exc.detail)[:512],
                 }
             )
-    return {"acknowledgements": acknowledgements}
+    content = json.dumps(
+        {"acknowledgements": acknowledgements}, separators=(",", ":")
+    ).encode("utf-8")
+    if len(content) > MAX_TRACE_BATCH_ACK_BYTES:
+        raise HTTPException(
+            status_code=503, detail="trace batch acknowledgement is too large"
+        )
+    return Response(content=content, media_type="application/json")

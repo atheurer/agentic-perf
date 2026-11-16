@@ -18,6 +18,11 @@ The config root and `auth` section must be JSON objects. `auth.multi_user` and
 `auth.anonymous_read` must be JSON booleans, and `auth.token_ttl_days` must be a
 non-negative integer.
 
+`scripts/start-bg.sh restart` validates the complete application and runtime
+configuration before stopping healthy services. A malformed file or invalid
+state-store/orchestrator startup setting therefore leaves the running services
+untouched.
+
 ### Live config updates
 
 The orchestrator re-reads `config.json` at each agent dispatch.
@@ -238,6 +243,24 @@ or a user identity. User-scoped packages remain a future extension. See the
     "state_store": {
         "url": "http://localhost:8090",
         "port": 8090
+    },
+    "orchestrator_lease": {
+        "ttl_seconds": 30,
+        "renew_interval": 10,
+        "max_attempts": 12,
+        "drain_timeout_seconds": 20,
+        "recovery_delay_seconds": 5
+    },
+    "trace": {
+        "ingestion": {
+            "workers": 2,
+            "queue_size": 8
+        },
+        "query": {
+            "workers": 2,
+            "queue_size": 8,
+            "max_rss_mb": 4096
+        }
     },
     "poll_interval": 3.0,
     "jumpstarter_lease_sweep_interval_seconds": 60,
@@ -669,6 +692,135 @@ for provisioning (30) matches the previous jumpstarter default.
 |---|---|---|---|---|
 | `url` | string | `"http://localhost:8090"` | `STATE_STORE_URL` | State store base URL |
 | `port` | int | `8090` | `STORE_PORT` | Port for the state store server |
+
+---
+
+### `trace` — Trace Capacity
+
+Trace query and export work runs on a dedicated bounded executor. The state
+store also reserves a separate ingestion executor plus a control executor for
+health and orchestrator lease operations, so an exhausted query or ingestion
+worker pool cannot consume the workers needed to keep the control plane alive.
+
+| Field | Type | Default | Env override | Description |
+|---|---|---|---|---|
+| `query.workers` | int | `2` | — | Maximum concurrent trace query/export workers. These workers do not run health, ingestion-audit, or lease-renewal work. Values above 64 are rejected at startup. |
+| `query.queue_size` | int | `8` | `TRACE_QUERY_MAX_QUEUE` | Maximum trace query/export requests waiting behind active workers. When the bounded worker-plus-queue capacity is full, new requests return an audited HTTP 503 instead of growing an unbounded executor queue. Values above 1024 are rejected at startup. |
+| `query.max_rss_mb` | int | `4096` | `TRACE_QUERY_MAX_RSS_MB` | Resident-memory threshold for admitting new trace queries. At or above the limit, query/export requests return an audited HTTP 503 instead of increasing pressure on the store. |
+| `ingestion.workers` | int | `2` | — | Maximum concurrent single-event and batch trace ingestion workers. These workers do not run query/export, health, audit, or lease work. Values above 64 are rejected at startup. |
+| `ingestion.queue_size` | int | `8` | `TRACE_INGESTION_MAX_QUEUE` | Maximum trace ingestion requests or individual batch events waiting behind active workers. At capacity, single events return an audited HTTP 503 and batch events receive per-event HTTP 503 acknowledgements. Values above 1024 are rejected at startup. |
+
+Single-event and batch trace ingestion requests are limited to 8 MiB and 1024
+ASGI receive messages before FastAPI parses the body. The middleware aggregates
+request chunks into one bounded replay message. Oversized bodies or chunk counts
+receive HTTP 413 and increment the `ingestion_body_rejections` counter in the
+health response's `trace` section.
+
+The middleware authenticates trace ingestion before reading a request body and
+admits at most eight concurrent body buffers. Additional concurrent requests
+receive HTTP 503 before any body bytes are buffered, bounding aggregate
+middleware memory to 64 MiB.
+
+`STATE_STORE_CONTROL_WORKERS` controls the separate reserved executor and
+defaults to `2`. It is an environment-only setting. Raise it only when the state
+store can sustain additional concurrent control operations; lower it when
+memory or database contention requires stricter admission. Control work has no
+additional queue beyond these workers; a saturated control executor returns
+HTTP 503 instead of building an unbounded backlog. Values above 64 are rejected
+at startup.
+
+`STATE_STORE_LEASE_WORKERS` controls an additional executor reserved for
+orchestrator lease inspect/acquire/renew/release operations and defaults to `1`.
+Health and ordinary control reads cannot consume these lease workers. Lease
+work also has no additional queue beyond its workers, so a saturated lease
+executor returns HTTP 503 rather than delaying lease renewal behind stale work.
+Values above 64 are rejected at startup.
+
+Terminal trace query/export audits use their own bounded executor so they cannot
+consume query, health, or lease workers. Query and export responses reserve an
+audit admission slot before delivery. If no slot is available, the state store
+attempts one strict write on a separate one-worker executor with a zero-length
+queue. A successful fallback is still followed by HTTP 503, because the response
+was not admitted to the normal audit path; if that fallback is also full, the
+request fails closed with HTTP 503. This backpressure increments
+`audit_queue_fallbacks` in the health response's `trace` section. Audit write
+failures for denied and cancelled requests are logged without replacing the
+original 401, 422, or 429 response or the cancellation.
+Query and export response delivery is additionally bounded to 5 seconds. A
+timeout before response start returns HTTP 503; after response start, the
+connection is closed and the failed response is audited because ASGI cannot
+replace headers already sent to the client.
+
+Query cancellation is checked while waiting for the trace-store lock, while
+streaming rows from SQLite, and during response serialization. Disconnected
+clients therefore stop occupying the query executor instead of leaving the
+store to finish abandoned work.
+
+Connected queries also have a bounded SQLite execution budget shared across
+direct and causal scans. A query that would exceed that budget fails as too
+broad instead of scanning indefinitely behind a connected client.
+
+Export payload verification runs only when payloads are included. References
+are deduplicated by ticket and digest, and each export is limited to 8 MiB of
+aggregate verification reads so a large event page cannot trigger unbounded
+payload I/O.
+
+State-store shutdown stops accepting executor submissions, cancels queued work,
+and waits up to five seconds for running workers. If a blocked worker remains,
+the shared stores and process lock stay open for the service supervisor's forced
+termination path instead of being closed underneath live code.
+
+---
+
+### `orchestrator_lease` — Leader Lease and Recovery
+
+| Field | Type | Default | Env override | Description |
+|---|---|---|---|---|
+| `ttl_seconds` | float | `30` | `ORCHESTRATOR_LEASE_TTL_SECONDS` | Leader lease duration. |
+| `renew_interval` | float | `ttl_seconds / 3` | `ORCHESTRATOR_LEASE_RENEW_INTERVAL` | Normal renewal cadence. Renewal runs on a dedicated thread so application-loop stalls cannot starve it. |
+| `max_attempts` | int | `12` | `ORCHESTRATOR_LEASE_MAX_ATTEMPTS` | Initial and recovery acquisition attempts. |
+| `drain_timeout_seconds` | float | `20` | `ORCHESTRATOR_LEASE_DRAIN_TIMEOUT_SECONDS` | Upper bound for active agents to finish their current work after lease loss before remaining tasks are cancelled. The effective interval is shortened to remain inside the last confirmed lease, reserving 250 ms for forced termination when cleanup cannot finish. |
+| `recovery_delay_seconds` | float | `5` | `ORCHESTRATOR_LEASE_RECOVERY_DELAY_SECONDS` | Delay before the process drains the old dispatcher and attempts to re-acquire the leader lease. The launcher supervisor remains the fallback if recovery cannot complete. |
+
+Initial acquisition retries transport failures, `408`, `425`, `429`, and HTTP
+5xx responses with bounded backoff; authentication and other terminal client
+errors remain fatal. Transient renewal failures are retried until the last
+confirmed lease deadline. A rejected or superseded lease stops new dispatch
+immediately and enters the drain/recovery path. Tickets with claims from the
+prior leader are marked `interrupted`, moved to
+`awaiting_customer_guidance`, and receive a
+`deposed_claim_reconciliation` record before they can be dispatched again.
+Closed tickets have their stale claims cleared without an invalid status
+transition. Reconciliation pages scan at most 16 MiB of deferred ticket records;
+when that budget is reached, the endpoint returns a resumable cursor and marks
+the page for retry so the remaining records are not skipped.
+
+---
+
+### Background Service Supervision
+
+`scripts/start-bg.sh start` launches a small orchestrator supervisor. The
+supervisor restarts an exited orchestrator with bounded exponential backoff and
+reports `crash_looping` in `start-bg.sh status` when repeated failures cross the
+configured threshold. Logs are rotated at service starts and as the supervisor
+log grows past its configured byte threshold, preserving a bounded history
+instead of truncating the prior run.
+
+| Variable | Default | Description |
+|---|---|---|
+| `START_BG_LOG_BACKUPS` | `5` | Number of rotated backups retained for state-store, orchestrator, and supervisor logs. Values above 100 are rejected at startup. |
+| `START_BG_LOG_MAX_BYTES` | `1048576` | Size threshold at which the supervisor log rotates while the service runs. The current file can exceed the threshold by at most one log record. |
+| `START_BG_RESTART_BACKOFF` | `2` | Initial orchestrator restart delay in seconds. |
+| `START_BG_RESTART_BACKOFF_MAX` | `60` | Maximum restart delay in seconds. |
+| `START_BG_RESTART_STABLE_SECONDS` | `60` | Runtime after which a restarted process is considered stable and the failure counter resets. |
+| `START_BG_CRASH_LOOP_THRESHOLD` | `3` | Consecutive short-lived exits that mark the supervisor status as `crash_looping`. |
+| `START_BG_ORCH_LEASE_TIMEOUT` | lease TTL + recovery delay + acquisition retry budget | Seconds the launcher allows an orchestrator to wait while acquiring the leader lease before treating startup as failed. The default includes `orchestrator_lease.ttl_seconds`, `orchestrator_lease.recovery_delay_seconds`, and the configured acquisition attempts, per-attempt request timeout, and exponential backoff. |
+
+The supervisor state is in
+`$AGENTIC_PERF_HOME/orchestrator-supervisor.status`; its log is
+`$AGENTIC_PERF_HOME/logs/orchestrator-supervisor.log`. `stop` terminates the
+supervisor before the orchestrator so the watchdog cannot restart a service
+while an operator is stopping it.
 
 ---
 
@@ -1569,6 +1721,23 @@ variable overrides, which take precedence over the file.
 | `OPENAI_BASE_URL` | `llm.base_url` |
 | `STATE_STORE_URL` | `state_store.url` |
 | `STORE_PORT` | `state_store.port` |
+| `TRACE_QUERY_MAX_RSS_MB` | `trace.query.max_rss_mb` |
+| `TRACE_QUERY_MAX_QUEUE` | `trace.query.queue_size` |
+| `TRACE_INGESTION_MAX_QUEUE` | `trace.ingestion.queue_size` |
+| `STATE_STORE_CONTROL_WORKERS` | Reserved state-store control-worker count (environment only) |
+| `STATE_STORE_LEASE_WORKERS` | Reserved orchestrator-lease-worker count (environment only) |
+| `ORCHESTRATOR_LEASE_TTL_SECONDS` | `orchestrator_lease.ttl_seconds` |
+| `ORCHESTRATOR_LEASE_RENEW_INTERVAL` | `orchestrator_lease.renew_interval` |
+| `ORCHESTRATOR_LEASE_MAX_ATTEMPTS` | `orchestrator_lease.max_attempts` |
+| `ORCHESTRATOR_LEASE_DRAIN_TIMEOUT_SECONDS` | `orchestrator_lease.drain_timeout_seconds` |
+| `ORCHESTRATOR_LEASE_RECOVERY_DELAY_SECONDS` | `orchestrator_lease.recovery_delay_seconds` |
+| `START_BG_LOG_BACKUPS` | Rotated service-log backups (environment only) |
+| `START_BG_LOG_MAX_BYTES` | Supervisor-log rotation threshold in bytes (environment only) |
+| `START_BG_RESTART_BACKOFF` | Initial supervisor restart delay (environment only) |
+| `START_BG_RESTART_BACKOFF_MAX` | Maximum supervisor restart delay (environment only) |
+| `START_BG_RESTART_STABLE_SECONDS` | Stable-runtime reset threshold (environment only) |
+| `START_BG_CRASH_LOOP_THRESHOLD` | Crash-loop status threshold (environment only) |
+| `START_BG_ORCH_LEASE_TIMEOUT` | Leader-lease startup wait in seconds (environment only) |
 | `POLL_INTERVAL` | `poll_interval` |
 | `SSH_KEY` | `ssh_key` |
 | `SSH_KEY_VAULT_SECRET` | `ssh_key_vault_secret` |

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import logging
 import os
 import threading
 import time
@@ -24,6 +25,8 @@ from providers.tracing import (
     current_trace_context,
 )
 from providers.tracing.client import TraceClient, TraceDeliveryError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -212,7 +215,13 @@ class AuditedSubprocessRunner:
         with cls._default_recorder_lock:
             recorder, cls._default_recorder = cls._default_recorder, None
         if recorder is not None:
-            recorder.close()
+            try:
+                recorder.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close the default subprocess trace recorder",
+                    exc_info=True,
+                )
 
     def _output_descriptors(self, stdout: bytes, stderr: bytes) -> dict[str, Any]:
         return {

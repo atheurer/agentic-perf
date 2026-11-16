@@ -640,6 +640,7 @@ class TestSkippedPlanSteps:
         dispatcher.store_url = "http://localhost:8090"
         dispatcher.events = None
         dispatcher.mark_done = AsyncMock()
+        dispatcher.is_deposed.return_value = False
 
         mock_get = MagicMock()
         mock_get.status_code = 200
@@ -693,6 +694,7 @@ class TestSkippedPlanSteps:
         dispatcher.store_url = "http://localhost:8090"
         dispatcher.events = None
         dispatcher.mark_done = AsyncMock()
+        dispatcher.is_deposed.return_value = False
 
         mock_get = MagicMock()
         mock_get.status_code = 200

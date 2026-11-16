@@ -318,6 +318,21 @@ async def test_default_recorder_is_shared_and_reset_closes_it(
         AuditedSubprocessRunner.reset_default_recorder()
 
 
+def test_reset_default_recorder_never_raises_on_flush_failure() -> None:
+    class FailingTraceClient:
+        def close(self) -> None:
+            raise TraceDeliveryError("trace spool delivery failed")
+
+    previous = AuditedSubprocessRunner._default_recorder
+    AuditedSubprocessRunner._default_recorder = FailingTraceClient()
+    try:
+        AuditedSubprocessRunner.reset_default_recorder()
+    finally:
+        AuditedSubprocessRunner._default_recorder = previous
+
+    assert AuditedSubprocessRunner._default_recorder is None
+
+
 async def test_mutating_spawn_without_context_fails_before_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

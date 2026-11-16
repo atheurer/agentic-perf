@@ -134,28 +134,46 @@ class PayloadBlobStore:
         """Read a private content-addressed payload after strict verification."""
         if not ref.startswith("sha256:") or len(ref) != 71:
             raise PayloadStorageError("invalid payload reference")
+        if max_bytes < 0:
+            raise PayloadStorageError("payload byte limit must be non-negative")
         target = self.directory / ref.removeprefix("sha256:")
+        fd: int | None = None
         try:
-            if (
-                target.parent != self.directory
-                or target.is_symlink()
-                or not target.is_file()
-            ):
+            if target.parent != self.directory:
                 raise PayloadStorageError("unsafe payload reference")
             directory_mode = self.directory.stat().st_mode
-            if directory_mode & 0o077 or target.stat().st_mode & 0o077:
+            if directory_mode & 0o077:
                 raise PayloadStorageError(
                     "payload exceeds policy or has unsafe permissions"
                 )
-            content = target.read_bytes()
+            fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+            target_stat = os.fstat(fd)
+            if not stat.S_ISREG(target_stat.st_mode) or target_stat.st_mode & 0o077:
+                raise PayloadStorageError(
+                    "payload exceeds policy or has unsafe permissions"
+                )
+            if target_stat.st_size > max_bytes:
+                raise PayloadStorageError("payload exceeds byte limit")
+            content = bytearray()
+            remaining = max_bytes + 1
+            while remaining > 0:
+                chunk = os.read(fd, min(65_536, remaining))
+                if not chunk:
+                    break
+                content.extend(chunk)
+                remaining -= len(chunk)
+            content_bytes = bytes(content)
             if (
-                len(content) > max_bytes
-                or hashlib.sha256(content).hexdigest() != ref[7:]
+                len(content_bytes) > max_bytes
+                or hashlib.sha256(content_bytes).hexdigest() != ref[7:]
             ):
                 raise PayloadStorageError("payload integrity check failed")
-            return content
+            return content_bytes
         except OSError as exc:
             raise PayloadStorageError("could not read payload") from exc
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def _fsync_directory(self) -> None:
         fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)

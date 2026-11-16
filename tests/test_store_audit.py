@@ -21,6 +21,7 @@ from state_store.models import (
     TransitionRequest,
 )
 from state_store.store import TicketStore
+from state_store.trace_store import TraceStoreWriteError
 
 
 @pytest.fixture
@@ -52,6 +53,21 @@ def _read_entries(audit_path):
     log = AuditLog(path=audit_path)
     try:
         return log.read(limit=10_000)
+    finally:
+        log.close()
+
+
+def test_required_audit_write_propagates_store_failure(tmp_path):
+    class FailingStore:
+        def insert_event(self, _event):
+            raise TraceStoreWriteError("audit store unavailable")
+
+    log = AuditLog(path=tmp_path / "audit.jsonl", trace_store=FailingStore())
+    try:
+        with pytest.raises(TraceStoreWriteError, match="audit store unavailable"):
+            log.log_required("trace_query", "PERF-1", {"outcome": "failed"})
+
+        log.log("trace_query", "PERF-1", {"outcome": "failed"})
     finally:
         log.close()
 

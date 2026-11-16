@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -15,7 +17,13 @@ from providers.tracing import (
     ActionType,
     LifecycleDescriptor,
     LifecycleState,
+    PayloadDescriptor,
     TraceEventV1,
+)
+from providers.tracing.query import (
+    TraceQuery,
+    TraceQueryCancelled,
+    TraceQueryTooBroad,
 )
 from state_store.trace_store import (
     OperationRecord,
@@ -104,6 +112,178 @@ def test_shared_store_serializes_reads_with_write_transactions(
             release.set()
             assert writer.result().state == "prepared"
             assert reader.result().state == "prepared"
+
+
+def test_query_waiting_for_store_lock_observes_cancellation(tmp_path: Path) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        cancelled = threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as executor, store._lock:
+            future = executor.submit(
+                store.query_events,
+                TraceQuery(limit=1),
+                cancelled=cancelled.is_set,
+            )
+            time.sleep(0.15)
+            assert not future.done()
+            cancelled.set()
+            with pytest.raises(TraceQueryCancelled):
+                future.result(timeout=2)
+
+
+def test_query_events_uses_bound_filters_and_causal_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    occurred_at = datetime(2026, 11, 12, 20, 0, tzinfo=timezone.utc)
+    with TraceStore(tmp_path / "trace.db") as store:
+        root = store.insert_event(event(occurred_at=occurred_at))
+        child = store.insert_event(
+            event(
+                trace_id=root.trace_id,
+                parent_action_id=root.action_id,
+                occurred_at=occurred_at,
+            )
+        )
+        grandchild = store.insert_event(
+            event(
+                trace_id=root.trace_id,
+                parent_action_id=child.action_id,
+                occurred_at=occurred_at,
+            )
+        )
+        store.insert_event(event(ticket_id="PERF-other", occurred_at=occurred_at))
+
+        scoped = store.query_events(
+            TraceQuery(
+                ticket_id="PERF-1",
+                since=occurred_at,
+                until=occurred_at,
+                limit=10,
+            )
+        )
+        assert [item.action_id for item in scoped] == [
+            root.action_id,
+            child.action_id,
+            grandchild.action_id,
+        ]
+
+        monkeypatch.setattr(store, "MAX_CAUSAL_EVENTS", 2)
+        with pytest.raises(TraceQueryTooBroad):
+            store.query_events(
+                TraceQuery(
+                    ticket_id="PERF-1",
+                    action_id=child.action_id,
+                    causal=True,
+                    limit=10,
+                )
+            )
+
+        with pytest.raises(TraceQueryCancelled):
+            store.query_events(
+                TraceQuery(retry_kind="not-present"),
+                cancelled=lambda: True,
+            )
+
+
+def test_query_events_enforces_serialized_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        store.insert_event(event(attributes={"payload": "\u00e9" * 600}))
+        monkeypatch.setattr(store, "MAX_QUERY_RAW_BYTES", 1024)
+        statements: list[str] = []
+        connection = store._open_connection()
+        connection.set_trace_callback(statements.append)
+
+        try:
+            with pytest.raises(TraceQueryTooBroad, match="query budget"):
+                store.query_events(TraceQuery(limit=10))
+        finally:
+            connection.set_trace_callback(None)
+
+        assert any("length(CAST(event_json AS BLOB))" in sql for sql in statements)
+        assert not any(
+            sql.startswith("SELECT event_json FROM trace_events") for sql in statements
+        )
+
+
+def test_query_events_enforces_database_execution_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        store.insert_event(event())
+        monkeypatch.setattr(store, "MAX_QUERY_PROGRESS_STEPS", 1)
+        monkeypatch.setattr(store, "_QUERY_PROGRESS_HANDLER_INTERVAL", 1)
+
+        with pytest.raises(TraceQueryTooBroad, match="database execution budget"):
+            store.query_events(TraceQuery(limit=10))
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_index"),
+    [
+        (
+            TraceQuery(lifecycle_state="started", limit=10),
+            "trace_events_lifecycle_state_global_seq_idx",
+        ),
+        (
+            TraceQuery(retry_kind="transport_replay", limit=10),
+            "trace_events_retry_kind_global_seq_idx",
+        ),
+        (
+            TraceQuery(idempotency_outcome="reused", limit=10),
+            "trace_events_idempotency_outcome_global_seq_idx",
+        ),
+    ],
+)
+def test_query_filter_indexes_bound_scan_work(
+    tmp_path: Path, query: TraceQuery, expected_index: str
+) -> None:
+    with TraceStore(tmp_path / "trace.db") as store:
+        predicates, values = store._query_predicates(query)
+        where_clause = " AND ".join(predicates)
+        plan = store._open_connection().execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT global_seq FROM trace_events "
+            f"WHERE {where_clause} ORDER BY global_seq LIMIT ?",
+            (*values, query.limit),
+        )
+        details = " ".join(row["detail"] for row in plan)
+
+        assert expected_index in details
+
+
+def test_payload_reference_lookup_checks_active_and_history_without_materializing(
+    tmp_path: Path,
+) -> None:
+    digest = "sha256:" + "a" * 64
+    with TraceStore(
+        tmp_path / "trace.db", history_db_path=tmp_path / "trace-history.db"
+    ) as store:
+        store.insert_event(event(input=PayloadDescriptor(blob_ref=digest)))
+        store.insert_event(
+            event(
+                ticket_id="PERF-other",
+                output=PayloadDescriptor(blob_ref="sha256:" + "b" * 64),
+            )
+        )
+
+        assert store.payload_is_referenced("PERF-1", digest)
+        assert not store.payload_is_referenced("PERF-other", digest)
+        with pytest.raises(TraceQueryCancelled):
+            store.payload_is_referenced("PERF-1", digest, cancelled=lambda: True)
+
+        plan_query = "EXPLAIN QUERY PLAN " + TraceStore._PAYLOAD_REFERENCE_SQL
+        plan = " ".join(
+            row["detail"]
+            for row in store._open_connection().execute(
+                plan_query, ("PERF-1", digest, "PERF-1", digest)
+            )
+        )
+        assert "trace_events_ticket_input_blob_idx" in plan
+        assert "trace_events_ticket_output_blob_idx" in plan
+
+        assert store.migrate_ticket_traces("PERF-1") == 1
+        assert store.payload_is_referenced("PERF-1", digest)
 
 
 def test_multiprocess_cold_start_has_gap_free_sequences(tmp_path: Path) -> None:

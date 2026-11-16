@@ -11,6 +11,7 @@ from .context import (
     trace_context_environment,
     trace_context_from_environment,
 )
+from .limits import MAX_TRACE_INGEST_BODY_BYTES
 from .models import (
     SCHEMA_VERSION,
     ActionDescriptor,
@@ -56,6 +57,7 @@ __all__ = [
     "LifecycleState",
     "MCPIdentity",
     "MonotonicTimer",
+    "MAX_TRACE_INGEST_BODY_BYTES",
     "OperationOutcome",
     "PayloadDescriptor",
     "PayloadBlobStore",

@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import uuid
+from bisect import bisect_left, bisect_right, insort
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -103,6 +104,11 @@ class TicketDispatchBlocked(Exception):
 
 
 class TicketStore:
+    MAX_CLAIM_RECONCILIATION_RECORD_BYTES = 8 * 1024 * 1024
+    MAX_CLAIM_RECONCILIATION_SCAN_BYTES = 16 * 1024 * 1024
+    MAX_CLAIM_RECONCILIATION_FIELD_CHARS = 4096
+    MAX_CLAIM_RECONCILIATION_PAGE_BYTES = 512 * 1024
+
     def __init__(
         self,
         persist_dir: str | Path | None = None,
@@ -117,6 +123,8 @@ class TicketStore:
         # into memory.  Loaded on demand by get_ticket().
         self._deferred_paths: dict[str, Path] = {}
         self._deferred_transition_seqs: dict[str, int] = {}
+        self._unreadable_ticket_paths: dict[str, Path] = {}
+        self._ticket_ids: list[str] = []
         self._lock = threading.Lock()
         self._global_seq = 0
         self._persist_dir = Path(persist_dir) if persist_dir else DEFAULT_PERSIST_DIR
@@ -135,6 +143,55 @@ class TicketStore:
         # amounts to hundreds of reads per minute under the store lock.
         self._lease_cache: OrchestratorLease | None = self._read_lease_from_disk()
         self._load_from_disk()
+
+    def _register_ticket_id(self, ticket_id: str) -> None:
+        index = bisect_left(self._ticket_ids, ticket_id)
+        if index == len(self._ticket_ids) or self._ticket_ids[index] != ticket_id:
+            insort(self._ticket_ids, ticket_id)
+
+    def _unregister_ticket_id(self, ticket_id: str) -> None:
+        index = bisect_left(self._ticket_ids, ticket_id)
+        if index < len(self._ticket_ids) and self._ticket_ids[index] == ticket_id:
+            self._ticket_ids.pop(index)
+
+    @classmethod
+    def _claim_reconciliation_text(cls, value: object) -> str | None:
+        if (
+            isinstance(value, str)
+            and len(value) <= cls.MAX_CLAIM_RECONCILIATION_FIELD_CHARS
+        ):
+            return value
+        return None
+
+    @classmethod
+    def _project_claim_reconciliation_claim(cls, claim: object) -> dict[str, object]:
+        """Keep only claim fields consumed by deposed-claim reconciliation."""
+        raw = claim if isinstance(claim, dict) else {}
+        projected: dict[str, object] = {}
+        for field in (
+            "claim_id",
+            "owner",
+            "session_id",
+            "epoch",
+            "expires",
+        ):
+            if field not in raw:
+                continue
+            value = raw[field]
+            if field == "epoch":
+                projected[field] = (
+                    value
+                    if isinstance(value, int) and not isinstance(value, bool)
+                    else None
+                )
+            else:
+                projected[field] = cls._claim_reconciliation_text(value)
+        return projected
+
+    @classmethod
+    def _project_claim_reconciliation_marker(cls, marker: object) -> dict[str, object]:
+        raw = marker if isinstance(marker, dict) else {}
+        return {"claim_id": cls._claim_reconciliation_text(raw.get("claim_id"))}
 
     def _lease_now(self) -> datetime:
         now = self._clock()
@@ -234,6 +291,10 @@ class TicketStore:
                 )
             epoch = (current.epoch + 1) if current is not None else 1
             if current is not None:
+                if self._audit is not None:
+                    self._audit.log_required(
+                        "orchestrator_lease_expire", "-", {"epoch": current.epoch}
+                    )
                 self._cancel_pending_approvals_unlocked_all(
                     reason="orchestrator lease takeover"
                 )
@@ -757,6 +818,7 @@ class TicketStore:
                 owners=list(owners) if owners else [],
             )
             self._tickets[ticket.id] = ticket
+            self._register_ticket_id(ticket.id)
             self._persist_ticket(ticket)
             self._audit_log(
                 "create_ticket",
@@ -816,6 +878,149 @@ class TicketStore:
             if status is not None:
                 tickets = [t for t in tickets if t.status == status]
             return [t.model_copy() for t in tickets]
+
+    def list_ticket_claim_reconciliation_page(
+        self,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        scan_limit: int = 1000,
+    ) -> tuple[list[dict[str, object]], str | None, bool]:
+        """Return a bounded page of closed tickets that still carry a claim."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        scan_limit = max(limit, scan_limit)
+        with self._lock:
+            start = bisect_right(self._ticket_ids, after_id) if after_id else 0
+            ticket_ids = self._ticket_ids[start : start + scan_limit]
+            active_records = {
+                ticket_id: (
+                    ticket.status.value,
+                    ticket.custom_fields.get("claim"),
+                    ticket.custom_fields.get("deposed_claim_reconciliation"),
+                )
+                for ticket_id in ticket_ids
+                if (ticket := self._tickets.get(ticket_id)) is not None
+            }
+            deferred_paths = {
+                ticket_id: self._deferred_paths.get(ticket_id)
+                for ticket_id in ticket_ids
+                if ticket_id not in active_records
+            }
+            unreadable_paths = {
+                ticket_id: self._unreadable_ticket_paths.get(ticket_id)
+                for ticket_id in deferred_paths
+                if deferred_paths[ticket_id] is None
+            }
+
+        tickets: list[dict[str, object]] = []
+        read_errors = False
+        retained_bytes = 0
+        scan_bytes = 0
+        scan_budget = max(
+            self.MAX_CLAIM_RECONCILIATION_SCAN_BYTES,
+            self.MAX_CLAIM_RECONCILIATION_RECORD_BYTES,
+        )
+        for index, ticket_id in enumerate(ticket_ids):
+            record = active_records.get(ticket_id)
+            if record is not None:
+                status, claim, marker = record
+            else:
+                path = deferred_paths.get(ticket_id)
+                if path is None:
+                    read_errors = True
+                    logger.error(
+                        "Ticket %s has no readable active or deferred record%s",
+                        ticket_id,
+                        (
+                            f" (path: {unreadable_paths[ticket_id]})"
+                            if unreadable_paths.get(ticket_id) is not None
+                            else ""
+                        ),
+                    )
+                    continue
+                try:
+                    with path.open("rb") as handle:
+                        record_bytes = os.fstat(handle.fileno()).st_size
+                        if record_bytes > self.MAX_CLAIM_RECONCILIATION_RECORD_BYTES:
+                            raise ValueError(
+                                "ticket record exceeds claim reconciliation size limit"
+                            )
+                        if scan_bytes + record_bytes > scan_budget:
+                            logger.warning(
+                                "Claim reconciliation scan budget reached before %s",
+                                ticket_id,
+                            )
+                            cursor = ticket_ids[index - 1] if index else None
+                            return tickets, cursor, read_errors
+                        scan_bytes += record_bytes
+                        payload = handle.read(record_bytes)
+                    if len(payload) != record_bytes:
+                        raise ValueError(
+                            "ticket record changed while claim reconciliation read it"
+                        )
+                    raw = payload.decode("utf-8")
+                    status, _ = self._extract_ticket_metadata(raw)
+                    if status != TicketStatus.CLOSED.value:
+                        raise ValueError(
+                            f"deferred ticket has invalid status {status!r}"
+                        )
+                    document = json.loads(raw)
+                    if not isinstance(document, dict):
+                        raise ValueError("ticket document is not an object")
+                    if document.get("id") != ticket_id:
+                        raise ValueError("ticket ID does not match filename")
+                    custom_fields = document.get("custom_fields", {})
+                    if not isinstance(custom_fields, dict):
+                        raise ValueError("ticket custom_fields is not an object")
+                    claim = custom_fields.get("claim")
+                    marker = custom_fields.get("deposed_claim_reconciliation")
+                except (OSError, TypeError, UnicodeError, ValueError):
+                    read_errors = True
+                    logger.exception("Failed to inspect deferred ticket %s", ticket_id)
+                    continue
+            if status != TicketStatus.CLOSED.value:
+                continue
+            if claim is None:
+                continue
+            fields: dict[str, object] = {
+                "claim": self._project_claim_reconciliation_claim(claim)
+            }
+            if marker is not None:
+                fields["deposed_claim_reconciliation"] = (
+                    self._project_claim_reconciliation_marker(marker)
+                )
+            ticket = {
+                "id": ticket_id,
+                "status": status,
+                "custom_fields": fields,
+            }
+            ticket_bytes = len(
+                json.dumps(ticket, separators=(",", ":")).encode("utf-8")
+            )
+            if ticket_bytes > self.MAX_CLAIM_RECONCILIATION_PAGE_BYTES:
+                read_errors = True
+                logger.error(
+                    "Reconciliation response record for %s exceeds page budget",
+                    ticket_id,
+                )
+                continue
+            if (
+                tickets
+                and retained_bytes + ticket_bytes
+                > self.MAX_CLAIM_RECONCILIATION_PAGE_BYTES
+            ):
+                return tickets, ticket_ids[index - 1], read_errors
+            tickets.append(ticket)
+            retained_bytes += ticket_bytes
+            if len(tickets) >= limit:
+                more_records_known = index + 1 < len(ticket_ids)
+                if more_records_known or len(ticket_ids) == scan_limit:
+                    return tickets, ticket_id, read_errors
+                return tickets, None, read_errors
+        if len(ticket_ids) == scan_limit:
+            return tickets, ticket_ids[-1], read_errors
+        return tickets, None, read_errors
 
     def get_cached_usage_summary(self, ticket_id: str) -> dict | None:
         """Return the persisted usage snapshot for a closed ticket, if present."""
@@ -2599,9 +2804,9 @@ class TicketStore:
             if expires.tzinfo is None:
                 expires = expires.replace(tzinfo=timezone.utc)
         except (KeyError, TypeError, ValueError):
-            self.reject_claim_fence(
-                ticket_id, "claim_malformed", "ticket claim expiry is malformed"
-            )
+            # A malformed claim cannot authorize an agent mutation. Let the
+            # active leader clear it instead of blocking the ticket forever.
+            return
         if expires <= self._lease_now():
             return
         if any(key in claim for key in ("session_id", "epoch", "claim_id")) and (
@@ -2613,9 +2818,7 @@ class TicketStore:
             or not isinstance(claim.get("claim_id"), str)
             or not claim["claim_id"]
         ):
-            self.reject_claim_fence(
-                ticket_id, "claim_malformed", "ticket claim identity is malformed"
-            )
+            return
         # A claim from a deposed session is already fenced by the lease. A live
         # current claim (including legacy claims without identity) must finish
         # before recovery can change its ticket.
@@ -2818,6 +3021,7 @@ class TicketStore:
         # hidden by an in-memory deletion.
         with self._lock:
             self._tickets.pop(ticket_id, None)
+            self._unregister_ticket_id(ticket_id)
 
         logger.info(f"Archived ticket {ticket_id}: {archived}")
         return {"ticket_id": ticket_id, "archived_files": archived}
@@ -2845,10 +3049,16 @@ class TicketStore:
             return None
         try:
             ticket = Ticket.model_validate_json(path.read_text(encoding="utf-8"))
+            if ticket.id != ticket_id:
+                raise ValueError(
+                    f"deferred ticket ID {ticket.id!r} does not match {ticket_id!r}"
+                )
             self._migrate_legacy_validation(ticket)
             self._tickets[ticket.id] = ticket
+            self._unreadable_ticket_paths.pop(ticket_id, None)
             return ticket
         except Exception:
+            self._unreadable_ticket_paths[ticket_id] = path
             logger.exception(f"Failed to load deferred ticket from {path}")
             return None
 
@@ -2873,17 +3083,18 @@ class TicketStore:
                     "loading_tickets",
                     detail=f"{index}/{total} tickets processed ({loaded} active, {deferred} deferred)",
                 )
+            ticket_id = path.stem
             try:
                 raw = path.read_text(encoding="utf-8")
                 # Fast status check before full validation.
                 # Ticket JSON has "status":"closed" near the top.
                 # Defer terminal tickets to avoid expensive
                 # model_validate_json on startup.
-                ticket_id = path.stem
                 status, seq = self._extract_ticket_metadata(raw)
                 if status in terminal_values:
                     self._deferred_paths[ticket_id] = path
                     self._deferred_transition_seqs[ticket_id] = seq
+                    self._register_ticket_id(ticket_id)
                     deferred += 1
                     # Track transition_seq without validating the full model
                     # so _global_seq stays correct for new tickets.
@@ -2893,10 +3104,13 @@ class TicketStore:
                 ticket = Ticket.model_validate_json(raw)
                 self._migrate_legacy_validation(ticket)
                 self._tickets[ticket.id] = ticket
+                self._register_ticket_id(ticket.id)
                 loaded += 1
                 if ticket.transition_seq > self._global_seq:
                     self._global_seq = ticket.transition_seq
             except Exception:
+                self._register_ticket_id(ticket_id)
+                self._unreadable_ticket_paths[ticket_id] = path
                 logger.exception(f"Failed to load ticket from {path}")
         logger.info(
             "Loaded %d active tickets, deferred %d terminal tickets",

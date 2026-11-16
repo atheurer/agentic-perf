@@ -387,6 +387,8 @@ INVENTORIED_SIDE_EFFECTS = (
     ("orchestrator/main.py", "_block_absent_suite", "mutating_http_state"),
     ("orchestrator/main.py", "_block_handoff_failed", "mutating_http_state"),
     ("orchestrator/main.py", "_check_stale_tasks", "mutating_http_state"),
+    ("orchestrator/main.py", "_claim_is_deposed", "filesystem"),
+    ("orchestrator/main.py", "_reconcile_deposed_claims", "mutating_http_state"),
     ("orchestrator/main.py", "_normalize_ticket_directives", "mutating_http_state"),
     ("orchestrator/main.py", "_persist_retry_state", "mutating_http_state"),
     ("orchestrator/main.py", "_process_stop_requests", "mutating_http_state"),
@@ -827,6 +829,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/tracing/fingerprints.py", "load_audit_key", "filesystem"),
     ("providers/tracing/payloads.py", "_fsync_directory", "filesystem"),
     ("providers/tracing/payloads.py", "build", "mutating_http_state"),
+    ("providers/tracing/payloads.py", "get", "filesystem"),
     ("providers/tracing/payloads.py", "put", "filesystem"),
     ("providers/tracing/spool.py", "__init__", "filesystem"),
     ("providers/tracing/spool.py", "_fsync_dir", "filesystem"),
@@ -835,6 +838,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/tracing/spool.py", "close", "filesystem"),
     ("providers/tracing/spool.py", "compact", "filesystem"),
     ("providers/tracing/spool.py", "pending", "filesystem"),
+    ("providers/tracing/spool.py", "pending_batch", "filesystem"),
     ("providers/tracing/spool.py", "_is_spool_locked", "filesystem"),
     ("providers/tracing/spool.py", "_try_prune_file", "filesystem"),
     ("providers/webhook_enrichment.py", "_call_get_run_info", "mutating_http_state"),
@@ -889,6 +893,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/api/trace_operations.py", "acquire", "mutating_http_state"),
     ("state_store/api/trace_operations.py", "register", "mutating_http_state"),
     ("state_store/api/trace_operations.py", "transition", "mutating_http_state"),
+    ("state_store/api/traces.py", "__call__", "filesystem"),
     ("state_store/api/traces.py", "ingest", "mutating_http_state"),
     ("state_store/api/traces.py", "ingest_batch", "mutating_http_state"),
     ("state_store/api/transitions.py", "transition_ticket", "mutating_http_state"),
@@ -928,6 +933,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/store.py", "_write_orchestrator_lease", "filesystem"),
     ("state_store/store.py", "archive_ticket", "filesystem"),
     ("state_store/store.py", "create_approval_request", "filesystem"),
+    (
+        "state_store/store.py",
+        "list_ticket_claim_reconciliation_page",
+        "filesystem",
+    ),
     ("state_store/trace_store.py", "__init__", "filesystem"),
     ("state_store/trace_store.py", "latest_event_time", "filesystem"),
 )
@@ -2800,6 +2810,18 @@ INVENTORY_DISPOSITIONS = {
         "orchestrator/main.py:_check_stale_tasks",
         "2027-12-31",
     ),
+    ("orchestrator/main.py", "_claim_is_deposed", "filesystem"): (
+        "system_only",
+        "orchestration-maintainers",
+        "orchestrator/main.py:_claim_is_deposed",
+        "2027-12-31",
+    ),
+    ("orchestrator/main.py", "_reconcile_deposed_claims", "mutating_http_state"): (
+        "system_only",
+        "orchestration-maintainers",
+        "orchestrator/main.py:_reconcile_deposed_claims",
+        "2027-12-31",
+    ),
     ("orchestrator/main.py", "_persist_retry_state", "mutating_http_state"): (
         "system_only",
         "orchestration-maintainers",
@@ -4468,6 +4490,12 @@ INVENTORY_DISPOSITIONS = {
         "providers/tracing/payloads.py:build",
         "2027-12-31",
     ),
+    ("providers/tracing/payloads.py", "get", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "providers/tracing/payloads.py:get",
+        "2027-12-31",
+    ),
     ("providers/tracing/payloads.py", "put", "filesystem"): (
         "audited",
         "observability-maintainers",
@@ -4514,6 +4542,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/tracing/spool.py:pending",
+        "2027-12-31",
+    ),
+    ("providers/tracing/spool.py", "pending_batch", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "providers/tracing/spool.py:pending_batch",
         "2027-12-31",
     ),
     ("providers/tracing/spool.py", "_is_spool_locked", "filesystem"): (
@@ -4824,6 +4858,12 @@ INVENTORY_DISPOSITIONS = {
         "state_store/api/trace_operations.py:transition",
         "2027-12-31",
     ),
+    ("state_store/api/traces.py", "__call__", "filesystem"): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/api/traces.py:__call__",
+        "2027-12-31",
+    ),
     ("state_store/api/traces.py", "ingest", "mutating_http_state"): (
         "system_only",
         "state-store-maintainers",
@@ -5056,6 +5096,16 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/store.py:create_approval_request",
+        "2027-12-31",
+    ),
+    (
+        "state_store/store.py",
+        "list_ticket_claim_reconciliation_page",
+        "filesystem",
+    ): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/store.py:list_ticket_claim_reconciliation_page",
         "2027-12-31",
     ),
     ("state_store/trace_store.py", "__init__", "filesystem"): (

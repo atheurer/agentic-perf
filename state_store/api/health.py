@@ -7,12 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from paths import TRACE_SPOOL_DIR
 
 from ..models import TERMINAL_STATUSES, TicketStatus
+from .executors import run_control_worker
 
 router = APIRouter(tags=["health"])
 
 
-@router.get("/health")
-def health(request: Request):
+def _health_snapshot(request: Request):
     store = request.app.state.store
     lease = store.get_orchestrator_lease()
     counts = store.count_by_status()
@@ -52,6 +52,11 @@ def health(request: Request):
         # metadata belong behind the authenticated control endpoint.
         "orchestrator_lease": {"active": lease is not None},
     }
+
+
+@router.get("/health")
+async def health(request: Request):
+    return await run_control_worker(request, _health_snapshot, request)
 
 
 async def _require_authenticated(request: Request):

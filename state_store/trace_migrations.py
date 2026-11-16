@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Callable
 
 Migration = Callable[[sqlite3.Connection], None]
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 6
 
 
 def _migration_1(connection: sqlite3.Connection) -> None:
@@ -85,11 +85,43 @@ def _migration_4(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE operation_history ADD COLUMN terminal_outcome TEXT")
 
 
+def _migration_5(connection: sqlite3.Connection) -> None:
+    """Index payload references so authorization checks do not scan a ticket."""
+    connection.execute(
+        "CREATE INDEX trace_events_ticket_input_blob_idx "
+        "ON trace_events(ticket_id, json_extract(event_json, '$.input.blob_ref'))"
+    )
+    connection.execute(
+        "CREATE INDEX trace_events_ticket_output_blob_idx "
+        "ON trace_events(ticket_id, json_extract(event_json, '$.output.blob_ref'))"
+    )
+
+
+def _migration_6(connection: sqlite3.Connection) -> None:
+    """Index every supported trace-query filter to bound scan work."""
+    connection.execute(
+        "CREATE INDEX trace_events_lifecycle_state_global_seq_idx "
+        "ON trace_events(lifecycle_state, global_seq)"
+    )
+    connection.execute(
+        "CREATE INDEX trace_events_retry_kind_global_seq_idx "
+        "ON trace_events("
+        "json_extract(event_json, '$.lifecycle.retry_kind'), global_seq)"
+    )
+    connection.execute(
+        "CREATE INDEX trace_events_idempotency_outcome_global_seq_idx "
+        "ON trace_events("
+        "json_extract(event_json, '$.idempotency.outcome'), global_seq)"
+    )
+
+
 MIGRATIONS: dict[int, Migration] = {
     1: _migration_1,
     2: _migration_2,
     3: _migration_3,
     4: _migration_4,
+    5: _migration_5,
+    6: _migration_6,
 }
 
 

@@ -137,17 +137,15 @@ def test_two_real_orchestrators_share_one_fenced_production_leader(
     The runtime homes are intentionally separate (as are normal dev instances),
     but both mains use the same service URL and token.  The winning readiness
     line occurs after the production lease acquisition; the other main must
-    fail *before* it creates a dispatcher or can claim any ticket.
+    stay available for recovery without creating a dispatcher or claiming work,
+    then take over after the leader exits.
     """
     with FaultHarness(tmp_path) as harness:
         winner = harness.start_main("fault-a")
         wait_for_log(winner, "Orchestrator started")
         loser = harness.start_main("fault-b")
-        # A losing real main exits on the production 409 leader-lease response.
-        deadline = __import__("time").monotonic() + 10
-        while loser.poll() is None and __import__("time").monotonic() < deadline:
-            __import__("time").sleep(0.02)
-        assert loser.poll() not in (None, 0), harness.evidence()
+        wait_for_log(loser, "Leader lease unavailable; reacquiring")
+        assert loser.poll() is None, harness.evidence()
         loser_log = (tmp_path / "runtime-fault-b" / "orchestrator.log").read_text()
         assert "orchestrator leader lease unavailable" in loser_log
         assert "Orchestrator started" not in loser_log
@@ -158,6 +156,16 @@ def test_two_real_orchestrators_share_one_fenced_production_leader(
         )
         assert lease.status_code == 200, harness.evidence()
         assert lease.json()["lease"]["pid"] == winner.pid
+
+        stop_process(winner)
+        wait_for_log(loser, "Orchestrator started", timeout=20)
+        lease = httpx.get(
+            f"{harness.store_url}/api/v1/control/orchestrator-lease",
+            headers=harness.headers,
+            timeout=2,
+        )
+        assert lease.status_code == 200, harness.evidence()
+        assert lease.json()["lease"]["pid"] == loser.pid
 
 
 @pytest.mark.asyncio

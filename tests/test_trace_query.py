@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from providers.tracing import (
     ActionDescriptor,
@@ -13,6 +16,7 @@ from providers.tracing import (
 from providers.tracing.models import PayloadDescriptor
 from providers.tracing.query import (
     TraceQuery,
+    TraceQueryTooBroad,
     decode_cursor,
     diagnostics,
     export_events,
@@ -54,6 +58,26 @@ def test_export_formats_are_stable() -> None:
     manifest = export_manifest([event], content)
     assert manifest["count"] == 1
     assert len(manifest["event_content_digest"]) == 64
+
+
+@pytest.mark.parametrize("format", ["jsonl", "csv"])
+def test_export_events_stops_at_byte_budget(format: str) -> None:
+    consumed = 0
+
+    def events():
+        nonlocal consumed
+        for _ in range(100):
+            consumed += 1
+            yield TraceEventV1(
+                ticket_id="PERF-budget",
+                action=ActionDescriptor(type=ActionType.API),
+                lifecycle=LifecycleDescriptor(state=LifecycleState.REQUESTED),
+            )
+
+    with pytest.raises(TraceQueryTooBroad, match="too broad"):
+        export_events(events(), format, max_bytes=1024)
+
+    assert 0 < consumed < 100
 
 
 def test_manifest_only_lists_resolvable_blob_references() -> None:
@@ -139,3 +163,80 @@ def test_cursor_decoder_rejects_malformed_shapes() -> None:
         pass
     else:
         raise AssertionError("malformed cursor was accepted")
+
+
+def test_query_normalizes_naive_timestamps_to_utc() -> None:
+    occurred_at = datetime(2026, 11, 12, 20, 0, tzinfo=timezone.utc)
+    event = TraceEventV1(
+        ticket_id="PERF-time",
+        occurred_at=occurred_at,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+    naive = occurred_at.replace(tzinfo=None)
+
+    naive_result = query_events(
+        [event],
+        TraceQuery(
+            since=naive,
+            until=naive + timedelta(seconds=1),
+        ),
+    )
+    aware_result = query_events(
+        [event],
+        TraceQuery(
+            since=occurred_at,
+            until=occurred_at + timedelta(seconds=1),
+        ),
+    )
+
+    assert naive_result == aware_result == [event]
+
+
+def test_diagnostics_reports_cycles_and_missing_parents() -> None:
+    first = TraceEventV1(
+        ticket_id="PERF-cycle",
+        action_id="1" * 16,
+        parent_action_id="2" * 16,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+    second = TraceEventV1(
+        ticket_id="PERF-cycle",
+        action_id="2" * 16,
+        parent_action_id=first.action_id,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+    orphan = TraceEventV1(
+        ticket_id="PERF-cycle",
+        action_id="3" * 16,
+        parent_action_id="4" * 16,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+
+    result = diagnostics([first, second, orphan])
+
+    assert result["cycles"] == [first.action_id, second.action_id]
+    assert result["missing_parents"] == [orphan.parent_action_id]
+
+
+def test_diagnostics_bounds_sequence_gap_expansion() -> None:
+    first = TraceEventV1(
+        ticket_id="PERF-gap",
+        ticket_seq=1,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+    second = TraceEventV1(
+        ticket_id="PERF-gap",
+        ticket_seq=1_000_000,
+        action=ActionDescriptor(type=ActionType.STATE),
+        lifecycle=LifecycleDescriptor(state=LifecycleState.STARTED),
+    )
+
+    result = diagnostics([first, second], max_sequence_gaps=3)
+
+    assert result["sequence_gaps"] == [2, 3, 4]
+    assert result["sequence_gaps_truncated"] is True
