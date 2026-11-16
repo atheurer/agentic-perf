@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from agents.benchmark.harnesses import boot_time as harness
-from providers.execution import AuditedSubprocessRunner
+from providers.execution import AmbiguousHTTPReplayError, AuditedSubprocessRunner
 from providers.tracing import bind_trace_context, new_trace_context, reset_trace_context
 
 
@@ -1817,7 +1817,53 @@ class TestBootTimeUBootConfig:
         assert "uboot_config_applied" not in result
         assert "helper reported success" in result["notes"]
         assert "durable persistence of the applied outcome failed" in result["notes"]
-        assert "pre-persisted indeterminate" in result["notes"]
+        assert "last confirmed durable U-Boot state is indeterminate" in result["notes"]
+        assert "final PATCH may or may not have committed" in result["notes"]
+        assert "Failed to persist" in result["error"]
+        assert [c for c in call_log if "set-uboot" in c]
+        assert not [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]
+        assert http_client.patch.await_count == 2
+        patch_fields = [
+            call.kwargs["json"]["fields"] for call in http_client.patch.await_args_list
+        ]
+        assert [fields["uboot_config_state"] for fields in patch_fields] == [
+            "indeterminate",
+            "applied",
+        ]
+        assert patch_fields[0]["uboot_config_applied"] is None
+        assert patch_fields[1]["uboot_config_applied"] == ["bootdelay=0"]
+
+    async def test_ambiguous_final_patch_after_helper_success_stays_indeterminate(
+        self, tmp_path, monkeypatch
+    ):
+        runner, call_log = self._make_runner()
+        http_client = self._fake_http_client()
+        request = httpx.Request("PATCH", "http://state-store/api/v1/tickets/T/fields")
+        http_client.patch = AsyncMock(
+            side_effect=[
+                MagicMock(status_code=200),
+                AmbiguousHTTPReplayError(
+                    "mutating request failed after send; refusing replay",
+                    request=request,
+                ),
+            ]
+        )
+
+        result = await self._run_uboot_ticket(
+            tmp_path,
+            monkeypatch,
+            self._make_s32g_ticket(),
+            runner,
+            http_client,
+        )
+
+        assert result["status"] == "failed"
+        assert result["uboot_config_state"] == "indeterminate"
+        assert "uboot_config_applied" not in result
+        assert "helper reported success" in result["notes"]
+        assert "last confirmed durable U-Boot state is indeterminate" in result["notes"]
+        assert "final PATCH may or may not have committed" in result["notes"]
+        assert "retains" not in result["notes"]
         assert "Failed to persist" in result["error"]
         assert [c for c in call_log if "set-uboot" in c]
         assert not [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]

@@ -327,6 +327,7 @@ When `workflow_source` is set, triage automatically sets `harness: "arcaflow-plu
 
 | Directive | Description | Examples |
 |---|---|---|
+| `configure_bootdelay` | Set U-Boot `bootdelay=0` before measurement. Enabled automatically for S32G boards; use `false` to opt out, or `true` to force configuration on non-S32G boards. Accepts booleans or the quoted strings `true`, `false`, `1`, `0`, `yes`, `no`, `on`, or `off`; numeric `1` and `0` are rejected. | `true`, `false`, `"true"`, `"false"` |
 | `jumpstarter_serial` | Enable *active* serial capture during boot-time measurement (replaces SSH-based reboot with serial-based). Active capture suppresses passive `serial_capture` during the benchmark. | `true`, `false` |
 | `ssh_password` | Override default SSH password | `password` |
 | `system_config` | Post-flash system configuration operations | See below |

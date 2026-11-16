@@ -699,8 +699,8 @@ async def run_boot_time_test(
                     f"U-Boot helper reported success for board"
                     f" '{_board_name}' (trigger: {_bootdelay_trigger}), but"
                     " durable persistence of the applied outcome failed. The"
-                    " ticket retains its pre-persisted indeterminate U-Boot"
-                    " configuration state."
+                    " last confirmed durable U-Boot state is indeterminate;"
+                    " the final PATCH may or may not have committed."
                 )
             return _uboot_stop_response(
                 _uboot_config_state,
