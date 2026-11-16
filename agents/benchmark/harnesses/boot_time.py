@@ -8,6 +8,7 @@ dispatches here with a :class:`BootTimeContext`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ from providers.execution import (
     RootedPath,
     durable_filesystem_emitter,
 )
+from providers.skills.boot_time import parse_configure_bootdelay
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,84 @@ class BootTimeContext:
 
 
 _MAX_BOOT_SERIAL_READ = 1024 * 1024
+_UBOOT_SSH_RECOVERY_TIMEOUT_S = 180.0
+_UBOOT_SSH_POLL_INTERVAL_S = 5.0
+_UBOOT_SSH_CONNECT_TIMEOUT_S = 5.0
+
+
+def _normalize_uboot_targets(
+    assigned_hardware_ips: Any,
+) -> tuple[list[str] | None, str | None]:
+    """Return normalized lease targets, or a reason the guard must fail closed."""
+    if not isinstance(assigned_hardware_ips, dict):
+        return None, "assigned_hardware_ips.targets is missing or malformed"
+
+    raw_targets = assigned_hardware_ips.get("targets")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        return None, "assigned_hardware_ips.targets is missing, empty, or malformed"
+
+    targets: list[str] = []
+    for raw_target in raw_targets:
+        if not isinstance(raw_target, str):
+            return None, "assigned_hardware_ips.targets is malformed"
+        target = raw_target.strip().lower()
+        if not target:
+            return None, "assigned_hardware_ips.targets is malformed"
+        targets.append(target)
+    return targets, None
+
+
+def _uboot_output_digest(output: bytes) -> str:
+    """Return bounded, content-free metadata for helper output."""
+    return hashlib.sha256(output).hexdigest()[:16]
+
+
+def _uboot_stop_response(
+    state: str,
+    note: str,
+    error: str,
+    *,
+    status: str = "failed",
+    applied: list[str] | None = None,
+) -> str:
+    """Build a U-Boot outcome response that stops before benchmarking."""
+    response: dict[str, Any] = {
+        "status": status,
+        "error": error,
+        "uboot_config_state": state,
+    }
+    if state == "applied" and applied:
+        response["uboot_config_applied"] = applied
+    if note:
+        response["notes"] = note
+    return json.dumps(response)
+
+
+async def _patch_uboot_outcome(
+    ticket_id: str,
+    state: str,
+    applied: list[str] | None,
+    note: str,
+) -> None:
+    """Durably persist a U-Boot outcome; callers decide how failures stop work."""
+    from agents.server_utils import ticket_state_headers
+    from providers.execution import AuditedAsyncHTTPClient
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    async with AuditedAsyncHTTPClient(
+        timeout=10.0, headers=ticket_state_headers()
+    ) as client:
+        response = await client.patch(
+            f"{store_url}/api/v1/tickets/{ticket_id}/fields",
+            json={
+                "fields": {
+                    "uboot_config_state": state,
+                    "uboot_config_applied": applied if state == "applied" else None,
+                    "uboot_config_note": note or None,
+                }
+            },
+        )
+        response.raise_for_status()
 
 
 def _boot_serial_diagnostics(serial_log_path: Path) -> dict[str, Any]:
@@ -339,34 +419,58 @@ async def run_boot_time_test(
     #
     # Opt out per-ticket with directive: configure_bootdelay=false
     # Force on for non-S32G boards with: configure_bootdelay=true
-    _uboot_directives = fields.get("directives", {}) if ctx.ticket else {}
+    _uboot_custom_fields = fields if ctx.ticket else {}
+    _uboot_directives = _uboot_custom_fields.get("directives", {})
     _uboot_meta = _js_meta if ctx.ticket else {}  # extracted in SSH-wait section
-    _board_target = _uboot_meta.get("board_target", "").lower()
-    _board_selector = _uboot_meta.get("selector", "").lower()
+    _board_target = str(_uboot_meta.get("board_target", "")).lower()
+    _board_selector = str(_uboot_meta.get("selector", "")).lower()
     _is_s32g = "s32g" in _board_target or "s32g" in _board_selector
-    # Coerce the directive to bool: accept Python bools, the strings
-    # "true"/"false"/"1"/"0" (case-insensitive), and integers.  Unrecognised
-    # values fall back to the auto-detect result.  This prevents a directive
-    # value of the string "false" (truthy in Python) from enabling config
-    # when the user intended to opt out.
-    _raw_bootdelay_directive = _uboot_directives.get("configure_bootdelay", None)
-    if _raw_bootdelay_directive is None:
-        _configure_bootdelay: bool = _is_s32g
-    elif isinstance(_raw_bootdelay_directive, bool):
-        _configure_bootdelay = _raw_bootdelay_directive
-    elif isinstance(_raw_bootdelay_directive, int):
-        _configure_bootdelay = bool(_raw_bootdelay_directive)
-    elif isinstance(_raw_bootdelay_directive, str):
-        _configure_bootdelay = _raw_bootdelay_directive.strip().lower() not in (
-            "false",
-            "0",
-            "no",
-            "off",
+    _board_name = _board_target or _board_selector or "unknown"
+    _uboot_ticket_id = os.environ.get("TICKET_ID", "") if ctx.ticket else ""
+
+    _bootdelay_present = "configure_bootdelay" in _uboot_directives
+    _raw_bootdelay_directive = _uboot_directives.get("configure_bootdelay")
+    _configure_bootdelay = parse_configure_bootdelay(_raw_bootdelay_directive)
+    if _bootdelay_present and _configure_bootdelay is None:
+        _uboot_config_note = (
+            f"U-Boot configuration skipped for board '{_board_name}':"
+            " configure_bootdelay has an invalid value; accepted values are"
+            " true/false/1/0/yes/no/on/off."
+        )
+        if _uboot_ticket_id:
+            try:
+                await _patch_uboot_outcome(
+                    _uboot_ticket_id, "skipped", None, _uboot_config_note
+                )
+            except Exception as _persist_exc:
+                logger.warning(
+                    "[boot-time] Failed to persist invalid U-Boot directive"
+                    " outcome (%s)",
+                    type(_persist_exc).__name__,
+                )
+                return _uboot_stop_response(
+                    "skipped",
+                    _uboot_config_note,
+                    "Failed to persist the invalid U-Boot directive outcome.",
+                )
+        return _uboot_stop_response(
+            "skipped",
+            _uboot_config_note,
+            "Invalid configure_bootdelay directive value.",
+            status="rejected",
+        )
+
+    if _bootdelay_present:
+        _bootdelay_trigger = (
+            f"directive configure_bootdelay={str(_configure_bootdelay).lower()}"
         )
     else:
         _configure_bootdelay = _is_s32g
+        _bootdelay_trigger = "automatic S32G board detection"
+
     _uboot_env_applied: list[str] = []  # e.g. ["bootdelay=0"]
     _uboot_config_note: str = ""
+    _uboot_config_state = "skipped"
     _uboot_attempted: bool = False
 
     if _js_lease_id and _configure_bootdelay:
@@ -379,8 +483,9 @@ async def run_boot_time_test(
             )
             # Surface the absence so the user knows bootdelay was not configured.
             _uboot_config_note = (
-                "U-Boot configuration skipped: jumpstarter-serial-helper.py"
-                f" not found in {scripts_dir}."
+                f"U-Boot configuration skipped for board '{_board_name}'"
+                f" (trigger: {_bootdelay_trigger}):"
+                f" jumpstarter-serial-helper.py not found in {scripts_dir}."
                 " bootdelay may be non-zero; measurements may include"
                 " U-Boot autoboot delay."
             )
@@ -390,33 +495,72 @@ async def run_boot_time_test(
             # the board that was provisioned; sut_host is the IP the platform
             # agent assigned to that same board.  A mismatch signals stale or
             # mismatched metadata and would mutate the wrong board.
-            _known_targets: list[str] = (
-                ((fields.get("assigned_hardware_ips") or {}).get("targets") or [])
-                if ctx.ticket
-                else []
+            _known_targets, _targets_error = _normalize_uboot_targets(
+                _uboot_custom_fields.get("assigned_hardware_ips")
             )
+            _normalized_sut_host = sut_host.strip().lower()
             _host_verified = (
-                not _known_targets  # no recorded IPs — cannot check, proceed
-                or sut_host in _known_targets
+                _known_targets is not None and _normalized_sut_host in _known_targets
             )
             if not _host_verified:
+                _target_reason = _targets_error or (
+                    f"sut_host {sut_host!r} is not in the normalized lease target list"
+                )
                 logger.warning(
-                    "[boot-time] sut_host %s not in lease's assigned targets %s;"
-                    " skipping U-Boot configuration to avoid mutating wrong board",
-                    sut_host,
-                    _known_targets,
+                    "[boot-time] U-Boot target guard failed: %s;"
+                    " skipping persistent configuration",
+                    _target_reason,
                 )
                 _uboot_config_note = (
-                    f"U-Boot configuration skipped: sut_host {sut_host!r} does"
-                    f" not match lease targets {_known_targets}."
+                    f"U-Boot configuration skipped for board '{_board_name}'"
+                    f" (trigger: {_bootdelay_trigger}): {_target_reason}."
                     " bootdelay may be non-zero."
                 )
             else:
+                if not _uboot_ticket_id:
+                    return _uboot_stop_response(
+                        "skipped",
+                        (
+                            f"U-Boot configuration skipped for board"
+                            f" '{_board_name}' (trigger: {_bootdelay_trigger}):"
+                            " the attempt outcome could not be persisted."
+                        ),
+                        "Cannot persist U-Boot attempt state before mutation.",
+                    )
+
+                _attempt_note = (
+                    f"U-Boot configuration attempting bootdelay=0 for board"
+                    f" '{_board_name}' (trigger: {_bootdelay_trigger})."
+                    " Outcome is indeterminate until the helper returns."
+                )
+                try:
+                    await _patch_uboot_outcome(
+                        _uboot_ticket_id,
+                        "indeterminate",
+                        None,
+                        _attempt_note,
+                    )
+                except Exception as _persist_exc:
+                    logger.warning(
+                        "[boot-time] Failed to persist U-Boot attempt state (%s)",
+                        type(_persist_exc).__name__,
+                    )
+                    return _uboot_stop_response(
+                        "skipped",
+                        (
+                            f"U-Boot configuration skipped for board"
+                            f" '{_board_name}' (trigger: {_bootdelay_trigger}):"
+                            " attempt outcome persistence failed; set-uboot was"
+                            " not invoked."
+                        ),
+                        "Cannot persist U-Boot attempt state before mutation.",
+                    )
+
                 _uboot_attempted = True
                 logger.info(
                     "[boot-time] Configuring U-Boot bootdelay=0"
                     " (board=%s, sut=%s, lease=%s)",
-                    _board_target or "unknown",
+                    _board_name,
                     sut_host,
                     _js_lease_id,
                 )
@@ -438,97 +582,127 @@ async def run_boot_time_test(
                         timeout=120,
                         mutating=True,
                     )
-                    if _uboot_result.returncode == 0:
+                    if _uboot_result.timed_out is True:
+                        _uboot_config_state = "indeterminate"
+                        _uboot_config_note = (
+                            f"U-Boot configuration indeterminate for board"
+                            f" '{_board_name}' (trigger: {_bootdelay_trigger}):"
+                            " set-uboot timed out after 120 seconds. saveenv"
+                            " may have committed; benchmark stopped before"
+                            " measurement."
+                        )
+                        logger.warning(
+                            "[boot-time] U-Boot configuration timed out"
+                            " (rc=%s, stderr_bytes=%d, stderr_sha256=%s)",
+                            _uboot_result.returncode,
+                            len(_uboot_result.stderr),
+                            _uboot_output_digest(_uboot_result.stderr),
+                        )
+                    elif _uboot_result.returncode == 0:
                         logger.info(
                             "[boot-time] U-Boot bootdelay=0 configured and verified"
                             " (board=%s)",
-                            _board_target or "unknown",
+                            _board_name,
                         )
+                        _uboot_config_state = "applied"
                         _uboot_env_applied = ["bootdelay=0"]
                         _uboot_config_note = (
-                            f"U-Boot configured: bootdelay=0"
-                            f" (auto-applied for S32G board '{_board_target}')."
+                            f"U-Boot configured: bootdelay=0 for board"
+                            f" '{_board_name}' (trigger: {_bootdelay_trigger})."
                             " Removes U-Boot autoboot delay from measurements."
                             " Disable with directive configure_bootdelay=false."
                         )
                     else:
-                        # Log exit code and a capped, printable-only tail of
-                        # stderr.  The helper mirrors the raw serial console
-                        # transcript to stderr; logging it verbatim could
-                        # expose board debug output in server logs.
-                        _stderr_lines = _uboot_result.stderr.decode(
-                            errors="replace"
-                        ).splitlines()
-                        _safe_tail = "\n".join(
-                            ln
-                            for ln in _stderr_lines[-10:]
-                            if ln.strip()
-                            and not any(c < " " and c not in "\t\n" for c in ln)
+                        _uboot_config_state = "indeterminate"
+                        _uboot_config_note = (
+                            f"U-Boot configuration indeterminate for board"
+                            f" '{_board_name}' (trigger: {_bootdelay_trigger}):"
+                            f" set-uboot exited nonzero (rc={_uboot_result.returncode})."
+                            " saveenv may have committed; benchmark stopped"
+                            " before measurement."
                         )
                         logger.warning(
-                            "[boot-time] U-Boot configuration failed"
-                            " (rc=%d); last helper output:\n%s",
+                            "[boot-time] U-Boot configuration indeterminate"
+                            " (rc=%s, stderr_bytes=%d, stderr_sha256=%s)",
                             _uboot_result.returncode,
-                            _safe_tail or "(no printable output)",
+                            len(_uboot_result.stderr),
+                            _uboot_output_digest(_uboot_result.stderr),
                         )
-                        _uboot_config_note = (
-                            f"U-Boot configuration attempted but failed"
-                            f" (rc={_uboot_result.returncode})."
-                            " bootdelay may be non-zero; measurements may"
-                            " include U-Boot autoboot delay."
-                        )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "[boot-time] U-Boot configuration timed out after 120s"
-                    )
-                    _uboot_config_note = (
-                        "U-Boot configuration timed out (120s)."
-                        " bootdelay may be non-zero; measurements may include"
-                        " U-Boot autoboot delay."
-                    )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as _uboot_exc:
-                    logger.warning(
-                        "[boot-time] U-Boot configuration failed: %s", _uboot_exc
-                    )
+                    _uboot_config_state = "indeterminate"
                     _uboot_config_note = (
-                        f"U-Boot configuration failed: {_uboot_exc}."
-                        " bootdelay may be non-zero; measurements may include"
-                        " U-Boot autoboot delay."
+                        f"U-Boot configuration indeterminate for board"
+                        f" '{_board_name}' (trigger: {_bootdelay_trigger}):"
+                        f" helper invocation raised {type(_uboot_exc).__name__}."
+                        " saveenv may have committed; benchmark stopped before"
+                        " measurement."
                     )
+                    logger.warning(
+                        "[boot-time] U-Boot configuration indeterminate after %s",
+                        type(_uboot_exc).__name__,
+                    )
+    elif not _configure_bootdelay:
+        _uboot_config_note = (
+            f"U-Boot configuration skipped for board '{_board_name}'"
+            f" (trigger: configure_bootdelay=false)."
+        )
+    elif not _js_lease_id:
+        _uboot_config_note = (
+            f"U-Boot configuration skipped for board '{_board_name}'"
+            f" (trigger: {_bootdelay_trigger}): no Jumpstarter lease is"
+            " available."
+        )
+    else:
+        _uboot_config_note = (
+            f"U-Boot configuration skipped for board '{_board_name}'"
+            f" (trigger: {_bootdelay_trigger})."
+        )
 
-    # Persist the U-Boot config outcome to the ticket immediately so it
-    # is recorded even if the agent task is later cancelled before the
-    # tool result is processed (including the SSH-failure early return
-    # below).  Best-effort: failure to persist does not block the benchmark.
-    _uboot_ticket_id = os.environ.get("TICKET_ID", "") if ctx.ticket else ""
-    if _uboot_ticket_id and (_uboot_env_applied or _uboot_config_note):
+    if not _uboot_attempted and _uboot_ticket_id:
         try:
-            from agents.server_utils import ticket_state_headers
-            from providers.execution import AuditedAsyncHTTPClient
-
-            _uboot_store_url = os.environ.get(
-                "STATE_STORE_URL", "http://localhost:8090"
+            await _patch_uboot_outcome(
+                _uboot_ticket_id,
+                "skipped",
+                None,
+                _uboot_config_note,
             )
-            async with AuditedAsyncHTTPClient(
-                timeout=10.0, headers=ticket_state_headers()
-            ) as _uboot_client:
-                await _uboot_client.patch(
-                    f"{_uboot_store_url}/api/v1/tickets/{_uboot_ticket_id}/fields",
-                    json={
-                        "fields": {
-                            "uboot_config_applied": _uboot_env_applied or None,
-                            "uboot_config_note": _uboot_config_note or None,
-                        }
-                    },
-                )
-                logger.info(
-                    "[boot-time] Persisted U-Boot config outcome to ticket %s",
-                    _uboot_ticket_id,
-                )
         except Exception as _persist_exc:
             logger.warning(
-                "[boot-time] Failed to persist U-Boot config outcome: %s",
-                _persist_exc,
+                "[boot-time] Failed to persist skipped U-Boot outcome (%s)",
+                type(_persist_exc).__name__,
+            )
+            return _uboot_stop_response(
+                "skipped",
+                _uboot_config_note,
+                "Failed to persist the skipped U-Boot configuration outcome.",
+            )
+
+    if _uboot_attempted:
+        try:
+            await _patch_uboot_outcome(
+                _uboot_ticket_id,
+                _uboot_config_state,
+                _uboot_env_applied,
+                _uboot_config_note,
+            )
+        except Exception as _persist_exc:
+            logger.warning(
+                "[boot-time] Failed to persist final U-Boot outcome (%s)",
+                type(_persist_exc).__name__,
+            )
+            return _uboot_stop_response(
+                _uboot_config_state,
+                _uboot_config_note,
+                "Failed to persist the final U-Boot configuration outcome.",
+                applied=_uboot_env_applied,
+            )
+        if _uboot_config_state == "indeterminate":
+            return _uboot_stop_response(
+                _uboot_config_state,
+                _uboot_config_note,
+                "U-Boot configuration is indeterminate; benchmark stopped.",
             )
 
     # After any U-Boot configuration attempt (success, failure, or timeout)
@@ -542,9 +716,16 @@ async def run_boot_time_test(
         import socket as _uboot_sock
 
         _uboot_ssh_ready = False
-        for _uboot_attempt in range(36):  # 36 × 5s = 3 min
+        _recovery_deadline = time.monotonic() + _UBOOT_SSH_RECOVERY_TIMEOUT_S
+        for _uboot_attempt in range(36):
+            _remaining = _recovery_deadline - time.monotonic()
+            if _remaining <= 0:
+                break
             try:
-                _s = _uboot_sock.create_connection((sut_host, 22), timeout=5)
+                _s = _uboot_sock.create_connection(
+                    (sut_host, 22),
+                    timeout=min(_UBOOT_SSH_CONNECT_TIMEOUT_S, _remaining),
+                )
                 _s.close()
                 _uboot_ssh_ready = True
                 break
@@ -553,7 +734,10 @@ async def run_boot_time_test(
                     "[boot-time] Waiting for SSH after U-Boot config (attempt %d/36)",
                     _uboot_attempt + 1,
                 )
-                await asyncio.sleep(5)
+                _remaining = _recovery_deadline - time.monotonic()
+                if _remaining <= 0:
+                    break
+                await asyncio.sleep(min(_UBOOT_SSH_POLL_INTERVAL_S, _remaining))
         if _uboot_ssh_ready:
             logger.info("[boot-time] SSH ready after U-Boot config")
         else:
@@ -567,10 +751,11 @@ async def run_boot_time_test(
                     "status": "failed",
                     "error": (
                         f"Board at {sut_host} did not come back via SSH within"
-                        " 3 minutes after U-Boot configuration. The board may"
+                        " 180 seconds after U-Boot configuration. The board may"
                         " be stuck at the U-Boot prompt or not booting."
                         " Manual recovery may be required."
                     ),
+                    "uboot_config_state": _uboot_config_state,
                     "uboot_config_applied": _uboot_env_applied,
                     "notes": _uboot_config_note,
                 }
@@ -1480,6 +1665,7 @@ async def run_boot_time_test(
     if stall_diag:
         response["stall_diagnostics"] = stall_diag
 
+    response["uboot_config_state"] = _uboot_config_state
     if _uboot_env_applied:
         response["uboot_config_applied"] = _uboot_env_applied
     if _uboot_config_note:

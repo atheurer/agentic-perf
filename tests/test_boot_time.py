@@ -842,6 +842,46 @@ class TestRepoRegistration:
         assert "boot-time-analysis-scripts" in config.harness_repos
 
 
+class TestBootTimeDirectiveSchema:
+    """Boot-time-specific directive registration and value validation."""
+
+    def test_configure_bootdelay_is_registered(self):
+        from providers.directives import get_recognized_directives
+
+        assert "configure_bootdelay" in get_recognized_directives()
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (True, True),
+            (False, False),
+            ("true", True),
+            ("TRUE", True),
+            ("1", True),
+            ("Yes", True),
+            ("On", True),
+            ("false", False),
+            ("FALSE", False),
+            ("0", False),
+            ("No", False),
+            ("Off", False),
+        ],
+    )
+    def test_configure_bootdelay_accepts_canonical_values(self, value, expected):
+        from providers.skills.boot_time import parse_configure_bootdelay
+
+        assert parse_configure_bootdelay(value) is expected
+
+    @pytest.mark.parametrize(
+        "value",
+        ["flase", "truthy", "yes please", 2, 1.0, None, []],
+    )
+    def test_configure_bootdelay_rejects_invalid_values(self, value):
+        from providers.skills.boot_time import parse_configure_bootdelay
+
+        assert parse_configure_bootdelay(value) is None
+
+
 class TestOutputDirPersistence:
     """Verify output_dir is written to custom_fields early."""
 
@@ -858,7 +898,8 @@ class TestOutputDirPersistence:
         client = _FakeClient(
             _FakeResponse(
                 {"custom_fields": {"output_dirs": []}}, status_code=get_status
-            )
+            ),
+            _FakeResponse(status_code=200),
         )
         start_observations = []
 
@@ -897,10 +938,10 @@ class TestOutputDirPersistence:
         assert result["status"] == "completed"
         assert len(start_observations) == 1
         assert [call[0] for call in start_observations[0]] == (
-            ["GET", "PATCH"] if get_status == 200 else ["GET"]
+            ["PATCH", "GET", "PATCH"] if get_status == 200 else ["PATCH", "GET"]
         )
         if get_status == 200:
-            assert start_observations[0][1][2]["fields"] == {
+            assert start_observations[0][2][2]["fields"] == {
                 "output_dir": str(tmp_path),
                 "output_dirs": [str(tmp_path)],
             }
@@ -1237,7 +1278,13 @@ class TestBootTimeUBootConfig:
             }
         )
 
-    def _make_runner(self, uboot_rc: int = 0) -> tuple[MagicMock, list]:
+    def _make_runner(
+        self,
+        uboot_rc: int = 0,
+        *,
+        timed_out: bool = False,
+        stderr: bytes | None = None,
+    ) -> tuple[MagicMock, list]:
         """
         Return (runner mock, call_log).  set-uboot uses runner.run(); passive
         serial and power-cycle use runner.start().  call_log records every argv.
@@ -1251,8 +1298,11 @@ class TestBootTimeUBootConfig:
         # ProcessResult-like stub returned by runner.run()
         uboot_result = MagicMock()
         uboot_result.returncode = uboot_rc
+        uboot_result.timed_out = timed_out
         uboot_result.stdout = b""
-        uboot_result.stderr = b"[uboot] saveenv OK" if uboot_rc == 0 else b"Error"
+        uboot_result.stderr = stderr or (
+            b"[uboot] saveenv OK" if uboot_rc == 0 else b"Error"
+        )
 
         async def run(argv, **_kwargs):
             call_log.append(list(argv))
@@ -1276,6 +1326,121 @@ class TestBootTimeUBootConfig:
         client.__aexit__ = AsyncMock(return_value=False)
         client.patch = AsyncMock(return_value=MagicMock(status_code=200))
         return client
+
+    async def _run_uboot_ticket(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        ticket: dict,
+        runner: MagicMock,
+        http_client: MagicMock | None = None,
+        socket_side_effect=None,
+    ) -> dict:
+        """Run one boot-time tool call with U-Boot test doubles in place."""
+        from agents.benchmark import server
+
+        monkeypatch.setenv("TICKET_ID", "PERF-BOOT-TEST")
+        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
+        (tmp_path / "jumpstarter-serial-helper.py").write_text("# stub\n")
+        mock_cache = MagicMock()
+        mock_cache.get_path.return_value = tmp_path
+        http_client = http_client or self._fake_http_client()
+
+        socket_patch = (
+            patch("socket.create_connection", return_value=MagicMock())
+            if socket_side_effect is None
+            else patch("socket.create_connection", side_effect=socket_side_effect)
+        )
+        with (
+            patch.object(server, "_initialized", True),
+            patch.object(server, "_repo_cache", mock_cache),
+            patch.object(server, "_ticket", ticket),
+            patch("paths.create_artifact_dir", return_value=tmp_path),
+            socket_patch,
+            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch(
+                "providers.execution.AuditedAsyncHTTPClient", return_value=http_client
+            ),
+            patch("agents.server_utils.ticket_state_headers", return_value={}),
+        ):
+            return json.loads(
+                await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
+            )
+
+    @pytest.mark.parametrize(
+        "directive_value",
+        ["flase", "truthy", "yes please", 2, 1.0, None, []],
+    )
+    async def test_invalid_configure_bootdelay_never_falls_back_to_autodetect(
+        self, tmp_path, monkeypatch, directive_value
+    ):
+        runner, call_log = self._make_runner()
+        http_client = self._fake_http_client()
+
+        result = await self._run_uboot_ticket(
+            tmp_path,
+            monkeypatch,
+            self._make_s32g_ticket({"configure_bootdelay": directive_value}),
+            runner,
+            http_client,
+        )
+
+        assert result["status"] == "rejected"
+        assert result["uboot_config_state"] == "skipped"
+        assert "uboot_config_applied" not in result
+        assert "invalid value" in result["notes"]
+        assert "s32g_vnp_rdb3" in result["notes"]
+        assert not [c for c in call_log if "set-uboot" in c]
+        assert not [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]
+        assert http_client.patch.await_count == 1
+        fields = http_client.patch.await_args.kwargs["json"]["fields"]
+        assert fields["uboot_config_state"] == "skipped"
+        assert fields["uboot_config_applied"] is None
+
+    @pytest.mark.parametrize(
+        "assigned_hardware_ips",
+        [
+            None,
+            {},
+            {"targets": None},
+            {"targets": []},
+            {"targets": "192.0.2.10"},
+            {"targets": [123]},
+            {"targets": ["   "]},
+        ],
+        ids=[
+            "missing",
+            "no-targets",
+            "null-targets",
+            "empty-targets",
+            "string-targets",
+            "non-string-target",
+            "blank-target",
+        ],
+    )
+    async def test_missing_or_malformed_targets_skip_persistent_mutation(
+        self, tmp_path, monkeypatch, assigned_hardware_ips
+    ):
+        ticket = self._make_s32g_ticket()
+        ticket["custom_fields"]["assigned_hardware_ips"] = assigned_hardware_ips
+        runner, call_log = self._make_runner()
+        http_client = self._fake_http_client()
+
+        result = await self._run_uboot_ticket(
+            tmp_path, monkeypatch, ticket, runner, http_client
+        )
+
+        assert result["status"] == "completed"
+        assert result["uboot_config_state"] == "skipped"
+        assert "uboot_config_applied" not in result
+        assert "assigned_hardware_ips.targets" in result["notes"]
+        assert not [c for c in call_log if "set-uboot" in c]
+        assert [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]
+        assert http_client.patch.await_count == 1
+        fields = http_client.patch.await_args.kwargs["json"]["fields"]
+        assert fields["uboot_config_state"] == "skipped"
+        assert fields["uboot_config_applied"] is None
 
     async def test_s32g_triggers_uboot_config_by_default(self, tmp_path, monkeypatch):
         """An S32G board with no directive gets bootdelay=0 configured."""
@@ -1321,15 +1486,19 @@ class TestBootTimeUBootConfig:
         assert cmd[idx + 2] == "0"
 
         assert result.get("uboot_config_applied") == ["bootdelay=0"]
+        assert result.get("uboot_config_state") == "applied"
         assert "bootdelay=0" in (result.get("notes") or "")
         assert "configure_bootdelay=false" in (result.get("notes") or "")
 
         # Outcome persisted to ticket via PATCH
         http_client.patch.assert_awaited()
-        patch_body = http_client.patch.call_args.kwargs.get("json", {})
-        assert patch_body.get("fields", {}).get("uboot_config_applied") == [
-            "bootdelay=0"
+        patch_states = [
+            call.kwargs["json"]["fields"]["uboot_config_state"]
+            for call in http_client.patch.await_args_list
         ]
+        assert patch_states == ["indeterminate", "applied"]
+        patch_body = http_client.patch.await_args_list[-1].kwargs["json"]
+        assert patch_body["fields"]["uboot_config_applied"] == ["bootdelay=0"]
 
     async def test_non_s32g_board_skips_uboot_config(self, tmp_path, monkeypatch):
         """A non-S32G Jumpstarter board must not receive U-Boot config."""
@@ -1466,44 +1635,178 @@ class TestBootTimeUBootConfig:
         uboot_calls = [c for c in call_log if "set-uboot" in c]
         assert len(uboot_calls) == 1
         assert result.get("uboot_config_applied") == ["bootdelay=0"]
+        assert result.get("uboot_config_state") == "applied"
+        notes = result.get("notes", "")
+        assert "some_other_board" in notes
+        assert "directive configure_bootdelay=true" in notes
+        assert "auto-applied" not in notes
+        assert "S32G" not in notes
 
-    async def test_uboot_failure_is_non_fatal_and_noted(self, tmp_path, monkeypatch):
-        """A set-uboot failure should not abort the benchmark; a note is added."""
-        from agents.benchmark import server
-
-        monkeypatch.setenv("TICKET_ID", "PERF-BOOT-TEST")
-        (tmp_path / "boot-timings-test.sh").write_text("#!/bin/bash\n")
-        (tmp_path / "jumpstarter-serial-helper.py").write_text("# stub\n")
-        mock_cache = MagicMock()
-        mock_cache.get_path.return_value = tmp_path
-        runner, call_log = self._make_runner(uboot_rc=1)
+    async def test_uboot_nonzero_result_is_indeterminate_and_stops_benchmark(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A nonzero helper result may have committed saveenv and must stop work."""
+        private_stderr = b"PRIVATE U-BOOT CONSOLE OUTPUT"
+        runner, call_log = self._make_runner(uboot_rc=1, stderr=private_stderr)
         http_client = self._fake_http_client()
 
-        with (
-            patch.object(server, "_initialized", True),
-            patch.object(server, "_repo_cache", mock_cache),
-            patch.object(server, "_ticket", self._make_s32g_ticket()),
-            patch("paths.create_artifact_dir", return_value=tmp_path),
-            patch("socket.create_connection", return_value=MagicMock()),
-            patch.object(harness, "AuditedSubprocessRunner", return_value=runner),
-            patch("asyncio.sleep", new_callable=AsyncMock),
-            patch(
-                "providers.execution.AuditedAsyncHTTPClient", return_value=http_client
-            ),
-            patch("agents.server_utils.ticket_state_headers", return_value={}),
-        ):
-            result = json.loads(
-                await server.execute_boot_time_test(sut_host="192.0.2.10", samples=1)
-            )
+        result = await self._run_uboot_ticket(
+            tmp_path,
+            monkeypatch,
+            self._make_s32g_ticket(),
+            runner,
+            http_client,
+        )
 
-        uboot_calls = [c for c in call_log if "set-uboot" in c]
-        assert len(uboot_calls) == 1
+        assert result["status"] == "failed"
+        assert result["uboot_config_state"] == "indeterminate"
         assert "uboot_config_applied" not in result
-        notes = result.get("notes", "")
-        assert notes, "A failure note must be present"
-        assert "failed" in notes.lower()
-        # Failure outcome persisted
-        http_client.patch.assert_awaited()
+        assert "exited nonzero (rc=1)" in result["notes"]
+        assert [c for c in call_log if "set-uboot" in c]
+        assert not [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]
+        patch_fields = [
+            call.kwargs["json"]["fields"] for call in http_client.patch.await_args_list
+        ]
+        assert [fields["uboot_config_state"] for fields in patch_fields] == [
+            "indeterminate",
+            "indeterminate",
+        ]
+        assert all(fields["uboot_config_applied"] is None for fields in patch_fields)
+        assert "PRIVATE U-BOOT CONSOLE OUTPUT" not in caplog.text
+        assert "stderr_sha256" in caplog.text
+
+    async def test_uboot_timeout_is_indeterminate_and_stops_benchmark(
+        self, tmp_path, monkeypatch
+    ):
+        """A helper timeout must not be collapsed into an ordinary exit failure."""
+        runner, call_log = self._make_runner(
+            uboot_rc=124, timed_out=True, stderr=b"PRIVATE SERIAL"
+        )
+        http_client = self._fake_http_client()
+
+        result = await self._run_uboot_ticket(
+            tmp_path,
+            monkeypatch,
+            self._make_s32g_ticket(),
+            runner,
+            http_client,
+        )
+
+        assert result["status"] == "failed"
+        assert result["uboot_config_state"] == "indeterminate"
+        assert "uboot_config_applied" not in result
+        assert "timed out after 120 seconds" in result["notes"]
+        assert "exited nonzero" not in result["notes"]
+        assert [c for c in call_log if "set-uboot" in c]
+        assert not [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]
+        patch_fields = [
+            call.kwargs["json"]["fields"] for call in http_client.patch.await_args_list
+        ]
+        assert [fields["uboot_config_state"] for fields in patch_fields] == [
+            "indeterminate",
+            "indeterminate",
+        ]
+
+    async def test_cancellation_after_attempt_patch_retains_indeterminate(
+        self, tmp_path, monkeypatch
+    ):
+        """Cancellation must propagate and leave the durable attempt state."""
+        runner, call_log = self._make_runner()
+        helper_returned = asyncio.Event()
+
+        async def blocked_run(argv, **_kwargs):
+            call_log.append(list(argv))
+            await helper_returned.wait()
+            raise AssertionError("set-uboot should have been cancelled")
+
+        runner.run = AsyncMock(side_effect=blocked_run)
+        http_client = self._fake_http_client()
+        patch_payloads: list[dict] = []
+        attempt_patched = asyncio.Event()
+
+        async def record_patch(*_args, **kwargs):
+            patch_payloads.append(kwargs["json"])
+            attempt_patched.set()
+            return MagicMock(status_code=200)
+
+        http_client.patch = AsyncMock(side_effect=record_patch)
+
+        task = asyncio.create_task(
+            self._run_uboot_ticket(
+                tmp_path,
+                monkeypatch,
+                self._make_s32g_ticket(),
+                runner,
+                http_client,
+            )
+        )
+        await attempt_patched.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(patch_payloads) == 1
+        fields = patch_payloads[0]["fields"]
+        assert fields["uboot_config_state"] == "indeterminate"
+        assert fields["uboot_config_applied"] is None
+        assert "attempting" in fields["uboot_config_note"]
+        assert [c for c in call_log if "set-uboot" in c]
+        assert not [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]
+
+    def _rejected_patch_response(self) -> MagicMock:
+        request = httpx.Request("PATCH", "http://state-store/api/v1/tickets/T/fields")
+        response = MagicMock(status_code=503)
+        response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "rejected", request=request, response=response
+        )
+        return response
+
+    async def test_rejected_attempt_patch_prevents_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        runner, call_log = self._make_runner()
+        http_client = self._fake_http_client()
+        http_client.patch = AsyncMock(return_value=self._rejected_patch_response())
+
+        result = await self._run_uboot_ticket(
+            tmp_path,
+            monkeypatch,
+            self._make_s32g_ticket(),
+            runner,
+            http_client,
+        )
+
+        assert result["status"] == "failed"
+        assert result["uboot_config_state"] == "skipped"
+        assert "set-uboot was not invoked" in result["notes"]
+        assert not [c for c in call_log if "set-uboot" in c]
+        assert not [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]
+        assert http_client.patch.await_count == 1
+
+    async def test_rejected_final_patch_fails_instead_of_claiming_success(
+        self, tmp_path, monkeypatch
+    ):
+        runner, call_log = self._make_runner()
+        http_client = self._fake_http_client()
+        http_client.patch = AsyncMock(
+            side_effect=[MagicMock(status_code=200), self._rejected_patch_response()]
+        )
+
+        result = await self._run_uboot_ticket(
+            tmp_path,
+            monkeypatch,
+            self._make_s32g_ticket(),
+            runner,
+            http_client,
+        )
+
+        assert result["status"] == "failed"
+        assert result["uboot_config_state"] == "applied"
+        assert result["uboot_config_applied"] == ["bootdelay=0"]
+        assert "Failed to persist" in result["error"]
+        assert [c for c in call_log if "set-uboot" in c]
+        assert not [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]
+        assert http_client.patch.await_count == 2
 
     async def test_missing_helper_script_sets_note(self, tmp_path, monkeypatch):
         """Missing jumpstarter-serial-helper.py sets a warning note in the result."""
@@ -1629,6 +1932,7 @@ class TestBootTimeUBootConfig:
         assert len(uboot_calls) == 1
         # Result is a failure because board did not come back
         assert result["status"] == "failed"
+        assert result["uboot_config_state"] == "applied"
         assert (
             "SSH" in result.get("error", "") or "ssh" in result.get("error", "").lower()
         )
