@@ -435,7 +435,8 @@ async def run_boot_time_test(
         _uboot_config_note = (
             f"U-Boot configuration skipped for board '{_board_name}':"
             " configure_bootdelay has an invalid value; accepted values are"
-            " true/false/1/0/yes/no/on/off."
+            " booleans or the quoted strings 'true', 'false', '1', '0',"
+            " 'yes', 'no', 'on', or 'off'; numeric 1 and 0 are rejected."
         )
         if _uboot_ticket_id:
             try:
@@ -646,7 +647,7 @@ async def run_boot_time_test(
     elif not _configure_bootdelay:
         _uboot_config_note = (
             f"U-Boot configuration skipped for board '{_board_name}'"
-            f" (trigger: configure_bootdelay=false)."
+            f" (trigger: {_bootdelay_trigger})."
         )
     elif not _js_lease_id:
         _uboot_config_note = (
@@ -692,11 +693,19 @@ async def run_boot_time_test(
                 "[boot-time] Failed to persist final U-Boot outcome (%s)",
                 type(_persist_exc).__name__,
             )
+            if _uboot_config_state == "applied":
+                _uboot_config_state = "indeterminate"
+                _uboot_config_note = (
+                    f"U-Boot helper reported success for board"
+                    f" '{_board_name}' (trigger: {_bootdelay_trigger}), but"
+                    " durable persistence of the applied outcome failed. The"
+                    " ticket retains its pre-persisted indeterminate U-Boot"
+                    " configuration state."
+                )
             return _uboot_stop_response(
                 _uboot_config_state,
                 _uboot_config_note,
                 "Failed to persist the final U-Boot configuration outcome.",
-                applied=_uboot_env_applied,
             )
         if _uboot_config_state == "indeterminate":
             return _uboot_stop_response(
@@ -705,9 +714,10 @@ async def run_boot_time_test(
                 "U-Boot configuration is indeterminate; benchmark stopped.",
             )
 
-    # After any U-Boot configuration attempt (success, failure, or timeout)
-    # the helper power-cycles the board and runs 'boot'.  Wait for SSH
-    # readiness before proceeding — the board may still be booting.
+    # Only a helper-reported successful configuration reaches this recovery
+    # wait; indeterminate outcomes already returned above. The helper
+    # power-cycles the board and runs 'boot', so wait for SSH readiness
+    # before proceeding — the board may still be booting.
     # If SSH does not recover the board is unusable for benchmarking
     # regardless of whether the config succeeded, so return a failure
     # rather than letting the benchmark attempt and fail with a less

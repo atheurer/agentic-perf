@@ -26,6 +26,9 @@ _BOOTDELAY_FALSE_VALUES = {"false", "0", "no", "off"}
 def parse_configure_bootdelay(value: Any) -> bool | None:
     """Parse the strict configure_bootdelay directive value.
 
+    Accepted values are booleans or one of the quoted strings ``"true"``,
+    ``"false"``, ``"1"``, ``"0"``, ``"yes"``, ``"no"``, ``"on"``, or
+    ``"off"``. Numeric integers ``1`` and ``0`` are rejected.
     Return ``None`` for values the boot-time harness must reject rather than
     infer from board auto-detection.
     """
@@ -69,7 +72,8 @@ register_directives(
         "kpi_pattern": "Regex pattern for KPI log line matching (string)",
         "configure_bootdelay": (
             "Configure U-Boot bootdelay=0 before boot-time tests "
-            "(bool or true/false/1/0/yes/no/on/off)"
+            "(booleans or the quoted strings 'true', 'false', '1', '0', "
+            "'yes', 'no', 'on', or 'off'; numeric 1 and 0 are rejected)"
         ),
     },
     aliases={

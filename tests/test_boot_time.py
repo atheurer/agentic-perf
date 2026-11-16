@@ -850,6 +850,13 @@ class TestBootTimeDirectiveSchema:
 
         assert "configure_bootdelay" in get_recognized_directives()
 
+    def test_configure_bootdelay_description_documents_quoted_values(self):
+        from providers.directives import format_directive_schema_for_prompt
+
+        result = format_directive_schema_for_prompt({"configure_bootdelay"})
+        assert "booleans or the quoted strings" in result
+        assert "numeric 1 and 0 are rejected" in result
+
     @pytest.mark.parametrize(
         ("value", "expected"),
         [
@@ -874,7 +881,7 @@ class TestBootTimeDirectiveSchema:
 
     @pytest.mark.parametrize(
         "value",
-        ["flase", "truthy", "yes please", 2, 1.0, None, []],
+        ["flase", "truthy", "yes please", 2, 1, 0, 1.0, None, []],
     )
     def test_configure_bootdelay_rejects_invalid_values(self, value):
         from providers.skills.boot_time import parse_configure_bootdelay
@@ -1370,7 +1377,7 @@ class TestBootTimeUBootConfig:
 
     @pytest.mark.parametrize(
         "directive_value",
-        ["flase", "truthy", "yes please", 2, 1.0, None, []],
+        ["flase", "truthy", "yes please", 2, 1, 0, 1.0, None, []],
     )
     async def test_invalid_configure_bootdelay_never_falls_back_to_autodetect(
         self, tmp_path, monkeypatch, directive_value
@@ -1390,6 +1397,7 @@ class TestBootTimeUBootConfig:
         assert result["uboot_config_state"] == "skipped"
         assert "uboot_config_applied" not in result
         assert "invalid value" in result["notes"]
+        assert "numeric 1 and 0 are rejected" in result["notes"]
         assert "s32g_vnp_rdb3" in result["notes"]
         assert not [c for c in call_log if "set-uboot" in c]
         assert not [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]
@@ -1538,6 +1546,9 @@ class TestBootTimeUBootConfig:
         uboot_calls = [c for c in call_log if "set-uboot" in c]
         assert uboot_calls == [], "Non-S32G board should not trigger U-Boot config"
         assert "uboot_config_applied" not in result
+        notes = result.get("notes", "")
+        assert "automatic S32G board detection" in notes
+        assert "configure_bootdelay=false" not in notes
 
     @pytest.mark.parametrize(
         "directive_value",
@@ -1587,6 +1598,7 @@ class TestBootTimeUBootConfig:
             f"configure_bootdelay={directive_value!r} must suppress config"
         )
         assert "uboot_config_applied" not in result
+        assert "directive configure_bootdelay=false" in (result.get("notes") or "")
 
     async def test_configure_bootdelay_true_forces_non_s32g(
         self, tmp_path, monkeypatch
@@ -1801,12 +1813,24 @@ class TestBootTimeUBootConfig:
         )
 
         assert result["status"] == "failed"
-        assert result["uboot_config_state"] == "applied"
-        assert result["uboot_config_applied"] == ["bootdelay=0"]
+        assert result["uboot_config_state"] == "indeterminate"
+        assert "uboot_config_applied" not in result
+        assert "helper reported success" in result["notes"]
+        assert "durable persistence of the applied outcome failed" in result["notes"]
+        assert "pre-persisted indeterminate" in result["notes"]
         assert "Failed to persist" in result["error"]
         assert [c for c in call_log if "set-uboot" in c]
         assert not [c for c in call_log if str(c[0]).endswith("boot-timings-test.sh")]
         assert http_client.patch.await_count == 2
+        patch_fields = [
+            call.kwargs["json"]["fields"] for call in http_client.patch.await_args_list
+        ]
+        assert [fields["uboot_config_state"] for fields in patch_fields] == [
+            "indeterminate",
+            "applied",
+        ]
+        assert patch_fields[0]["uboot_config_applied"] is None
+        assert patch_fields[1]["uboot_config_applied"] == ["bootdelay=0"]
 
     async def test_missing_helper_script_sets_note(self, tmp_path, monkeypatch):
         """Missing jumpstarter-serial-helper.py sets a warning note in the result."""
