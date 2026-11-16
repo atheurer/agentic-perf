@@ -64,6 +64,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ),
     (
         "agents/benchmark/harnesses/boot_time.py",
+        "_patch_uboot_outcome",
+        "mutating_http_state",
+    ),
+    (
+        "agents/benchmark/harnesses/boot_time.py",
         "_post_progress_comment",
         "mutating_http_state",
     ),
@@ -1204,6 +1209,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/benchmark/harnesses/boot_time.py:_append_output_dir",
+        "2027-12-31",
+    ),
+    (
+        "agents/benchmark/harnesses/boot_time.py",
+        "_patch_uboot_outcome",
+        "mutating_http_state",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/harnesses/boot_time.py:_patch_uboot_outcome",
         "2027-12-31",
     ),
     (
