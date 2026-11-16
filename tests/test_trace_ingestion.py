@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import sqlite3
 import threading
@@ -25,7 +26,11 @@ from providers.tracing import (
     TraceEventV1,
 )
 from providers.tracing.query import TraceQuery, TraceQueryCancelled, TraceQueryTooBroad
-from state_store.api.executors import run_control_worker, run_lease_worker
+from state_store.api.executors import (
+    BoundedThreadPoolExecutor,
+    run_control_worker,
+    run_lease_worker,
+)
 from state_store.api.health import health as health_endpoint
 from state_store.api.router import api_router
 from state_store.api.traces import (
@@ -34,6 +39,7 @@ from state_store.api.traces import (
     _json_dumps,
     _PayloadAuditResponse,
     _query_store,
+    _record_cancelled_query,
     _record_query_audit,
     _render_export_response,
     _TraceAuditResponse,
@@ -54,7 +60,18 @@ from state_store.main import (
     _trace_read_operation,
     create_app,
 )
-from state_store.trace_store import TraceStore
+from state_store.trace_store import TraceStore, TraceStoreWriteError
+
+_TEST_AUDIT_FALLBACK_EXECUTOR = BoundedThreadPoolExecutor(
+    max_workers=1,
+    queue_size=0,
+    thread_name_prefix="test-trace-audit-fallback",
+)
+_TEST_AUDIT_EXECUTOR = BoundedThreadPoolExecutor(
+    max_workers=1,
+    queue_size=1,
+    thread_name_prefix="test-trace-audit",
+)
 
 
 def payload(event: TraceEventV1) -> dict:
@@ -173,6 +190,9 @@ def test_export_blob_verification_charges_failed_read_to_full_budget(
 
 def make_app(tmp_path, user_store: UserStore | None = None) -> FastAPI:
     app = FastAPI()
+    app.state.auth_dependency = make_auth_dependency(
+        "service", multi_user=True, user_store=user_store
+    )
     app.state.trace_store = TraceStore(tmp_path / "trace.db")
     app.state.trace_instance_id = "server-instance"
     app.state.trace_health = {
@@ -180,10 +200,14 @@ def make_app(tmp_path, user_store: UserStore | None = None) -> FastAPI:
         "ingestion_failures": 0,
         "schema_rejections": 0,
         "quarantined_frames": 0,
-        "audit_queue_rejections": 0,
+        "audit_queue_fallbacks": 0,
         "ingestion_queue_rejections": 0,
         "ingestion_body_rejections": 0,
     }
+    app.state.trace_query_audit_fallback_executor = _TEST_AUDIT_FALLBACK_EXECUTOR
+    app.state.trace_query_audit_fallback_slots = _TEST_AUDIT_FALLBACK_EXECUTOR.slots
+    app.state.trace_query_audit_executor = _TEST_AUDIT_EXECUTOR
+    app.state.trace_query_audit_slots = _TEST_AUDIT_EXECUTOR.slots
     app.add_middleware(traces_api.TraceIngestBodyLimitMiddleware)
     app.include_router(
         api_router,
@@ -195,6 +219,29 @@ def make_app(tmp_path, user_store: UserStore | None = None) -> FastAPI:
         ],
     )
     return app
+
+
+def middleware_scope() -> dict:
+    app = FastAPI()
+    app.state.auth_dependency = make_auth_dependency("service")
+    return {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/v1/traces/events",
+        "headers": [(b"authorization", b"Bearer service")],
+        "app": app,
+    }
+
+
+def trace_audit_state(audit_log, **attributes):
+    return SimpleNamespace(
+        audit_log=audit_log,
+        trace_query_audit_executor=_TEST_AUDIT_EXECUTOR,
+        trace_query_audit_slots=_TEST_AUDIT_EXECUTOR.slots,
+        trace_query_audit_fallback_executor=_TEST_AUDIT_FALLBACK_EXECUTOR,
+        trace_query_audit_fallback_slots=_TEST_AUDIT_FALLBACK_EXECUTOR.slots,
+        **attributes,
+    )
 
 
 def event() -> TraceEventV1:
@@ -305,7 +352,7 @@ async def test_trace_body_limit_counts_streamed_chunks_without_content_length(
             "type": "http",
             "method": "POST",
             "path": "/api/v1/traces/events",
-            "headers": [],
+            "headers": [(b"authorization", b"Bearer service")],
             "app": app,
         },
         receive,
@@ -315,6 +362,166 @@ async def test_trace_body_limit_counts_streamed_chunks_without_content_length(
     assert downstream_called is False
     assert sent[0]["status"] == 413
     assert app.state.trace_health["ingestion_body_rejections"] == 1
+
+
+async def test_trace_body_limit_aggregates_chunks_for_asgi_replay() -> None:
+    downstream_messages = []
+
+    async def downstream(_scope, receive, _send) -> None:
+        while True:
+            message = await receive()
+            downstream_messages.append(message)
+            if message["type"] == "http.disconnect":
+                return
+
+    middleware = traces_api.TraceIngestBodyLimitMiddleware(downstream)
+    messages = [
+        {"type": "http.request", "body": b"", "more_body": True},
+        {"type": "http.request", "body": b"1", "more_body": True},
+        {"type": "http.request", "body": b"", "more_body": True},
+        {"type": "http.request", "body": b"2", "more_body": False},
+    ]
+
+    async def receive():
+        return messages.pop(0)
+
+    async def send(_message) -> None:
+        raise AssertionError("valid request should reach downstream")
+
+    await middleware(
+        middleware_scope(),
+        receive,
+        send,
+    )
+
+    assert downstream_messages == [
+        {"type": "http.request", "body": b"12", "more_body": False},
+        {"type": "http.disconnect"},
+    ]
+
+
+async def test_unauthenticated_maximum_trace_body_is_never_buffered() -> None:
+    scope = middleware_scope()
+    scope["headers"] = [(b"authorization", b"Bearer invalid")]
+    receive_calls = 0
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        raise AssertionError("authentication must reject before reading the body")
+
+    async def downstream(_scope, _receive, _send) -> None:
+        raise AssertionError("unauthenticated requests must not reach downstream")
+
+    responses = []
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            responses.append(message["status"])
+
+    middleware = traces_api.TraceIngestBodyLimitMiddleware(downstream)
+    await asyncio.gather(*(middleware(scope, receive, send) for _ in range(16)))
+
+    assert receive_calls == 0
+    assert responses == [401] * 16
+
+
+async def test_trace_body_buffers_are_bounded_under_concurrent_maximum_requests() -> (
+    None
+):
+    buffers_admitted = asyncio.Event()
+    release_buffers = asyncio.Event()
+    downstream_bodies = []
+
+    async def downstream(_scope, receive, _send) -> None:
+        message = await receive()
+        downstream_bodies.append(len(message["body"]))
+        await release_buffers.wait()
+
+    def make_receive():
+        first_message = True
+
+        async def receive():
+            nonlocal first_message
+            if first_message:
+                first_message = False
+                return {
+                    "type": "http.request",
+                    "body": b"x" * traces_api.MAX_TRACE_INGEST_BODY_BYTES,
+                    "more_body": True,
+                }
+            buffers_admitted.set()
+            await release_buffers.wait()
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        return receive
+
+    middleware = traces_api.TraceIngestBodyLimitMiddleware(
+        downstream, max_buffered_requests=2
+    )
+    sent_messages = []
+
+    async def send(message):
+        sent_messages.append(message)
+
+    requests = [
+        asyncio.create_task(middleware(middleware_scope(), make_receive(), send))
+        for _ in range(4)
+    ]
+
+    await asyncio.wait_for(buffers_admitted.wait(), 1)
+    await asyncio.sleep(0)
+    done, pending = await asyncio.wait(requests, timeout=0.1)
+    assert len(done) == 2
+    assert len(pending) == 2
+    assert [
+        message["status"]
+        for message in sent_messages
+        if message["type"] == "http.response.start"
+    ] == [503, 503]
+
+    release_buffers.set()
+    await asyncio.gather(*requests)
+    assert downstream_bodies == [
+        traces_api.MAX_TRACE_INGEST_BODY_BYTES,
+        traces_api.MAX_TRACE_INGEST_BODY_BYTES,
+    ]
+
+
+@pytest.mark.parametrize("chunk", [b"", b"1"])
+async def test_trace_body_limit_bounds_zero_or_one_byte_chunks(
+    monkeypatch, chunk
+) -> None:
+    monkeypatch.setattr(traces_api, "MAX_TRACE_INGEST_MESSAGES", 2)
+    downstream_called = False
+
+    async def downstream(_scope, _receive, _send) -> None:
+        nonlocal downstream_called
+        downstream_called = True
+
+    middleware = traces_api.TraceIngestBodyLimitMiddleware(downstream)
+    messages = [
+        {"type": "http.request", "body": chunk, "more_body": True},
+        {"type": "http.request", "body": chunk, "more_body": True},
+        {"type": "http.request", "body": chunk, "more_body": True},
+    ]
+
+    async def receive():
+        return messages.pop(0)
+
+    sent = []
+
+    async def send(message) -> None:
+        sent.append(message)
+
+    await middleware(
+        middleware_scope(),
+        receive,
+        send,
+    )
+
+    assert downstream_called is False
+    assert sent[0]["status"] == 413
 
 
 async def test_query_and_export_continuations_are_exposed(tmp_path) -> None:
@@ -349,6 +556,61 @@ async def test_query_and_export_continuations_are_exposed(tmp_path) -> None:
     manifest = exported.json()["manifest"]
     assert manifest["has_more"] and manifest["next_cursor"]
     await client.aclose()
+
+
+async def test_large_export_manifest_header_is_replaced_with_bounded_digest(
+    tmp_path, monkeypatch
+) -> None:
+    refs = [f"sha256:{index:064x}" for index in range(1600)]
+
+    monkeypatch.setattr(
+        traces_api,
+        "_verified_blob_refs",
+        lambda events, **_kwargs: set(refs),
+    )
+    app = make_app(tmp_path)
+    for index, ref in enumerate(refs):
+        app.state.trace_store.insert_event(
+            event().model_copy(
+                update={
+                    "action_id": f"{index + 1:016x}",
+                    "input": PayloadDescriptor(blob_ref=ref),
+                }
+            )
+        )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            "/api/v1/traces/export",
+            params={
+                "ticket_id": "PERF-1",
+                "limit": len(refs),
+                "format": "json",
+                "detailed": "true",
+                "include_payloads": "true",
+            },
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        await client.aclose()
+        app.state.trace_store.close()
+
+    assert response.status_code == 200
+    manifest = response.json()["manifest"]
+    assert manifest["blob_digests"] == refs
+    full_manifest = traces_api._json_dumps(manifest, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    assert len(full_manifest) > traces_api.MAX_TRACE_MANIFEST_HEADER_BYTES
+    header = response.headers["X-Trace-Manifest"]
+    assert len(header.encode("utf-8")) <= (traces_api.MAX_TRACE_MANIFEST_HEADER_BYTES)
+    header_manifest = json.loads(header)
+    assert (
+        header_manifest["full_manifest_digest"]
+        == hashlib.sha256(full_manifest).hexdigest()
+    )
 
 
 async def test_causal_query_continuation_advances_through_expanded_scope(
@@ -810,8 +1072,8 @@ async def test_trace_audit_response_records_once_after_delivery(
     audits: list[tuple] = []
     request = SimpleNamespace(
         app=SimpleNamespace(
-            state=SimpleNamespace(
-                audit_log=SimpleNamespace(log=lambda *args: audits.append(args))
+            state=trace_audit_state(
+                SimpleNamespace(log=lambda *args: audits.append(args))
             )
         )
     )
@@ -972,6 +1234,64 @@ async def test_pre_route_trace_validation_is_audited_for_alias_routes(
         ),
     ]
     assert all("trace-query-audit" in name for name in audit_threads)
+
+
+async def test_pre_route_denied_audit_preserves_actor_identity(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("state_store.main.TRACE_DB_PATH", tmp_path / "trace.db")
+    app = create_app(initialize_immediately=True)
+    actors: list[dict[str, str]] = []
+    original_audit_log = app.state.audit_log
+
+    def audit(*_args) -> None:
+        actors.append(get_actor())
+
+    app.state.audit_log = SimpleNamespace(log_required=audit)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            "/api/v1/traces/query",
+            params={"ticket_id": "PERF-1", "limit": 0},
+            headers={"Authorization": f"Bearer {app.state.api_token}"},
+        )
+    finally:
+        await client.aclose()
+        app.state.audit_log = original_audit_log
+        _close_runtime(app)
+
+    assert response.status_code == 422
+    assert actors == [{"kind": "service", "username": "deployment", "ip": "127.0.0.1"}]
+
+
+async def test_pre_route_denied_audit_failure_preserves_validation_response(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("state_store.main.TRACE_DB_PATH", tmp_path / "trace.db")
+    app = create_app(initialize_immediately=True)
+    original_audit_log = app.state.audit_log
+    app.state.audit_log = SimpleNamespace(
+        log_required=lambda *_args: (_ for _ in ()).throw(
+            TraceStoreWriteError("audit store unavailable")
+        )
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            "/api/v1/traces/query",
+            params={"ticket_id": "PERF-1", "limit": 0},
+            headers={"Authorization": f"Bearer {app.state.api_token}"},
+        )
+    finally:
+        await client.aclose()
+        app.state.audit_log = original_audit_log
+        _close_runtime(app)
+
+    assert response.status_code == 422
 
 
 async def test_memory_guard_returns_audited_503(tmp_path) -> None:
@@ -1235,6 +1555,64 @@ async def test_full_payload_queue_returns_audited_503(tmp_path, monkeypatch) -> 
     ]
 
 
+async def test_payload_audit_failure_preserves_404(tmp_path) -> None:
+    app = make_app(tmp_path)
+    digest = "a" * 64
+    app.state.audit_log = SimpleNamespace(
+        log_required=lambda *_args: (_ for _ in ()).throw(
+            TraceStoreWriteError("audit store unavailable")
+        )
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            f"/api/v1/traces/PERF-1/payloads/{digest}",
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        await client.aclose()
+        app.state.trace_store.close()
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "payload not found"
+
+
+async def test_payload_audit_failure_preserves_delivered_200(
+    tmp_path, monkeypatch
+) -> None:
+    app = make_app(tmp_path)
+    digest = "a" * 64
+    app.state.trace_store.payload_is_referenced = (
+        lambda _ticket_id, _blob_ref, *, cancelled: True
+    )
+    app.state.audit_log = SimpleNamespace(
+        log_required=lambda *_args: (_ for _ in ()).throw(
+            TraceStoreWriteError("audit store unavailable")
+        )
+    )
+    monkeypatch.setattr(
+        traces_api,
+        "PayloadBlobStore",
+        lambda **_kwargs: SimpleNamespace(get=lambda *_args, **_kwargs: b"payload"),
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            f"/api/v1/traces/PERF-1/payloads/{digest}",
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        await client.aclose()
+        app.state.trace_store.close()
+
+    assert response.status_code == 200
+    assert response.content == b"payload"
+
+
 async def test_payload_cancellation_records_audit(tmp_path) -> None:
     app = make_app(tmp_path)
     entered = threading.Event()
@@ -1286,7 +1664,7 @@ async def test_payload_cancellation_records_audit(tmp_path) -> None:
     ]
 
 
-async def test_full_audit_queue_drops_without_waiting_or_queueing(
+async def test_full_audit_queue_writes_strict_fallback_and_fails_closed(
     tmp_path, caplog
 ) -> None:
     class ObservedExecutor(ThreadPoolExecutor):
@@ -1304,36 +1682,209 @@ async def test_full_audit_queue_drops_without_waiting_or_queueing(
     assert slots.acquire(blocking=False)
     app.state.trace_query_audit_executor = audit_executor
     app.state.trace_query_audit_slots = slots
-    app.state.audit_log = SimpleNamespace(log=lambda *_args: None)
+    audits: list[tuple] = []
+    audit_threads: list[str] = []
+    app.state.audit_log = SimpleNamespace(
+        log_required=lambda *args: (
+            audits.append(args),
+            audit_threads.append(threading.current_thread().name),
+        )
+    )
     request = SimpleNamespace(app=SimpleNamespace(state=app.state))
     try:
-        await asyncio.wait_for(
-            _record_query_audit(request, "trace_query", "PERF-1", "failed"),
-            timeout=0.5,
-        )
+        with pytest.raises(HTTPException) as exc_info:
+            await asyncio.wait_for(
+                _record_query_audit(request, "trace_query", "PERF-1", "failed"),
+                timeout=0.5,
+            )
     finally:
         slots.release()
         audit_executor.shutdown(wait=True)
         app.state.trace_store.close()
 
     assert audit_executor.submissions == 0
-    assert app.state.trace_health["audit_queue_rejections"] == 1
-    assert "Trace audit queue is full" in caplog.text
+    assert audit_threads[0].startswith("test-trace-audit-fallback")
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "trace audit capacity is full"
+    assert audits == [
+        (
+            "trace_query",
+            "PERF-1",
+            {"outcome": "failed", "error": None, "ticket_scoped": True},
+        )
+    ]
+    assert app.state.trace_health["audit_queue_fallbacks"] == 1
+    assert "using dedicated strict fallback" in caplog.text
 
 
-async def test_audit_fallback_writes_exactly_once_without_dedicated_executor() -> None:
+async def test_full_audit_queue_strict_fallback_failure_is_not_swallowed(
+    tmp_path,
+) -> None:
+    app = make_app(tmp_path)
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    app.state.trace_query_audit_executor = ThreadPoolExecutor(max_workers=1)
+    app.state.trace_query_audit_slots = slots
+
+    def fail_required(*_args) -> None:
+        raise TraceStoreWriteError("audit store unavailable")
+
+    app.state.audit_log = SimpleNamespace(log_required=fail_required)
+    request = SimpleNamespace(app=SimpleNamespace(state=app.state))
+    try:
+        with pytest.raises(TraceStoreWriteError, match="audit store unavailable"):
+            await _record_query_audit(request, "trace_query", "PERF-1", "failed")
+    finally:
+        slots.release()
+        app.state.trace_query_audit_executor.shutdown(wait=True)
+        app.state.trace_store.close()
+
+
+async def test_saturated_strict_fallback_fails_closed(tmp_path) -> None:
+    app = make_app(tmp_path)
+    primary_slots = threading.BoundedSemaphore(1)
+    fallback_slots = threading.BoundedSemaphore(1)
+    assert primary_slots.acquire(blocking=False)
+    assert fallback_slots.acquire(blocking=False)
+    app.state.trace_query_audit_slots = primary_slots
+    app.state.trace_query_audit_fallback_slots = fallback_slots
+    audits: list[tuple] = []
+    app.state.audit_log = SimpleNamespace(
+        log_required=lambda *args: audits.append(args)
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=app.state))
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await _record_query_audit(
+                request, "trace_query", "PERF-1", "failed", "query failed"
+            )
+    finally:
+        primary_slots.release()
+        fallback_slots.release()
+        app.state.trace_store.close()
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "trace audit capacity is full"
+    assert audits == []
+    assert app.state.trace_health["audit_queue_fallbacks"] == 1
+
+
+@pytest.mark.parametrize(
+    ("path", "operation"),
+    [
+        ("/api/v1/traces/query", "trace_query"),
+        ("/api/v1/traces/export", "trace_export"),
+    ],
+)
+async def test_trace_response_reserves_audit_slot_before_delivery(
+    path, operation, tmp_path
+) -> None:
+    app = make_app(tmp_path)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="audit")
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    app.state.trace_query_audit_executor = executor
+    app.state.trace_query_audit_slots = slots
+    audits: list[tuple] = []
+    app.state.audit_log = SimpleNamespace(
+        log_required=lambda *args: audits.append(args)
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            path,
+            params={"ticket_id": "PERF-1"},
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        await client.aclose()
+        executor.shutdown(wait=True)
+        app.state.trace_store.close()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "trace audit capacity is full"
+    assert audits == [
+        (
+            operation,
+            "PERF-1",
+            {
+                "outcome": "failed",
+                "error": "trace audit capacity is full",
+                "ticket_scoped": True,
+            },
+        )
+    ]
+
+
+async def test_trace_response_capacity_unavailable_fails_closed_without_delivery(
+    tmp_path, monkeypatch
+) -> None:
+    app = make_app(tmp_path)
+    audits: list[tuple] = []
+    app.state.audit_log = SimpleNamespace(
+        log_required=lambda *args: audits.append(args)
+    )
+    original_reserve = traces_api._reserve_trace_audit
+    reserve_calls = 0
+
+    def reserve_once_then_succeed(request):
+        nonlocal reserve_calls
+        reserve_calls += 1
+        if reserve_calls == 1:
+            return None
+        return original_reserve(request)
+
+    monkeypatch.setattr(traces_api, "_reserve_trace_audit", reserve_once_then_succeed)
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.get(
+            "/api/v1/traces/query",
+            params={"ticket_id": "PERF-1"},
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        await client.aclose()
+        app.state.trace_store.close()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "trace audit capacity is full"
+    assert reserve_calls == 1
+    assert audits == [
+        (
+            "trace_query",
+            "PERF-1",
+            {
+                "outcome": "failed",
+                "error": "trace audit capacity is full",
+                "ticket_scoped": True,
+            },
+        )
+    ]
+
+
+async def test_absent_primary_audit_executor_falls_back_and_fails_closed() -> None:
     audits: list[tuple] = []
     request = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
-                audit_log=SimpleNamespace(log=lambda *args: audits.append(args))
+                audit_log=SimpleNamespace(log=lambda *args: audits.append(args)),
+                trace_query_audit_fallback_executor=_TEST_AUDIT_FALLBACK_EXECUTOR,
+                trace_query_audit_fallback_slots=(_TEST_AUDIT_FALLBACK_EXECUTOR.slots),
             )
         )
     )
 
-    await _record_query_audit(
-        request, "trace_query", "PERF-1", "failed", "store failure"
-    )
+    with pytest.raises(HTTPException) as exc_info:
+        await _record_query_audit(
+            request, "trace_query", "PERF-1", "failed", "store failure"
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "trace audit capacity is full"
 
     assert audits == [
         (
@@ -1346,6 +1897,364 @@ async def test_audit_fallback_writes_exactly_once_without_dedicated_executor() -
             },
         )
     ]
+
+
+async def test_trace_response_without_audit_log_delivers_without_reservation() -> None:
+    sent: list[str] = []
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    response = _TraceAuditResponse(
+        Response(b"ok"),
+        request=request,
+        operation="trace_query",
+        ticket_id="PERF-1",
+    )
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message["type"])
+
+    await response({"type": "http"}, receive, send)
+
+    assert sent == ["http.response.start", "http.response.body"]
+
+
+async def test_trace_response_send_timeout_after_start_records_indeterminate_audit(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(traces_api, "TRACE_AUDIT_RESPONSE_SEND_TIMEOUT_SECONDS", 1.0)
+    audits: list[tuple] = []
+    sent: list[str] = []
+    body_started = asyncio.Event()
+
+    def log_audit(*args) -> None:
+        audits.append(args)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=trace_audit_state(SimpleNamespace(log=log_audit)))
+    )
+
+    response = _TraceAuditResponse(
+        Response(b"ok"),
+        request=request,
+        operation="trace_query",
+        ticket_id="PERF-1",
+    )
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message["type"])
+        if message["type"] == "http.response.body":
+            body_started.set()
+            await asyncio.sleep(3600)
+
+    task = asyncio.create_task(response({"type": "http"}, receive, send))
+    await asyncio.wait_for(body_started.wait(), timeout=1)
+    await asyncio.wait_for(task, timeout=2)
+
+    assert sent == ["http.response.start", "http.response.body"]
+    assert audits == [
+        (
+            "trace_query",
+            "PERF-1",
+            {
+                "outcome": "indeterminate",
+                "error": "trace audit response send timed out",
+                "ticket_scoped": True,
+            },
+        )
+    ]
+
+
+async def test_trace_response_send_timeout_survives_fastapi_middleware(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(traces_api, "TRACE_AUDIT_RESPONSE_SEND_TIMEOUT_SECONDS", 1.0)
+    audits: list[tuple] = []
+    sent: list[str] = []
+    body_started = asyncio.Event()
+    app = FastAPI()
+
+    class BlockingSendMiddleware:
+        def __init__(self, downstream_app: object) -> None:
+            self.app = downstream_app
+
+        async def __call__(self, scope, receive, send) -> None:
+            async def delayed_body_send(message: dict) -> None:
+                await send(message)
+                sent.append(message["type"])
+                if message["type"] == "http.response.body" and message.get("body"):
+                    body_started.set()
+                    await asyncio.sleep(1.0)
+
+            await self.app(scope, receive, delayed_body_send)
+
+    app.add_middleware(BlockingSendMiddleware)
+
+    @app.get("/")
+    async def trace_query() -> Response:
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=trace_audit_state(SimpleNamespace(log=audit)))
+        )
+        return _TraceAuditResponse(
+            Response(b"ok"),
+            request=request,
+            operation="trace_query",
+            ticket_id="PERF-1",
+        )
+
+    def audit(*args) -> None:
+        audits.append(args)
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(_message: dict) -> None:
+        pass
+
+    task = asyncio.create_task(
+        app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "path": "/",
+                "raw_path": b"/",
+                "root_path": "",
+                "scheme": "http",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 12345),
+                "server": ("test", 80),
+            },
+            receive,
+            send,
+        )
+    )
+    await asyncio.wait_for(body_started.wait(), timeout=1)
+    await asyncio.wait_for(task, timeout=2)
+
+    assert sent == ["http.response.start", "http.response.body"]
+    assert audits == [
+        (
+            "trace_query",
+            "PERF-1",
+            {
+                "outcome": "indeterminate",
+                "error": "trace audit response send timed out",
+                "ticket_scoped": True,
+            },
+        )
+    ]
+
+
+async def test_cancellation_during_send_timeout_audit_preserves_failed_outcome(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(traces_api, "TRACE_AUDIT_RESPONSE_SEND_TIMEOUT_SECONDS", 0.1)
+    audit_started = threading.Event()
+    release = threading.Event()
+    audit_done = threading.Event()
+    audits: list[tuple] = []
+
+    def log_audit(*args) -> None:
+        audit_started.set()
+        if not release.wait(1):
+            raise RuntimeError("timeout audit was not released")
+        audits.append(args)
+        audit_done.set()
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=trace_audit_state(SimpleNamespace(log=log_audit)))
+    )
+    response = _TraceAuditResponse(
+        Response(b"ok"),
+        request=request,
+        operation="trace_query",
+        ticket_id="PERF-1",
+    )
+
+    async def receive() -> dict:
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict) -> None:
+        if message["type"] == "http.response.start":
+            await asyncio.sleep(3600)
+
+    task = asyncio.create_task(response({"type": "http"}, receive, send))
+    try:
+        await asyncio.wait_for(asyncio.to_thread(audit_started.wait, 1), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+        await asyncio.to_thread(audit_done.wait, 1)
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert [audit[2]["outcome"] for audit in audits] == ["failed"]
+
+
+async def test_success_audit_failure_preserves_delivered_response() -> None:
+    sent: list[dict] = []
+
+    def log_audit(*_args) -> None:
+        raise RuntimeError("success audit failed")
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=trace_audit_state(SimpleNamespace(log=log_audit)))
+    )
+    response = _TraceAuditResponse(
+        Response(b"ok", status_code=200),
+        request=request,
+        operation="trace_query",
+        ticket_id="PERF-1",
+    )
+
+    async def receive() -> dict:
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await response({"type": "http"}, receive, send)
+
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 200
+    assert sent[1] == {
+        "type": "http.response.body",
+        "body": b"ok",
+    }
+
+
+async def test_trace_response_send_timeout_before_start_records_failed_audit(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(traces_api, "TRACE_AUDIT_RESPONSE_SEND_TIMEOUT_SECONDS", 0.1)
+    audits: list[tuple] = []
+    sent: list[dict] = []
+
+    def log_audit(*args) -> None:
+        audits.append(args)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=trace_audit_state(SimpleNamespace(log=log_audit)))
+    )
+    response = _TraceAuditResponse(
+        Response(b"ok"),
+        request=request,
+        operation="trace_query",
+        ticket_id="PERF-1",
+    )
+
+    async def receive() -> dict:
+        return {"type": "http.disconnect"}
+
+    send_attempts = 0
+
+    async def send(message: dict) -> None:
+        nonlocal send_attempts
+        send_attempts += 1
+        if send_attempts == 1:
+            await asyncio.sleep(3600)
+        sent.append(message)
+
+    await response({"type": "http"}, receive, send)
+
+    assert sent[0]["status"] == 503
+    assert sent[0]["type"] == "http.response.start"
+    assert len(sent) == 2
+    assert sent[1]["type"] == "http.response.body"
+    assert audits[0][2]["outcome"] == "failed"
+
+
+async def test_legacy_timestamp_cursor_continues_without_global_sequence() -> None:
+    first = event().model_copy(
+        update={
+            "global_seq": None,
+            "occurred_at": datetime(2024, 1, 1, tzinfo=timezone.utc),
+        }
+    )
+    second = event().model_copy(
+        update={
+            "global_seq": None,
+            "occurred_at": datetime(2024, 1, 2, tzinfo=timezone.utc),
+        }
+    )
+    selected, has_more, cursor = traces_api.page_events(
+        [first, second], cursor=None, limit=1
+    )
+    continuation, continuation_has_more, next_cursor = traces_api.page_events(
+        [first, second], cursor=cursor, limit=1
+    )
+
+    assert selected == [first]
+    assert has_more
+    assert traces_api._cursor_sequence(cursor) == 0
+    assert continuation == [second]
+    assert not continuation_has_more
+    assert next_cursor is None
+
+
+async def test_cancelled_query_audit_failure_preserves_cancellation() -> None:
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=trace_audit_state(
+                SimpleNamespace(
+                    log_required=lambda *_args: (_ for _ in ()).throw(
+                        TraceStoreWriteError("audit store unavailable")
+                    )
+                )
+            )
+        )
+    )
+
+    await _record_cancelled_query(request, "trace_query", "PERF-1")
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "operation"),
+    [(query_trace, "trace_query"), (export_trace, "trace_export")],
+)
+async def test_handler_denied_audit_failure_preserves_403(endpoint, operation) -> None:
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            principal=Principal(kind="user", username="other", is_admin=False)
+        ),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                multi_user=True,
+                store=SimpleNamespace(
+                    get_ticket=lambda _ticket_id: SimpleNamespace(owners=["owner"])
+                ),
+                **{
+                    "audit_log": SimpleNamespace(
+                        log_required=lambda *_args: (_ for _ in ()).throw(
+                            TraceStoreWriteError("audit store unavailable")
+                        )
+                    ),
+                    "trace_query_audit_executor": _TEST_AUDIT_EXECUTOR,
+                    "trace_query_audit_slots": _TEST_AUDIT_EXECUTOR.slots,
+                    "trace_query_audit_fallback_executor": (
+                        _TEST_AUDIT_FALLBACK_EXECUTOR
+                    ),
+                    "trace_query_audit_fallback_slots": (
+                        _TEST_AUDIT_FALLBACK_EXECUTOR.slots
+                    ),
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await endpoint(request, ticket_id="PERF-1", limit=1)
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "trace access requires ticket ownership"
 
 
 @pytest.mark.parametrize(
@@ -1395,6 +2304,10 @@ async def test_unexpected_trace_failures_audit_once(
                 trace_query_max_rss_bytes=0,
                 trace_query_shutdown=threading.Event(),
                 audit_log=SimpleNamespace(log=lambda *args: audits.append(args)),
+                trace_query_audit_executor=_TEST_AUDIT_EXECUTOR,
+                trace_query_audit_slots=_TEST_AUDIT_EXECUTOR.slots,
+                trace_query_audit_fallback_executor=_TEST_AUDIT_FALLBACK_EXECUTOR,
+                trace_query_audit_fallback_slots=(_TEST_AUDIT_FALLBACK_EXECUTOR.slots),
             )
         ),
         is_disconnected=is_disconnected,
@@ -1441,6 +2354,10 @@ async def test_trace_task_cancellation_records_audit(endpoint, operation) -> Non
             state=SimpleNamespace(
                 trace_store=SimpleNamespace(query_events=query_events),
                 audit_log=SimpleNamespace(log=log),
+                trace_query_audit_executor=_TEST_AUDIT_EXECUTOR,
+                trace_query_audit_slots=_TEST_AUDIT_EXECUTOR.slots,
+                trace_query_audit_fallback_executor=_TEST_AUDIT_FALLBACK_EXECUTOR,
+                trace_query_audit_fallback_slots=(_TEST_AUDIT_FALLBACK_EXECUTOR.slots),
             )
         ),
         is_disconnected=is_disconnected,
@@ -1523,6 +2440,10 @@ async def test_trace_cancellation_outside_store_records_audit(
                 store=SimpleNamespace(get_ticket=get_ticket),
                 trace_store=SimpleNamespace(query_events=lambda *_args, **_kwargs: []),
                 audit_log=SimpleNamespace(log=log),
+                trace_query_audit_executor=_TEST_AUDIT_EXECUTOR,
+                trace_query_audit_slots=_TEST_AUDIT_EXECUTOR.slots,
+                trace_query_audit_fallback_executor=_TEST_AUDIT_FALLBACK_EXECUTOR,
+                trace_query_audit_fallback_slots=(_TEST_AUDIT_FALLBACK_EXECUTOR.slots),
             )
         ),
         is_disconnected=is_disconnected,
@@ -1580,7 +2501,7 @@ async def test_trace_cancellation_during_terminal_audit_is_recorded_once(
         state=SimpleNamespace(
             principal=Principal(kind="service", username="service", is_admin=False)
         ),
-        app=SimpleNamespace(state=SimpleNamespace(audit_log=SimpleNamespace(log=log))),
+        app=SimpleNamespace(state=trace_audit_state(SimpleNamespace(log=log))),
         is_disconnected=is_disconnected,
     )
     task = asyncio.create_task(
@@ -1621,7 +2542,7 @@ async def test_cancellation_during_response_success_audit_is_recorded_once(
         audit_done.set()
 
     request = SimpleNamespace(
-        app=SimpleNamespace(state=SimpleNamespace(audit_log=SimpleNamespace(log=log)))
+        app=SimpleNamespace(state=trace_audit_state(SimpleNamespace(log=log)))
     )
     response = _TraceAuditResponse(
         Response(content=b"ok"),
@@ -1669,23 +2590,14 @@ async def test_cancellation_during_response_success_audit_is_recorded_once(
 @pytest.mark.parametrize("operation", ["trace_query", "trace_export"])
 async def test_queued_audit_survives_request_cancellation(operation) -> None:
     audit_started = threading.Event()
-    release_worker = threading.Event()
+    release = threading.Event()
     audit_done = threading.Event()
     audits: list[tuple] = []
 
-    class ObservedExecutor(ThreadPoolExecutor):
-        def __init__(self):
-            super().__init__(max_workers=1)
-            self.submissions = 0
-
-        def submit(self, *args, **kwargs):
-            future = super().submit(*args, **kwargs)
-            self.submissions += 1
-            if self.submissions > 1:
-                audit_started.set()
-            return future
-
     def log(*args) -> None:
+        audit_started.set()
+        if not release.wait(1):
+            raise RuntimeError("audit worker was not released")
         audits.append(args)
         audit_done.set()
 
@@ -1694,28 +2606,28 @@ async def test_queued_audit_survives_request_cancellation(operation) -> None:
 
     request = SimpleNamespace(
         state=SimpleNamespace(),
-        app=SimpleNamespace(state=SimpleNamespace(audit_log=SimpleNamespace(log=log))),
+        app=SimpleNamespace(state=trace_audit_state(SimpleNamespace(log=log))),
         is_disconnected=is_disconnected,
     )
-    loop = asyncio.get_running_loop()
-    executor = ObservedExecutor()
-    loop.set_default_executor(executor)
-    blocker = executor.submit(release_worker.wait, 1)
+    executor = BoundedThreadPoolExecutor(
+        max_workers=1,
+        queue_size=1,
+        thread_name_prefix="test-trace-audit",
+    )
+    request.app.state.trace_query_audit_executor = executor
+    request.app.state.trace_query_audit_slots = executor.slots
     task = asyncio.create_task(
         _record_query_audit(request, operation, "PERF-1", "success")
     )
     try:
-        deadline = loop.time() + 1
-        while not audit_started.is_set() and loop.time() < deadline:
-            await asyncio.sleep(0.001)
+        await asyncio.wait_for(asyncio.to_thread(audit_started.wait, 1), timeout=1)
         assert audit_started.is_set()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
     finally:
-        release_worker.set()
+        release.set()
         await asyncio.to_thread(audit_done.wait, 1)
-        await asyncio.to_thread(blocker.result, 1)
         executor.shutdown(wait=True)
 
     assert len(audits) == 1
@@ -1744,7 +2656,11 @@ async def test_trace_cursor_outside_sqlite_integer_is_rejected(
         ),
         app=SimpleNamespace(
             state=SimpleNamespace(
-                audit_log=SimpleNamespace(log=lambda *args: audits.append(args))
+                audit_log=SimpleNamespace(log=lambda *args: audits.append(args)),
+                trace_query_audit_executor=_TEST_AUDIT_EXECUTOR,
+                trace_query_audit_slots=_TEST_AUDIT_EXECUTOR.slots,
+                trace_query_audit_fallback_executor=_TEST_AUDIT_FALLBACK_EXECUTOR,
+                trace_query_audit_fallback_slots=(_TEST_AUDIT_FALLBACK_EXECUTOR.slots),
             )
         ),
         is_disconnected=is_disconnected,
@@ -1986,6 +2902,38 @@ async def test_ingest_queue_saturation_returns_audited_503(tmp_path) -> None:
             },
         )
     ]
+
+
+async def test_ingest_saturation_audit_failure_preserves_503(tmp_path) -> None:
+    app = make_app(tmp_path)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ingestion")
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    app.state.trace_ingestion_executor = executor
+    app.state.trace_ingestion_slots = slots
+    app.state.audit_log = SimpleNamespace(
+        log_required=lambda *_args: (_ for _ in ()).throw(
+            TraceStoreWriteError("audit store unavailable")
+        )
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+    try:
+        response = await client.post(
+            "/api/v1/traces/events",
+            json=payload(event()),
+            headers={"Authorization": "Bearer service"},
+        )
+    finally:
+        slots.release()
+        await client.aclose()
+        executor.shutdown(wait=True)
+        app.state.trace_store.close()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "trace ingestion queue is full"
+    assert app.state.trace_health["ingestion_queue_rejections"] == 1
 
 
 async def test_batch_ingest_saturation_preserves_per_event_acknowledgements(

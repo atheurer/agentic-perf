@@ -56,7 +56,7 @@ from .ratelimit import (
     make_rate_limit_dependency,
 )
 from .store import TicketStore
-from .trace_store import TraceStore
+from .trace_store import TraceStore, TraceStoreWriteError
 
 __all__ = ["MAX_EXECUTOR_QUEUE_SIZE", "MAX_EXECUTOR_WORKERS"]
 
@@ -173,6 +173,14 @@ def _initialize_runtime(app: FastAPI, port: int, cfg: dict) -> None:
         thread_name_prefix="trace-query-audit",
     )
     app.state.trace_query_audit_slots = app.state.trace_query_audit_executor.slots
+    app.state.trace_query_audit_fallback_executor = BoundedThreadPoolExecutor(
+        max_workers=1,
+        queue_size=0,
+        thread_name_prefix="trace-query-audit-fallback",
+    )
+    app.state.trace_query_audit_fallback_slots = (
+        app.state.trace_query_audit_fallback_executor.slots
+    )
     app.state.control_executor = BoundedThreadPoolExecutor(
         max_workers=executor_settings["control_workers"],
         queue_size=0,
@@ -191,7 +199,7 @@ def _initialize_runtime(app: FastAPI, port: int, cfg: dict) -> None:
         "ingestion_failures": 0,
         "schema_rejections": 0,
         "quarantined_frames": 0,
-        "audit_queue_rejections": 0,
+        "audit_queue_fallbacks": 0,
         "ingestion_queue_rejections": 0,
         "ingestion_body_rejections": 0,
     }
@@ -469,6 +477,7 @@ def _close_runtime(app: FastAPI) -> None:
         "control_executor",
         "lease_executor",
         "trace_query_audit_executor",
+        "trace_query_audit_fallback_executor",
     ):
         executor = getattr(app.state, name, None)
         if executor is not None:
@@ -593,15 +602,29 @@ def create_app(*, initialize_immediately: bool = False) -> FastAPI:
                     422: "request validation rejected",
                     429: "rate limit rejected",
                 }[response.status_code]
-                from .api.traces import _run_trace_audit_worker
-
-                await _run_trace_audit_worker(
-                    request,
-                    audit_log.log,
-                    operation,
-                    _trace_read_ticket_id(request) or "*",
-                    {"outcome": "denied", "error": error},
+                from .api.traces import (
+                    TraceAuditFallbackUnavailable,
+                    _audit_write,
+                    _run_trace_audit_worker,
                 )
+
+                # Route dependencies run in a task context that does not flow
+                # back into BaseHTTPMiddleware. Restore the principal here so
+                # the audit worker inherits the authenticated identity.
+                await _set_audit_actor(request)
+                try:
+                    await _run_trace_audit_worker(
+                        request,
+                        _audit_write(audit_log),
+                        operation,
+                        _trace_read_ticket_id(request) or "*",
+                        {"outcome": "denied", "error": error},
+                    )
+                except (TraceAuditFallbackUnavailable, TraceStoreWriteError):
+                    logger.exception(
+                        "Failed to audit denied trace request for %s",
+                        request.url.path,
+                    )
         return response
 
     @app.exception_handler(RequestValidationError)

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import providers.execution.filesystem as audited_filesystem
 from providers.redaction import Redactor
 from providers.tracing import PayloadBlobStore, PayloadBuilder, PayloadStorageError
 from providers.tracing.fingerprints import load_audit_key
@@ -152,6 +153,24 @@ def test_blob_get_rejects_oversized_file_before_reading(tmp_path, monkeypatch) -
 
     with pytest.raises(PayloadStorageError, match="exceeds byte limit"):
         store.get(ref, max_bytes=64)
+
+
+def test_blob_get_does_not_create_filesystem_audit_events(
+    tmp_path, monkeypatch
+) -> None:
+    store = PayloadBlobStore(tmp_path / "blobs", ticket_id="PERF-1")
+    ref = store.put(b"safe")
+
+    def unexpected_emitter():
+        raise AssertionError("payload read created a filesystem audit event")
+
+    monkeypatch.setattr(
+        audited_filesystem,
+        "durable_filesystem_emitter",
+        unexpected_emitter,
+    )
+
+    assert store.get(ref, max_bytes=128) == b"safe"
 
 
 def test_concurrent_first_key_creation_returns_one_stable_key(tmp_path) -> None:

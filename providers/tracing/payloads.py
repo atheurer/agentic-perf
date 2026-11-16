@@ -138,7 +138,6 @@ class PayloadBlobStore:
             raise PayloadStorageError("payload byte limit must be non-negative")
         target = self.directory / ref.removeprefix("sha256:")
         fd: int | None = None
-        filesystem = None
         try:
             if target.parent != self.directory:
                 raise PayloadStorageError("unsafe payload reference")
@@ -147,29 +146,7 @@ class PayloadBlobStore:
                 raise PayloadStorageError(
                     "payload exceeds policy or has unsafe permissions"
                 )
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            if self._ticket_id is None:
-                from providers.execution import AuditedFilesystem
-
-                filesystem = AuditedFilesystem.system(self.directory)
-            else:
-                from providers.execution import (
-                    AuditedFilesystem,
-                    RootedPath,
-                    durable_filesystem_emitter,
-                )
-
-                filesystem = AuditedFilesystem(
-                    RootedPath(
-                        self.directory,
-                        "artifact",
-                        logical_prefix="trace-payloads",
-                    ),
-                    ticket_id=self._ticket_id,
-                    emit=durable_filesystem_emitter(),
-                    critical=True,
-                )
-            fd = filesystem.open_descriptor(target.name, flags)
+            fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
             target_stat = os.fstat(fd)
             if not stat.S_ISREG(target_stat.st_mode) or target_stat.st_mode & 0o077:
                 raise PayloadStorageError(
@@ -196,8 +173,6 @@ class PayloadBlobStore:
             raise PayloadStorageError("could not read payload") from exc
         finally:
             if fd is not None:
-                if filesystem is not None:
-                    filesystem.forget_descriptor(fd)
                 os.close(fd)
 
     def _fsync_directory(self) -> None:

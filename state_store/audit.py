@@ -71,23 +71,31 @@ class AuditLog:
         ticket_id: str,
         data: dict[str, Any],
     ) -> None:
+        try:
+            self.log_required(mutation, ticket_id, data)
+        except TraceStoreWriteError:
+            logger.exception(
+                "Failed to write audit entry for %s on %s",
+                mutation,
+                ticket_id,
+            )
+
+    def log_required(
+        self,
+        mutation: str,
+        ticket_id: str,
+        data: dict[str, Any],
+    ) -> None:
         with self._lock:
             if self._redactor:
                 data = self._redactor.redact(ticket_id, data)
             if self._process_identity:
                 data = {**data, "state_store": self._process_identity}
-            try:
-                with self._trace_lock:
-                    stored = self._trace_store.insert_event(
-                        audit_to_trace(ticket_id, mutation, get_actor(), data)
-                    )
-                self._seq = max(self._seq, stored.global_seq or 0)
-            except TraceStoreWriteError:
-                logger.exception(
-                    "Failed to write audit entry for %s on %s",
-                    mutation,
-                    ticket_id,
+            with self._trace_lock:
+                stored = self._trace_store.insert_event(
+                    audit_to_trace(ticket_id, mutation, get_actor(), data)
                 )
+            self._seq = max(self._seq, stored.global_seq or 0)
 
     def read(
         self,

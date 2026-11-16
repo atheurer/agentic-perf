@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -44,8 +46,12 @@ MAX_TRACE_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_TRACE_BATCH_ACK_BYTES = 512 * 1024
 MAX_EXPORT_VERIFICATION_BYTES = 8 * 1024 * 1024
 MAX_VERIFIED_PAYLOAD_BYTES = 1024 * 1024
+MAX_TRACE_MANIFEST_HEADER_BYTES = 64 * 1024
+MAX_TRACE_INGEST_MESSAGES = 1024
+TRACE_AUDIT_RESPONSE_SEND_TIMEOUT_SECONDS = 5.0
 TRACE_INGEST_PATHS = frozenset({"/api/v1/traces/events", "/api/v1/traces/events/batch"})
 logger = logging.getLogger(__name__)
+MAX_TRACE_INGEST_BODY_BUFFERS = 8
 
 
 class TraceBatch(BaseModel):
@@ -55,8 +61,16 @@ class TraceBatch(BaseModel):
 class TraceIngestBodyLimitMiddleware:
     """Reject oversized trace ingestion bodies before FastAPI parses them."""
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_buffered_requests: int = MAX_TRACE_INGEST_BODY_BUFFERS,
+    ) -> None:
         self.app = app
+        if max_buffered_requests < 1:
+            raise ValueError("max_buffered_requests must be positive")
+        self._buffer_slots = threading.BoundedSemaphore(max_buffered_requests)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if (
@@ -80,51 +94,129 @@ class TraceIngestBodyLimitMiddleware:
                 return
             break
 
-        messages: list[Message] = []
+        auth = self._auth_dependency(scope)
+        if auth is None:
+            await self._send_error(
+                scope,
+                send,
+                status_code=503,
+                detail="trace ingestion authentication is unavailable",
+            )
+            return
+        try:
+            await auth(Request(scope, receive))
+        except HTTPException as exc:
+            await self._send_error(
+                scope,
+                send,
+                status_code=exc.status_code,
+                detail=str(exc.detail),
+                headers=exc.headers,
+            )
+            return
+
+        if not self._buffer_slots.acquire(blocking=False):
+            await self._reject(
+                scope,
+                send,
+                status_code=503,
+                detail="trace ingestion body buffer capacity is full",
+            )
+            return
+
+        body = bytearray()
+        message_count = 0
         total = 0
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                return
-            if message["type"] != "http.request":
-                continue
-            total += len(message.get("body", b""))
-            if total > limit:
-                await self._reject(scope, send)
-                return
-            messages.append(message)
-            if not message.get("more_body", False):
-                break
+        try:
+            while True:
+                message = await receive()
+                message_count += 1
+                if message["type"] == "http.disconnect":
+                    return
+                if message_count > MAX_TRACE_INGEST_MESSAGES:
+                    await self._reject(scope, send)
+                    return
+                if message["type"] != "http.request":
+                    continue
+                chunk = message.get("body", b"")
+                total += len(chunk)
+                if total > limit:
+                    await self._reject(scope, send)
+                    return
+                body.extend(chunk)
+                if not message.get("more_body", False):
+                    break
 
-        index = 0
+            replayed = False
 
-        async def replay() -> Message:
-            nonlocal index
-            if index < len(messages):
-                message = messages[index]
-                index += 1
-                return message
-            return {"type": "http.disconnect"}
+            async def replay() -> Message:
+                nonlocal replayed
+                if not replayed:
+                    replayed = True
+                    return {
+                        "type": "http.request",
+                        "body": bytes(body),
+                        "more_body": False,
+                    }
+                return {"type": "http.disconnect"}
 
-        await self.app(scope, replay, send)
+            await self.app(scope, replay, send)
+        finally:
+            self._buffer_slots.release()
 
-    async def _reject(self, scope: Scope, send: Send) -> None:
+    @staticmethod
+    def _auth_dependency(scope: Scope):
+        app = scope.get("app")
+        return getattr(getattr(app, "state", None), "auth_dependency", None)
+
+    async def _reject(
+        self,
+        scope: Scope,
+        send: Send,
+        *,
+        status_code: int = 413,
+        detail: str = "trace ingestion request body is too large",
+        headers: dict[str, str] | None = None,
+    ) -> None:
         app = scope.get("app")
         _bump_trace_health_state(
             getattr(app, "state", None), "ingestion_body_rejections"
         )
-        body = b'{"detail":"trace ingestion request body is too large"}'
+        await self._send_error(
+            scope, send, status_code=status_code, detail=detail, headers=headers
+        )
+
+    async def _send_error(
+        self,
+        scope: Scope,
+        send: Send,
+        *,
+        status_code: int,
+        detail: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        body = json.dumps({"detail": detail}, separators=(",", ":")).encode()
+        response_headers = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ]
+        if headers:
+            response_headers.extend(
+                (name.lower().encode("latin-1"), value.encode("latin-1"))
+                for name, value in headers.items()
+            )
         await send(
             {
                 "type": "http.response.start",
-                "status": 413,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode("ascii")),
-                ],
+                "status": status_code,
+                "headers": response_headers,
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+
+class TraceAuditFallbackUnavailable(RuntimeError):
+    """The dedicated strict-audit fallback has no admission slot."""
 
 
 def _authorize_query(request: Request, ticket_id: str | None) -> bool:
@@ -280,8 +372,16 @@ def _query_from_params(
 
 
 def _cursor_sequence(cursor: str | None) -> int:
+    """Return the SQLite sequence filter for a page cursor.
+
+    Legacy events without a global sequence use timestamp cursors. They sort
+    after sequenced events and are filtered again by ``page_events``, so the
+    SQL prefilter can safely start at zero for those cursors.
+    """
     marker = decode_cursor(cursor)
     if marker is None:
+        return 0
+    if marker[0] == 1:
         return 0
     if marker[0] != 0:
         raise ValueError("invalid trace cursor for stored events")
@@ -297,49 +397,192 @@ async def _record_query_audit(
     ticket_id: str | None,
     outcome: str,
     error: str | None = None,
+    reservation: _TraceAuditReservation | None = None,
+    fail_closed: bool = True,
 ) -> None:
     audit_log = getattr(request.app.state, "audit_log", None)
-    if audit_log is not None:
-        task = asyncio.create_task(
-            _run_trace_audit_worker(
-                request,
-                audit_log.log,
-                operation,
-                ticket_id or "*",
-                {
-                    "outcome": outcome,
-                    "error": error,
-                    "ticket_scoped": bool(ticket_id),
-                },
-            )
+    if audit_log is None:
+        if reservation is not None:
+            reservation.release()
+        return
+
+    if reservation is None:
+        reservation = _reserve_trace_audit(request)
+        if reservation is None:
+            try:
+                await _write_trace_audit_with_fallback(
+                    request, audit_log, operation, ticket_id, outcome, error
+                )
+            except TraceAuditFallbackUnavailable:
+                if fail_closed:
+                    raise HTTPException(
+                        status_code=503, detail="trace audit capacity is full"
+                    ) from None
+                logger.warning("Dropping non-response trace audit after fallback loss")
+                return
+            if fail_closed:
+                raise HTTPException(
+                    status_code=503, detail="trace audit capacity is full"
+                )
+            return
+
+    task = asyncio.create_task(
+        _run_trace_audit_worker(
+            request,
+            _audit_write(audit_log),
+            operation,
+            ticket_id or "*",
+            {
+                "outcome": outcome,
+                "error": error,
+                "ticket_scoped": bool(ticket_id),
+            },
+            reservation=reservation,
         )
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            task.add_done_callback(_consume_audit_result)
+    )
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.add_done_callback(_consume_audit_result)
+        raise
+    except TraceAuditFallbackUnavailable:
+        if fail_closed:
+            raise HTTPException(
+                status_code=503, detail="trace audit capacity is full"
+            ) from None
+        logger.warning("Dropping non-response trace audit after fallback loss")
+    except TraceStoreWriteError:
+        if fail_closed:
             raise
+        logger.warning("Dropping non-response trace audit after store failure")
+
+
+async def _record_best_effort_query_audit(
+    request: Request,
+    operation: str,
+    ticket_id: str | None,
+    outcome: str,
+    error: str | None = None,
+    reservation: _TraceAuditReservation | None = None,
+) -> None:
+    """Record a terminal audit without replacing the route's real outcome."""
+    await _record_query_audit(
+        request,
+        operation,
+        ticket_id,
+        outcome,
+        error,
+        reservation=reservation,
+        fail_closed=False,
+    )
+
+
+class _TraceAuditReservation:
+    def __init__(self, slots=None) -> None:
+        self._slots = slots
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._slots is not None:
+            self._slots.release()
+
+
+def _audit_write(audit_log):
+    write = getattr(audit_log, "log_required", None)
+    return write if write is not None else audit_log.log
+
+
+async def _write_trace_audit_with_fallback(
+    request: Request,
+    audit_log,
+    operation: str,
+    ticket_id: str | None,
+    outcome: str,
+    error: str | None,
+) -> None:
+    await _run_trace_audit_fallback(
+        request,
+        _audit_write(audit_log),
+        operation,
+        ticket_id or "*",
+        {
+            "outcome": outcome,
+            "error": error,
+            "ticket_scoped": bool(ticket_id),
+        },
+    )
+
+
+async def _run_trace_audit_fallback(
+    request: Request,
+    function,
+    /,
+    *args,
+    **kwargs,
+) -> None:
+    """Attempt one strict write on a dedicated executor with no queue."""
+    state = getattr(getattr(request, "app", None), "state", None)
+    _bump_trace_health_state(state, "audit_queue_fallbacks")
+    logger.warning("Trace audit queue is full; using dedicated strict fallback")
+    executor = getattr(state, "trace_query_audit_fallback_executor", None)
+    slots = getattr(state, "trace_query_audit_fallback_slots", None)
+    if executor is None or slots is None:
+        raise TraceAuditFallbackUnavailable
+    try:
+        await run_bounded_executor(executor, slots, function, *args, **kwargs)
+    except BoundedExecutorSaturated as exc:
+        raise TraceAuditFallbackUnavailable from exc
+
+
+def _reserve_trace_audit(request: Request) -> _TraceAuditReservation | None:
+    state = getattr(getattr(request, "app", None), "state", None)
+    executor = getattr(state, "trace_query_audit_executor", None)
+    if executor is None:
+        return None
+    slots = getattr(state, "trace_query_audit_slots", None)
+    if slots is not None and slots.acquire(blocking=False):
+        return _TraceAuditReservation(slots)
+    return None
 
 
 async def _run_trace_audit_worker(
-    request: Request, function, /, *args, **kwargs
+    request: Request,
+    function,
+    /,
+    *args,
+    reservation: _TraceAuditReservation | None = None,
+    **kwargs,
 ) -> bool:
     """Bound audit writes independently from query and control work."""
     state = getattr(getattr(request, "app", None), "state", None)
     executor = getattr(state, "trace_query_audit_executor", None)
+    if reservation is not None:
+        if executor is None:
+            try:
+                await _run_trace_audit_fallback(request, function, *args, **kwargs)
+            finally:
+                reservation.release()
+            return True
+        context = contextvars.copy_context()
+        try:
+            future = executor.submit(context.run, function, *args, **kwargs)
+        except BaseException:
+            reservation.release()
+            raise
+        future.add_done_callback(lambda _future: reservation.release())
+        return await asyncio.wrap_future(future)
     if executor is None:
-        await asyncio.to_thread(function, *args, **kwargs)
+        await _run_trace_audit_fallback(request, function, *args, **kwargs)
         return True
     slots = getattr(state, "trace_query_audit_slots", None)
     try:
         await run_bounded_executor(executor, slots, function, *args, **kwargs)
     except BoundedExecutorSaturated:
-        health = getattr(state, "trace_health", None)
-        if isinstance(health, dict):
-            health["audit_queue_rejections"] = (
-                int(health.get("audit_queue_rejections", 0)) + 1
-            )
-        logger.warning("Trace audit queue is full; dropping terminal audit event")
-        return False
+        await _run_trace_audit_fallback(request, function, *args, **kwargs)
+        return True
     return True
 
 
@@ -352,17 +595,23 @@ async def _record_cancelled_query(
     request: Request,
     operation: str,
     ticket_id: str | None,
+    reservation: _TraceAuditReservation | None = None,
 ) -> None:
-    """Finalize cancellation even if the request task is cancelled again."""
-    await asyncio.shield(
-        _record_query_audit(
-            request,
-            operation,
-            ticket_id,
-            "cancelled",
-            "request cancelled",
+    """Record cancellation best effort without replacing the cancellation."""
+    try:
+        await asyncio.shield(
+            _record_query_audit(
+                request,
+                operation,
+                ticket_id,
+                "cancelled",
+                "request cancelled",
+                reservation=reservation,
+                fail_closed=False,
+            )
         )
-    )
+    except TraceStoreWriteError:
+        logger.exception("Failed to record cancelled %s", operation)
 
 
 def _check_render_cancelled(cancelled: Callable[[], bool] | None) -> None:
@@ -605,15 +854,30 @@ def _render_export_response(
             ),
             cancelled=cancelled,
         )
+    manifest_json = _json_dumps(export_meta, separators=(",", ":"), cancelled=cancelled)
+    if len(manifest_json.encode("utf-8")) > MAX_TRACE_MANIFEST_HEADER_BYTES:
+        manifest_json = _json_dumps(
+            {
+                "manifest_version": export_meta["manifest_version"],
+                "count": export_meta["count"],
+                "has_more": export_meta["has_more"],
+                "next_cursor": export_meta["next_cursor"],
+                "content_digest": export_meta["content_digest"],
+                "full_manifest_digest_algorithm": "sha256-utf8",
+                "full_manifest_digest": hashlib.sha256(
+                    manifest_json.encode("utf-8")
+                ).hexdigest(),
+            },
+            separators=(",", ":"),
+            cancelled=cancelled,
+        )
     response = Response(content, media_type=media)
-    response.headers["X-Trace-Manifest"] = _json_dumps(
-        export_meta, separators=(",", ":"), cancelled=cancelled
-    )
+    response.headers["X-Trace-Manifest"] = manifest_json
     return response
 
 
 class _TraceAuditResponse(Response):
-    """Record success only after ASGI accepts the complete response body."""
+    """Record the terminal audit after ASGI accepts the response body."""
 
     def __init__(
         self,
@@ -635,31 +899,106 @@ class _TraceAuditResponse(Response):
         self._audit_ticket_id = ticket_id
 
     async def __call__(self, scope, receive, send) -> None:
-        try:
+        audit_log = getattr(self._audit_request.app.state, "audit_log", None)
+        if audit_log is None:
             await super().__call__(scope, receive, send)
+            return
+        reservation = _reserve_trace_audit(self._audit_request)
+        if reservation is None:
+            try:
+                await _write_trace_audit_with_fallback(
+                    self._audit_request,
+                    audit_log,
+                    self._audit_operation,
+                    self._audit_ticket_id,
+                    "failed",
+                    "trace audit capacity is full",
+                )
+            except TraceAuditFallbackUnavailable:
+                pass
+            raise HTTPException(status_code=503, detail="trace audit capacity is full")
+        try:
+            send_timed_out = False
+            terminal_outcome: str | None = None
+            response_started = False
+
+            async def bounded_send(message: Message) -> None:
+                nonlocal response_started
+                await send(message)
+                if message["type"] == "http.response.start":
+                    response_started = True
+
+            send_task = asyncio.create_task(
+                super().__call__(scope, receive, bounded_send)
+            )
+            try:
+                await asyncio.wait_for(
+                    send_task,
+                    timeout=TRACE_AUDIT_RESPONSE_SEND_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                send_timed_out = True
+                terminal_outcome = "indeterminate" if response_started else "failed"
+                send_task.cancel()
+                try:
+                    await send_task
+                except asyncio.CancelledError:
+                    pass
+                await _record_query_audit(
+                    self._audit_request,
+                    self._audit_operation,
+                    self._audit_ticket_id,
+                    terminal_outcome,
+                    "trace audit response send timed out",
+                    reservation=reservation,
+                )
+                if not response_started:
+                    failure = Response(
+                        content='{"detail":"trace response send timed out"}',
+                        status_code=503,
+                        media_type="application/json",
+                    )
+                    await failure(scope, receive, send)
+                return
         except asyncio.CancelledError:
+            if terminal_outcome is not None:
+                raise
             await _record_cancelled_query(
                 self._audit_request,
                 self._audit_operation,
                 self._audit_ticket_id,
+                reservation=reservation,
             )
             raise
         except Exception as exc:
+            if send_timed_out:
+                raise
+            terminal_outcome = "failed"
             await _record_query_audit(
                 self._audit_request,
                 self._audit_operation,
                 self._audit_ticket_id,
                 "failed",
                 _unexpected_audit_error(self._audit_operation.replace("_", " "), exc),
+                reservation=reservation,
             )
             raise
         else:
-            await _record_query_audit(
-                self._audit_request,
-                self._audit_operation,
-                self._audit_ticket_id,
-                "success",
-            )
+            try:
+                await _record_best_effort_query_audit(
+                    self._audit_request,
+                    self._audit_operation,
+                    self._audit_ticket_id,
+                    "success",
+                    reservation=reservation,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Dropping post-delivery trace success audit",
+                    exc_info=True,
+                )
 
 
 class _PayloadAuditResponse(Response):
@@ -731,7 +1070,9 @@ async def query(
     try:
         detailed = await _authorize_query_off_loop(request, ticket_id)
     except HTTPException as exc:
-        await record_terminal("denied", str(exc.detail))
+        await _record_best_effort_query_audit(
+            request, "trace_query", ticket_id, "denied", str(exc.detail)
+        )
         raise
     except TraceQueryResourceExhausted as exc:
         await record_terminal("failed", str(exc))
@@ -852,7 +1193,9 @@ async def export(
     try:
         detailed = await _authorize_query_off_loop(request, ticket_id)
     except HTTPException as exc:
-        await record_terminal("denied", str(exc.detail))
+        await _record_best_effort_query_audit(
+            request, "trace_export", ticket_id, "denied", str(exc.detail)
+        )
         raise
     except TraceQueryResourceExhausted as exc:
         await record_terminal("failed", str(exc))
@@ -1092,13 +1435,16 @@ async def payload_content(ticket_id: str, digest: str, request: Request) -> Resp
 
     async def audit(outcome: str, error: str = "") -> None:
         if audit_log is not None:
-            await _run_trace_audit_worker(
-                request,
-                audit_log.log,
-                "trace_payload_read",
-                ticket_id,
-                {"digest": digest[:80], "outcome": outcome, "error": error},
-            )
+            try:
+                await _run_trace_audit_worker(
+                    request,
+                    _audit_write(audit_log),
+                    "trace_payload_read",
+                    ticket_id,
+                    {"digest": digest[:80], "outcome": outcome, "error": error},
+                )
+            except (TraceAuditFallbackUnavailable, TraceStoreWriteError):
+                logger.exception("Failed to audit trace payload read")
 
     try:
         detailed = await _authorize_query_off_loop(request, ticket_id)
@@ -1235,7 +1581,9 @@ async def _run_ingestion_worker(
     except BoundedExecutorSaturated as exc:
         _bump_trace_health(request, "ingestion_queue_rejections")
         detail = "trace ingestion queue is full"
-        await _record_query_audit(request, operation, event.ticket_id, "failed", detail)
+        await _record_best_effort_query_audit(
+            request, operation, event.ticket_id, "failed", detail
+        )
         raise HTTPException(status_code=503, detail=detail) from exc
 
 

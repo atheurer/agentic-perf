@@ -291,6 +291,10 @@ class TicketStore:
                 )
             epoch = (current.epoch + 1) if current is not None else 1
             if current is not None:
+                if self._audit is not None:
+                    self._audit.log_required(
+                        "orchestrator_lease_expire", "-", {"epoch": current.epoch}
+                    )
                 self._cancel_pending_approvals_unlocked_all(
                     reason="orchestrator lease takeover"
                 )

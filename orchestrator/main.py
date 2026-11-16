@@ -2986,6 +2986,17 @@ def _closed_claim_page_state(
     return True, None, False
 
 
+def _warn_claim_reconciliation_read_errors(
+    page: dict[str, Any], cursor: str | None
+) -> None:
+    if page.get("read_errors") is True:
+        logger.warning(
+            "Closed-ticket claim reconciliation page contains unreadable records; "
+            "restarting from cursor %r",
+            cursor,
+        )
+
+
 def _claim_reconciliation_marker(
     claim: Any, *, session_id: str, epoch: int
 ) -> dict[str, Any]:
@@ -4190,6 +4201,9 @@ async def _poll_loop_after_lease(
                     closed_page = await fetch_ticket_claim_reconciliation_page(
                         config.state_store_url,
                         after=closed_claims_cursor,
+                    )
+                    _warn_claim_reconciliation_read_errors(
+                        closed_page, closed_claims_cursor
                     )
                     closed_tickets = closed_page["tickets"]
                     _, failed_closed_claims = await _reconcile_deposed_claims(

@@ -710,9 +710,16 @@ worker pool cannot consume the workers needed to keep the control plane alive.
 | `ingestion.workers` | int | `2` | — | Maximum concurrent single-event and batch trace ingestion workers. These workers do not run query/export, health, audit, or lease work. Values above 64 are rejected at startup. |
 | `ingestion.queue_size` | int | `8` | `TRACE_INGESTION_MAX_QUEUE` | Maximum trace ingestion requests or individual batch events waiting behind active workers. At capacity, single events return an audited HTTP 503 and batch events receive per-event HTTP 503 acknowledgements. Values above 1024 are rejected at startup. |
 
-Single-event and batch trace ingestion requests are limited to 8 MiB before
-FastAPI parses the body. Oversized requests receive HTTP 413 and increment the
-`ingestion_body_rejections` counter in the health response's `trace` section.
+Single-event and batch trace ingestion requests are limited to 8 MiB and 1024
+ASGI receive messages before FastAPI parses the body. The middleware aggregates
+request chunks into one bounded replay message. Oversized bodies or chunk counts
+receive HTTP 413 and increment the `ingestion_body_rejections` counter in the
+health response's `trace` section.
+
+The middleware authenticates trace ingestion before reading a request body and
+admits at most eight concurrent body buffers. Additional concurrent requests
+receive HTTP 503 before any body bytes are buffered, bounding aggregate
+middleware memory to 64 MiB.
 
 `STATE_STORE_CONTROL_WORKERS` controls the separate reserved executor and
 defaults to `2`. It is an environment-only setting. Raise it only when the state
@@ -730,10 +737,19 @@ executor returns HTTP 503 rather than delaying lease renewal behind stale work.
 Values above 64 are rejected at startup.
 
 Terminal trace query/export audits use their own bounded executor so they cannot
-consume query, health, or lease workers. If that audit queue is saturated, the
-event is dropped immediately with a warning and the `audit_queue_rejections`
-counter in the health response's `trace` section is incremented; request tasks
-do not wait indefinitely for an audit slot.
+consume query, health, or lease workers. Query and export responses reserve an
+audit admission slot before delivery. If no slot is available, the state store
+attempts one strict write on a separate one-worker executor with a zero-length
+queue. A successful fallback is still followed by HTTP 503, because the response
+was not admitted to the normal audit path; if that fallback is also full, the
+request fails closed with HTTP 503. This backpressure increments
+`audit_queue_fallbacks` in the health response's `trace` section. Audit write
+failures for denied and cancelled requests are logged without replacing the
+original 401, 422, or 429 response or the cancellation.
+Query and export response delivery is additionally bounded to 5 seconds. A
+timeout before response start returns HTTP 503; after response start, the
+connection is closed and the failed response is audited because ASGI cannot
+replace headers already sent to the client.
 
 Query cancellation is checked while waiting for the trace-store lock, while
 streaming rows from SQLite, and during response serialization. Disconnected

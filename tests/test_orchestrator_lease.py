@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -14,6 +15,7 @@ import httpx
 import pytest
 from fastapi import Depends, FastAPI
 
+import orchestrator.main as orchestrator_main
 from orchestrator.config import OrchestratorConfig
 from orchestrator.leader_lease import LeaderLeaseClient, LeaderLeaseUnavailable
 from orchestrator.main import (
@@ -28,10 +30,12 @@ from orchestrator.main import (
     _poll_loop_after_lease,
     _reconcile_deposed_claims,
     _renew_leader_lease,
+    _warn_claim_reconciliation_read_errors,
     poll_loop,
 )
 from state_store.api.health import health
 from state_store.api.router import api_router
+from state_store.audit import AuditLog
 from state_store.auth import make_auth_dependency
 from state_store.identity import UserStore
 from state_store.models import (
@@ -114,6 +118,21 @@ def test_closed_claim_reconciliation_advances_after_ticket_failure() -> None:
         cycle_failed=False,
     )
     assert state == (False, None, False)
+
+
+def test_claim_reconciliation_read_errors_warn_operators(monkeypatch) -> None:
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        orchestrator_main.logger,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    _warn_claim_reconciliation_read_errors({"read_errors": True}, "PERF-1")
+    _warn_claim_reconciliation_read_errors({"read_errors": False}, "PERF-1")
+
+    assert len(warnings) == 1
+    assert warnings[0][0][1] == "PERF-1"
 
 
 @pytest.mark.asyncio
@@ -2230,6 +2249,33 @@ def test_expiry_takeover_fences_old_session_and_survives_restart():
         assert not restarted.release_orchestrator_lease(first.session_id, lease.epoch)
         with pytest.raises(PermissionError):
             restarted.renew_orchestrator_lease(first.session_id, lease.epoch, 10)
+
+
+def test_direct_expired_lease_takeover_audits_displaced_epoch():
+    now = [datetime.now(timezone.utc)]
+    with TemporaryDirectory() as directory:
+        audit_path = Path(directory) / "audit.jsonl"
+        audit = AuditLog(path=audit_path)
+        store = TicketStore(
+            persist_dir=directory,
+            audit_log=audit,
+            clock=lambda: now[0],
+        )
+        first = _request()
+        lease = store.acquire_orchestrator_lease(first)
+        now[0] += timedelta(seconds=11)
+
+        replacement = store.acquire_orchestrator_lease(_request())
+
+        entries = audit.read()
+        assert [entry["mutation"] for entry in entries] == [
+            "orchestrator_lease_acquire",
+            "orchestrator_lease_expire",
+            "orchestrator_lease_acquire",
+        ]
+        assert entries[1]["data"] == {"epoch": lease.epoch}
+        assert entries[2]["data"]["epoch"] == replacement.epoch
+        audit.close()
 
 
 def test_release_fsyncs_persistence_directory(tmp_path, monkeypatch):

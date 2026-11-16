@@ -829,6 +829,7 @@ INVENTORIED_SIDE_EFFECTS = (
     ("providers/tracing/fingerprints.py", "load_audit_key", "filesystem"),
     ("providers/tracing/payloads.py", "_fsync_directory", "filesystem"),
     ("providers/tracing/payloads.py", "build", "mutating_http_state"),
+    ("providers/tracing/payloads.py", "get", "filesystem"),
     ("providers/tracing/payloads.py", "put", "filesystem"),
     ("providers/tracing/spool.py", "__init__", "filesystem"),
     ("providers/tracing/spool.py", "_fsync_dir", "filesystem"),
@@ -4487,6 +4488,12 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "providers/tracing/payloads.py:build",
+        "2027-12-31",
+    ),
+    ("providers/tracing/payloads.py", "get", "filesystem"): (
+        "audited",
+        "observability-maintainers",
+        "providers/tracing/payloads.py:get",
         "2027-12-31",
     ),
     ("providers/tracing/payloads.py", "put", "filesystem"): (
