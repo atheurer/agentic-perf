@@ -19,6 +19,29 @@ _SAMPLE_RE = re.compile(rb"^Sample (\d+) at ", re.MULTILINE)
 # reader split it across chunks.
 _PROGRESS_TAIL_BYTES = 64 * 1024
 
+_BOOTDELAY_TRUE_VALUES = {"true", "1", "yes", "on"}
+_BOOTDELAY_FALSE_VALUES = {"false", "0", "no", "off"}
+
+
+def parse_configure_bootdelay(value: Any) -> bool | None:
+    """Parse the strict configure_bootdelay directive value.
+
+    Accepted values are booleans or one of the quoted strings ``"true"``,
+    ``"false"``, ``"1"``, ``"0"``, ``"yes"``, ``"no"``, ``"on"``, or
+    ``"off"``. Numeric integers ``1`` and ``0`` are rejected.
+    Return ``None`` for values the boot-time harness must reject rather than
+    infer from board auto-detection.
+    """
+    if type(value) is bool:
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _BOOTDELAY_TRUE_VALUES:
+            return True
+        if normalized in _BOOTDELAY_FALSE_VALUES:
+            return False
+    return None
+
 
 def _parse_boot_time_progress(chunks: list[bytes]) -> dict[str, Any]:
     """Extract sample count from boot-time subprocess stdout."""
@@ -39,6 +62,7 @@ register_directives(
         "serial_capture",
         "kpi_pattern",
         "warm_boot_fallback_to_cold",
+        "configure_bootdelay",
     },
     descriptions={
         "sample_count": "Number of reboot cycles to collect (int, e.g. 50)",
@@ -46,6 +70,11 @@ register_directives(
         "power_off_delay": "Seconds to wait between power off and power on for cold reboot (int, e.g. 20)",
         "serial_capture": "Capture serial console output during test (bool)",
         "kpi_pattern": "Regex pattern for KPI log line matching (string)",
+        "configure_bootdelay": (
+            "Configure U-Boot bootdelay=0 before boot-time tests "
+            "(booleans or the quoted strings 'true', 'false', '1', '0', "
+            "'yes', 'no', 'on', or 'off'; numeric 1 and 0 are rejected)"
+        ),
     },
     aliases={
         # Sample count variants
