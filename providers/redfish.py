@@ -26,6 +26,7 @@ class RedfishClient:
         *,
         ca_bundle: str | None = None,
         client: AuditedAsyncHTTPClient | None = None,
+        system_path: str = "/redfish/v1/Systems/System.Embedded.1",
     ) -> None:
         parsed = urlsplit(endpoint)
         if (
@@ -47,8 +48,8 @@ class RedfishClient:
         self._client = client or AuditedAsyncHTTPClient(
             timeout=15.0, verify=ssl.create_default_context(cafile=ca_bundle)
         )
-        # Dell iDRAC uses System.Embedded.1; verified live on r7725 (mgmt-* @ 10.6.61.186)
-        self._system_path = "/redfish/v1/Systems/System.Embedded.1"
+        # Dell iDRAC default (r7725 mgmt-* @ 10.6.61.186); override for HPE/SMC via system_path param
+        self._system_path = system_path
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -123,10 +124,11 @@ class RedfishClient:
     async def poll_until_ssh_reachable(
         self, check_ssh, timeout: float = 300, interval: float = 10
     ) -> None:
-        elapsed = 0.0
-        while elapsed < timeout:
+        import time
+
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
             if await check_ssh():
                 return
             await asyncio.sleep(interval)
-            elapsed += interval
         raise RedfishError("power", "Timed out waiting for OS SSH to become reachable")
