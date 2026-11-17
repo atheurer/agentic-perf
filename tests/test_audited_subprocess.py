@@ -250,7 +250,12 @@ async def test_streamed_output_timeout_and_cancellation_emit_one_terminal() -> N
         reset_trace_context(token)
 
 
-async def test_mutating_spawn_requires_critical_recorder() -> None:
+async def test_mutating_spawn_requires_critical_recorder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("STATE_STORE_URL", raising=False)
+    monkeypatch.delenv("AGENTIC_PERF_API_TOKEN", raising=False)
+    monkeypatch.setattr(AuditedSubprocessRunner, "_default_recorder", None)
     token = bind_trace_context(new_trace_context(ticket_id="PERF-1"))
     try:
         with pytest.raises(TraceDeliveryError):

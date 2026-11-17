@@ -988,17 +988,18 @@ class TestWhitespaceRejection:
 
 
 class TestTopologySafety:
-    def test_extra_benchmarks_beyond_legs_are_ignored(self):
-        """More benchmark steps than order legs: extras are kept but not
-        transformed (the canonical shape only has kernel/bench pairs for
-        the defined legs)."""
+    def test_extra_benchmarks_beyond_order_legs_are_rejected(self):
+        """More benchmark steps than order legs are ambiguous and must
+        pause rather than silently dropping or reusing a workload."""
         plan = default_plan()
-        plan["steps"].append({"id": 5, "agent_type": "benchmark", "params": {}})
-        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
-        assert err == ""
-        # The extra benchmark is preserved but not transformed
-        benches = [s for s in new_plan["steps"] if s["agent_type"] == "benchmark"]
-        assert len(benches) >= 2  # the canonical A/B pair from the transform
+        plan["steps"].extend(
+            [
+                {"id": 5, "agent_type": "benchmark", "params": {}},
+                {"id": 6, "agent_type": "benchmark", "params": {}},
+            ]
+        )
+        _, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert "extra benchmark steps" in err
 
     def test_intermediate_provision_before_benchmark_is_preserved(self):
         """Steps before the single benchmark are head content — the
@@ -1015,20 +1016,27 @@ class TestTopologySafety:
         assert new_plan["steps"][1]["agent_type"] == "provision"
         assert new_plan["steps"][2]["agent_type"] == "provision"
 
-    def test_steps_between_benchmarks_are_replaced_by_canonical_shape(self):
-        """The transform replaces the span between the first and last
-        benchmark with the canonical kernel/bench sequence. Intermediate
-        steps are replaced, not preserved — the A/B shape supersedes
-        whatever was between the original benchmarks."""
+    def test_missing_legs_are_inserted_before_post_benchmark_steps(self):
+        """Missing order legs are cloned from the benchmark template and
+        inserted before the original post-benchmark steps."""
         plan = default_plan()
-        plan["steps"].append({"id": 5, "agent_type": "provision", "params": {}})
-        plan["steps"].append({"id": 6, "agent_type": "benchmark", "params": {}})
-        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        new_plan, err = build_kernel_comparison_plan(plan, {**GOOD, "order": "ABBA"})
         assert err == ""
-        # The canonical shape has kernel-A, bench-A, kernel-B, bench-B
-        labels = [s["params"].get("label") for s in new_plan["steps"]]
-        assert labels.count("kernel-A") == 1
-        assert labels.count("kernel-B") == 1
+        agent_types = [s["agent_type"] for s in new_plan["steps"]]
+        assert agent_types == [
+            "resource",
+            "provision",
+            "provision",
+            "benchmark",
+            "provision",
+            "benchmark",
+            "provision",
+            "benchmark",
+            "provision",
+            "benchmark",
+            "review",
+            "teardown",
+        ]
 
 
 def normalized_plan_is_none(err):
@@ -1522,6 +1530,15 @@ class TestTriageEmittedABShape:
         labels = [s["params"].get("label") for s in new_plan["steps"]]
         assert labels.count("kernel-A") == 1
         assert labels.count("kernel-B") == 1
-        # The intermediate provision is preserved between the two pairs
         agent_types = [s["agent_type"] for s in new_plan["steps"]]
-        assert agent_types.count("provision") == 3  # harness + kernel-A + kernel-B
+        assert agent_types == [
+            "resource",
+            "provision",
+            "provision",
+            "benchmark",
+            "provision",
+            "provision",
+            "benchmark",
+            "review",
+            "teardown",
+        ]

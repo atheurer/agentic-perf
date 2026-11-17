@@ -94,12 +94,13 @@ class TraceClient:
             # than failing the calling operation. The spool is flushed on
             # the next successful delivery, so the audit trail is
             # eventually consistent.
-            self.spool.append(event)
+            try:
+                self.spool.append(event)
+            except (SpoolError, OSError) as exc:
+                raise TraceDeliveryError(
+                    "critical trace event was not centrally persisted"
+                ) from exc
             return event
-        except (httpx.HTTPError, ValueError, KeyError, SpoolError, OSError) as exc:
-            raise TraceDeliveryError(
-                "critical trace event was not centrally persisted"
-            ) from exc
 
     def flush(self, *, deadline: float | None = None) -> int:
         """Flush the spool while honoring a hard caller-visible deadline.

@@ -1002,6 +1002,9 @@ async def write_transition(
                     merged_hosts = dict(stored_record.get("hosts") or {})
                     merged_hosts.update(transition.get("hosts") or {})
                     transition["hosts"] = merged_hosts
+                    transition["state"] = transition_state(
+                        merged_hosts, list(transition.get("requested_hosts", []))
+                    )
                     transition["record_version"] = int(
                         stored_record.get("record_version", 0)
                     )

@@ -200,25 +200,44 @@ def build_kernel_comparison_plan(
         )
 
     template = dict(steps[bench_indexes[0]])
-    pre_bench = [dict(s) for s in steps[: bench_indexes[0]]]
-    post_bench = [dict(s) for s in steps[bench_indexes[-1] + 1 :]]
+    new_steps: list[dict[str, Any]] = []
+    letter_idx = 0
+    last_benchmark_end: int | None = None
 
-    new_steps: list[dict[str, Any]] = list(pre_bench)
-    for letter_idx, letter in enumerate(normalized["order"]):
+    for step in steps:
+        if step.get("agent_type") != "benchmark":
+            new_steps.append(dict(step))
+            continue
+
+        letter = normalized["order"][letter_idx]
         release = normalized["baseline" if letter == "A" else "candidate"]
         kernel_step = _kernel_step(
             len(new_steps), release, normalized, role=_LETTER_ROLES[letter]
         )
         kernel_step["params"]["label"] = f"kernel-{letter}"
         new_steps.append(kernel_step)
-        if letter_idx < len(bench_indexes):
-            bench_source = dict(steps[bench_indexes[letter_idx]])
-        else:
-            bench_source = template
         new_steps.append(
-            _benchmark_copy(len(new_steps), bench_source, _LETTER_ROLES[letter])
+            _benchmark_copy(len(new_steps), dict(step), _LETTER_ROLES[letter])
         )
-    new_steps.extend(post_bench)
+        letter_idx += 1
+        last_benchmark_end = len(new_steps)
+
+    while letter_idx < len(normalized["order"]):
+        letter = normalized["order"][letter_idx]
+        release = normalized["baseline" if letter == "A" else "candidate"]
+        kernel_step = _kernel_step(
+            len(new_steps), release, normalized, role=_LETTER_ROLES[letter]
+        )
+        kernel_step["params"]["label"] = f"kernel-{letter}"
+        benchmark_step = _benchmark_copy(
+            len(new_steps) + 1, template, _LETTER_ROLES[letter]
+        )
+        insert_at = (
+            last_benchmark_end if last_benchmark_end is not None else len(new_steps)
+        )
+        new_steps[insert_at:insert_at] = [kernel_step, benchmark_step]
+        last_benchmark_end = insert_at + 2
+        letter_idx += 1
 
     for i, s in enumerate(new_steps):
         s["id"] = i
