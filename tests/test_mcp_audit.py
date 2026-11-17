@@ -683,6 +683,84 @@ async def test_client_sends_trace_metadata_without_changing_tool_arguments():
 
 
 @pytest.mark.asyncio
+async def test_list_resources_follows_pagination_and_audits_each_page():
+    first_page = SimpleNamespace(
+        resources=[{"uri": "crucible://docs/first"}],
+        nextCursor="cursor-1",
+    )
+    second_page = SimpleNamespace(
+        resources=[{"uri": "crucible://docs/second"}],
+        nextCursor=None,
+    )
+    session = AsyncMock()
+    session.list_resources = AsyncMock(side_effect=[first_page, second_page])
+    client = AgentMCPClient()
+    client._servers["local"] = _ServerConnection(
+        name="local",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+        agent_id="benchmark",
+        connected=True,
+    )
+
+    resources = await client.list_resources("local")
+
+    assert [resource["uri"] for resource in resources] == [
+        "crucible://docs/first",
+        "crucible://docs/second",
+    ]
+    assert session.list_resources.await_count == 2
+    assert session.list_resources.call_args_list[0].kwargs["params"].cursor is None
+    assert (
+        session.list_resources.call_args_list[1].kwargs["params"].cursor == "cursor-1"
+    )
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.RESPONSE_RECEIVED,
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.RESPONSE_RECEIVED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_resources_fails_closed_when_pagination_exceeds_limit(
+    monkeypatch,
+):
+    monkeypatch.setattr(mcp_client_module, "_MAX_RESOURCE_LIST_PAGES", 2)
+    page = SimpleNamespace(
+        resources=[{"uri": "crucible://docs/repeated"}],
+        nextCursor="cursor-1",
+    )
+    session = AsyncMock()
+    session.list_resources = AsyncMock(return_value=page)
+    client = AgentMCPClient()
+    client._servers["local"] = _ServerConnection(
+        name="local",
+        session=session,
+        transport="stdio",
+        session_id="session-1",
+        ticket_id="PERF-1",
+        agent_id="benchmark",
+        connected=True,
+    )
+
+    with pytest.raises(MCPToolCallError) as exc_info:
+        await client.list_resources("local")
+
+    assert exc_info.value.retry_classification == "ambiguous_after_send"
+    assert session.list_resources.await_count == 2
+    assert [event.lifecycle.state for event in client.audit_events] == [
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.RESPONSE_RECEIVED,
+        LifecycleState.REQUEST_SENT,
+        LifecycleState.RESPONSE_RECEIVED,
+        LifecycleState.FAILED,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_client_audits_pre_call_hook_boundaries():
     client = AgentMCPClient()
     client._tool_routing["tool"] = "local"

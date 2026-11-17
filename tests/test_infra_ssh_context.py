@@ -153,15 +153,6 @@ async def test_ssh_context_initialization_failure_remains_an_error(monkeypatch):
             {"host": "sut.example", "remote_path": "/tmp/test", "content": ""},
         ),
         ("read_remote_file", {"host": "sut.example", "remote_path": "/tmp/test"}),
-        ("list_controller_userenvs", {"controller": "controller.example"}),
-        (
-            "run_crucible_command",
-            {
-                "controller": "controller.example",
-                "command": "benchmark_list",
-                "arguments": {},
-            },
-        ),
         ("read_remote_dir", {"host": "sut.example", "remote_path": "/tmp"}),
         ("get_ethtool_info", {"host": "sut.example", "iface": "eth0"}),
         ("get_sysctl_values", {"host": "sut.example", "params": []}),

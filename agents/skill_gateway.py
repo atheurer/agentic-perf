@@ -33,6 +33,7 @@ _LOCAL_SUBJECT_DIRS = {
     "workflow/investigation": "investigation",
 }
 _UPSTREAM_REPOS = {
+    "harness/crucible": "crucible",
     "harness/kube-burner": "kube-burner",
     "harness/k8s-netperf": "k8s-netperf",
 }
@@ -678,7 +679,7 @@ def _parse_source_ref(ref: str, kind: str) -> tuple[str, str, str | None]:
         raise SkillGatewayError("invalid_ref", "Use a returned source document ref")
     subject = "/".join(parts[:2])
     path = parts[2]
-    if subject not in _LOCAL_SUBJECT_DIRS or not path:
+    if subject not in {*_LOCAL_SUBJECT_DIRS, *_UPSTREAM_REPOS} or not path:
         raise SkillGatewayError("invalid_ref", "Use a returned source document ref")
     if path.startswith(("/", "\\")) or "\\" in path or ":" in path:
         raise SkillGatewayError("invalid_document", "Invalid document path")
@@ -919,7 +920,11 @@ async def _ticket_source_snapshot(
     repo_cache: Any,
 ) -> tuple[dict[str, Any] | None, Any | None]:
     """Load one immutable ticket pin; upstream never falls back to shared cache files."""
-    if subject not in _LOCAL_SUBJECT_DIRS or kind not in {"local", "upstream"}:
+    if (
+        kind not in {"local", "upstream"}
+        or (kind == "local" and subject not in _LOCAL_SUBJECT_DIRS)
+        or (kind == "upstream" and subject not in _UPSTREAM_REPOS)
+    ):
         return None, None
     epoch = _ticket_source_epoch(provider, ticket_id)
 
@@ -1977,6 +1982,7 @@ async def _skill_context_list_search(
     cursor: str,
     ssh: Any,
     controller_host: str | None,
+    mcp_adapter: Any | None = None,
     local_skills_dir: Path | None,
     repo_cache: Any,
 ) -> str:
@@ -2062,7 +2068,7 @@ async def _skill_context_list_search(
             if organization.get("status") in {"available", "unavailable"}:
                 selected_sources.append("organization")
             if subject == "harness/crucible" and phase in {"benchmark", "review"}:
-                selected_sources.append("controller")
+                selected_sources.append("controller" if controller_host else "upstream")
             if subject in _LOCAL_SUBJECT_DIRS:
                 selected_sources.extend(["local", "upstream"])
             if project_documents:
@@ -2196,6 +2202,7 @@ async def _skill_context_list_search(
                     await controller_context_gateway(
                         ssh=ssh,
                         controller_host=controller_host,
+                        mcp_adapter=mcp_adapter,
                         ticket_id=ticket_id,
                         agent_name=agent_name,
                         phase=phase,
@@ -2210,6 +2217,7 @@ async def _skill_context_list_search(
                     await controller_context_gateway(
                         ssh=ssh,
                         controller_host=controller_host,
+                        mcp_adapter=mcp_adapter,
                         ticket_id=ticket_id,
                         agent_name=agent_name,
                         phase=phase,
@@ -2525,6 +2533,7 @@ async def _skill_context_list_search(
                     await controller_context_gateway(
                         ssh=ssh,
                         controller_host=controller_host,
+                        mcp_adapter=mcp_adapter,
                         ticket_id=ticket_id,
                         agent_name=agent_name,
                         phase=phase,
@@ -2539,6 +2548,7 @@ async def _skill_context_list_search(
                     await controller_context_gateway(
                         ssh=ssh,
                         controller_host=controller_host,
+                        mcp_adapter=mcp_adapter,
                         ticket_id=ticket_id,
                         agent_name=agent_name,
                         phase=phase,
@@ -2761,6 +2771,7 @@ async def skill_context_gateway(
     phase: str,
     ssh: Any = None,
     controller_host: str | None = None,
+    mcp_adapter: Any | None = None,
     subject: str = "harness/crucible",
     operation: str = "bootstrap",
     ref: str = "",
@@ -2962,32 +2973,87 @@ async def skill_context_gateway(
                         )
                     documents.extend(upstream_documents)
             if software_allowed:
-                software = json.loads(
-                    await controller_context_gateway(
-                        ssh=ssh,
-                        controller_host=controller_host,
-                        ticket_id=ticket_id,
-                        agent_name=agent_name,
-                        phase=phase,
-                        operation="bootstrap",
-                        max_bytes=max_bytes,
+                if not controller_host:
+                    try:
+                        (
+                            upstream_snapshot,
+                            upstream_cache,
+                        ) = await _ticket_source_snapshot(
+                            provider,
+                            ticket_id=ticket_id,
+                            subject=subject,
+                            kind="upstream",
+                            local_skills_dir=local_skills_dir,
+                            repo_cache=repo_cache,
+                        )
+                        upstream_documents = _list_upstream_documents(
+                            upstream_cache, subject
+                        )
+                        source, provenance_status = _upstream_provenance(
+                            upstream_cache, subject
+                        )
+                        sources.append(
+                            {
+                                "source": source,
+                                "scope": "upstream",
+                                "provenance_status": provenance_status,
+                                "status": "available",
+                                "revision": upstream_snapshot.get("revision"),
+                                "captured_at": upstream_snapshot.get("captured_at"),
+                                "reason": "ticket_pinned_upstream_commit",
+                                "document_count": len(upstream_documents),
+                            }
+                        )
+                        documents.extend(upstream_documents)
+                        entrypoints.extend(
+                            item["ref"]
+                            for item in upstream_documents
+                            if item.get("entrypoint")
+                        )
+                    except SkillGatewayError as exc:
+                        sources.append(
+                            {
+                                "source": "upstream",
+                                "scope": "upstream",
+                                "status": "unavailable",
+                                "reason": exc.code,
+                                "complete": False,
+                            }
+                        )
+                else:
+                    software = json.loads(
+                        await controller_context_gateway(
+                            ssh=ssh,
+                            controller_host=controller_host,
+                            mcp_adapter=mcp_adapter,
+                            ticket_id=ticket_id,
+                            agent_name=agent_name,
+                            phase=phase,
+                            operation="bootstrap",
+                            max_bytes=max_bytes,
+                        )
                     )
-                )
-                sources.append(
-                    {
-                        "source": "controller",
-                        "scope": "software",
-                        "status": "available"
-                        if software.get("found")
-                        else "unavailable",
-                        "reason": software.get("reason"),
-                    }
-                )
-                if isinstance(software.get("document"), dict):
-                    document = _software_document(software["document"])
-                    document.pop("content", None)
-                    documents.append(document)
-                    entrypoints.append(document["ref"])
+                    sources.append(
+                        {
+                            "source": "controller",
+                            "scope": "software",
+                            "status": "available"
+                            if software.get("found")
+                            else "unavailable",
+                            "reason": software.get("reason"),
+                            "metadata_selectors": software.get(
+                                "metadata_selectors", []
+                            ),
+                        }
+                    )
+                    for software_document_value in software.get("documents", []):
+                        if not isinstance(software_document_value, dict):
+                            continue
+                        document = _software_document(software_document_value)
+                        document.pop("content", None)
+                        documents.append(document)
+                        if document.get("entrypoint"):
+                            entrypoints.append(document["ref"])
             elif subject == "harness/crucible" and phase == "triage":
                 sources.append(
                     {
@@ -3274,6 +3340,7 @@ async def skill_context_gateway(
                 await controller_context_gateway(
                     ssh=ssh,
                     controller_host=controller_host,
+                    mcp_adapter=mcp_adapter,
                     ticket_id=ticket_id,
                     agent_name=agent_name,
                     phase=phase,
@@ -3307,6 +3374,7 @@ async def skill_context_gateway(
                 cursor=cursor,
                 ssh=ssh,
                 controller_host=controller_host,
+                mcp_adapter=mcp_adapter,
                 local_skills_dir=local_skills_dir,
                 repo_cache=repo_cache,
             )

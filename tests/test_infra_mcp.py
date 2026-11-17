@@ -65,7 +65,13 @@ def mock_infra_server(tmp_path: Path) -> Path:
 
         @mcp.tool()
         async def list_controller_userenvs(controller: str) -> str:
-            return json.dumps({"exit_code": 0, "stdout": "fedora44\\n"})
+            return json.dumps({
+                "controller": controller,
+                "source": "crucible_mcp",
+                "official": [{"name": "fedora44", "label": "Fedora 44"}],
+                "external": [],
+                "deprecated": [],
+            })
 
         @mcp.tool()
         async def read_remote_dir(host: str, remote_path: str, max_mb: int = 100) -> str:

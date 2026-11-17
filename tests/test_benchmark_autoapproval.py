@@ -1061,8 +1061,7 @@ async def test_autoapproval_with_unknown_validation_rejected(tmp_path, monkeypat
         )
     )
     assert result["status"] == "rejected"
-    assert result["reason_code"] == "approval_required"
-    assert "no validation record" in result["auto_approval_error"]
+    assert result["reason_code"] == "mcp_revalidation_required"
     assert api.calls == []
     assert not [c for c in calls if c[0] == "launch"]
 

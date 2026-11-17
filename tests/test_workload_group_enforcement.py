@@ -21,6 +21,7 @@ import agents.benchmark.server as benchmark_server
 import agents.server_utils as server_utils
 import orchestrator.main as orch_main
 from providers.kernel_plan import build_kernel_comparison_plan
+from tests.test_benchmark_tools import BenchmarkMCP
 
 A = "5.14.0-503.14.1.el9_5.x86_64"
 B = "5.14.0-503.16.1.el9_5.x86_64"
@@ -318,6 +319,9 @@ def _wire_execute(monkeypatch, tmp_path, *, plan_ticket, record_run_file):
         "runfile_fingerprint": benchmark_server._runfile_fingerprint(record_run_file),
         "harness": "crucible",
         "controller": "controller",
+        "execution_transport": "crucible_mcp",
+        "mcp_contract_version": "3",
+        "crucible_idempotency_key": "T-WG:crucible:val-788",
         "state": "executable",
     }
     ticket = plan_ticket
@@ -328,6 +332,7 @@ def _wire_execute(monkeypatch, tmp_path, *, plan_ticket, record_run_file):
 
     monkeypatch.setattr(server_utils, "assert_ticket_active", active_check)
     monkeypatch.setattr(benchmark_server, "_ticket", ticket)
+    monkeypatch.setattr(benchmark_server, "_crucible_mcp", BenchmarkMCP())
     monkeypatch.setattr(
         benchmark_server,
         "_skill_provider",

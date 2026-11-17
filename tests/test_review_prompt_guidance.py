@@ -24,6 +24,48 @@ def test_valid_zeros_and_unexpected_patterns_are_still_reported_as_evidence():
     assert "A valid measured value of zero is not missing data" in prompt
 
 
+def test_crucible_review_requires_period_discovery_and_mcp_artifacts():
+    prompt = " ".join(REVIEW_SYSTEM_PROMPT.split())
+
+    assert "call `get_run_summary` with the MCP job ID" in prompt
+    assert "call `list_cdm_periods`" in prompt
+    assert "call `get_cdm_metric` with the discovered period" in prompt
+    assert "do not choose an arbitrary period" in prompt
+    assert "provide `compare_results` with a `periods` mapping" in prompt
+    assert "pass that value as the next call's `listing_offset`" in prompt
+    assert "Keep `offset` for paginating the content" in prompt
+    assert "Do not discover or search controller run directories" in prompt
+    assert "does not decompress `.xz` files" in prompt
+    assert "cdm_api_requests" not in prompt
+    assert "auto-decompresses" not in prompt
+
+
+def test_crucible_review_message_does_not_expose_ssh_identity():
+    from agents.review.agent import ReviewAgent
+
+    agent = ReviewAgent.__new__(ReviewAgent)
+    agent._skill_provider = None
+    agent._repo_cache = None
+    agent.tools = []
+    ticket = {
+        "id": "PERF-MCP-REVIEW",
+        "summary": "Review the Crucible run",
+        "description": "Review the benchmark results.",
+        "custom_fields": {
+            "directives": {"harness": "crucible"},
+            "assigned_hardware_ips": {"controller": "controller.example"},
+            "ssh_key_path": "/secret/path/key",
+        },
+    }
+
+    content = agent._build_messages(ticket)[0]["content"]
+
+    assert "controller.example" in content
+    assert "Controller (SSH)" not in content
+    assert "SSH Key" not in content
+    assert "/secret/path/key" not in content
+
+
 def test_boot_time_review_keeps_artifact_tools_and_describes_artifact_analysis():
     from agents.review.agent import ReviewAgent
 

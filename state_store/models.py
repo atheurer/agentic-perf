@@ -477,6 +477,20 @@ class ValidationRecordV1(BaseModel):
     run_command: str = Field(min_length=1, max_length=500)
     validator_command: str = Field(min_length=1, max_length=500)
     validator_version: str = Field(min_length=1, max_length=128)
+    # Crucible MCP execution metadata is present only for contract-v3 records.
+    # Optional fields keep pre-MCP validation records addressable without a
+    # data migration.
+    execution_transport: Literal["crucible_mcp"] | None = None
+    mcp_contract_version: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32,
+    )
+    crucible_idempotency_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=512,
+    )
     # Controller output is never embedded in validation records.  This
     # descriptor has only redacted, bounded metadata and an optional private
     # content-addressed reference.

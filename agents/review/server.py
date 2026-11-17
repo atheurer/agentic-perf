@@ -13,17 +13,15 @@ import asyncio
 import json
 import logging
 import os
-import shlex
 import sys
 from pathlib import Path
 from typing import Any
-
-import httpx
 
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
+from agents.crucible_mcp import CrucibleMCPAdapter
 from agents.mcp_audit import create_ticket_mcp
 from agents.server_utils import (
     build_crucible_context_gateway,
@@ -48,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 mcp = create_ticket_mcp("review-agent")
 
+
 SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 
 # Module-level globals — lazily initialized by _ensure_init()
@@ -59,11 +58,19 @@ _skill_provider = None
 _crucible_context = None
 _repo_cache = None
 _ticket: dict[str, Any] = {}
+_crucible_mcp: CrucibleMCPAdapter | None = None
 
 
 async def _ensure_init():
     """Lazily initialize providers and SSH from env vars on first tool call."""
-    global _initialized, _ssh, _skill_provider, _crucible_context, _repo_cache, _ticket
+    global \
+        _initialized, \
+        _ssh, \
+        _skill_provider, \
+        _crucible_context, \
+        _repo_cache, \
+        _ticket, \
+        _crucible_mcp
     if _initialized:
         return
     async with _cdm_init_lock:
@@ -83,12 +90,20 @@ async def _ensure_init():
             context,
             repo_cache,
         )
+        controller = ticket_controller_host(ticket)
+        ticket_id = str(ticket.get("id") or os.environ.get("TICKET_ID", ""))
+        if controller and ticket_id:
+            _crucible_mcp = CrucibleMCPAdapter.from_config(
+                controller=controller,
+                ticket_id=ticket_id,
+                agent_id="review-agent",
+            )
         _initialized = True
 
 
 async def _ensure_cdm_init():
     """Load ticket and review configuration without resolving SSH credentials."""
-    global _cdm_initialized, _ticket, _skill_provider
+    global _cdm_initialized, _ticket, _skill_provider, _crucible_mcp
     if _initialized or _cdm_initialized:
         return
     async with _cdm_init_lock:
@@ -108,6 +123,14 @@ async def _ensure_cdm_init():
         provider = await build_skill_provider_async(skill_phase="review")
         _ticket = ticket
         _skill_provider = provider
+        controller = ticket_controller_host(ticket)
+        ticket_id = str(ticket.get("id") or os.environ.get("TICKET_ID", ""))
+        if controller and ticket_id:
+            _crucible_mcp = CrucibleMCPAdapter.from_config(
+                controller=controller,
+                ticket_id=ticket_id,
+                agent_id="review-agent",
+            )
         _cdm_initialized = True
 
 
@@ -137,6 +160,7 @@ async def get_skill_context(
         phase="review",
         ssh=_ssh,
         controller_host=ticket_controller_host(_ticket),
+        mcp_adapter=_crucible_mcp,
         subject=subject,
         operation=operation,
         ref=ref,
@@ -209,6 +233,7 @@ async def _get_crucible_benchmark_context_tool(
     return await controller_context_gateway(
         ssh=_ssh,
         controller_host=ticket_controller_host(_ticket),
+        mcp_adapter=_crucible_mcp,
         ticket_id=os.environ.get("TICKET_ID", ""),
         agent_name="review-agent",
         phase="review",
@@ -240,6 +265,7 @@ async def _legacy_get_crucible_benchmark_context(
         return await controller_context_gateway(
             ssh=_ssh,
             controller_host=ticket_controller_host(_ticket),
+            mcp_adapter=_crucible_mcp,
             ticket_id=os.environ.get("TICKET_ID", ""),
             agent_name="review-agent",
             phase="review",
@@ -327,8 +353,131 @@ async def read_harness_doc(harness: str, doc_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# SSH-based result tools (ssh_key_path removed — resolved from ticket)
+# MCP-backed result and indexed-metric tools
 # ---------------------------------------------------------------------------
+
+
+def _decode_mcp_result(raw: str) -> dict[str, Any]:
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Crucible MCP returned an invalid response") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("Crucible MCP returned an invalid response")
+    return decoded
+
+
+def _controller_error(reason: str, message: str) -> str:
+    return json.dumps({"status": "error", "reason": reason, "message": message})
+
+
+def _review_adapter(controller: str) -> tuple[Any | None, str | None]:
+    assigned_controller = ticket_controller_host(_ticket)
+    if not assigned_controller or controller != assigned_controller:
+        return None, _controller_error(
+            "controller_mismatch",
+            "The controller must match the ticket's assigned Crucible controller.",
+        )
+    if _crucible_mcp is None:
+        return None, _controller_error(
+            "unsupported_controller",
+            "The assigned Crucible controller does not support MCP contract v3.",
+        )
+    return _crucible_mcp, None
+
+
+def _unknown_mcp_identifier(exc: Exception) -> bool:
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in ("unknown mcp job", "jobnotfound", "not found", "no such job")
+    )
+
+
+async def _find_local_run_path(
+    adapter: Any,
+    run_id: str,
+) -> tuple[str | None, str | None]:
+    offset = 0
+    for _ in range(10):
+        raw = await adapter.call_tool(
+            "list_local_runs", {"limit": 1000, "offset": offset}
+        )
+        payload = _decode_mcp_result(raw)
+        for run in payload.get("runs", []):
+            if not isinstance(run, dict) or run.get("run_id") != run_id:
+                continue
+            run_path = run.get("path")
+            if isinstance(run_path, str) and run_path:
+                return run_path, None
+        next_offset = payload.get("next_offset")
+        complete = payload.get("complete") is True
+        if complete or not isinstance(next_offset, int) or next_offset <= offset:
+            break
+        offset = next_offset
+    return None, (
+        "The historical run was not found within bounded local-run pagination."
+    )
+
+
+async def _run_artifact_context(
+    controller: str,
+    run_id: str,
+    *,
+    full_listing: bool,
+    listing_offset: int = 0,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    adapter, error = _review_adapter(controller)
+    if adapter is None or error is not None:
+        return None, None, error
+    try:
+        raw = await adapter.call_tool(
+            "list_run_artifacts",
+            {
+                "mcp_job_id": run_id,
+                "limit": 1000 if full_listing else 1,
+                "offset": listing_offset,
+            },
+        )
+        return {"mcp_job_id": run_id}, _decode_mcp_result(raw), None
+    except Exception as exc:
+        if not _unknown_mcp_identifier(exc):
+            return (
+                None,
+                None,
+                _controller_error(
+                    "mcp_transport_error",
+                    "The Crucible MCP artifact request failed.",
+                ),
+            )
+    run_path, lookup_error = await _find_local_run_path(adapter, run_id)
+    if run_path is None:
+        return (
+            None,
+            None,
+            _controller_error(
+                "run_not_found", lookup_error or "The run was not found."
+            ),
+        )
+    try:
+        raw = await adapter.call_tool(
+            "list_run_artifacts",
+            {
+                "run_path": run_path,
+                "limit": 1000 if full_listing else 1,
+                "offset": listing_offset,
+            },
+        )
+        return {"run_path": run_path}, _decode_mcp_result(raw), None
+    except Exception:
+        return (
+            None,
+            None,
+            _controller_error(
+                "mcp_transport_error",
+                "The Crucible MCP artifact request failed.",
+            ),
+        )
 
 
 @mcp.tool()
@@ -337,220 +486,132 @@ async def read_run_results(
     run_id: str,
     file_path: str = "",
     max_bytes: int = 4000,
+    offset: int = 0,
+    listing_offset: int = 0,
 ) -> str:
-    """Read benchmark run result files from the controller.
-
-    Two modes:
-    - Listing mode (no file_path): returns file paths and sizes for
-      all result/tool files in the run directory. Use this first to
-      see what is available, then request specific files.
-    - Reading mode (with file_path): returns the contents of one file.
-      file_path can be an absolute path (under /var/lib/crucible/run)
-      or a relative path within the run directory (e.g. 'config/tool-params.json').
-      Automatically decompresses .xz files. Use max_bytes to control
-      how much data is returned (default 4000 for a preview; call
-      again with a larger value if you need more).
-    """
-    await _ensure_init()
-
-    find_result = await _ssh.run(
-        controller,
-        f"ls -d /var/lib/crucible/run/*{run_id}* 2>/dev/null | head -1",
-        timeout=15,
-    )
-    run_dir = find_result.stdout.strip() if find_result.exit_code == 0 else ""
-    if not run_dir:
+    """List or read bounded, approved artifacts for a Crucible MCP job or historical run."""
+    await _ensure_cdm_init()
+    if type(listing_offset) is not int or listing_offset < 0:
         return json.dumps(
             {
-                "run_id": run_id,
-                "status": "not_found",
-                "message": f"No run directory found matching {run_id}",
+                "status": "error",
+                "reason": "invalid_listing_offset",
+                "message": "listing_offset must be a nonnegative integer.",
             }
         )
+    target, listing, error = await _run_artifact_context(
+        controller,
+        run_id,
+        full_listing=not file_path,
+        listing_offset=listing_offset if not file_path else 0,
+    )
+    if target is None or listing is None or error is not None:
+        return error or _controller_error("run_not_found", "The run was not found.")
 
+    run_path = target.get("run_path") or listing.get("run_path")
     if not file_path:
-        find_cmd = (
-            f"find {run_dir} -type f "
-            f"\\( -name '*.xz' -o -name '*.csv' -o -name '*.json' "
-            f"-o -name '*.txt' -o -name 'result*' \\) "
-            f"! -path '*/roadblock/*' ! -path '*/msgs/*' "
-            f"! -path '*/workshop/*' "
-            f"2>/dev/null"
-            f" | head -100"
-        )
-        find_files = await _ssh.run(controller, find_cmd, timeout=20)
-        raw_paths = (
-            find_files.stdout.strip().split("\n")
-            if find_files.exit_code == 0 and find_files.stdout.strip()
-            else []
-        )
-
-        if not raw_paths:
-            return json.dumps(
+        files = []
+        for artifact in listing.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            artifact_path = artifact.get("artifact_path")
+            if not isinstance(artifact_path, str):
+                continue
+            files.append(
                 {
-                    "status": "no_files_found",
-                    "run_id": run_id,
-                    "run_dir": run_dir,
-                    "message": "No result files found in run directory.",
+                    "path": artifact_path,
+                    "size_bytes": artifact.get("size"),
+                    "retrievable": artifact.get("retrievable") is True,
                 }
             )
-
-        size_cmd = "stat --printf='%s %n\\n' " + " ".join(
-            shlex.quote(p) for p in raw_paths
-        )
-        size_result = await _ssh.run(controller, size_cmd, timeout=20)
-        files = []
-        if size_result.exit_code == 0 and size_result.stdout.strip():
-            for line in size_result.stdout.strip().split("\n"):
-                parts = line.split(" ", 1)
-                if len(parts) == 2:
-                    try:
-                        files.append(
-                            {
-                                "path": parts[1],
-                                "size_bytes": int(parts[0]),
-                            },
-                        )
-                    except ValueError:
-                        files.append({"path": parts[1], "size_bytes": -1})
-        else:
-            files = [{"path": p, "size_bytes": -1} for p in raw_paths]
-
         return json.dumps(
             {
                 "status": "ok",
                 "run_id": run_id,
-                "run_dir": run_dir,
+                "run_path": run_path,
                 "files": files,
+                "complete": listing.get("complete") is True,
+                "listing_offset": listing_offset,
+                "next_offset": listing.get("next_offset"),
                 "message": (
-                    "Use read_run_results with a specific file_path to "
-                    "read contents. Files ending in .xz are automatically "
-                    "decompressed. Start with max_bytes=4000 (default) to "
-                    "preview, then request more if needed."
+                    "Use a returned relative artifact_path. Compressed artifacts "
+                    "and artifacts over the MCP bound are reported as unsupported."
                 ),
             }
         )
 
-    if not file_path.startswith("/"):
-        resolved_path = os.path.normpath(os.path.join(run_dir, file_path))
-        try:
-            if os.path.commonpath([resolved_path, run_dir]) != run_dir:
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "run_id": run_id,
-                        "file_path": file_path,
-                        "message": (
-                            f"Access denied. Path '{file_path}' traverses "
-                            f"outside run directory {run_dir}."
-                        ),
-                    }
-                )
-        except ValueError:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "run_id": run_id,
-                    "file_path": file_path,
-                    "message": f"Access denied. Invalid path '{file_path}'.",
-                }
-            )
-    else:
-        resolved_path = os.path.normpath(file_path)
-        try:
-            if (
-                os.path.commonpath([resolved_path, "/var/lib/crucible/run"])
-                != "/var/lib/crucible/run"
-            ):
-                return json.dumps(
-                    {
-                        "status": "error",
-                        "run_id": run_id,
-                        "file_path": file_path,
-                        "message": (
-                            "Access denied. Only paths under "
-                            "/var/lib/crucible/run are permitted."
-                        ),
-                    }
-                )
-        except ValueError:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "run_id": run_id,
-                    "file_path": file_path,
-                    "message": (
-                        "Access denied. Only paths under "
-                        "/var/lib/crucible/run are permitted."
-                    ),
-                }
-            )
-
-    qpath = shlex.quote(resolved_path)
-    check_file = await _ssh.run(
-        controller,
-        f"test -f {qpath}",
-        timeout=10,
-    )
-    if check_file.exit_code != 0:
+    if file_path.endswith(".xz"):
         return json.dumps(
             {
-                "status": "not_found",
+                "status": "unsupported",
                 "run_id": run_id,
-                "run_dir": run_dir,
                 "file_path": file_path,
-                "resolved_path": resolved_path,
+                "reason": "compressed_artifact_not_supported",
+                "message": "MCP artifact reads do not decompress .xz artifacts.",
+            }
+        )
+    if type(offset) is not int or offset < 0:
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "invalid_offset",
+                "message": "offset must be a nonnegative integer.",
+            }
+        )
+    limit = min(max(max_bytes, 100), 50_000)
+    adapter, adapter_error = _review_adapter(controller)
+    if adapter is None or adapter_error is not None:
+        return adapter_error or _controller_error(
+            "unsupported_controller", "Crucible MCP is unavailable."
+        )
+    try:
+        raw = await adapter.call_tool(
+            "get_run_artifact",
+            {
+                **target,
+                "artifact_path": file_path,
+                "offset": offset,
+                "limit": limit,
+            },
+        )
+        artifact = _decode_mcp_result(raw)
+    except Exception:
+        return json.dumps(
+            {
+                "status": "unsupported",
+                "run_id": run_id,
+                "file_path": file_path,
+                "reason": "artifact_not_retrievable",
                 "message": (
-                    f"File '{file_path}' not found in {run_dir}"
-                    if not file_path.startswith("/")
-                    else f"File not found: {resolved_path}"
+                    "The artifact is not retrievable through the bounded MCP "
+                    "artifact contract."
                 ),
             }
         )
-
-    limit_bytes = min(max(max_bytes, 100), 50000)
-    is_xz = resolved_path.endswith(".xz")
-    if is_xz:
-        cmd = f"xzcat {qpath} 2>/dev/null | head -c {limit_bytes}"
-    else:
-        cmd = f"head -c {limit_bytes} {qpath}"
-
-    read_result = await _ssh.run(controller, cmd, timeout=30)
-    if read_result.exit_code != 0:
+    text = artifact.get("text")
+    if not isinstance(text, str):
         return json.dumps(
             {
                 "status": "error",
                 "run_id": run_id,
                 "file_path": file_path,
-                "resolved_path": resolved_path,
-                "message": f"Failed to read {resolved_path}",
-                "stderr": (read_result.stderr[:500] if read_result.stderr else ""),
+                "reason": "invalid_artifact_response",
+                "message": "Crucible returned an invalid artifact response.",
             }
         )
-
-    content = read_result.stdout or ""
-    file_size_cmd = f"stat --printf='%s' {qpath}"
-    file_size_result = await _ssh.run(
-        controller,
-        file_size_cmd,
-        timeout=10,
-    )
-    try:
-        file_size = int(file_size_result.stdout.strip())
-    except (ValueError, AttributeError):
-        file_size = -1
-
     return json.dumps(
         {
             "status": "ok",
             "run_id": run_id,
             "file_path": file_path,
-            "resolved_path": resolved_path,
-            "is_compressed": is_xz,
-            "bytes_read": len(content),
-            "file_size": file_size,
-            "truncated": len(content) >= limit_bytes,
-            "content": content,
+            "resolved_path": artifact.get("artifact_path", file_path),
+            "run_path": artifact.get("run_path", run_path),
+            "bytes_read": len(text.encode("utf-8")),
+            "file_size": artifact.get("size"),
+            "offset": artifact.get("offset", offset),
+            "next_offset": artifact.get("next_offset"),
+            "truncated": artifact.get("complete") is not True,
+            "content": text,
         }
     )
 
@@ -561,236 +622,322 @@ async def get_run_summary(
     run_id: str,
     harness: str = "crucible",
 ) -> str:
-    """Get a structured JSON summary of a crucible benchmark run. Reads the result-summary.json from the crucible run directory. Only applicable when the harness is crucible — check get_review_config first."""
-    await _ensure_init()
-
-    find_result = await _ssh.run(
-        controller,
-        f"ls -d /var/lib/crucible/run/*{run_id}* 2>/dev/null | head -1",
-        timeout=15,
-    )
-    run_dir = find_result.stdout.strip() if find_result.exit_code == 0 else ""
-    if not run_dir:
-        return json.dumps(
-            {
-                "run_id": run_id,
-                "status": "not_found",
-                "message": f"No run directory found matching {run_id}",
-            }
-        )
-
-    summary_path = f"{run_dir}/run/result-summary.json"
-    result = await _ssh.run(controller, f"cat {summary_path}", timeout=30)
-    if result.exit_code != 0:
-        return json.dumps(
-            {
-                "run_id": run_id,
-                "status": "error",
-                "run_dir": run_dir,
-                "message": f"{summary_path} not found — run may still be indexing",
-                "stderr": result.stderr[:500] if result.stderr else "",
-            }
-        )
-
-    try:
-        return json.dumps(json.loads(result.stdout))
-    except json.JSONDecodeError:
-        return json.dumps(
-            {
-                "run_id": run_id,
-                "status": "error",
-                "message": "result-summary.json exists but is not valid JSON",
-                "raw": result.stdout[:2000],
-            }
-        )
-
-
-async def cdm_api_request(
-    controller: str,
-    path: str,
-    method: str = "GET",
-    body: dict | None = None,
-    port: int = 3000,
-) -> str:
-    """Internal helper — use cdm_api_requests (plural) to make CDM queries."""
+    """Get a completed Crucible summary by MCP job ID or verified historical run ID."""
     await _ensure_cdm_init()
-
-    method = method.upper()
-    fields = _ticket.get("custom_fields", {}) if isinstance(_ticket, dict) else {}
-    if not isinstance(fields, dict):
-        fields = {}
-    controllers = [ticket_controller_host(_ticket)]
-    for key in ("ssh_hardware_ips", "assigned_hardware_ips"):
-        addresses = fields.get(key)
-        if isinstance(addresses, dict):
-            controllers.append(addresses.get("controller"))
-    context = fields.get("crucible_controller_context")
-    if isinstance(context, dict):
-        controllers.extend((context.get("host"), context.get("controller")))
-    allowed_hosts = {
-        host.strip().rstrip(".").casefold()
-        for host in controllers
-        if isinstance(host, str) and host.strip()
-    }
-    configured_port = 3000
-    if _skill_provider is not None:
-        try:
-            config = await skill_config_view(
-                _skill_provider, "crucible", "review", "review"
-            )
-            configured_port = config.get("cdm_port", 3000)
-        except Exception:
-            return json.dumps(
-                {
-                    "status": "error",
-                    "method": method,
-                    "path": path,
-                    "error": "Unable to verify the configured CDM port",
-                }
-            )
-    if (
-        controller.rstrip(".").casefold() not in allowed_hosts
-        or port != configured_port
-    ):
-        return json.dumps(
-            {
-                "status": "error",
-                "method": method,
-                "path": path,
-                "error": "CDM requests require a recorded controller and configured CDM port",
-            }
+    if harness != "crucible":
+        return _controller_error(
+            "unsupported_harness", "Run summaries are only available for Crucible."
         )
-    if (
-        method not in {"GET", "POST"}
-        or not path.startswith("/")
-        or path.startswith("//")
-        or "%" in path.split("?", 1)[0]
-        or "\\" in path.split("?", 1)[0]
-    ):
-        return json.dumps(
-            {
-                "status": "error",
-                "method": method,
-                "path": path,
-                "error": "Expected GET or POST and an absolute API path",
-            }
+    adapter, error = _review_adapter(controller)
+    if adapter is None or error is not None:
+        return error
+    try:
+        raw = await adapter.call_tool("get_run_summary", {"mcp_job_id": run_id})
+        result = _decode_mcp_result(raw)
+        return json.dumps({**result, "run_id": run_id, "identifier_type": "mcp_job"})
+    except Exception as exc:
+        if not _unknown_mcp_identifier(exc):
+            return _controller_error(
+                "mcp_transport_error",
+                "The Crucible MCP summary request failed.",
+            )
+
+    run_path, lookup_error = await _find_local_run_path(adapter, run_id)
+    if run_path is None:
+        return _controller_error(
+            "run_not_found", lookup_error or "The run was not found."
         )
     try:
-        url = httpx.URL(scheme="http", host=controller, port=port).join(path)
-        if not (url.path in {"/api/v1", "/health"} or url.path.startswith("/api/v1/")):
-            return json.dumps(
-                {
-                    "status": "error",
-                    "method": method,
-                    "path": path,
-                    "error": "Expected a CDM API or health path",
-                }
-            )
-        async with AuditedAsyncHTTPClient(timeout=60.0, trust_env=False) as client:
-            if method == "GET":
-                response = await client.get(url)
-            else:
-                response = await client.post(url, json=body or {})
-    except (httpx.RequestError, httpx.InvalidURL, ValueError) as exc:
-        return json.dumps(
-            {
-                "status": "error",
-                "method": method,
-                "path": path,
-                "error": f"CDM request failed: {type(exc).__name__}: {exc}",
-            }
+        raw = await adapter.call_tool("get_local_run_summary", {"run_path": run_path})
+        result = _decode_mcp_result(raw)
+    except Exception:
+        return _controller_error(
+            "mcp_transport_error",
+            "The Crucible MCP historical summary request failed.",
         )
-
-    try:
-        response_body = response.json()
-        valid_json = True
-    except ValueError:
-        response_body = response.text
-        valid_json = False
-    if not response.is_success:
-        error = response_body.get("error") if isinstance(response_body, dict) else None
-        return json.dumps(
-            {
-                "status": "error",
-                "method": method,
-                "path": path,
-                "status_code": response.status_code,
-                "error": error or f"CDM returned HTTP {response.status_code}",
-                "response_body": response_body,
-            }
-        )
-    if not valid_json:
-        return json.dumps(
-            {
-                "status": "error",
-                "method": method,
-                "path": path,
-                "status_code": response.status_code,
-                "raw_output": response_body,
-                "error": "Response is not valid JSON",
-            }
-        )
-    return json.dumps(response_body)
+    return json.dumps({**result, "run_id": run_id, "identifier_type": "historical_run"})
 
 
 @mcp.tool()
-async def cdm_api_requests(
+async def list_cdm_periods(
     controller: str,
-    requests: list[dict],
-    port: int = 3000,
+    run_id: str,
 ) -> str:
-    """Query CDM directly on a recorded controller (default HTTP port 3000).
-
-    Each request needs 'label', 'method', and 'path'; POST may include 'body'.
-    Requests run concurrently. HTTP errors include the status and response body;
-    large outputs are available through the ticket workspace.
-    """
+    """Discover indexed primary periods for a historical Crucible CDM run."""
     await _ensure_cdm_init()
+    adapter, error = _review_adapter(controller)
+    if adapter is None or error is not None:
+        return error
+    try:
+        raw = await adapter.call_tool("list_indexed_periods", {"run": run_id})
+        return json.dumps(_decode_mcp_result(raw))
+    except Exception:
+        return _controller_error(
+            "mcp_transport_error", "The Crucible period discovery request failed."
+        )
 
-    async def _one(req: dict) -> tuple[str, dict]:
-        label = req.get("label", req.get("path", "?"))
-        try:
-            raw = await cdm_api_request(
-                controller=controller,
-                path=req.get("path", ""),
-                method=req.get("method", "POST"),
-                body=req.get("body"),
-                port=port,
-            )
-            return label, json.loads(raw)
-        except Exception as exc:
-            return label, {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
-    results = await asyncio.gather(*[_one(r) for r in requests])
-    return json.dumps(dict(results))
+@mcp.tool()
+async def get_cdm_metric(
+    controller: str,
+    run_id: str,
+    source: str,
+    metric_type: str,
+    period: str = "",
+    begin: int | None = None,
+    end: int | None = None,
+    aggregation: str | None = None,
+    breakout: list[str] | None = None,
+    filter: str = "",
+    resolution: int = 1,
+) -> str:
+    """Query one structured CDM metric after period discovery."""
+    await _ensure_cdm_init()
+    adapter, error = _review_adapter(controller)
+    if adapter is None or error is not None:
+        return error
+    if not period and (begin is None or end is None):
+        return _controller_error(
+            "period_required",
+            "Provide a discovered period or both begin and end.",
+        )
+    if aggregation is not None and aggregation not in {"sum", "avg", "max", "min"}:
+        return _controller_error(
+            "invalid_aggregation",
+            "aggregation must be sum, avg, max, or min.",
+        )
+    arguments: dict[str, Any] = {
+        "run": run_id,
+        "source": source,
+        "type": metric_type,
+        "resolution": resolution,
+    }
+    if period:
+        arguments["period"] = period
+    if begin is not None:
+        arguments["begin"] = begin
+    if end is not None:
+        arguments["end"] = end
+    if aggregation is not None:
+        arguments["aggregation"] = aggregation
+    if breakout:
+        arguments["breakout"] = breakout
+    if filter:
+        arguments["filter"] = filter
+    try:
+        raw = await adapter.call_tool("get_indexed_metric", arguments)
+        return json.dumps(_decode_mcp_result(raw))
+    except Exception:
+        return _controller_error(
+            "mcp_transport_error", "The structured CDM metric query failed."
+        )
+
+
+def _metric_aggregates(
+    result: dict[str, Any], aggregation: str
+) -> tuple[dict[str, Any], int]:
+    values = result.get("values")
+    if not isinstance(values, dict):
+        return {}, 0
+    aggregates: dict[str, Any] = {}
+    non_numeric = 0
+    for breakout_key, samples in values.items():
+        if not isinstance(samples, list):
+            continue
+        numeric = []
+        for sample in samples:
+            if not isinstance(sample, dict):
+                continue
+            value = sample.get("value")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                numeric.append(float(value))
+            else:
+                non_numeric += 1
+        if not numeric:
+            continue
+        if aggregation == "sum":
+            aggregate = sum(numeric)
+        elif aggregation == "min":
+            aggregate = min(numeric)
+        elif aggregation == "max":
+            aggregate = max(numeric)
+        else:
+            aggregate = sum(numeric) / len(numeric)
+        aggregates[str(breakout_key)] = {
+            "aggregation": aggregation,
+            "value": aggregate,
+            "samples": len(numeric),
+        }
+    return aggregates, non_numeric
 
 
 @mcp.tool()
 async def compare_results(
     controller: str,
     run_ids: list[str],
-    metric_name: str = "",
-    port: int = 3000,
+    metric_name: str,
+    period: str = "",
+    periods: dict[str, str] | None = None,
+    aggregation: str = "avg",
+    breakout: list[str] | None = None,
+    filter: str = "",
 ) -> str:
-    """Compare metrics between two or more benchmark runs via the CDM API. Only applicable for crucible runs."""
+    """Compare a period-scoped CDM metric across two or more historical runs."""
     await _ensure_cdm_init()
-
-    results = {}
-    for rid in run_ids:
-        api_result = await cdm_api_request(
-            controller,
-            "/api/v1/iterations/metric-values",
-            method="POST",
-            body={"runIds": [rid]},
-            port=port,
+    adapter, error = _review_adapter(controller)
+    if adapter is None or error is not None:
+        return error
+    if len(run_ids) < 2:
+        return _controller_error(
+            "invalid_comparison", "At least two run IDs are required."
         )
-        results[rid] = json.loads(api_result)
+    if aggregation not in {"sum", "avg", "max", "min"}:
+        return _controller_error(
+            "invalid_aggregation",
+            "aggregation must be sum, avg, max, or min.",
+        )
+    separator = "::" if "::" in metric_name else "/" if "/" in metric_name else ""
+    if not separator:
+        return _controller_error(
+            "invalid_metric_name",
+            "metric_name must use source::type or source/type.",
+        )
+    source, metric_type = metric_name.split(separator, 1)
+    if not source or not metric_type:
+        return _controller_error(
+            "invalid_metric_name",
+            "metric_name must include both source and type.",
+        )
 
+    period_mapping = periods or {}
+    if not isinstance(period_mapping, dict):
+        return _controller_error(
+            "invalid_period_mapping",
+            "periods must map each run ID to a nonempty period ID.",
+        )
+    unknown_run_ids = [run_id for run_id in period_mapping if run_id not in run_ids]
+    if unknown_run_ids:
+        return json.dumps(
+            {
+                "status": "invalid_period_mapping",
+                "run_ids": run_ids,
+                "metric_name": metric_name,
+                "unknown_run_ids": unknown_run_ids,
+                "message": "The period mapping contains unknown run IDs.",
+            }
+        )
+    invalid_period_ids = [
+        run_id
+        for run_id, mapped_period in period_mapping.items()
+        if not isinstance(mapped_period, str) or not mapped_period
+    ]
+    if invalid_period_ids:
+        return json.dumps(
+            {
+                "status": "invalid_period_mapping",
+                "run_ids": run_ids,
+                "metric_name": metric_name,
+                "run_ids_with_invalid_periods": invalid_period_ids,
+                "message": "Each period mapping value must be a nonempty string.",
+            }
+        )
+
+    selected_period_by_run: dict[str, str] = {}
+    discovered_periods: dict[str, list[str]] = {}
+    for run_id in run_ids:
+        try:
+            raw = await adapter.call_tool("list_indexed_periods", {"run": run_id})
+            period_result = _decode_mcp_result(raw)
+        except Exception:
+            return _controller_error(
+                "period_discovery_failed",
+                f"Period discovery failed for run {run_id}.",
+            )
+        periods = []
+        for item in period_result.get("periods", []):
+            if isinstance(item, dict) and isinstance(
+                item.get("primary_period_id"), str
+            ):
+                periods.append(item["primary_period_id"])
+        discovered_periods[run_id] = periods
+        unique_periods = list(dict.fromkeys(periods))
+
+        selected_period = period_mapping.get(run_id)
+        if selected_period is None and period:
+            selected_period = period
+        if selected_period is None and len(unique_periods) == 1:
+            selected_period = unique_periods[0]
+
+        if selected_period and selected_period not in unique_periods:
+            return json.dumps(
+                {
+                    "status": "invalid_period",
+                    "run_ids": run_ids,
+                    "metric_name": metric_name,
+                    "run_id": run_id,
+                    "requested_period": selected_period,
+                    "discovered_periods": unique_periods,
+                    "message": "The requested period was not discovered for this run.",
+                }
+            )
+        if selected_period:
+            selected_period_by_run[run_id] = selected_period
+
+    ambiguous = {
+        run_id: periods
+        for run_id, periods in discovered_periods.items()
+        if run_id not in selected_period_by_run
+    }
+    if ambiguous:
+        return json.dumps(
+            {
+                "status": "ambiguous_period",
+                "run_ids": run_ids,
+                "metric_name": metric_name,
+                "periods": ambiguous,
+                "message": (
+                    "Period discovery returned zero or multiple periods; select "
+                    "an explicit period instead of choosing arbitrarily."
+                ),
+            }
+        )
+
+    results: dict[str, Any] = {}
+    for run_id in run_ids:
+        arguments: dict[str, Any] = {
+            "run": run_id,
+            "source": source,
+            "type": metric_type,
+            "period": selected_period_by_run[run_id],
+            "aggregation": aggregation,
+        }
+        if breakout:
+            arguments["breakout"] = breakout
+        if filter:
+            arguments["filter"] = filter
+        try:
+            raw = await adapter.call_tool("get_indexed_metric", arguments)
+            metric_result = _decode_mcp_result(raw)
+        except Exception:
+            return _controller_error(
+                "mcp_transport_error",
+                f"The structured CDM metric query failed for run {run_id}.",
+            )
+        aggregates, non_numeric = _metric_aggregates(metric_result, aggregation)
+        results[run_id] = {
+            "period": selected_period_by_run[run_id],
+            "metric": metric_result,
+            "aggregates": aggregates,
+            "non_numeric_samples": non_numeric,
+        }
     return json.dumps(
         {
             "status": "ok",
             "run_ids": run_ids,
             "metric_name": metric_name,
+            "aggregation": aggregation,
+            "periods": selected_period_by_run,
+            "discovered_periods": discovered_periods,
             "results": results,
         }
     )
@@ -851,8 +998,8 @@ async def get_review_config(harness_name: str) -> str:
                     f"No 'review' section found in {harness_name} private-skills config. "
                     f"Check output_dir/output_dirs on the ticket for local artifacts "
                     f"(use list_benchmark_artifacts + read_benchmark_artifact). "
-                    f"If no local artifacts, try read_run_results with the results "
-                    f"directory from the run file or execution config."
+                    f"For Crucible, use get_run_summary and read_run_results "
+                    f"through MCP."
                 ),
                 "results_dir_pattern": execution.get("results_dir_pattern", ""),
                 "execution_keys": list(execution.keys()),

@@ -273,11 +273,11 @@ Instead, they discover capabilities through **skill providers**.
 | 1 | Triage | Parsed intent: fio benchmark, 4K random read, hypothesis = measure baseline IOPS |
 | 2 | Resource | User provided host directly — null provider, no reservation needed |
 | 3 | Provisioning | Detected crucible already installed on controller, skipped reinstall |
-| 4 | Benchmark | Generated crucible run-file, validated against schema, executed via `crucible run` |
+| 4 | Benchmark | Generated Crucible run-file, validated and executed through controller MCP contract v3 |
 | 5 | Review | Analyzed results — **verdict: hypothesis confirmed** |
 
 - All 5 agents powered by Claude (Vertex AI)
-- Real SSH to real hardware, real crucible execution
+- Real hardware access, real Crucible execution through the controller MCP boundary
 - Run ID: `403a4761-e46d-4813-bbb6-5377c8a3da05`
 - Total engineer time: **one prompt**
 
