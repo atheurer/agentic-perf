@@ -301,7 +301,11 @@ def test_outage_and_partial_batch_leave_unacknowledged_events_for_replay(
     client.spool.close()
 
 
-def test_critical_fails_closed_and_clean_close_drains(tmp_path) -> None:
+def test_critical_spools_and_proceeds_when_delivery_fails(tmp_path) -> None:
+    """record_critical spools and proceeds on delivery failure: the caller's
+    SSH mutation must not be treated as failed when only the audit trail
+    cannot be delivered (the #1336 fail-closed regression)."""
+
     def unavailable(_: httpx.Request) -> httpx.Response:
         return httpx.Response(503)
 
@@ -311,9 +315,14 @@ def test_critical_fails_closed_and_clean_close_drains(tmp_path) -> None:
         spool_dir=tmp_path,
         client=httpx.Client(transport=httpx.MockTransport(unavailable)),
     )
+    # Spools instead of raising — the mutation itself is unaffected.
+    client.record_critical(event())
+    # The spooled event survives on disk for later delivery.
+    assert len(list(client.spool.pending())) == 1
+    # close() attempts one final delivery; with the endpoint still down it
+    # raises, but the spooled event is retained for the next producer.
     with pytest.raises(TraceDeliveryError):
-        client.record_critical(event())
-    client.close()
+        client.close()
 
     delivered: list[str] = []
 
@@ -350,6 +359,31 @@ def test_critical_fails_closed_and_clean_close_drains(tmp_path) -> None:
     assert len(delivered) == 1
     assert not list((tmp_path / "ok").glob("*.spool"))
     assert not list((tmp_path / "ok").glob("*.ack"))
+
+
+def test_critical_local_spool_failure_fails_closed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local spool failure is not silently swallowed as a successful
+    critical-event write."""
+
+    def unavailable(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(unavailable)),
+    )
+
+    def fail_append(_: TraceEventV1) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(client.spool, "append", fail_append)
+    with pytest.raises(TraceDeliveryError, match="not centrally persisted"):
+        client.record_critical(event())
+    client.close(flush_timeout=0)
 
 
 def test_outage_during_close_leaves_durable_spool_for_sweeper(tmp_path) -> None:

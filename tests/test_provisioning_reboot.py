@@ -1152,6 +1152,57 @@ class TestCheckpointWriter:
         assert versions == [1, 2]
         assert transition["record_version"] == 2
 
+    @pytest.mark.asyncio
+    async def test_conflict_retry_recomputes_state_from_merged_hosts(
+        self, fake_store, monkeypatch
+    ):
+        import copy
+
+        import agents.provisioning.kernel as kernel
+        from agents.provisioning.kernel import new_transition, write_transition
+        from providers.rhel_kernel import KernelSpec
+
+        transition = new_transition(
+            2, KernelSpec(KERNEL_B), HOSTS, intent_id=None, approval_request_id=None
+        )
+        transition["hosts"] = {
+            HOSTS[0]: {"host": HOSTS[0], "state": "verified"},
+        }
+        transition["state"] = "verified"
+
+        stored = copy.deepcopy(transition)
+        stored["hosts"][HOSTS[1]] = {"host": HOSTS[1], "state": "pending"}
+        stored["record_version"] = 1
+
+        async def fake_read(*args, **kwargs):
+            return copy.deepcopy(stored)
+
+        calls = 0
+
+        async def fake_write(
+            client, ticket_id, kind, record_id, record, expected_version
+        ):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+
+                class Response:
+                    status_code = 409
+
+                class Conflict(Exception):
+                    response = Response()
+
+                raise Conflict("version conflict")
+            return {**record, "record_version": expected_version + 1}
+
+        monkeypatch.setattr(kernel, "_read_transition_record", fake_read)
+        monkeypatch.setattr(kernel, "_write_kernel_record", fake_write)
+        await write_transition("PERF-TEST", 2, transition)
+
+        assert calls == 2
+        assert transition["state"] == "in_progress"
+        assert transition["hosts"][HOSTS[1]]["state"] == "pending"
+
     def test_state_table_covers_thirteen_states(self):
         from providers.rhel_kernel import (
             HOST_STATE_TRANSITIONS,
