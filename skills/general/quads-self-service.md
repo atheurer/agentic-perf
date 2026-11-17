@@ -67,6 +67,24 @@ to preserve the current disk contents. If QUADS reports that the requested OS
 is unavailable, report the exact QUADS error and available OS choices rather
 than silently substituting another OS.
 
+For a no-prep reservation, omit `ostype` and set `wipe` explicitly to `false`:
+
+```bash
+curl -s -k -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"description": "short description", "qinq": 0, "wipe": false}' \
+  "https://$API_HOST/api/v3/assignments/self"
+```
+
+This preserves the hosts' current disk contents and power state. QUADS still
+moves switch ports to the assignment cloud and performs its IPMI credential
+bookkeeping. QUADS normalizes omitted `ostype` and `boot_order` values to its
+configured Foreman defaults, so verify `wipe: false` in the response instead of
+inferring behavior from those normalized fields. A no-wipe assignment is
+auto-validated after the cloud move; `last_build` may still be updated as move
+bookkeeping and is not proof that an OS was installed.
+
 ### 4. Schedule each host into the assignment
 
 ```bash

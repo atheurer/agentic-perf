@@ -81,6 +81,33 @@ limits the reinstall to the named host roles; omit it when the request applies
 to all allocated hosts. Actual installability is checked against the selected
 Foreman deployment and target host.
 
+For a no-prep initial QUADS reservation, combine `reserve_without_os` with an
+explicit `quads_selection.wipe` value of `false`:
+
+```json
+{
+  "custom_fields": {
+    "directives": {
+      "platform_reinstall": {
+        "provider": "foreman",
+        "os": "RHEL 10.0",
+        "reserve_without_os": true
+      }
+    },
+    "quads_selection": {"wipe": false}
+  }
+}
+```
+
+This asks QUADS to move the selected hosts into the assignment cloud without
+reprovisioning them or powering them on for an install. QUADS still performs its
+normal switch-cloud move and IPMI credential bookkeeping. Do not infer
+provisioning intent from the returned `ostype` or `boot_order`: when those
+fields are omitted, QUADS normalizes them to its configured Foreman defaults
+even though `wipe:false` makes them inert. Verify the returned `wipe` value.
+Also treat `last_build` as move bookkeeping rather than proof of an OS rebuild;
+QUADS can update it during a no-wipe cloud move.
+
 ### Formal QUADS Assignment Identity
 
 When the user supplies existing hosts from a council-allocated QUADS
