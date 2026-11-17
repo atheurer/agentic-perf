@@ -16,7 +16,7 @@ import httpx
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.shared.exceptions import McpError
-from mcp.types import CONNECTION_CLOSED
+from mcp.types import CONNECTION_CLOSED, PaginatedRequestParams
 
 from agents.mcp_stdio import audited_stdio_client
 from agents.tool_ownership import owner_harness_from_tool, tool_visible_to_model
@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 _SDK_STDIO_CLIENT = stdio_client
 _MCP_TIMEOUT_CANCELLATION = "agentic-perf-mcp-timeout"
 _MCP_PROVIDER_CANCELLATION = "agentic-perf-mcp-provider-cancellation"
+_MAX_RESOURCE_LIST_PAGES = 100
 
 
 class MCPToolCallError(RuntimeError):
@@ -1025,14 +1026,38 @@ class AgentMCPClient:
             ticket_id=conn.ticket_id,
             agent_id=conn.agent_id,
         )
-        self._record_boundary(
-            conn,
-            LifecycleState.REQUEST_SENT,
-            context=context,
-            tool_name="list_resources",
-        )
+
+        resources: list[dict[str, Any]] = []
+        cursor: str | None = None
         try:
-            result = await conn.session.list_resources()
+            for _ in range(_MAX_RESOURCE_LIST_PAGES):
+                self._record_boundary(
+                    conn,
+                    LifecycleState.REQUEST_SENT,
+                    context=context,
+                    tool_name="list_resources",
+                )
+                result = await conn.session.list_resources(
+                    params=PaginatedRequestParams(cursor=cursor)
+                )
+                self._record_boundary(
+                    conn,
+                    LifecycleState.RESPONSE_RECEIVED,
+                    context=context,
+                    tool_name="list_resources",
+                    outcome=OperationOutcome.SUCCESS,
+                )
+                resources.extend(
+                    self._serialize_resource(resource)
+                    for resource in getattr(result, "resources", [])
+                )
+                cursor = getattr(result, "nextCursor", None)
+                if cursor is None:
+                    return resources
+            raise MCPToolCallError(
+                "MCP resource listing exceeded the maximum page count",
+                "ambiguous_after_send",
+            )
         except asyncio.CancelledError as exc:
             self._record_boundary(
                 conn,
@@ -1053,18 +1078,6 @@ class AgentMCPClient:
                 error=exc,
             )
             raise
-        resources = [
-            self._serialize_resource(resource)
-            for resource in getattr(result, "resources", [])
-        ]
-        self._record_boundary(
-            conn,
-            LifecycleState.RESPONSE_RECEIVED,
-            context=context,
-            tool_name="list_resources",
-            outcome=OperationOutcome.SUCCESS,
-        )
-        return resources
 
     async def read_resource(self, server_name: str, uri: str) -> str:
         """Read one resource from an approved, connected MCP server."""

@@ -5053,7 +5053,10 @@ async def validate_benchmark(
             or result.get("message")
             or json.dumps(result, sort_keys=True)
         )
-        valid = result.get("valid") is True or result.get("status") == "valid"
+        if "valid" in result:
+            valid = result["valid"] is True
+        else:
+            valid = result.get("status") == "valid"
         if valid:
             # Re-read the ticket: the plan may have been corrected since this
             # MCP server process started (e.g. an operator fixing an interface

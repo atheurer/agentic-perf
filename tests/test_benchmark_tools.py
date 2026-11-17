@@ -177,6 +177,7 @@ class BenchmarkMCP:
         launch=None,
         run_error=None,
         prepare_error=None,
+        validation_response: dict[str, object] | None = None,
         logs: list[dict] | None = None,
     ) -> None:
         self.valid = valid
@@ -196,6 +197,7 @@ class BenchmarkMCP:
         self.launch = launch
         self.run_error = run_error
         self.prepare_error = prepare_error
+        self.validation_response = validation_response
         self.log_responses = logs or [{"text": "progress line", "next_offset": None}]
         self.calls: list[tuple[str, dict]] = []
         self.prepare_count = 0
@@ -209,6 +211,8 @@ class BenchmarkMCP:
                 raise MCPToolCallError(
                     json.dumps({"code": "too_large"}), "request_too_large"
                 )
+            if self.validation_response is not None:
+                return json.dumps(self.validation_response)
             return json.dumps({"valid": self.valid, "errors": self.errors})
         if name == "prepare_run":
             if self.prepare_error is not None:
@@ -375,6 +379,66 @@ async def test_validate_benchmark_maps_structured_mcp_errors(monkeypatch):
     assert result["valid"] is False
     assert result["errors"] == ["invalid endpoint schema"]
     assert adapter.calls[0][0] == "validate_run"
+
+
+@pytest.mark.asyncio
+async def test_validate_benchmark_rejects_contradictory_valid_false_with_valid_status(
+    monkeypatch,
+):
+    import agents.benchmark.server as server
+
+    adapter = BenchmarkMCP(validation_response={"valid": False, "status": "valid"})
+    monkeypatch.setattr(server, "_crucible_mcp", adapter)
+    monkeypatch.setattr(
+        server,
+        "_ticket",
+        {
+            "custom_fields": {
+                "directives": {"harness": "crucible"},
+                "assigned_hardware_ips": {"controller": "controller.example"},
+            }
+        },
+    )
+    handlers = _benchmark_handlers_with_mcp()
+
+    result = await handlers["validate_benchmark"](
+        controller="controller.example",
+        run_file={"benchmarks": [{"name": "uperf", "mv-params": {}}], "tags": {}},
+        harness="crucible",
+    )
+
+    assert result["status"] == "invalid"
+    assert result["valid"] is False
+    assert "validation_id" not in result
+
+
+@pytest.mark.asyncio
+async def test_validate_benchmark_uses_status_fallback_when_valid_absent(monkeypatch):
+    import agents.benchmark.server as server
+
+    adapter = BenchmarkMCP(validation_response={"status": "valid"})
+    monkeypatch.setattr(server, "_crucible_mcp", adapter)
+    monkeypatch.setattr(
+        server,
+        "_ticket",
+        {
+            "custom_fields": {
+                "directives": {"harness": "crucible"},
+                "assigned_hardware_ips": {"controller": "controller.example"},
+            }
+        },
+    )
+    handlers = _benchmark_handlers_with_mcp()
+
+    result = await handlers["validate_benchmark"](
+        controller="controller.example",
+        run_file={"benchmarks": [{"name": "uperf", "mv-params": {}}], "tags": {}},
+        harness="crucible",
+    )
+
+    assert result["status"] == "valid"
+    assert result["valid"] is True
+    assert result["validation_id"].startswith("val-")
 
 
 @pytest.mark.asyncio
