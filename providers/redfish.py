@@ -47,8 +47,8 @@ class RedfishClient:
         self._client = client or AuditedAsyncHTTPClient(
             timeout=15.0, verify=ssl.create_default_context(cafile=ca_bundle)
         )
-        # Resolve ComputerSystem path lazily; default per spec
-        self._system_path = "/redfish/v1/Systems/1"
+        # Dell iDRAC uses System.Embedded.1; verified live on r7725 (mgmt-* @ 10.6.61.186)
+        self._system_path = "/redfish/v1/Systems/System.Embedded.1"
 
     async def close(self) -> None:
         await self._client.aclose()
