@@ -340,6 +340,7 @@ def _mcp_registrations_from_tree(
     audited_instances: set[str] = set()
     tool_decorators: set[str] = set()
     audited_wrappers: set[str] = set()
+    factory_aliases = _factory_aliases(tree)
 
     # Resolve the intentionally small, local alias graph to a fixed point:
     # ``server = factory()``, ``alias = server``, and ``register = alias.tool``.
@@ -357,7 +358,7 @@ def _mcp_registrations_from_tree(
             names = _assignment_names(node)
             is_audited_instance = (
                 isinstance(value, ast.Call)
-                and _call_name(value.func) in _factory_aliases(tree)
+                and _call_name(value.func) in factory_aliases
             ) or (isinstance(value, ast.Name) and value.id in audited_instances)
             if is_audited_instance:
                 before = len(audited_instances)
