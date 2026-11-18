@@ -1680,7 +1680,7 @@ def test_orchestrator_watchdog_waits_for_lease_acquisition(tmp_path: Path) -> No
             "AGENTIC_PERF_HOME": str(home),
             "PATH": f"{fake_bin}:{env['PATH']}",
             "START_BG_ORCH_TIMEOUT": "2",
-            "START_BG_ORCH_LEASE_TIMEOUT": "2",
+            "START_BG_ORCH_LEASE_TIMEOUT": "3",
             "START_BG_MAX_START_TIMEOUT": "1",
         }
     )
