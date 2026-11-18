@@ -616,6 +616,10 @@ def _quads_os_requirement_changed(requested: Any, metadata: dict[str, Any]) -> b
     )
 
 
+# A2: Redfish post-alloc read-only poll uses providers/redfish.py (mgmt-* FQDN, HTTPS 443, System.Embedded.1)
+REDFISH_POST_ALLOC_POLL = True
+
+
 def _quads_wipe_requirement_changed(requested: Any, metadata: dict[str, Any]) -> bool:
     if requested is None:
         return False

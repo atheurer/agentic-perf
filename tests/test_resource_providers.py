@@ -2949,7 +2949,7 @@ class TestProviderCorrectAutoReservation:
                     "provider_metadata": {"assignment_id": 73},
                     "hosts": ["host-a", "host-b"],
                 },
-                {"hostnames": ["host-a", "host-b"], "wipe": True},
+                {"hostnames": ["host-a", "host-b"], "wipe": False},
                 "73",
                 {"controller": "host-a", "targets": ["host-b"]},
                 True,
