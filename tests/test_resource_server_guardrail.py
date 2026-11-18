@@ -656,7 +656,10 @@ async def test_quads_reinstall_omits_os_from_initial_reservation():
         )
     )
     assert result["status"] == "success"
-    assert provider.reserve.await_args.args[0] == {"hostnames": ["host-01"], "wipe": False}
+    assert provider.reserve.await_args.args[0] == {
+        "hostnames": ["host-01"],
+        "wipe": False,
+    }
 
 
 @pytest.mark.asyncio
