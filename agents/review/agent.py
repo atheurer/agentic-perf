@@ -303,6 +303,7 @@ class ReviewAgent(AgentBase):
             "get_run_summary",
             "list_cdm_periods",
             "get_cdm_metric",
+            "get_run_metric_by_period",
             "compare_results",
         }
     )

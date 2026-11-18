@@ -200,7 +200,9 @@ should follow a similar pattern:
 14. `POST /api/v1/run/<id>/metric-types` — list metric types per source
 
 The mean, min, max, stddev are computed from the per-sample primary metric
-values. The LLM should compute these from the raw values.
+values. For primary benchmark metrics the LLM computes these from the
+returned values; for continuously sampled tool metrics,
+`get_run_metric_by_period` performs the period-scoped math in code.
 
 ## Example: Getting fio IOPS for a Run
 
@@ -231,6 +233,19 @@ curl -s -X POST http://localhost:3000/api/v1/metric-data \
 - Iteration/sample/period IDs are UUIDs — get them from the API, don't guess.
 - The `metric-data` endpoint requires `begin`/`end` timestamps from the
   period range. Always fetch period ranges before requesting metric data.
+- **Prefer `get_run_metric_by_period` for tool metrics.** For continuously
+  sampled tool/benchmark metrics (e.g. `mpstat` `Busy-CPU`), the review agent
+  exposes `get_run_metric_by_period`, which discovers the run's indexed
+  primary periods and queries `metric-data` once per period in code. It
+  returns a duration-weighted mean for each period plus an aggregate across
+  periods (`n_samples`, `mean`, `min`, `max`, `stddev`). Callers pass only
+  `source`/`type` (and an optional `breakout`), so the period time math is not
+  left to the model and inter-period idle time is excluded.
+- The structured `get_cdm_metric` tool requires a `period` id or both `begin`
+  and `end`. A run-scoped metric-data query with no window spans the idle gaps
+  between periods and dilutes tool metrics such as CPU utilization, so use
+  `list_cdm_periods` to discover valid period ids and scope every query to
+  one.
 - `breakout` enables per-CPU, per-device, per-direction disaggregation.
   Start with empty breakout for aggregate values, then drill down if needed.
 - Tool metrics (sysstat, procstat, mpstat) provide host-level context:

@@ -32,6 +32,10 @@ def test_crucible_review_requires_period_discovery_and_mcp_artifacts():
     assert "call `get_cdm_metric` with the discovered period" in prompt
     assert "do not choose an arbitrary period" in prompt
     assert "provide `compare_results` with a `periods` mapping" in prompt
+    assert "call `get_run_metric_by_period` with the metric's source and type" in prompt
+    assert (
+        "whole-run averages do not dilute active-time values with idle time" in prompt
+    )
     assert "pass that value as the next call's `listing_offset`" in prompt
     assert "Keep `offset` for paginating the content" in prompt
     assert "Do not discover or search controller run directories" in prompt
