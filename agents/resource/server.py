@@ -1028,6 +1028,21 @@ def _quads_ticket_requirements() -> dict[str, Any]:
         for key in ("os", "wipe", "hostnames"):
             if key in source and source[key] is not None:
                 requirements[key] = source[key]
+    # A2: default QUADS to wipe:false unless explicitly set (retain true for non-QUADS; explicit quads.wipe overrides)
+    if "wipe" not in requirements:
+        # ticket hosts sourced from QUADS or quads_selection implies no-prep
+        cf = _ticket.get("custom_fields", {}) if isinstance(_ticket, dict) else {}
+        has_quads_hosts = any(
+            isinstance(h, dict) and not h.get("host")
+            for h in cf.get("required_hosts", [])
+            if isinstance(cf.get("required_hosts"), list)
+        )
+        if (
+            has_quads_hosts
+            or cf.get("quads_selection") is not None
+            or cf.get("quads") is not None
+        ):
+            requirements["wipe"] = False
     explicit = custom_fields.get("quads_selection")
     if isinstance(explicit, dict) and "hostnames" in explicit:
         requirements["hostnames"] = explicit["hostnames"]

@@ -381,7 +381,7 @@ class QuadsResourceProvider(ResourceProvider):
             raise ValueError("QUADS reservation requires an Agentic Perf ticket key")
         logger.info("[quads-provider] Creating assignment for ticket: %s", ticket_key)
         assignment = await self._client.create_assignment(
-            ticket_key, os_type=os_type, wipe=selection["wipe"]
+            ticket_key, os_type=os_type, wipe=selection.get("wipe", False)
         )
         logger.info(
             f"[quads-provider] Assignment created: id={assignment['id']} "
@@ -420,7 +420,7 @@ class QuadsResourceProvider(ResourceProvider):
                 "cloud_name": assignment["cloud_name"],
                 "ticket": assignment.get("ticket"),
                 "os": os_type,
-                "wipe": selection["wipe"],
+                "wipe": selection.get("wipe", False),
                 "ssh_setup": ssh_result,
             },
             "message": f"Reserved {len(hostnames)} hosts via QUADS",

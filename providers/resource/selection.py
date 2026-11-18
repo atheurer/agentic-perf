@@ -175,7 +175,8 @@ def _quads_hosts_in_requirement_order(
 def _validate_quads_selection(
     normalized: dict[str, Any], context: dict[str, Any]
 ) -> dict[str, Any]:
-    normalized.setdefault("wipe", True)
+    # A2: default QUADS wipe:false for no-prep; explicit quads.wipe overrides
+    normalized.setdefault("wipe", False)
     hostnames = normalized["hostnames"]
     expected_count = _managed_host_count(context.get("required_hosts"))
     if expected_count is not None and len(hostnames) != expected_count:

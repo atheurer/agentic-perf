@@ -121,7 +121,7 @@ def test_quads_selection_must_cover_ticket_hosts_and_match_eligible_options():
     ) == {**valid_selection, "wipe": False}
     assert validate_reservation_selection("quads", valid_selection) == {
         **valid_selection,
-        "wipe": True,
+        "wipe": False,
     }
 
 
