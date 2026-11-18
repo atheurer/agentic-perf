@@ -308,7 +308,7 @@ class TestQuadsResourceProvider:
         assert result["provider_metadata"]["cloud_name"] == "cloud01"
         assert result["hosts"] == ["host1.example.com"]
         mock_client.create_assignment.assert_awaited_once_with(
-            "PERF-TEST", os_type=None, wipe=True
+            "PERF-TEST", os_type=None, wipe=False
         )
 
     @pytest.mark.asyncio
