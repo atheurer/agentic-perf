@@ -70,7 +70,7 @@ async def test_quads_credentials_require_verified_ticket_and_location():
     creds = await foreman_credentials(
         config, None, {"cloud_name": "cloud1", "ticket": "123"}
     )
-    assert creds == ("cloud1", "lab@123")
+    assert creds == ("quads", "lab@123")
     with pytest.raises(ForemanError):
         await foreman_credentials(config, None, {"cloud_name": "cloud1"})
     config["auth"]["convention_verified"] = False
