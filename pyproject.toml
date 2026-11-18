@@ -31,7 +31,7 @@ dependencies = [
     # Reject oversized traceparent values before regex matching:
     # CVE-2026-126360 / GHSA-mf5v-w3w3-f6cg. fastmcp-slim permits the
     # vulnerable release; keep fresh installs on the patched API.
-    "opentelemetry-api>=1.45.2",
+    "opentelemetry-api~=1.45.2",
 ]
 
 [project.scripts]
@@ -51,14 +51,14 @@ gemini = [
     "google-genai>=2.0.0",
 ]
 telemetry = [
-    "opentelemetry-sdk>=1.20.0",
-    "opentelemetry-api>=1.20.0",
-    "opentelemetry-semantic-conventions-ai>=0.4.0",
-    "opentelemetry-instrumentation-anthropic>=0.50.0",
-    "opentelemetry-instrumentation-openai>=0.50.0",
+    "opentelemetry-api~=1.45.2",
+    "opentelemetry-sdk~=1.45.2",
+    "opentelemetry-semantic-conventions-ai~=0.5.1",
+    "opentelemetry-instrumentation-anthropic~=0.62.4",
+    "opentelemetry-instrumentation-openai~=0.62.4",
 ]
 telemetry-export = [
-    "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
+    "opentelemetry-exporter-otlp-proto-grpc~=1.45.2",
 ]
 vertex = [
     "anthropic[vertex]>=0.40.0",
@@ -74,6 +74,7 @@ jumpstarter = [
 ]
 dev = [
     "cryptography>=41.0.0",
+    "httpx2>=2.0.0,<3",
     "pytest>=8.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0",
