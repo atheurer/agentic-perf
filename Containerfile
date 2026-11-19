@@ -71,7 +71,17 @@ FROM registry.access.redhat.com/ubi9/python-312
 
 USER 0
 
-RUN dnf install -y --setopt=install_weak_deps=False \
+# Workaround for a UBI9 repo inconsistency: UBI9 appstream currently ships netavark 3:1.17.2
+# (epoch bumped 2 -> 3) requiring aardvark-dns >= 3:1.17, but the UBI9 repos
+# only carry aardvark-dns 2:1.17.1, which RPM epoch comparison cannot satisfy.
+# No older netavark remains in the repo, so podman is uninstallable from UBI9
+# alone. Pull the matching epoch-3 aardvark-dns from CentOS Stream 9 AppStream
+# (GPG-verified with the official CentOS key); everything else stays UBI.
+# Remove this once UBI9 publishes aardvark-dns with epoch 3.
+RUN rpm --import https://www.centos.org/keys/RPM-GPG-KEY-CentOS-Official \
+    && dnf install -y --setopt=install_weak_deps=False \
+        --repofrompath=cs9-appstream,https://mirror.stream.centos.org/9-stream/AppStream/x86_64/os/ \
+        --enablerepo=cs9-appstream \
         openssh-clients \
         git \
         jq \
