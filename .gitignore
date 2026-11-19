@@ -29,3 +29,9 @@ docs/.claude/
 tui/aptui
 tui/dist/
 .pi/
+
+# Local lab run analysis and operator bookmarks — not intended for the
+# public repository (contain internal hostnames, subnets, and personal
+# account URLs). See the repository security model in AGENTS.md.
+run-analysis/
+enmaas_management
