@@ -76,9 +76,9 @@ def test_network_configuration_tools_and_verification_route_are_prompted():
     assert "These requirements may appear only in verbatim directives" in prompt
     assert "expected_mtu" in prompt
     assert "including the complete CIDR when a subnet is required" in prompt
-    assert "it does not expose DHCP lease metadata" in prompt
-    assert "Request clarification if lease verification is required" in prompt
-    assert "nm_show_connection for DHCP profile and live-address state" in prompt
+    assert "expected_dhcp=true" in prompt
+    assert "acquired DHCP4 lease" in prompt
+    assert "an UP interface with no address can never" in prompt
     assert "If `all_ok` is false, do not report provisioning as complete" in prompt
     assert "Do not call submit_provisioning_result in the same response" in prompt
 

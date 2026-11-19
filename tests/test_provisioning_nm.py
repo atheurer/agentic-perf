@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shlex
+
 import pytest
 
 from tests.conftest import MockSSHExecutor, SSHResult, make_provisioning_handlers
@@ -279,6 +281,7 @@ class TestNmVerifyInterface:
             "actual": ["192.0.2.9"],
             "actual_interfaces": ["192.0.2.9"],
             "expected": expected_ip,
+            "status": "checked",
             "ok": expected_ok,
         }
 
@@ -362,3 +365,189 @@ class TestNmVerifyInterface:
         )
         assert result["checks"]["state"]["ok"] is True
         assert result["all_ok"] is True
+
+
+class TestNmVerifyInterfaceDhcp:
+    """Regression tests for #1375: DHCP verification cannot pass without
+    an acquired DHCP4 lease, and an unasserted address check is labeled
+    as not requested rather than silently passing."""
+
+    @pytest.mark.asyncio
+    async def test_dhcp_passes_with_auto_method_and_lease(self):
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP"
+                ),
+                "ip addr show": SSHResult(
+                    stdout="    inet 192.0.2.10/24 scope global eno1\n"
+                ),
+                "conn=$(nmcli": SSHResult(
+                    stdout="Wired connection 1\nauto\noption:dhcp-lease-time  60\nip_address   192.0.2.10"
+                ),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="eno1",
+            expected_dhcp=True,
+        )
+        assert result["all_ok"] is True
+        assert result["checks"]["dhcp"] == {
+            "connection": "Wired connection 1",
+            "ipv4_method": "auto",
+            "dhcp4_lease": True,
+            "expected": "auto method with acquired DHCP4 lease",
+            "ok": True,
+        }
+        assert result["checks"]["ip"]["status"] == "checked"
+        assert result["checks"]["ip"]["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_up_interface_without_address_fails_dhcp(self):
+        """The headline bug: an UP interface with no IPv4 address (no lease
+        acquired) must not pass DHCP verification."""
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP"
+                ),
+                "ip addr show": SSHResult(stdout=""),
+                "conn=$(nmcli": SSHResult(stdout="Wired connection 1\nauto\n"),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="eno1",
+            expected_dhcp=True,
+        )
+        assert result["all_ok"] is False
+        # Both the ip check (no live address) and the dhcp check (no lease)
+        # must fail.
+        assert result["checks"]["ip"]["ok"] is False
+        assert result["checks"]["dhcp"]["ok"] is False
+        assert result["checks"]["dhcp"]["dhcp4_lease"] is False
+
+    @pytest.mark.asyncio
+    async def test_manual_method_with_live_address_fails_dhcp(self):
+        """A live address plus a non-auto profile is not a DHCP lease."""
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP"
+                ),
+                "ip addr show": SSHResult(
+                    stdout="    inet 192.0.2.10/24 scope global eno1\n"
+                ),
+                "conn=$(nmcli": SSHResult(stdout="static-profile\nmanual\n"),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="eno1",
+            expected_dhcp=True,
+        )
+        assert result["all_ok"] is False
+        assert result["checks"]["dhcp"]["ipv4_method"] == "manual"
+        assert result["checks"]["dhcp"]["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_auto_method_without_lease_fails_dhcp(self):
+        """ipv4.method=auto alone proves nothing — a stale or manually added
+        address can coexist with an auto profile. The nmcli DHCP4 state must
+        be non-empty for the check to pass."""
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP"
+                ),
+                "ip addr show": SSHResult(
+                    stdout="    inet 192.0.2.10/24 scope global eno1\n"
+                ),
+                "conn=$(nmcli": SSHResult(stdout="Wired connection 1\nauto\n"),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="eno1",
+            expected_dhcp=True,
+        )
+        assert result["all_ok"] is False
+        assert result["checks"]["dhcp"]["ok"] is False
+        assert result["checks"]["dhcp"]["dhcp4_lease"] is False
+
+    @pytest.mark.asyncio
+    async def test_ip_check_labeled_not_requested_when_unasserted(self):
+        """Distinguish 'not requested' from a verified address so callers
+        cannot accidentally treat an unasserted address as verified."""
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 9000 state UP"
+                ),
+                "ip addr show": SSHResult(stdout=""),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="eno1",
+            expected_mtu=9000,
+        )
+        assert result["all_ok"] is True
+        assert result["checks"]["ip"]["status"] == "not_requested"
+        assert result["checks"]["ip"]["expected"] is None
+        # No DHCP check is emitted when it was not requested.
+        assert "dhcp" not in result["checks"]
+
+    @pytest.mark.asyncio
+    async def test_expected_ip_check_is_labeled_checked(self):
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP"
+                ),
+                "ip addr show": SSHResult(
+                    stdout="    inet 192.0.2.10/24 scope global eno1\n"
+                ),
+            }
+        )
+        handlers = make_handlers(ssh)
+        result = await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="eno1",
+            expected_ip="192.0.2.10/24",
+        )
+        assert result["all_ok"] is True
+        assert result["checks"]["ip"]["status"] == "checked"
+
+    @pytest.mark.asyncio
+    async def test_interface_name_is_shell_quoted_in_commands(self):
+        """The interface name is LLM-supplied; hostile values must stay data."""
+        ssh = MockSSHExecutor(
+            results={
+                "ip link show": SSHResult(
+                    stdout="2: eno1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP"
+                ),
+                "ip addr show": SSHResult(stdout=""),
+            }
+        )
+        handlers = make_handlers(ssh)
+        await handlers["nm_verify_interface"](
+            host="10.0.0.1",
+            interface="eno1; reboot",
+        )
+        # The mock answers any `ip link show` with a healthy interface, so
+        # all_ok is irrelevant here; what matters is that the hostile value
+        # reached the remote shell only as quoted data.
+        ran = [c for c in ssh.calls if c["method"] == "run"]
+        assert ran
+        for call in ran:
+            # After shell parsing, the hostile name must survive as a single
+            # intact token, never as shell syntax (unquoted, shlex.split
+            # would yield "eno1;" and "reboot" as separate tokens).
+            assert "eno1; reboot" in shlex.split(call["command"])
