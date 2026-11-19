@@ -200,6 +200,31 @@ def build_kernel_comparison_plan(
         )
 
     template = dict(steps[bench_indexes[0]])
+
+    # Triage's LLM occasionally emits its own kernel-transition provision
+    # steps (a provision step with a params.kernel mapping). Those steps
+    # would survive this transform untouched (#1355) — the canonical kernel
+    # steps inserted below are the only kernel transitions a kernel-
+    # comparison plan may contain, so drop any triage-emitted ones here.
+    # Code owns the kernel step; the LLM's version is at best a duplicate
+    # transition and at worst carries the baseline package on the candidate
+    # leg (observed on PERF-AFD1570F).
+    dropped = [
+        s
+        for s in steps
+        if s.get("agent_type") == "provision"
+        and isinstance((s.get("params") or {}).get("kernel"), dict)
+    ]
+    if dropped:
+        steps = [s for s in steps if s not in dropped]
+        bench_indexes = [
+            i for i, s in enumerate(steps) if s.get("agent_type") == "benchmark"
+        ]
+        if not bench_indexes:
+            return None, (
+                "execution plan has no benchmark step to build the comparison from"
+            )
+
     new_steps: list[dict[str, Any]] = []
     letter_idx = 0
     last_benchmark_end: int | None = None
@@ -241,6 +266,23 @@ def build_kernel_comparison_plan(
 
     for i, s in enumerate(new_steps):
         s["id"] = i
+
+    # Invariant: every kernel-transition step the plan carries must match
+    # the directive — candidate legs install the directive's package, base
+    # legs reboot the preinstalled stock kernel. Defensive check on the
+    # transform's own output so a regression here can never reach dnf
+    # (#1355). The leg's role is derived from the canonical kernel-<letter>
+    # label the transform assigns.
+    for s in new_steps:
+        kernel = (s.get("params") or {}).get("kernel")
+        if not isinstance(kernel, dict):
+            continue
+        label = str((s.get("params") or {}).get("label") or "")
+        letter = label.removeprefix("kernel-")[-1:] if label else ""
+        role = _LETTER_ROLES.get(letter)
+        expected = normalized["package"] if role == "candidate" else "kernel"
+        if kernel.get("package") != expected:
+            kernel["package"] = expected
 
     return {
         "current_step": plan.get("current_step", 0),
