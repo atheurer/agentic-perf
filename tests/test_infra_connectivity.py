@@ -510,3 +510,74 @@ class TestPortConnectivityUDP:
         explicit = await srv.test_port_connectivity(*arguments, protocol="tcp")
         assert default == explicit
         assert "protocol" not in json.loads(default)["tests"][0]
+
+
+class TestPortConnectivityAddressValidation:
+    """Test addresses are validated for both protocols before any SSH call."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("protocol", ["tcp", "udp"])
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {"server_test_ip": "-e/bin/sh"},
+            {"server_test_ip": "192.0.2.2; exit 0"},
+            {"client_test_ip": "$(reboot)"},
+            {"server_test_ip": "host.example.com"},
+            # Scoped IPv6: ipaddress accepts these, but the zone index is
+            # unconstrained text and must never reach a remote shell.
+            {"server_test_ip": "fe80::1%eth0"},
+            {"client_test_ip": "fe80::1%$(reboot)"},
+        ],
+    )
+    async def test_invalid_addresses_do_not_reach_ssh(
+        self, patch_ssh, protocol, arguments
+    ):
+        base = {
+            "server_ssh_host": "10.0.0.1",
+            "client_ssh_host": "10.0.0.2",
+            "server_test_ip": "192.168.1.1",
+            "client_test_ip": "192.168.1.2",
+            "port": 5201,
+            "protocol": protocol,
+        }
+        base.update(arguments)
+        result = json.loads(await srv.test_port_connectivity(**base))
+        assert "error" in result
+        assert "IP literal" in result["error"]
+        assert patch_ssh.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("protocol", ["tcp", "udp"])
+    async def test_scoped_ipv6_is_rejected_with_zone_hint(self, patch_ssh, protocol):
+        result = json.loads(
+            await srv.test_port_connectivity(
+                server_ssh_host="10.0.0.1",
+                client_ssh_host="10.0.0.2",
+                server_test_ip="fe80::1%eth0",
+                port=5201,
+                protocol=protocol,
+            )
+        )
+        assert "unscoped" in result["error"]
+        assert patch_ssh.calls == []
+
+    @pytest.mark.asyncio
+    async def test_valid_ipv6_tcp_address_is_quoted_in_commands(self, patch_ssh):
+        result = json.loads(
+            await srv.test_port_connectivity(
+                server_ssh_host="10.0.0.1",
+                client_ssh_host="10.0.0.2",
+                server_test_ip="fd00::1",
+                port=5201,
+                protocol="tcp",
+            )
+        )
+        assert result["all_reachable"] is True
+        # The address must appear as an intact token in the commands. Valid
+        # unscoped IP literals contain no shell metacharacters, so shlex.quote
+        # renders them bare — the quoting is defense in depth for the day
+        # validation regresses, verified above by the rejection tests.
+        run_cmds = [c["command"] for c in patch_ssh.calls if c["method"] == "run"]
+        assert any("nc -l fd00::1 5201" in cmd for cmd in run_cmds)
+        assert any("nc -z -w " in cmd and "fd00::1 5201" in cmd for cmd in run_cmds)
