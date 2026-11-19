@@ -120,10 +120,14 @@ def _summarize(results: dict[str, dict]) -> dict:
         or r.get("installed") is True
         or r.get("verified") is True
     )
-    failed = total - success
+    # Expected skips (e.g. controller_only_install scoping) are their own
+    # bucket; counting them as failures makes a correct call read as broken.
+    skipped = sum(1 for r in results.values() if r.get("status") == "skipped")
+    failed = total - success - skipped
+    summary = f"{total} host(s): {success} success, {skipped} skipped, {failed} failed"
     return {
         "results": results,
-        "summary": f"{total} host(s): {success} success, {failed} failed",
+        "summary": summary,
     }
 
 
@@ -182,6 +186,12 @@ def _filter_controller_only(
         return hosts, {}
 
     filtered = [h for h in hosts if h == controller_host]
+    if not filtered:
+        # controller_host is authoritative: when the caller scopes to a
+        # dedicated controller but omits it from the host list, inject it
+        # rather than skipping every host and doing nothing. The caller's
+        # non-controller hosts are still reported as skipped below.
+        filtered = [controller_host]
     skipped: dict[str, dict] = {}
     for h in hosts:
         if h != controller_host:

@@ -23,10 +23,14 @@ Tools that take uniform parameters across hosts use `hosts: list[str]`:
 
 Install-related tools also accept `controller_host` — set this to the
 controller's IP when the harness uses a dedicated controller so the
-harness is only installed/checked/verified on the controller. For
-direct-execution harnesses (no controller), omit `controller_host`.
+harness is only installed/checked/verified on the controller. The
+controller is also included in the operation automatically if you omit it
+from `hosts`; endpoints you do list are reported as `skipped`, which is
+expected and not a failure. For direct-execution harnesses (no controller),
+omit `controller_host`.
 
-All batched tools return results keyed by host, with a summary line.
+All batched tools return results keyed by host, with a summary line that
+breaks out success, skipped, and failed counts separately.
 
 Network configuration tools (`nm_show_connection`, `nm_set_mtu`,
 `nm_set_ip`, `nm_set_dhcp`, `nm_verify_interface`) take a single host per

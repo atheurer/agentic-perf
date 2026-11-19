@@ -8,6 +8,7 @@ import pytest
 from agents.provisioning.prompts import PROVISIONING_BASE_PROMPT
 from agents.provisioning.server import (
     _crucible_identity_probe_command,
+    _filter_controller_only,
     _parse_os_release,
     _summarize,
     _verify_harness_install_one,
@@ -521,7 +522,7 @@ def test_summarize_all_success():
         "h2": {"status": "ok"},
     }
     s = _summarize(results)
-    assert s["summary"] == "2 host(s): 2 success, 0 failed"
+    assert s["summary"] == "2 host(s): 2 success, 0 skipped, 0 failed"
     assert "h1" in s["results"]
     assert "h2" in s["results"]
 
@@ -533,7 +534,18 @@ def test_summarize_mixed():
         "h3": {"status": "already_installed"},
     }
     s = _summarize(results)
-    assert s["summary"] == "3 host(s): 2 success, 1 failed"
+    assert s["summary"] == "3 host(s): 2 success, 0 skipped, 1 failed"
+
+
+def test_summarize_counts_skipped_separately():
+    """Expected controller-only skips must not read as failures."""
+    results = {
+        "controller": {"status": "success"},
+        "client": {"status": "skipped"},
+        "server": {"status": "skipped"},
+    }
+    s = _summarize(results)
+    assert s["summary"] == "3 host(s): 1 success, 2 skipped, 0 failed"
 
 
 def test_summarize_boolean_fields():
@@ -544,7 +556,7 @@ def test_summarize_boolean_fields():
         "h4": {"installed": False},
     }
     s = _summarize(results)
-    assert s["summary"] == "4 host(s): 3 success, 1 failed"
+    assert s["summary"] == "4 host(s): 3 success, 0 skipped, 1 failed"
 
 
 # --- Batched tool handler tests ---
@@ -609,7 +621,7 @@ async def test_batched_check_platform_contract_partial_failure(mock_provider):
 
     results = {"h1": r1, "h2": r2}
     s = _summarize(results)
-    assert s["summary"] == "2 host(s): 1 success, 1 failed"
+    assert s["summary"] == "2 host(s): 1 success, 0 skipped, 1 failed"
     assert results["h1"]["status"] == "ok"
     assert results["h2"]["status"] == "failed"
 
@@ -654,7 +666,7 @@ async def test_batched_check_host_prerequisites():
 
     results = await _gather_for_hosts(["h1", "h2"], _check_one)
     s = _summarize(results)
-    assert s["summary"] == "2 host(s): 2 success, 0 failed"
+    assert s["summary"] == "2 host(s): 2 success, 0 skipped, 0 failed"
     for host in ["h1", "h2"]:
         assert results[host]["all_met"] is True
 
@@ -687,7 +699,7 @@ async def test_batched_install_packages():
     raw = await asyncio.gather(*coros)
     results = {t["host"]: r for t, r in zip(targets, raw)}
     s = _summarize(results)
-    assert s["summary"] == "2 host(s): 2 success, 0 failed"
+    assert s["summary"] == "2 host(s): 2 success, 0 skipped, 0 failed"
 
     # Verify different packages were used per host
     h1_calls = [c for c in ssh.calls if c["host"] == "h1"]
@@ -1223,3 +1235,31 @@ async def test_verify_annotates_changed_host_key_with_tool_guidance(
     assert "10.6.60.88" in result["error"]
     assert "host-key replacement tool" in result["error"]
     assert "ssh-keygen" not in result["error"]
+
+
+def test_filter_controller_only_injects_missing_controller():
+    """controller_host is authoritative: scope to it even when hosts omits it."""
+    filtered, skipped = _filter_controller_only(
+        ["client", "server"], "ctrl", {"controller_only_install": True}
+    )
+    assert filtered == ["ctrl"]
+    assert set(skipped) == {"client", "server"}
+    assert all(r["status"] == "skipped" for r in skipped.values())
+
+
+def test_filter_controller_only_keeps_controller_when_listed():
+    filtered, skipped = _filter_controller_only(
+        ["ctrl", "client"], "ctrl", {"controller_only_install": True}
+    )
+    assert filtered == ["ctrl"]
+    assert set(skipped) == {"client"}
+
+
+def test_filter_controller_only_noop_without_flag_or_host():
+    assert _filter_controller_only(["h1"], "", {"controller_only_install": True}) == (
+        ["h1"],
+        {},
+    )
+    assert _filter_controller_only(
+        ["h1"], "ctrl", {"controller_only_install": False}
+    ) == (["h1"], {})
