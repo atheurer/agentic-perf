@@ -8,6 +8,7 @@ before burning LLM tokens on a doomed run.
 
 from __future__ import annotations
 
+import difflib
 import logging
 from typing import Any
 
@@ -147,11 +148,27 @@ def _check_awaiting_provision(ticket: dict[str, Any]) -> tuple[bool, str]:
         all_assigned.update(targets)
         missing = [h for h in named_hosts if h not in all_assigned]
         if missing:
+            # The identity came from triage's required_hosts; the resource
+            # agent merely copied what it was handed. Name the source field
+            # and the closest assigned host so one dropped DNS label — the
+            # common copy slip — is a 30-second diagnosis instead of a
+            # misdirected resource-agent debugging session (PERF-51EC4BDA).
+            details = []
+            for host in missing:
+                closest = difflib.get_close_matches(
+                    host, sorted(all_assigned), n=1, cutoff=0.5
+                )
+                detail = f"required_hosts[].host={host!r}"
+                if closest:
+                    detail += f" (closest assigned host: {closest[0]!r})"
+                details.append(detail)
             return (
                 False,
-                f"User-provided host identities not found in "
-                f"assigned_hardware_ips: {missing}. The resource "
-                f"agent must submit these exact strings verbatim.",
+                f"Triage submitted host identities that are not among the "
+                f"assigned hosts: {'; '.join(details)}. The resource agent "
+                f"assigns what triage named, so fix triage's required_hosts "
+                f"or the ticket description, then re-run triage. Assigned: "
+                f"controller={controller}, targets={sorted(targets)}.",
             )
 
     return True, ""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import re
@@ -11,7 +12,7 @@ from agents.base import AgentBase
 from agents.mcp_client import AgentMCPClient
 from agents.skill_context import skill_context_prompt
 from providers.events import EventBus
-from providers.llm.base import LLMProvider, LLMResponse, ToolDefinition
+from providers.llm.base import LLMProvider, LLMResponse, ToolCall, ToolDefinition
 
 from .prompts import TRIAGE_SYSTEM_PROMPT
 
@@ -386,6 +387,72 @@ def _filter_direct_required_hosts(
             filtered_host["roles"] = remaining_roles
             filtered.append(filtered_host)
     return filtered or [{"roles": ["client"]}]
+
+
+# Hostnames (dotted FQDN labels) and IPv4 addresses, for verifying that a
+# required_hosts[].host value was actually named by the user.
+_HOSTNAME_TOKEN_RE = re.compile(
+    r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b"
+    r"|\b(?:\d{1,3}\.){3}\d{1,3}\b"
+)
+
+
+def _collect_custom_field_text(value: Any) -> str:
+    """Flatten custom_fields into searchable text for host-verbatim checks."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(_collect_custom_field_text(v) for v in value.values())
+    if isinstance(value, list):
+        return " ".join(_collect_custom_field_text(v) for v in value)
+    return ""
+
+
+def _verbatim_host_mismatches(
+    required_hosts: Any,
+    ticket: dict[str, Any] | None,
+) -> list[tuple[int, str, list[str]]]:
+    """Find required_hosts[].host values the user never named.
+
+    Returns ``(index, submitted_host, suggested_hosts)`` tuples for every
+    entry whose ``host`` appears neither verbatim (case-insensitive substring)
+    in the ticket description nor in any custom-fields text. Suggested hosts
+    are the hostname/IP tokens the description actually contains, closest
+    match first, so the model can correct a dropped DNS label inside the same
+    loop instead of failing the awaiting_provision handoff two agents later.
+    """
+    if not isinstance(required_hosts, list):
+        return []
+    if not isinstance(ticket, dict):
+        return []
+    description = ticket.get("description")
+    if not isinstance(description, str) or not description.strip():
+        # Nothing user-authored to verify against; leave the handoff checks
+        # as the boundary rather than rejecting blindly.
+        return []
+
+    known_text = (
+        description + "\n" + _collect_custom_field_text(ticket.get("custom_fields"))
+    )
+    known_lower = known_text.casefold()
+    known_hosts = sorted(set(_HOSTNAME_TOKEN_RE.findall(description)))
+
+    mismatches: list[tuple[int, str, list[str]]] = []
+    for i, entry in enumerate(required_hosts):
+        if not isinstance(entry, dict):
+            continue
+        host = entry.get("host")
+        if not isinstance(host, str) or not host.strip():
+            continue
+        submitted = host.strip()
+        if submitted.casefold() in known_lower:
+            continue
+        suggestions = sorted(
+            set(difflib.get_close_matches(submitted, known_hosts, n=3, cutoff=0.5))
+            or known_hosts[:3]
+        )
+        mismatches.append((i, submitted, suggestions))
+    return mismatches
 
 
 _SCOPED_CONTEXT_CALL_RE = re.compile(
@@ -1038,6 +1105,61 @@ class TriageAgent(AgentBase):
         if self._ticket_id:
             return await self._request_human_input(self._ticket_id, question)
         return "No ticket context available."
+
+    async def _validate_submit_call(
+        self,
+        ticket_id: str,
+        submit_call: ToolCall,
+    ) -> str | None:
+        """Reject required_hosts[].host values the user never named.
+
+        Triage occasionally drops a DNS label while copying long, near-identical
+        sibling FQDNs. Nothing caught this until the awaiting_provision
+        handoff — after the resource and platform agents had already run — and
+        the handoff error blamed the resource agent, which had submitted the
+        correct strings (PERF-51EC4BDA). Check here, at submit time, against
+        the user-authored description and custom fields so the model can
+        self-correct inside the same loop.
+        """
+        if submit_call.name != "submit_triage_result":
+            return None
+        payload = submit_call.input
+        if not isinstance(payload, dict):
+            return None
+        mismatches = _verbatim_host_mismatches(
+            payload.get("required_hosts"), await self._ticket_for_validation(ticket_id)
+        )
+        if not mismatches:
+            return None
+        lines = [
+            "REJECTED: required_hosts contains host value(s) that do not appear "
+            "verbatim in the ticket description or custom fields. Copy the "
+            "hostnames the user named exactly — including every DNS label."
+        ]
+        for i, submitted, suggestions in mismatches:
+            line = f"  required_hosts[{i}].host = {submitted!r}"
+            if suggestions:
+                line += f" — did you mean one of: {', '.join(suggestions)}?"
+            lines.append(line)
+        lines.append(
+            "Fix the host value(s) and call submit_triage_result again. Omit "
+            "'host' entirely for hosts a provider should allocate."
+        )
+        return "\n".join(lines)
+
+    async def _ticket_for_validation(self, ticket_id: str) -> dict[str, Any] | None:
+        """Fetch the current ticket, failing open when the store is unreachable."""
+        try:
+            return await self._get_ticket(ticket_id)
+        except Exception:
+            # The awaiting_provision handoff re-checks host identities against
+            # assigned_hardware_ips; do not block the submit on a store error.
+            logger.warning(
+                "Unable to fetch ticket %s for host-verbatim validation",
+                ticket_id,
+                exc_info=True,
+            )
+            return None
 
     async def run(self, ticket_id: str) -> None:
         self._ticket_id = ticket_id

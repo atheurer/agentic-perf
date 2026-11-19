@@ -682,3 +682,49 @@ class TestKernelTransitionHandoff:
         }
         ok, reason = check_handoff("executing_benchmark", ticket)
         assert ok, reason
+
+
+class TestNamedHostIdentity:
+    """Host-identity handoff failures must blame triage, not the resource agent."""
+
+    def test_mismatched_named_host_names_triage_and_closest_assigned(self):
+        """PERF-51EC4BDA: one dropped DNS label on a sibling FQDN."""
+        full_client = "u37-h12-000-r7725.rdu3.labs.example.com"
+        full_server = "u37-h14-000-r7725.rdu3.labs.example.com"
+        dropped = "u37-h14-000-r7725.labs.example.com"
+        ticket = {
+            "custom_fields": {
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.1",
+                    "targets": [full_client, full_server],
+                },
+                "required_hosts": [
+                    {"roles": ["client"], "host": full_client},
+                    {"roles": ["server"], "host": dropped},
+                ],
+            }
+        }
+        ok, reason = check_handoff("awaiting_provision", ticket)
+        assert not ok
+        # The message must identify triage as the source of the identity...
+        assert "Triage" in reason
+        # ...name the offending value...
+        assert dropped in reason
+        # ...and suggest the closest assigned host for the one-label slip.
+        assert full_server in reason
+        assert "closest assigned host" in reason
+
+    def test_matching_named_hosts_pass(self):
+        ticket = {
+            "custom_fields": {
+                "assigned_hardware_ips": {
+                    "controller": "10.0.0.1",
+                    "targets": ["h1.example.com", "h2.example.com"],
+                },
+                "required_hosts": [
+                    {"roles": ["client"], "host": "h1.example.com"},
+                ],
+            }
+        }
+        ok, _ = check_handoff("awaiting_provision", ticket)
+        assert ok
