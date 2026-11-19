@@ -52,6 +52,7 @@ from agents.skill_gateway import (
     skill_config_view,
     skill_context_gateway,
 )
+from providers.crucible_identity import crucible_identity_probe_command
 from providers.llm.base import ToolDefinition
 from providers.rhel_kernel import KernelSpec
 from providers.ssh import SSHExecutor, annotate_host_key_error
@@ -1023,26 +1024,13 @@ async def _verify_harness_install_one(
 def _crucible_identity_probe_command(
     identity_path: str = "/root/.crucible/identity",
 ) -> str:
-    """Build a read-only shell probe for a non-empty Crucible email value."""
-    quoted_path = shlex.quote(identity_path)
-    return (
-        f"if test -r {quoted_path} && "
-        "awk -F= '"
-        "/^[[:space:]]*#/ { next } "
-        "$1 ~ /^[[:space:]]*(export[[:space:]]+)?CRUCIBLE_EMAIL[[:space:]]*$/ { "
-        "value = $2; "
-        'sub(/[[:space:]]+#.*/, "", value); '
-        'gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); '
-        'if ((substr(value, 1, 1) == "\\"" && '
-        'substr(value, length(value), 1) == "\\"") || '
-        '(substr(value, 1, 1) == sprintf("%c", 39) && '
-        'substr(value, length(value), 1) == sprintf("%c", 39))) '
-        "value = substr(value, 2, length(value) - 2); "
-        'gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); '
-        'found = (value != "" && value !~ /^#/) '
-        f"}} END {{ exit !found }}' {quoted_path}; "
-        "then printf 'identity=1'; else printf 'identity=0'; fi"
-    )
+    """Build a read-only shell probe for a non-empty Crucible email value.
+
+    Kept as a thin alias so existing imports keep working; the command lives
+    in :mod:`providers.crucible_identity` so the benchmark execution preflight
+    and provisioning verification share one implementation.
+    """
+    return crucible_identity_probe_command(identity_path)
 
 
 async def _check_existing_install_one(
