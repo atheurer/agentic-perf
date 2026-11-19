@@ -24,8 +24,14 @@ def test_state_store_token_loads_the_instance_credential(monkeypatch):
         assert utils.os.environ["AGENTIC_PERF_API_TOKEN"] == "token"
     finally:
         # _state_store_token intentionally exports the credential for the
-        # lifetime of the process; remove the test value before the next test.
-        monkeypatch.delenv("AGENTIC_PERF_API_TOKEN", raising=False)
+        # lifetime of the process. Remove the test value directly rather than
+        # via monkeypatch.delenv: delenv records the current (implementation-
+        # written) value for restoration at teardown, so when the variable was
+        # unset before the test, teardown would re-inject the test token into
+        # the process environment and send later tests at a remote operation
+        # registry (operation_registry_unavailable). monkeypatch's own
+        # teardown still restores the genuine pre-test value when one existed.
+        utils.os.environ.pop("AGENTIC_PERF_API_TOKEN", None)
 
 
 class FakeVaultProvider(SecretsProvider):
@@ -266,3 +272,28 @@ async def test_build_ssh_replaces_and_closes_owned_trace_client(
         if utils._ssh_key_stack is not None:
             await utils._ssh_key_stack.aclose()
         utils._ssh_key_stack = None
+
+
+def test_state_store_token_teardown_does_not_leak_the_test_token(monkeypatch):
+    """The token test's cleanup must not let monkeypatch restore the test value.
+
+    Regression guard for the order-dependent ``operation_registry_unavailable``
+    failures: monkeypatch.delenv in a finally block records the
+    implementation-written token as the value to restore, so a variable that
+    was unset before the test is re-injected at teardown. The token test now
+    pops directly; this pins the monkeypatch behavior it depends on.
+    """
+    import os
+
+    from _pytest.monkeypatch import MonkeyPatch
+
+    name = "AGENTIC_PERF_TOKEN_LEAK_PROBE"
+    monkeypatch.delenv(name, raising=False)
+    assert name not in os.environ
+
+    probe = MonkeyPatch()
+    probe.delenv(name, raising=False)  # start of the token test: no-op
+    os.environ[name] = "token"  # implementation writes the credential
+    os.environ.pop(name, None)  # fixed finally block: direct pop
+    probe.undo()  # teardown
+    assert name not in os.environ
