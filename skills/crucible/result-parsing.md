@@ -2,9 +2,11 @@
 
 The review agent should first check ticket artifacts and the result summary.
 Use the summary's metric inventory to decide which data can be queried through
-CDM. Query CDM with cdm_api_requests; use the run summary for indexed metadata
-and read_run_results for raw result files when the requested source is
-unavailable in CDM.
+CDM. Query CDM with get_run_summary for indexed run metadata, list_cdm_periods
+to discover the run's active (non-idle) measurement periods, get_cdm_metric
+for single-period metric retrieval, and get_run_metric_by_period for
+deterministic per-period metric series; use read_run_results for raw result
+files when the requested source is unavailable in CDM.
 Use get_skill_context with subject harness/crucible for the installed
 controller's result and CDM documentation instead of relying on old API routes
 or hard-coded controller paths.
