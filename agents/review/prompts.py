@@ -96,6 +96,12 @@ When comparing runs whose period IDs differ, provide `compare_results` with a
 `periods` mapping from each run ID to its discovered period. Use the shared
 `period` only when that period is valid for every requested run.
 
+For continuously sampled tool metrics (for example `mpstat` Busy-CPU,
+`sar-net`, or `procstat`), call `get_run_metric_by_period` with the metric's
+source and type. It bounds each query to the run's discovered primary
+periods, so whole-run averages do not dilute active-time values with idle
+time between periods.
+
 When artifact listings return `next_offset`, pass that value as the next call's
 `listing_offset` until `complete` is true. Keep `offset` for paginating the
 content of a selected artifact.

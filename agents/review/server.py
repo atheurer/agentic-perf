@@ -12,7 +12,9 @@ Connected via: AgentMCPClient (agents/mcp_client.py)
 import asyncio
 import json
 import logging
+import math
 import os
+import statistics
 import sys
 from pathlib import Path
 from typing import Any
@@ -941,6 +943,301 @@ async def compare_results(
             "results": results,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic per-period metric querying
+#
+# Crucible records tool metrics (mpstat CPU, sar-net, procstat, ...)
+# continuously, but a benchmark is only active inside its periods. The idle
+# gaps between periods carry no load, so a whole-run average dilutes real
+# busy-time utilization with idle time. These helpers discover the run's
+# indexed primary periods in code and query the metric once per period,
+# returning a duration-weighted mean for each period plus an aggregate across
+# periods. The LLM chooses only the metric (source/type/breakout), never the
+# time math. No caller-supplied time window is involved, so the "per period"
+# scoping cannot be bypassed by a model that miscomputes timestamps.
+# ---------------------------------------------------------------------------
+
+_MAX_CONCURRENT_PERIOD_QUERIES = 8
+
+
+def _weighted_point_mean(points: Any) -> tuple[float | None, int, float]:
+    """Duration-weighted mean of metric-data points within one period.
+
+    Returns ``(mean, point_count, total_duration_ms)``. ``mean`` is ``None``
+    when there are no usable numeric points. Point durations weight each
+    sample of the period; points without a duration (or with a non-finite one)
+    still count toward ``point_count`` but contribute no weight. Falls back to
+    an unweighted mean when no usable durations remain. Non-finite values and
+    durations are dropped so the result is always JSON-safe. Booleans are
+    rejected because ``bool`` is a subclass of ``int``.
+    """
+    vals: list[tuple[float, float | None]] = []
+    if isinstance(points, list):
+        for p in points:
+            if not isinstance(p, dict):
+                continue
+            v = p.get("value")
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            v_float = float(v)
+            if not math.isfinite(v_float):
+                continue
+            d = p.get("duration")
+            d_val: float | None = None
+            if isinstance(d, (int, float)) and not isinstance(d, bool):
+                d_float = float(d)
+                if math.isfinite(d_float) and d_float > 0:
+                    d_val = d_float
+            vals.append((v_float, d_val))
+    if not vals:
+        return None, 0, 0.0
+    total_dur = sum(d for _, d in vals if d is not None)
+    if total_dur > 0:
+        weighted = sum(v * d for v, d in vals if d is not None) / total_dur
+        return weighted, len(vals), total_dur
+    return sum(v for v, _ in vals) / len(vals), len(vals), 0.0
+
+
+def _aggregate_across_samples(samples: list[Any]) -> dict:
+    """Summarize per-period means across periods.
+
+    Each item is either a bare mean or a ``(mean, duration_ms)`` pair (as
+    produced by ``_weighted_point_mean``). ``n_samples`` is the number of
+    periods that produced a usable mean, not the number of raw metric points.
+    The cross-period ``mean`` is duration-weighted whenever every contributing
+    period reports a positive duration, so a long period is not outvoted by a
+    short one; otherwise it falls back to the unweighted mean. The
+    ``weighting`` field reports which mode produced ``mean`` (``"duration"`` or
+    ``"unweighted"``). ``min``/``max``/``stddev`` are unweighted statistics over
+    the per-period means, and
+    ``stddev`` is the sample standard deviation (``n - 1`` denominator, ``0.0``
+    for a single period). Returns ``{"n_samples": 0}`` when no period produced
+    a usable mean.
+    """
+    means: list[float] = []
+    durations: list[float | None] = []
+    for item in samples:
+        mean: Any = item
+        duration: Any = None
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            mean, duration = item
+        if isinstance(mean, bool) or not isinstance(mean, (int, float)):
+            continue
+        mean_float = float(mean)
+        if not math.isfinite(mean_float):
+            continue
+        duration_float: float | None = None
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            candidate = float(duration)
+            if math.isfinite(candidate) and candidate > 0:
+                duration_float = candidate
+        means.append(mean_float)
+        durations.append(duration_float)
+    if not means:
+        return {"n_samples": 0}
+    if all(d is not None for d in durations):
+        total_dur = sum(d for d in durations if d is not None)
+        aggregate_mean = (
+            sum(m * d for m, d in zip(means, durations) if d is not None) / total_dur
+        )
+        weighting = "duration"
+    else:
+        aggregate_mean = statistics.fmean(means)
+        weighting = "unweighted"
+    return {
+        "n_samples": len(means),
+        "mean": aggregate_mean,
+        "weighting": weighting,
+        "min": min(means),
+        "max": max(means),
+        "stddev": statistics.stdev(means) if len(means) > 1 else 0.0,
+    }
+
+
+def _discovered_period_ids(period_result: Any) -> list[str]:
+    """Return unique, nonempty primary period IDs in discovery order."""
+    periods: list[str] = []
+    if not isinstance(period_result, dict):
+        return periods
+    raw_periods = period_result.get("periods")
+    if not isinstance(raw_periods, list):
+        return periods
+    for item in raw_periods:
+        if isinstance(item, dict):
+            period_id = item.get("primary_period_id")
+            if isinstance(period_id, str) and period_id:
+                periods.append(period_id)
+    return list(dict.fromkeys(periods))
+
+
+@mcp.tool()
+async def get_run_metric_by_period(
+    controller: str,
+    run_id: str,
+    source: str,
+    type: str,
+    breakout: list[str] | None = None,
+    filter: str = "",
+    resolution: int = 1,
+) -> str:
+    """Fetch one Crucible tool/benchmark metric bounded to each discovered primary period.
+
+    Continuously sampled tool metrics (mpstat CPU, sar-net, procstat, ...) are
+    averaged over the whole run by default, which dilutes active-time values
+    with the idle time between periods. This tool discovers the run's indexed
+    primary periods and queries the metric once per period, returning a
+    duration-weighted mean for each period plus an aggregate across periods.
+    The caller supplies only source/type (e.g. source='mpstat',
+    type='Busy-CPU') and an optional breakout (e.g. ['cpu']); the tool does all
+    period time math. Crucible only.
+    """
+    if not run_id or not source or not type:
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "invalid_arguments",
+                "message": "run_id, source, and type must be non-empty.",
+            }
+        )
+    if (
+        not isinstance(resolution, int)
+        or isinstance(resolution, bool)
+        or resolution < 1
+    ):
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "invalid_arguments",
+                "message": "resolution must be an integer >= 1.",
+            }
+        )
+
+    await _ensure_cdm_init()
+    adapter, error = _review_adapter(controller)
+    if adapter is None or error is not None:
+        return error
+
+    breakout = breakout or []
+    try:
+        raw = await adapter.call_tool("list_indexed_periods", {"run": run_id})
+        period_result = _decode_mcp_result(raw)
+    except Exception as exc:
+        logger.warning(
+            "Period discovery failed for run %s: %s",
+            run_id,
+            exc.__class__.__name__,
+        )
+        return _controller_error(
+            "period_discovery_failed",
+            f"Period discovery failed for run {run_id}.",
+        )
+
+    periods = _discovered_period_ids(period_result)
+    if not periods:
+        return json.dumps(
+            {
+                "status": "no_data",
+                "run_id": run_id,
+                "source": source,
+                "type": type,
+                "message": "Run has no indexed primary periods (not indexed yet?).",
+            }
+        )
+
+    async def _metric(period_id: str) -> dict[str, Any]:
+        arguments: dict[str, Any] = {
+            "run": run_id,
+            "source": source,
+            "type": type,
+            "resolution": resolution,
+            "period": period_id,
+        }
+        if breakout:
+            arguments["breakout"] = breakout
+        if filter:
+            arguments["filter"] = filter
+        try:
+            raw = await adapter.call_tool("get_indexed_metric", arguments)
+            metric_result = _decode_mcp_result(raw)
+        except Exception as exc:
+            logger.warning(
+                "Period-scoped metric query failed for run %s period %s: %s",
+                run_id,
+                period_id,
+                exc.__class__.__name__,
+            )
+            return {
+                "period": period_id,
+                "error": "The structured CDM metric query failed for this period.",
+            }
+        values = metric_result.get("values")
+        per_breakout: dict[str, dict[str, Any]] = {}
+        if isinstance(values, dict):
+            for key, points in values.items():
+                mean, count, duration = _weighted_point_mean(points)
+                per_breakout[str(key)] = {
+                    "mean": mean,
+                    "points": count,
+                    "duration_ms": duration,
+                }
+        return {"period": period_id, "values": per_breakout}
+
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_PERIOD_QUERIES)
+
+    async def _metric_limited(period_id: str) -> dict[str, Any]:
+        async with semaphore:
+            return await _metric(period_id)
+
+    period_results = await asyncio.gather(*[_metric_limited(p) for p in periods])
+
+    by_breakout: dict[str, list[Any]] = {}
+    for result in period_results:
+        values = result.get("values")
+        if not isinstance(values, dict):
+            continue
+        for key, info in values.items():
+            if not isinstance(info, dict):
+                continue
+            by_breakout.setdefault(key, []).append(
+                (info.get("mean"), info.get("duration_ms"))
+            )
+    aggregate = {
+        key: _aggregate_across_samples(means) for key, means in by_breakout.items()
+    }
+
+    failed = [r["period"] for r in period_results if "error" in r]
+    if len(failed) == len(period_results):
+        return json.dumps(
+            {
+                "status": "error",
+                "run_id": run_id,
+                "source": source,
+                "type": type,
+                "reason": "metric_query_failed",
+                "message": "Every period-scoped metric query failed.",
+                "period_results": period_results,
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "status": "ok",
+        "run_id": run_id,
+        "source": source,
+        "type": type,
+        "breakout": breakout,
+        "period_bounded": True,
+        "note": (
+            "Values are bounded to each discovered primary period; "
+            "inter-period idle time is excluded."
+        ),
+        "period_results": period_results,
+        "aggregate": aggregate,
+    }
+    if failed:
+        payload["failed_periods"] = failed
+    return json.dumps(payload)
 
 
 # ---------------------------------------------------------------------------

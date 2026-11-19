@@ -256,6 +256,7 @@ TOOL_AUDIT_POLICY = (
         "agents/review/server.py:get_run_summary",
         "agents/review/server.py:list_cdm_periods",
         "agents/review/server.py:get_cdm_metric",
+        "agents/review/server.py:get_run_metric_by_period",
         "agents/review/server.py:compare_results",
         "agents/review/server.py:get_review_config",
         "agents/triage/server.py:get_skill_context",
