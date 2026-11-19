@@ -3231,14 +3231,19 @@ async def nm_verify_interface(
     interface: str,
     expected_mtu: int | None = None,
     expected_ip: str | None = None,
+    expected_dhcp: bool = False,
     user: str = "root",
 ) -> str:
-    """Verify that a network interface matches expected configuration. Checks live state (ip link) not just the NM profile. Returns pass/fail per parameter: mtu, ip_address, state."""
+    """Verify that a network interface matches expected configuration. Checks live state (ip link) not just the NM profile. Returns pass/fail per parameter: mtu, ip_address, dhcp, state. expected_dhcp=True requires an active NetworkManager connection with ipv4.method auto AND an acquired DHCP4 lease (nmcli DHCP4 state), not merely a live address."""
     await _ensure_init()
     checks: dict[str, dict] = {}
     all_ok = True
 
-    r_link = await _ssh.run(host, f"ip link show {interface} 2>/dev/null")
+    # The interface name is LLM-supplied and reaches a remote shell; quote it
+    # so it stays data even for hostile values.
+    q_interface = shlex.quote(interface)
+
+    r_link = await _ssh.run(host, f"ip link show {q_interface} 2>/dev/null")
     link_output = r_link.stdout
 
     m = re.search(r"mtu (\d+)", link_output)
@@ -3248,7 +3253,7 @@ async def nm_verify_interface(
     checks["mtu"] = {"actual": actual_mtu, "expected": expected_mtu, "ok": mtu_ok}
 
     r_addr = await _ssh.run(
-        host, f"ip addr show {interface} 2>/dev/null | grep 'inet '"
+        host, f"ip addr show {q_interface} 2>/dev/null | grep 'inet '"
     )
     actual_interfaces = [
         fields[1]
@@ -3256,17 +3261,58 @@ async def nm_verify_interface(
         if (fields := line.split()) and fields[0] == "inet" and len(fields) > 1
     ]
     actual_ips = [interface.split("/", 1)[0] for interface in actual_interfaces]
-    ip_ok = expected_ip is None or any(
-        _ipv4_interface_matches(expected_ip, interface)
-        for interface in actual_interfaces
-    )
+    if expected_ip is not None:
+        ip_ok = any(
+            _ipv4_interface_matches(expected_ip, interface)
+            for interface in actual_interfaces
+        )
+        ip_status = "checked"
+    elif expected_dhcp:
+        # A DHCP expectation implies at least one live IPv4 address; an UP
+        # interface with no address must not pass (#1375).
+        ip_ok = bool(actual_ips)
+        ip_status = "checked"
+    else:
+        # Explicitly distinguish "caller did not request an address check"
+        # from a verified address, so an unasserted address can never be
+        # mistaken for a DHCP lease (#1375).
+        ip_ok = True
+        ip_status = "not_requested"
     all_ok = all_ok and ip_ok
     checks["ip"] = {
         "actual": actual_ips,
         "actual_interfaces": actual_interfaces,
         "expected": expected_ip,
+        "status": ip_status,
         "ok": ip_ok,
     }
+
+    if expected_dhcp:
+        # Lease proof must come from NetworkManager's DHCP4 state, not from
+        # a live address: a stale or manually-added address can coexist with
+        # an ipv4.method=auto profile without any lease being acquired.
+        dhcp_cmd = (
+            f"conn=$(nmcli -g GENERAL.CONNECTION device show {q_interface} "
+            f"2>/dev/null); "
+            f'method=$(nmcli -g ipv4.method connection show "$conn" '
+            f"2>/dev/null); "
+            f"lease=$(nmcli -g DHCP4 device show {q_interface} 2>/dev/null); "
+            f'printf \'%s\\n%s\\n%s\' "$conn" "$method" "$lease"'
+        )
+        r_dhcp = await _ssh.run(host, dhcp_cmd)
+        lines = (r_dhcp.stdout or "").splitlines()
+        conn_name = lines[0].strip() if lines else ""
+        method = lines[1].strip() if len(lines) > 1 else ""
+        lease_output = "\n".join(lines[2:]).strip()
+        dhcp_ok = method == "auto" and bool(lease_output)
+        all_ok = all_ok and dhcp_ok
+        checks["dhcp"] = {
+            "connection": conn_name,
+            "ipv4_method": method,
+            "dhcp4_lease": bool(lease_output),
+            "expected": "auto method with acquired DHCP4 lease",
+            "ok": dhcp_ok,
+        }
 
     state_ok = "UP" in link_output and "state UP" in link_output
     checks["state"] = {"up": state_ok, "ok": state_ok}

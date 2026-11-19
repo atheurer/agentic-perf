@@ -125,13 +125,13 @@ installs the harness when it is missing, then verifies it, in one batched call.
    d. For every interface with an MTU or static-address requirement,
       call `nm_verify_interface` with `expected_mtu` and/or
       `expected_ip`, including the complete CIDR when a subnet is
-      required. Include the complete result in
+      required. For DHCP requirements, call `nm_verify_interface` with
+      `expected_dhcp=true` — it requires an active NetworkManager
+      connection with `ipv4.method: auto` AND an acquired DHCP4 lease
+      (nmcli DHCP4 state), so an UP interface with no address can never
+      pass. Include the complete result in
       submit_provisioning_result. If `all_ok` is false, do not report
-      provisioning as complete. For DHCP, use `nm_show_connection` to
-      confirm `ipv4.method: auto` and record the live interface state;
-      it does not expose DHCP lease metadata, so do not treat a live
-      address as lease proof. Request clarification if lease
-      verification is required.
+      provisioning as complete.
    e. When RX flow-steering rules are requested, call
       configure_flow_steering after tune_nic and before pin_irq.
       It reads back the active ethtool rule table and checks
