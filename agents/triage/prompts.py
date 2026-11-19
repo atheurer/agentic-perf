@@ -148,6 +148,11 @@ Your job is to analyze a performance test request ticket and:
      packages, include it: kernel_comparison: {..., "repo_url": "<url>"}.
      The kernel install step will configure the repository on the hosts
      automatically; without repo_url the packages must already be available.
+   - The candidate leg's `package` comes verbatim from
+     `kernel_comparison.package` — it is not your choice. Do NOT emit your
+     own kernel-install provision steps in the execution plan when
+     kernel_comparison is set; the plan builder inserts the kernel
+     transition steps deterministically from the directive.
 
    If the user does not mention a directive, omit it — downstream agents will use
    their own defaults. Do NOT invent directives the user didn't ask for.

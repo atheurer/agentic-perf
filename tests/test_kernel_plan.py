@@ -1542,3 +1542,139 @@ class TestTriageEmittedABShape:
             "review",
             "teardown",
         ]
+
+
+class TestTriageEmittedKernelSteps:
+    """Regression tests for #1355: the transform must not let triage-emitted
+    kernel-transition steps leak through (wrong package on the candidate leg,
+    or duplicate transitions alongside the canonical ones)."""
+
+    def test_triage_kernel_step_with_wrong_candidate_package_is_dropped(self):
+        # PERF-AFD1570F: the triage plan carried its own kernel-install step
+        # with the baseline package on what should be the candidate leg.
+        plan = default_plan()
+        plan["steps"].insert(
+            2,
+            {
+                "id": 2,
+                "agent_type": "provision",
+                "params": {
+                    "label": "install-rt-kernel",
+                    "kernel": {
+                        "release": KERNEL_B,
+                        "package": "kernel",  # wrong: should be kernel-rt
+                        "repo_url": REPO_URL,
+                    },
+                },
+            },
+        )
+        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert err == ""
+        kernel_steps = [
+            s for s in new_plan["steps"] if isinstance(s["params"].get("kernel"), dict)
+        ]
+        # Exactly the canonical kernel-A / kernel-B steps — the triage-emitted
+        # one was dropped, not duplicated.
+        assert [s["params"]["label"] for s in kernel_steps] == ["kernel-A", "kernel-B"]
+        for s in kernel_steps:
+            assert s["params"]["kernel"]["release"] in (KERNEL_A, KERNEL_B)
+        # The directive (no package key) defaults to "kernel" for candidate.
+        assert kernel_steps[1]["params"]["kernel"]["package"] == "kernel"
+        assert kernel_steps[0]["params"]["kernel"]["package"] == "kernel"
+
+    def test_triage_kernel_step_dropped_even_with_correct_package(self):
+        # Even a correct triage kernel step would duplicate the canonical
+        # transition; the transform owns kernel steps when the directive is
+        # active.
+        plan = default_plan()
+        plan["steps"].insert(
+            2,
+            {
+                "id": 2,
+                "agent_type": "provision",
+                "params": {
+                    "label": "kernel",
+                    "kernel": {
+                        "release": KERNEL_B,
+                        "package": "kernel-rt",
+                        "repo_url": REPO_URL,
+                    },
+                },
+            },
+        )
+        directive = dict(GOOD, package="kernel-rt", repo_url=REPO_URL)
+        new_plan, err = build_kernel_comparison_plan(plan, directive)
+        assert err == ""
+        kernel_steps = [
+            s for s in new_plan["steps"] if isinstance(s["params"].get("kernel"), dict)
+        ]
+        assert [s["params"]["label"] for s in kernel_steps] == ["kernel-A", "kernel-B"]
+        # Candidate leg carries the directive's package and repo.
+        assert kernel_steps[1]["params"]["kernel"]["package"] == "kernel-rt"
+        assert kernel_steps[1]["params"]["kernel"]["repo_url"] == REPO_URL
+        # Baseline leg is the stock kernel parity reboot.
+        assert kernel_steps[0]["params"]["kernel"]["package"] == "kernel"
+        assert "repo_url" not in kernel_steps[0]["params"]["kernel"]
+
+    def test_non_kernel_provision_steps_are_preserved(self):
+        # Ordinary provision steps (harness install, NIC tuning) must not be
+        # mistaken for kernel transitions.
+        plan = default_plan()
+        plan["steps"][1]["params"]["packages"] = ["podman", "git"]
+        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert err == ""
+        harness = [
+            s for s in new_plan["steps"] if s["params"].get("label") == "harness"
+        ]
+        assert harness and harness[0]["params"]["packages"] == ["podman", "git"]
+
+    def test_kernel_step_after_all_benchmarks_is_also_dropped(self):
+        plan = default_plan()
+        plan["steps"].append(
+            {
+                "id": 5,
+                "agent_type": "provision",
+                "params": {
+                    "label": "kernel",
+                    "kernel": {"release": KERNEL_B, "package": "kernel"},
+                },
+            }
+        )
+        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert err == ""
+        kernel_steps = [
+            s for s in new_plan["steps"] if isinstance(s["params"].get("kernel"), dict)
+        ]
+        assert [s["params"]["label"] for s in kernel_steps] == ["kernel-A", "kernel-B"]
+
+    def test_generated_candidate_step_package_matches_directive(self):
+        # The invariant: whatever the transform emits, the candidate kernel
+        # step's package equals the directive's package.
+        directive = dict(GOOD, package="kernel-rt", repo_url=REPO_URL)
+        plan, err = build_kernel_comparison_plan(default_plan(), directive)
+        assert err == ""
+        kernel_steps = [
+            s for s in plan["steps"] if isinstance(s["params"].get("kernel"), dict)
+        ]
+        by_label = {s["params"]["label"]: s for s in kernel_steps}
+        assert by_label["kernel-B"]["params"]["kernel"]["package"] == "kernel-rt"
+        assert by_label["kernel-A"]["params"]["kernel"]["package"] == "kernel"
+
+    def test_all_benchmarks_before_any_is_rejected_when_kernels_drop(self):
+        # Degenerate input: if dropping triage kernel steps leaves no
+        # benchmark step, the transform must say so rather than crash.
+        plan = {
+            "current_step": 0,
+            "run_ids": [],
+            "steps": [
+                {"id": 0, "agent_type": "resource", "params": {}},
+                {
+                    "id": 1,
+                    "agent_type": "provision",
+                    "params": {"kernel": {"release": KERNEL_B, "package": "kernel"}},
+                },
+            ],
+        }
+        new_plan, err = build_kernel_comparison_plan(plan, dict(GOOD))
+        assert new_plan is None
+        assert "no benchmark step" in err
