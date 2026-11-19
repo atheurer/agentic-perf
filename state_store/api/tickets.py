@@ -195,11 +195,16 @@ def create_ticket(body: CreateTicketRequest, request: Request):
         except Exception:
             pass
 
-    ticket = store.create_ticket(
-        body,
-        created_by=created_by,
-        owners=owners,
-    )
+    try:
+        ticket = store.create_ticket(
+            body,
+            created_by=created_by,
+            owners=owners,
+        )
+    except ValueError as e:
+        # Reserved-field and verbatim-directive rejections from the store
+        # are authoring errors, not server faults.
+        raise HTTPException(status_code=422, detail=str(e)) from e
 
     if normalization_report:
         from state_store.models import AddCommentRequest
