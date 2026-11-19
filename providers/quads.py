@@ -378,8 +378,12 @@ class QuadsClient:
         self,
         assignment_id: int,
         interval: int = 120,
-        timeout: int = 3600,
+        timeout: int = 7200,
     ) -> dict[str, Any]:
+        # Two hours: QUADS validation can occasionally exceed the previous
+        # one-hour window and may even report a transient failure before later
+        # succeeding (#1299); a premature TimeoutError returns an unknown
+        # outcome while the assignment remains active.
         elapsed = 0
         while elapsed < timeout:
             status = await self.get_assignment_status(assignment_id)
