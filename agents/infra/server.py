@@ -1350,13 +1350,33 @@ async def test_port_connectivity(
         return json.dumps(
             {"error": "UDP requires ports in 1..65535 and a positive timeout."}
         )
-    if protocol == "udp":
+    # Validate test addresses as plain IP literals for BOTH protocols before
+    # any SSH call — the TCP path interpolates them into remote shell
+    # commands, so a non-literal value would alter the command instead of
+    # being rejected (#1365). Scoped IPv6 (fe80::1%<scope>) is rejected even
+    # though ipaddress accepts it: the scope identifier is unconstrained
+    # text and is not needed for test traffic.
+    for label, value in (
+        ("server_test_ip", server_test_ip),
+        ("client_test_ip", client_test_ip),
+    ):
+        if not value:
+            continue
         try:
-            ipaddress.ip_address(server_test_ip)
-            if client_test_ip:
-                ipaddress.ip_address(client_test_ip)
+            parsed = ipaddress.ip_address(value)
         except ValueError:
-            return json.dumps({"error": "UDP test addresses must be IP literals."})
+            return json.dumps(
+                {"error": f"{label} must be an IP literal; got {value!r}."}
+            )
+        if getattr(parsed, "scope_id", None) is not None:
+            return json.dumps(
+                {
+                    "error": (
+                        f"{label} must be an unscoped IP literal; "
+                        f"zone indices are not supported (got {value!r})."
+                    )
+                }
+            )
     ssh = _get_ssh()
 
     async def _test_direction(
@@ -1370,8 +1390,11 @@ async def test_port_connectivity(
             return await _test_udp_connectivity_direction(
                 ssh, listener_ssh, connector_ssh, listen_ip, test_port, timeout, label
             )
+        # listen_ip is validated as an unscoped IP literal at the tool
+        # boundary; quoting keeps it data even if validation ever regresses.
         bg_cmd = (
-            f"nohup nc -l {listen_ip} {test_port} > /dev/null 2>&1 &"
+            f"nohup nc -l {shlex.quote(str(listen_ip))} {test_port} "
+            "> /dev/null 2>&1 &"
             f" echo {_PID_SENTINEL}$!"
         )
         start = await ssh.run(listener_ssh, bg_cmd, timeout=10)
@@ -1385,7 +1408,7 @@ async def test_port_connectivity(
                 "error": "Failed to start nc listener",
             }
         try:
-            test_cmd = f"nc -z -w {timeout} {listen_ip} {test_port}"
+            test_cmd = f"nc -z -w {timeout} {shlex.quote(str(listen_ip))} {test_port}"
             test = await ssh.run(connector_ssh, test_cmd, timeout=timeout + 5)
             return {
                 "direction": label,
