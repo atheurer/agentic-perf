@@ -24,6 +24,21 @@ selects the interface address it advertises; it is a server-side interface
 choice, not a substitute for a client remotehost value. Follow the installed
 benchmark subproject documentation when its behavior differs.
 
+uperf's engine scripts accept different argument sets per role, and rickshaw
+routes mv-params to roles via a per-param `"role"` attribute in the run file.
+`uperf-client` has no `ifname` option — passing it fails with "Unrecognized
+option specified" (rc=1 within a second, all samples failed). `ifname` is
+required on the server (`uperf-server-start`) because it drives the server's
+svc (IP/ports) advertisement; without it the client never learns the server
+address and fails with "remotehost is not set". Tag each mv-params entry with
+its role (`"role": "client"` on test-type/protocol/duration/nthreads,
+`"role": "server"` on ifname) rather than relying on defaults: an untagged
+ifname is routed to the client and breaks the run, and omitting ifname
+entirely breaks the server's svc advertisement. When the client reports
+"remotehost is not set", check the server's ifname/msgs/tx/svc first — that
+error means the client never received the advertisement, not that a client
+remotehost value is missing.
+
 If validation rejects a required role, profiler, or endpoint combination,
 inspect the returned schema and current controller guidance. Do not invent
 engine IDs or endpoints to work around the validator. Ask for clarification if
