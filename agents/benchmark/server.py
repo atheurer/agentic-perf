@@ -66,6 +66,7 @@ from providers.benchmark_identity import (
     comparison_fingerprint,
     comparison_step_requested,
 )
+from providers.crucible_identity import crucible_identity_probe_command
 from providers.execution import (
     AuditedFilesystem,
     RootedPath,
@@ -525,6 +526,61 @@ def _validate_run_command(
         )
 
     return True, "OK"
+
+
+async def _crucible_identity_preflight(controller: str) -> dict | None:
+    """Reject a crucible execution whose controller identity is not ready.
+
+    Runs the shared read-only ``/root/.crucible/identity`` probe over SSH.
+    Returns ``None`` when the identity is ready (or the probe could not run —
+    fail-open, matching the provisioning verification warning path), or a
+    rejection dict describing exactly how to remediate when the identity file
+    is missing its ``CRUCIBLE_EMAIL``.
+    """
+    probe = crucible_identity_probe_command()
+    try:
+        result = await _ssh.run(controller, probe, timeout=15)
+    except Exception:
+        # The probe is advisory: an SSH failure here must not block a run
+        # that verification already cleared.
+        logger.warning(
+            "Read-only Crucible identity preflight failed for %s",
+            controller,
+            exc_info=True,
+        )
+        return None
+    if result.exit_code != 0:
+        logger.warning(
+            "Crucible identity preflight probe exited %d for %s",
+            result.exit_code,
+            controller,
+        )
+        return None
+    marker = (result.stdout or "").strip().splitlines()[-1] if result.stdout else ""
+    if marker == "identity=1":
+        return None
+    if marker != "identity=0":
+        # Unparseable output: fail open rather than rejecting on a probe
+        # contract we do not control.
+        logger.warning(
+            "Crucible identity preflight returned unexpected output %r for %s",
+            marker,
+            controller,
+        )
+        return None
+    return {
+        "status": "rejected",
+        "harness": "crucible",
+        "reason_code": "crucible_identity_missing",
+        "message": (
+            "The controller's /root/.crucible/identity is missing a non-empty "
+            "CRUCIBLE_EMAIL. Crucible post-processing fails after the full run "
+            "completes (schema error: email does not match '^.+$'), discarding "
+            "all results. Create the file with CRUCIBLE_NAME and CRUCIBLE_EMAIL "
+            "on the controller before executing; no approval or run has been "
+            "consumed."
+        ),
+    }
 
 
 _FORBIDDEN_REBOOT_HOSTS = FORBIDDEN_REBOOT_HOSTS
@@ -2826,6 +2882,20 @@ async def execute_benchmark(
                     ),
                 }
             )
+
+    # Crucible's post-processing requires /root/.crucible/identity with a
+    # non-empty CRUCIBLE_NAME/CRUCIBLE_EMAIL; a fresh install has no file, and
+    # the failure otherwise appears only after the full run completes, as a
+    # schema error that never names the identity (PERF-AFD1570F,
+    # PERF-8C8B42B6: two full 27-test runs lost their post-processing).
+    # Checked here — before the one-shot approval is consumed and before any
+    # side effect — so the agent can remediate on the controller and retry
+    # without burning the approval or the run. Read-only and fail-open: an
+    # unresponsive probe must not block a valid run.
+    if harness_name == "crucible":
+        identity_rejection = await _crucible_identity_preflight(controller)
+        if identity_rejection is not None:
+            return json.dumps(identity_rejection)
 
     # Claim the durable intent before consuming the one-shot approval. A
     # reconnect that already consumed approval must still receive its cached
