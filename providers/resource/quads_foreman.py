@@ -69,12 +69,40 @@ def quads_assignment_directive(custom_fields: Any) -> dict[str, str] | None:
 
 
 def derive_quads_credentials(
-    auth: dict[str, Any], metadata: dict[str, Any]
+    auth: dict[str, Any],
+    metadata: dict[str, Any],
+    service_config: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
-    """Derive credentials only for a deployment that confirmed the convention."""
+    """Derive credentials only for a deployment that confirmed the convention.
+
+    Optional service_config overrides with defaults preserving current behavior:
+      {"quads": {"infra_location": "rdu3"}, "redfish": {"username": "quads", "password_template": "{infra_location}@{ticket}"}}
+    ticket is QUADS ticket field (e.g. 5161), not assignment ID.
+    """
+    cfg = service_config or {}
+    quads_cfg = cfg.get("quads") if isinstance(cfg.get("quads"), dict) else {}
+    redfish_cfg = cfg.get("redfish") if isinstance(cfg.get("redfish"), dict) else {}
+    # infra_location: service_config overrides auth fallback
+    location = (
+        quads_cfg.get("infra_location")
+        if isinstance(quads_cfg.get("infra_location"), str)
+        and quads_cfg.get("infra_location").strip()
+        else auth.get("infra_location")
+    )
+    username = (
+        redfish_cfg.get("username")
+        if isinstance(redfish_cfg.get("username"), str)
+        and redfish_cfg.get("username").strip()
+        else "quads"
+    )
+    template = (
+        redfish_cfg.get("password_template")
+        if isinstance(redfish_cfg.get("password_template"), str)
+        and redfish_cfg.get("password_template").strip()
+        else "{infra_location}@{ticket}"
+    )
     cloud = metadata.get("cloud_name")
     ticket = metadata.get("ticket")
-    location = auth.get("infra_location")
     if auth.get("convention_verified") is not True or any(
         not isinstance(value, str) or not value.strip()
         for value in (cloud, ticket, location)
@@ -83,7 +111,13 @@ def derive_quads_credentials(
             "configuration",
             "Verified QUADS cloud, assignment ticket and infra location are required",
         )
-    return cloud, f"{location}@{ticket}"
+    try:
+        password = template.format(infra_location=location, ticket=ticket, cloud=cloud)
+    except Exception:
+        raise ForemanError(
+            "configuration", "Invalid redfish password_template"
+        ) from None
+    return username, password
 
 
 async def verify_quads_ownership(
