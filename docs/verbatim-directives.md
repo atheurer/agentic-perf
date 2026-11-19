@@ -25,7 +25,10 @@ creation** (no LLM) and delivered byte-for-byte to the named agent.
 ````
 
 `<target>` is one of the agent keys: `provision`, `benchmark`, `review`,
-`resource`.
+`resource`. Ticket creation **rejects** a description whose fence uses any
+other target (HTTP 422 with the offending target, the closest valid key,
+and the full valid set) — the canonical set is enforced in code as
+`VALID_AGENT_TARGETS` in `state_store/directives.py`.
 
 **Example:**
 
@@ -96,4 +99,6 @@ Both directives reach the provision agent.
    ```
 
 4. **No alias mapping** — use the exact agent key. The canonical keys are
-   `provision`, `benchmark`, `review`, `resource`.
+   `provision`, `benchmark`, `review`, `resource`; any other fence target
+   is rejected at ticket creation with a did-you-mean suggestion rather
+   than being silently stored undelivered.

@@ -37,7 +37,7 @@ from providers.tracing import (
 from providers.usage import summarize_usage_events
 
 from .audit import AuditLog, get_actor
-from .directives import parse_verbatim_directives
+from .directives import parse_verbatim_directives, validate_verbatim_targets
 from .models import (
     _VALIDATION_RESERVED_FIELDS,
     TERMINAL_STATUSES,
@@ -804,6 +804,13 @@ class TicketStore:
             protected = _VALIDATION_RESERVED_FIELDS.intersection(custom_fields)
             if protected:
                 raise ValueError("benchmark validation fields are reserved")
+            verbatim_errors = validate_verbatim_targets(request.description)
+            if verbatim_errors:
+                # An unsupported agent:<target> fence is stored verbatim by the
+                # parser but delivered to no agent, silently discarding the
+                # author's guidance. Reject at ingestion with an actionable
+                # message so the author can fix the fence and resubmit.
+                raise ValueError("; ".join(verbatim_errors))
             verbatim = parse_verbatim_directives(request.description)
             if verbatim:
                 custom_fields["verbatim_directives"] = verbatim
