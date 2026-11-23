@@ -688,6 +688,13 @@ class AgentBase(ABC):
         ticket = await self._get_ticket(ticket_id)
         if not isinstance(ticket.get("custom_fields"), dict):
             ticket = {**ticket, "custom_fields": {}}
+        # Watermark for #1377: when this run's conversation is snapshotted,
+        # record which comments already existed so a remembered resume can
+        # append only the comments that arrived after the snapshot instead
+        # of re-appending the whole history every resume.
+        self._snapshot_comment_ids = [
+            c.get("id") for c in (ticket.get("comments") or []) if c.get("id")
+        ]
         self._dispatched_status = ticket.get("status", "")
         if not getattr(self, "_iteration_agent_type", None):
             self._iteration_agent_type = STATUS_AGENT_MAP.get(
@@ -777,11 +784,35 @@ class AgentBase(ABC):
             logger.info(
                 f"[{self.agent_name}] Resuming with {len(messages)} previous messages"
             )
+            # The snapshot predates whatever comment resumed this agent;
+            # without this the reply that resumed the ticket is invisible
+            # and the agent replays its stale prior outcome (#1377). Append
+            # the comments that arrived after the snapshot's watermark so
+            # the resuming instruction is always delivered, without
+            # re-appending the history the snapshot already contains.
+            watermark = cf.get("previous_messages_comment_ids") or []
+            seen = set(watermark) if isinstance(watermark, list) else set()
+            new_comments = [
+                c for c in self._user_comments(ticket) if c.get("id") not in seen
+            ]
+            if new_comments:
+                content = (
+                    "\n## Comments Since the Saved Conversation\n"
+                    "These arrived after the conversation snapshot above; "
+                    "the newest one is the instruction that resumed you.\n"
+                )
+                for comment in new_comments:
+                    content += (
+                        f"\n**{comment.get('author', 'user')}:** "
+                        f"{comment.get('body', '')}\n"
+                    )
+                messages.append({"role": "user", "content": content})
             await self._update_fields(
                 ticket_id,
                 {
                     "remember_previous": None,
                     "previous_messages": None,
+                    "previous_messages_comment_ids": None,
                 },
             )
         else:
@@ -2029,13 +2060,38 @@ class AgentBase(ABC):
         return "\n\n".join(parts)
 
     @staticmethod
-    def _user_comments(ticket: dict[str, Any]) -> list[dict[str, Any]]:
-        """Return only user-authored comments from a ticket.
+    def _is_machine_comment_author(author: Any) -> bool:
+        """True for pipeline-generated comments, never for a human's.
+
+        Agents post comments with author=<agent_name> (always "*-agent"),
+        and the orchestrator/system components use their own names. In
+        multi-user deployments a human's comment is stored with her real
+        username, so filtering on author == "user" silently dropped every
+        human reply (#1377).
+        """
+        if not isinstance(author, str) or not author:
+            return True
+        return author.endswith("-agent") or author in {
+            "orchestrator",
+            "system",
+            "fleet-coordinator",
+            "image-builder",
+        }
+
+    @classmethod
+    def _user_comments(cls, ticket: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return only human-authored comments from a ticket.
 
         Agent and system handoff messages are pipeline noise and should
-        not be injected into any agent's initial context.
+        not be injected into any agent's initial context. Human comments
+        carry author "user" (single-user) or the submitting user's name
+        (multi-user).
         """
-        return [c for c in (ticket.get("comments") or []) if c.get("author") == "user"]
+        return [
+            c
+            for c in (ticket.get("comments") or [])
+            if not cls._is_machine_comment_author(c.get("author"))
+        ]
 
     @staticmethod
     def _effective_harness(
@@ -2929,10 +2985,16 @@ class AgentBase(ABC):
         *,
         required: bool = False,
     ) -> None:
+        fields: dict[str, Any] = {"previous_messages": messages}
+        # Snapshot watermark (#1377): lets a remembered resume deliver only
+        # the comments that arrived after this snapshot.
+        watermark = getattr(self, "_snapshot_comment_ids", None)
+        if watermark is not None:
+            fields["previous_messages_comment_ids"] = watermark
         try:
             await self._update_fields(
                 ticket_id,
-                {"previous_messages": messages},
+                fields,
             )
         except Exception:
             logger.debug(f"Failed to save messages for {ticket_id}")

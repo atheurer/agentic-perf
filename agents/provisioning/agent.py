@@ -2329,10 +2329,9 @@ class ProvisioningAgent(AgentBase):
 
         # Agent/system handoff comments are pipeline noise — only surface
         # user comments so the agent focuses on human intent, not its own
-        # prior outputs.
-        comments = [
-            c for c in (ticket.get("comments") or []) if c.get("author") == "user"
-        ]
+        # prior outputs. _user_comments also covers multi-user deployments
+        # where human comments carry the submitter's real username.
+        comments = self._user_comments(ticket)
         if comments:
             content += "\n## Previous Comments\n"
             for comment in comments:
