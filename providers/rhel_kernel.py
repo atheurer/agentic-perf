@@ -145,7 +145,12 @@ def build_inventory_command(package: str = "kernel") -> str:
 
 
 def build_available_command(spec: KernelSpec) -> str:
-    return f"dnf -q list --available {spec.nevra} 2>&1"
+    # The RPM release strips the variant suffix ("+rt"): the RPM itself is
+    # built with the base release, only vmlinuz/initramfs filenames carry
+    # the suffix. Querying the full NEVRA asks dnf for a package-release
+    # that exists in no repo, falsely reporting a valid kernel as
+    # unavailable (#1415).
+    return f"dnf -q list --available {spec.package}-{spec.rpm_release} 2>&1"
 
 
 def build_repo_setup_command(
@@ -190,7 +195,10 @@ def build_repo_setup_command(
         f" 'sslcacert={ca_cert_path}'"
         f" > {_REPO_FILE}"
         f" && dnf clean metadata >/dev/null 2>&1"
-        f" && dnf -q repoquery --available {spec.nevra} >/dev/null 2>&1"
+        # rpm_release, not nevra: same +rt-suffix reasoning as
+        # build_available_command (#1415).
+        f" && dnf -q repoquery --available {spec.package}-{spec.rpm_release}"
+        f" >/dev/null 2>&1"
     )
 
 

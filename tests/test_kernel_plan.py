@@ -19,7 +19,11 @@ from providers.kernel_plan import (
     build_kernel_comparison_plan,
     validate_kernel_comparison,
 )
-from providers.rhel_kernel import KernelSpec, build_repo_setup_command
+from providers.rhel_kernel import (
+    KernelSpec,
+    build_available_command,
+    build_repo_setup_command,
+)
 from tests.test_provisioning_kernel_tools import (  # noqa: F401
     KERNEL_A,
     KERNEL_B,
@@ -278,6 +282,35 @@ class TestKernelSpecRepoUrl:
         assert f"dnf -q repoquery --available {spec.nevra}" in cmd
         assert " && dnf clean metadata" in cmd
         assert "dnf -q list --available" not in cmd
+
+    def test_build_available_command_uses_rpm_release_for_rt_suffix(self):
+        """#1415: the RPM release strips '+rt'; querying the full NEVRA asks
+        dnf for a package-release that exists in no repo."""
+        spec = KernelSpec(
+            release="6.12.0-264.9.1.el10_3.x86_64+rt", package="kernel-rt"
+        )
+        cmd = build_available_command(spec)
+        assert "dnf -q list --available kernel-rt-6.12.0-264.9.1.el10_3.x86_64" in cmd
+        assert "+rt" not in cmd
+
+    def test_build_available_command_plain_release_unchanged(self):
+        spec = KernelSpec(release=KERNEL_B)
+        cmd = build_available_command(spec)
+        assert f"dnf -q list --available kernel-{KERNEL_B}" in cmd
+
+    def test_build_repo_setup_command_uses_rpm_release_for_rt_suffix(self):
+        spec = KernelSpec(
+            release="6.12.0-264.9.1.el10_3.x86_64+rt",
+            package="kernel-rt",
+            repo_url=REPO_URL,
+        )
+        cmd = build_repo_setup_command(
+            spec, gpg_key_path="/etc/pki/k.key", ca_cert_path="/etc/pki/ca.pem"
+        )
+        assert (
+            "dnf -q repoquery --available kernel-rt-6.12.0-264.9.1.el10_3.x86_64" in cmd
+        )
+        assert "+rt" not in cmd
 
     def test_build_repo_setup_command_requires_url(self):
         with pytest.raises(ValueError):
