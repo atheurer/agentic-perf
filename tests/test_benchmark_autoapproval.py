@@ -487,14 +487,14 @@ async def test_malformed_2xx_create_without_readback_stays_reclaimable(
     store = TraceStore(tmp_path / "trace.db")
     try:
         operation = store.get_operation("benchmark-execution:T-788:intent-1")
-        assert operation.state == "prepared"
-        expiry = datetime.fromisoformat(operation.lease_expires_at)
+        # #1357: the retryable rejection released the pre-side-effect lease
+        # instead of stranding it in a live lease_acquired/prepared record —
+        # the retry can acquire immediately rather than waiting out the TTL.
+        assert operation.state == "released"
+        assert operation.lease_expires_at is None
     finally:
         store.close()
     api.fail_list_after_create = False
-    await asyncio.sleep(
-        max(0.0, (expiry - datetime.now(timezone.utc)).total_seconds()) + 0.05
-    )
     monkeypatch.setattr(
         benchmark_server,
         "_BENCHMARK_OPERATION_LEASE_TTL_SECONDS",

@@ -160,3 +160,29 @@ def test_trace_client_maps_operation_http_errors(tmp_path) -> None:
         client.operation_acquire("key", "hash", 30)
     client._client.close()
     client.spool.close()
+
+
+async def test_service_release_clears_lease_for_retry(tmp_path) -> None:
+    """#1357: the release action lets a retry acquire cleanly over the API."""
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_app(tmp_path)), base_url="http://test"
+    )
+    headers = {"Authorization": "Bearer service"}
+    body = {"operation_key": "key", "request_hash": "hash", "ttl_seconds": 60}
+    first = await client.post(
+        "/api/v1/traces/operations/acquire", json=body, headers=headers
+    )
+    assert first.json()["status"] == "acquired"
+    token = first.json()["operation"]["fencing_generation"]
+    released = await client.post(
+        "/api/v1/traces/operations/key/release",
+        json={"fencing_token": token},
+        headers=headers,
+    )
+    assert released.status_code == 200
+    assert released.json()["operation"]["state"] == "released"
+    retry = await client.post(
+        "/api/v1/traces/operations/acquire", json=body, headers=headers
+    )
+    assert retry.json()["status"] == "acquired"
+    assert retry.json()["operation"]["fencing_generation"] > token
