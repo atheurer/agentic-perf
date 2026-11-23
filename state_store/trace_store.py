@@ -1656,9 +1656,26 @@ class TraceStore:
                 self._audit(connection, current, "rejected:expired_lease")
                 connection.commit()
                 raise OperationLeaseError("operation lease has expired")
-            if state not in legal.get(current.state, set()) or (
-                allow_expired_reconciliation and current.state != "side_effect_started"
-            ):
+            if allow_expired_reconciliation:
+                # Expired-lease reconciliation (#1357): a launched operation
+                # may always be reconciled; a pre-side-effect operation
+                # (lease_acquired/prepared) only once its lease has actually
+                # expired — generic callers must not terminalize a live
+                # worker's lease, and there is no operator identity beyond
+                # the shared service principal to authorize otherwise.
+                expired_now = (
+                    current.lease_expires_at is None
+                    or datetime.fromisoformat(current.lease_expires_at)
+                    <= datetime.now(timezone.utc)
+                )
+                reconcilable = current.state == "side_effect_started" or (
+                    current.state in {"lease_acquired", "prepared"} and expired_now
+                )
+                if not reconcilable:
+                    self._audit(connection, current, "rejected:illegal_transition")
+                    connection.commit()
+                    raise OperationTransitionError("illegal operation transition")
+            elif state not in legal.get(current.state, set()):
                 self._audit(connection, current, "rejected:illegal_transition")
                 connection.commit()
                 raise OperationTransitionError("illegal operation transition")
@@ -1890,6 +1907,75 @@ class TraceStore:
             descriptor=descriptor,
             terminal_outcome="rejected",
         )
+
+    def release(
+        self,
+        operation_key: str,
+        owner: str,
+        fencing_token: int,
+    ) -> OperationRecord:
+        """Relinquish a pre-side-effect lease without terminalizing (#1357).
+
+        A deterministic rejection after acquire() but before any side effect
+        (approval binding mismatch, retryable approval failure) used to
+        leave the record in lease_acquired with a live lease: every retry
+        for the same intent was rejected existing_operation until the TTL
+        lapsed, and terminalizing instead would cache the failure forever
+        (the retry would replay it). Release clears owner and expiry so the
+        next attempt acquires cleanly; only lease_acquired and prepared may
+        be released — a launched operation still requires reconciliation.
+        """
+        with self._lock:
+            return self._release_locked(operation_key, owner, fencing_token)
+
+    def _release_locked(
+        self,
+        operation_key: str,
+        owner: str,
+        fencing_token: int,
+    ) -> OperationRecord:
+        try:
+            connection = self._open_connection()
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM operations WHERE operation_key=?", (operation_key,)
+            ).fetchone()
+            if row is None:
+                raise OperationTransitionError("operation was not found")
+            current = self._from_operation_row(row)
+            if current.owner != owner or current.fencing_generation != fencing_token:
+                self._audit(connection, current, "rejected:stale_fence")
+                connection.commit()
+                raise OperationLeaseError("stale owner or fencing token")
+            if current.state not in {"lease_acquired", "prepared"}:
+                self._audit(connection, current, "rejected:illegal_transition")
+                connection.commit()
+                raise OperationTransitionError(
+                    "only pre-side-effect operations can be released; "
+                    "launched operations require reconciliation"
+                )
+            updated = OperationRecord(
+                operation_key,
+                current.request_hash,
+                "released",
+                "",  # no owner: the next acquire takes over cleanly
+                None,  # no lease: nothing to expire
+                fencing_token,
+                current.result_descriptor,
+                current.external_ids,
+                None,
+            )
+            self._update_operation_tx(connection, updated)
+            self._audit(connection, updated, "released")
+            connection.commit()
+            return updated
+        except (OperationLeaseError, OperationTransitionError):
+            self._rollback_if_open()
+            raise
+        except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+            if self._connection is not None and self._connection.in_transaction:
+                self._connection.rollback()
+            raise TraceStoreWriteError("could not release operation") from exc
 
     def mark_indeterminate(
         self,

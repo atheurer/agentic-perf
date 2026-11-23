@@ -185,3 +185,101 @@ def test_restart_preserves_operation_state_matrix(tmp_path: Path) -> None:
             assert (
                 store.get_operation(f"terminal-{outcome}").terminal_outcome == outcome
             )
+
+
+class TestOperationRelease:
+    """#1357: pre-side-effect rejections must not strand a live lease."""
+
+    def test_release_lets_next_attempt_acquire_cleanly(self, tmp_path: Path) -> None:
+        with TraceStore(tmp_path / "trace.db") as store:
+            one = store.acquire_operation("key", "hash", "one", 1)
+            released = store.release("key", "one", one.fencing_generation)
+            assert released.state == "released"
+            assert released.owner == ""
+            assert released.lease_expires_at is None
+            # The retry acquires cleanly instead of waiting out the TTL.
+            two, status = store.acquire_operation_result("key", "hash", "two", 60)
+            assert status == "acquired"
+            assert two.fencing_generation > one.fencing_generation
+            assert two.state == "lease_acquired"
+
+    def test_release_from_prepared_is_legal(self, tmp_path: Path) -> None:
+        with TraceStore(tmp_path / "trace.db") as store:
+            one = store.acquire_operation("key", "hash", "one", 1)
+            prepared = store.mark_prepared("key", "one", one.fencing_generation)
+            released = store.release("key", "one", prepared.fencing_generation)
+            assert released.state == "released"
+
+    def test_release_refused_after_side_effect(self, tmp_path: Path) -> None:
+        with TraceStore(tmp_path / "trace.db") as store:
+            one = store.acquire_operation("key", "hash", "one", 1)
+            prepared = store.mark_prepared("key", "one", one.fencing_generation)
+            launched = store.mark_side_effect_started(
+                "key", "one", prepared.fencing_generation
+            )
+            with pytest.raises(OperationTransitionError, match="reconciliation"):
+                store.release("key", "one", launched.fencing_generation)
+
+    def test_release_is_fenced(self, tmp_path: Path) -> None:
+        with TraceStore(tmp_path / "trace.db") as store:
+            one = store.acquire_operation("key", "hash", "one", 1)
+            with pytest.raises(OperationLeaseError):
+                store.release("key", "other", one.fencing_generation)
+            with pytest.raises(OperationLeaseError):
+                store.release("key", "one", one.fencing_generation + 7)
+
+    def test_same_owner_reacquire_of_live_lease_does_not_extend(
+        self, tmp_path: Path
+    ) -> None:
+        """Rejected attempts must not push the retry window further out."""
+        with TraceStore(tmp_path / "trace.db") as store:
+            one = store.acquire_operation("key", "hash", "one", 60)
+            before = store.get_operation("key").lease_expires_at
+            record, status = store.acquire_operation_result("key", "hash", "one", 60)
+            assert status == "existing"
+            assert store.get_operation("key").lease_expires_at == before
+            assert record.fencing_generation == one.fencing_generation
+
+
+class TestExpiredLeaseReconciliation:
+    """#1357: an operator must be able to clear a stuck expired lease."""
+
+    def _expire(self, store: TraceStore, key: str) -> None:
+        store._connection.execute(
+            "UPDATE operations SET lease_expires_at=? WHERE operation_key=?",
+            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), key),
+        )
+
+    def test_reconcile_expired_lease_acquired(self, tmp_path: Path) -> None:
+        with TraceStore(tmp_path / "trace.db") as store:
+            one = store.acquire_operation("key", "hash", "one", 1)
+            self._expire(store, "key")
+            record = store.reconcile(
+                "key", "one", one.fencing_generation, {"outcome": "x"}, "failure"
+            )
+            assert record.state == "terminal"
+            assert record.terminal_outcome == "failure"
+
+    def test_reconcile_live_lease_acquired_is_refused(self, tmp_path: Path) -> None:
+        """Generic callers must not terminalize a live worker's lease."""
+        with TraceStore(tmp_path / "trace.db") as store:
+            one = store.acquire_operation("key", "hash", "one", 60)
+            with pytest.raises(OperationTransitionError):
+                store.reconcile(
+                    "key", "one", one.fencing_generation, {"outcome": "x"}, "failure"
+                )
+            assert store.get_operation("key").state == "lease_acquired"
+
+    def test_reconcile_launched_operation_still_legal_unexpired(
+        self, tmp_path: Path
+    ) -> None:
+        with TraceStore(tmp_path / "trace.db") as store:
+            one = store.acquire_operation("key", "hash", "one", 60)
+            prepared = store.mark_prepared("key", "one", one.fencing_generation)
+            launched = store.mark_side_effect_started(
+                "key", "one", prepared.fencing_generation
+            )
+            record = store.reconcile(
+                "key", "one", launched.fencing_generation, {"outcome": "x"}, "failure"
+            )
+            assert record.state == "terminal"

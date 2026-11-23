@@ -104,6 +104,11 @@ def _dispatch_transition(
         record = store.reject(
             operation_key, principal_username, body.fencing_token, body.descriptor or {}
         )
+    elif action == "release":
+        # Pre-side-effect lease relinquish (#1357): clears owner and expiry
+        # without terminalizing, so a retry can acquire cleanly instead of
+        # waiting out the lease TTL or replaying a cached failure.
+        record = store.release(operation_key, principal_username, body.fencing_token)
     elif action == "indeterminate":
         record = store.mark_indeterminate(
             operation_key, principal_username, body.fencing_token, body.descriptor or {}

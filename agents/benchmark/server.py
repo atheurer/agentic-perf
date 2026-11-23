@@ -860,9 +860,10 @@ class _BenchmarkOperation:
             "complete": "complete",
             "fail": "fail",
             "indeterminate": "mark_indeterminate",
+            "release": "release",
         }[action]
         call_kwargs = {"descriptor": kwargs.get("descriptor", {})}
-        if action in {"prepared", "side-effect-started"}:
+        if action in {"prepared", "side-effect-started", "release"}:
             call_kwargs = {}
         elif action == "external-id":
             call_kwargs = {"external_ids": kwargs.get("external_ids", {})}
@@ -882,6 +883,16 @@ class _BenchmarkOperation:
                 self._local.close()
         finally:
             self._closed = True
+
+    async def release(self, operation: dict[str, Any]) -> None:
+        """Relinquish a pre-side-effect lease without terminalizing (#1357).
+
+        Stops lease renewal first — a renewal racing the release would
+        either fail on the released record or resurrect the lease.
+        """
+        await self._await_renewal_resolution()
+        await self.stop_renewal()
+        await self.transition("release", operation)
 
     async def terminalize(
         self,
@@ -3042,6 +3053,17 @@ async def execute_benchmark(
                         "fail",
                         {"outcome": "approval_required", "benchmark_result": rejection},
                     )
+                else:
+                    # Retryable: release the pre-side-effect lease so the
+                    # retry acquires cleanly instead of waiting out the
+                    # TTL against existing_operation (#1357).
+                    try:
+                        await operation_guard.release(operation_record)
+                    except Exception:
+                        logger.exception(
+                            "[benchmark] operation release failed; lease "
+                            "will lapse at TTL"
+                        )
                 await operation_guard.close()
             return json.dumps(rejection)
 
@@ -3085,6 +3107,14 @@ async def execute_benchmark(
         persisted_approval_id = external_ids.get("approval_request_id")
         if persisted_approval_id and persisted_approval_id != approval_request_id:
             if operation_guard and operation_owned:
+                # Deterministic, retryable-with-right-input rejection before
+                # any side effect: release, don't leak the lease (#1357).
+                try:
+                    await operation_guard.release(operation_record)
+                except Exception:
+                    logger.exception(
+                        "[benchmark] operation release failed; lease will lapse at TTL"
+                    )
                 await operation_guard.close()
             return json.dumps(
                 {"status": "rejected", "reason_code": "approval_binding_mismatch"}
@@ -3101,6 +3131,12 @@ async def execute_benchmark(
                 )
             except Exception:
                 logger.exception("[benchmark] approval ID persistence failed")
+                try:
+                    await operation_guard.release(operation_record)
+                except Exception:
+                    logger.exception(
+                        "[benchmark] operation release failed; lease will lapse at TTL"
+                    )
                 await operation_guard.close()
                 return json.dumps(
                     {"status": "rejected", "reason_code": "approval_check_failed"}
