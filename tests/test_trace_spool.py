@@ -741,3 +741,77 @@ def test_blocked_spool_io_cannot_exceed_flush_or_close_deadline(
 
     assert flush_elapsed < 0.2
     assert close_elapsed < 0.2
+
+
+def test_drain_writes_one_batched_ack_per_spool(tmp_path, monkeypatch) -> None:
+    """#1380: the sweep must acknowledge once per spool (the last delivered
+    offset), not per event — each acknowledge re-validates the boundary from
+    the start of the spool and fsyncs the ack file plus its directory."""
+    producer = TraceSpool(tmp_path, name="batched")
+    expected = [event() for _ in range(5)]
+    for item in expected:
+        producer.append(item)
+    producer.close()
+
+    ack_calls: list[int] = []
+    original_acknowledge = TraceSpool.acknowledge
+
+    def counting_acknowledge(self, offset: int) -> None:
+        ack_calls.append(offset)
+        original_acknowledge(self, offset)
+
+    monkeypatch.setattr(TraceSpool, "acknowledge", counting_acknowledge)
+
+    delivered: list[str] = []
+    assert (
+        drain_abandoned_spools(
+            tmp_path, lambda item: delivered.append(str(item.event_id))
+        )
+        == 5
+    )
+    assert delivered == [str(item.event_id) for item in expected]
+    # Exactly one acknowledge call for the whole spool, at the final frame's
+    # offset (compaction resets the ack file directly, not via acknowledge).
+    assert len(ack_calls) == 1
+    assert ack_calls[0] > 0  # covers all five frames
+
+
+def test_drain_delivery_failure_acks_only_delivered_prefix(
+    tmp_path, monkeypatch
+) -> None:
+    """A delivery failure mid-spool must acknowledge only the delivered
+    prefix — successfully delivered frames are not replayed, undelivered
+    frames are."""
+    producer = TraceSpool(tmp_path, name="partial")
+    items = [event() for _ in range(4)]
+    for item in items:
+        producer.append(item)
+    producer.close()
+
+    ack_offsets: list[int] = []
+    original_acknowledge = TraceSpool.acknowledge
+
+    def recording_acknowledge(self, offset: int) -> None:
+        ack_offsets.append(offset)
+        original_acknowledge(self, offset)
+
+    monkeypatch.setattr(TraceSpool, "acknowledge", recording_acknowledge)
+
+    deliveries: list[str] = []
+
+    def flaky_deliver(item) -> None:
+        deliveries.append(str(item.event_id))
+        if len(deliveries) == 3:
+            raise ConnectionError("state store unreachable")
+
+    # The sweep must survive the delivery failure; the count reflects the
+    # two events that were delivered and had their prefix acknowledged.
+    assert drain_abandoned_spools(tmp_path, flaky_deliver) == 2
+    assert len(deliveries) == 3
+    # The prefix (2 successful deliveries) was acknowledged exactly once.
+    assert len([o for o in ack_offsets if o > 0]) == 1
+    # The undelivered frames remain pending for the next sweep.
+    reopened = TraceSpool(tmp_path, name="partial", create=False)
+    pending = [item.event_id for _, item in reopened.pending()]
+    assert [str(i) for i in pending] == [str(items[2].event_id), str(items[3].event_id)]
+    reopened.close()

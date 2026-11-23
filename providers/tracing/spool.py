@@ -528,6 +528,16 @@ def drain_abandoned_spools(
     This intentionally only acknowledges a frame after the supplied central
     delivery callback returns.  It is suitable for the orchestrator restart
     sweeper as well as a supervisor that reaps MCP subprocesses.
+
+    Frames are acknowledged in ONE batch per spool (the offset of the last
+    delivered frame) rather than per event (#1380): each acknowledge() both
+    re-validates the ack boundary from the start of the spool and fsyncs
+    the ack file and its directory, so per-event acks made a large backlog
+    cost events x directory-fsync single-threaded — 90% of a core pinned
+    for minutes with no visible progress. Delivery stays at-least-once:
+    undelivered frames are never acknowledged, so a crash between delivery
+    and the batch ack merely redelivers them on the next sweep (consumers
+    are already required to be idempotent).
     """
     root = Path(directory)
     if not root.exists():
@@ -545,13 +555,38 @@ def drain_abandoned_spools(
         except (BlockingIOError, FileNotFoundError):
             continue
         try:
-            for offset, event in spool.pending():
-                deliver(event)
-                spool.acknowledge(offset)
-                count += 1
+            delivered = 0
+            last_offset: int | None = None
+            try:
+                for offset, event in spool.pending():
+                    deliver(event)
+                    delivered += 1
+                    last_offset = offset
+            except SpoolCorruption:
+                # pending() already quarantined the corrupt spool (renamed
+                # it and left an empty replacement); acknowledging the
+                # delivered prefix would target the wrong file. Let the
+                # corruption reach the outer handler with no ack.
+                raise
+            except Exception:
+                # Delivery failed mid-spool: acknowledge only the delivered
+                # prefix so successfully delivered frames are not replayed,
+                # then let the failure propagate to the outer handler.
+                if last_offset is not None:
+                    spool.acknowledge(last_offset)
+                    count += delivered
+                raise
+            if last_offset is not None:
+                spool.acknowledge(last_offset)
+            count += delivered
             spool.compact()
         except SpoolCorruption as exc:
             logger.warning("Quarantined corrupt trace spool %s: %s", path, exc)
+            continue
+        except Exception:
+            # A delivery failure on one spool must not abort the sweep of
+            # the remaining spools; the prefix was already acknowledged.
+            logger.exception("Failed to drain trace spool %s", path)
             continue
         finally:
             spool.close()
