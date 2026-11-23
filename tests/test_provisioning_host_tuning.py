@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+import agents.provisioning.server as srv
 from tests.conftest import MockSSHExecutor, SSHResult, make_provisioning_handlers
 
 PROC_INTERRUPTS_ONE_QUEUE = """\
@@ -936,3 +937,203 @@ class TestVerifyHostTuning:
         # With no expected values, all checks are unconstrained — all_ok stays True
         assert result["all_ok"] is True
         assert "checks" in result
+
+
+class TestTuneTcpMultiqueue:
+    """Regression tests for #1370: tune_tcp(qdisc=...) must not destroy the
+    mq root on multiqueue devices, and the readback must prove every queue."""
+
+    MQ_MIXED_LEAVES = (
+        "qdisc mq 0: root\n"
+        "qdisc pfifo_fast 0: parent :1 bands 3 priomap ...\n"
+        "qdisc pfifo_fast 0: parent :2 bands 3 priomap ...\n"
+        "qdisc fq_codel 0: parent :3 limit 10240 flows ...\n"
+        "qdisc fq_codel 0: parent :4 limit 10240 flows ...\n"
+        "qdisc clsact ffff: parent ffff:fff\n"
+    )
+
+    MQ_ALL_PFIFO = (
+        "qdisc mq 0: root\n"
+        "qdisc pfifo_fast 0: parent :1 bands 3 priomap ...\n"
+        "qdisc pfifo_fast 0: parent :2 bands 3 priomap ...\n"
+        "qdisc pfifo_fast 0: parent :3 bands 3 priomap ...\n"
+        "qdisc pfifo_fast 0: parent :4 bands 3 priomap ...\n"
+        "qdisc clsact ffff: parent ffff:fff\n"
+    )
+
+    @pytest.mark.asyncio
+    async def test_mq_root_preserved_and_all_leaves_replaced(self):
+        commands_run = []
+        state = {"show": self.MQ_MIXED_LEAVES}
+
+        async def smart_run(host, command, timeout=300):
+            commands_run.append(command)
+            if "tc qdisc show" in command:
+                return SSHResult(stdout=state["show"])
+            if "tc qdisc replace" in command:
+                # Applying pfifo_fast to all children.
+                state["show"] = self.MQ_ALL_PFIFO
+                return SSHResult(stdout="ok")
+            return SSHResult(stdout="ok")
+
+        ssh = MockSSHExecutor()
+        ssh.run = smart_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["tune_tcp"](
+            host="10.0.0.1",
+            interface="eno16695np0",
+            qdisc="pfifo_fast",
+        )
+        assert result["status"] == "ok"
+        assert result["tc_qdisc"]["ok"] is True
+        assert result["tc_qdisc"]["root"] == "mq"
+        assert result["tc_qdisc"]["leaves"] == {
+            ":1": "pfifo_fast",
+            ":2": "pfifo_fast",
+            ":3": "pfifo_fast",
+            ":4": "pfifo_fast",
+        }
+        # The root was never replaced — only per-queue children.
+        assert not any("root pfifo_fast" in c for c in commands_run)
+        # All four parents were replaced (handles parsed from live output).
+        for parent in (":1", ":2", ":3", ":4"):
+            assert any(f"parent {parent} pfifo_fast" in c for c in commands_run)
+        # clsact was left alone.
+        assert not any("ffff" in c for c in commands_run)
+
+    @pytest.mark.asyncio
+    async def test_single_deviating_leaf_fails_readback(self):
+        # 8 pfifo_fast + 8 fq_codel leaves; replacement silently fails on
+        # one queue — the readback must report ok=false and a top-level
+        # error.
+        leaves = ["qdisc mq 0: root"]
+        for i in range(1, 17):
+            leaves.append(f"qdisc pfifo_fast 0: parent :{i} bands 3 priomap ...")
+        before = "\n".join(leaves) + "\n"
+        after = before.replace("parent :7 ", "parent :7 ")
+        after_lines = after.splitlines()
+        # Queue 7 keeps fq_codel (the replace failed there).
+        after_lines[7] = "qdisc fq_codel 0: parent :7 limit 10240 flows ..."
+        after = "\n".join(after_lines) + "\n"
+
+        state = {"show": before}
+
+        async def smart_run(host, command, timeout=300):
+            if "tc qdisc show" in command:
+                return SSHResult(stdout=state["show"])
+            if "parent :7 " in command:
+                return SSHResult(exit_code=1, stdout="RTNETLINK answers: Device busy")
+            if "tc qdisc replace" in command:
+                state["show"] = after
+                return SSHResult(stdout="ok")
+            return SSHResult(stdout="ok")
+
+        ssh = MockSSHExecutor()
+        ssh.run = smart_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["tune_tcp"](
+            host="10.0.0.1",
+            interface="eno16695np0",
+            qdisc="pfifo_fast",
+        )
+        assert result["status"] == "error"
+        assert result["tc_qdisc"]["ok"] is False
+        assert result["tc_qdisc"]["leaves"][":7"] == "fq_codel"
+        assert any("readback" in e for e in result["errors"])
+
+    @pytest.mark.asyncio
+    async def test_non_mq_root_still_gets_root_replacement(self):
+        commands_run = []
+
+        async def smart_run(host, command, timeout=300):
+            commands_run.append(command)
+            if "tc qdisc show" in command:
+                return SSHResult(stdout="qdisc fq 8001: root refcnt 2")
+            return SSHResult(stdout="ok")
+
+        ssh = MockSSHExecutor()
+        ssh.run = smart_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["tune_tcp"](
+            host="10.0.0.1",
+            interface="eno16695np0",
+            qdisc="fq",
+        )
+        assert result["status"] == "ok"
+        assert result["tc_qdisc"]["ok"] is True
+        assert result["tc_qdisc"]["root"] == "fq"
+        assert any(
+            "tc qdisc replace dev eno16695np0 root fq" in c for c in commands_run
+        )
+
+    @pytest.mark.asyncio
+    async def test_inspection_failure_fails_closed(self):
+        commands_run = []
+
+        async def tracking_run(host, command, timeout=300):
+            commands_run.append(command)
+            if "tc qdisc show" in command:
+                return SSHResult(exit_code=1, stdout="tc: command not found")
+            return SSHResult(stdout="ok")
+
+        ssh = MockSSHExecutor()
+        ssh.run = tracking_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["tune_tcp"](
+            host="10.0.0.1",
+            interface="eno16695np0",
+            qdisc="fq",
+        )
+        # Fail closed: without knowing the hierarchy, never touch the root.
+        assert result["status"] == "error"
+        assert result["tc_qdisc"]["ok"] is False
+        assert "inspection failed" in result["tc_qdisc"]["error"]
+        assert not any("tc qdisc replace" in c for c in commands_run)
+
+    @pytest.mark.asyncio
+    async def test_preserve_multiqueue_false_forces_single_root(self):
+        commands_run = []
+
+        async def smart_run(host, command, timeout=300):
+            commands_run.append(command)
+            if "tc qdisc show" in command:
+                return SSHResult(stdout="qdisc fq 8001: root refcnt 2")
+            return SSHResult(stdout="ok")
+
+        ssh = MockSSHExecutor()
+        ssh.run = smart_run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["tune_tcp"](
+            host="10.0.0.1",
+            interface="eno16695np0",
+            qdisc="fq",
+            preserve_multiqueue=False,
+        )
+        assert result["status"] == "ok"
+        assert any("root fq" in c for c in commands_run)
+
+
+class TestParseTcQdiscOutput:
+    def test_mq_root_with_children_and_clsact(self):
+        root, children = srv._parse_tc_qdisc_output(
+            TestTuneTcpMultiqueue.MQ_MIXED_LEAVES
+        )
+        assert root == "mq"
+        assert children == [
+            ("pfifo_fast", ":1"),
+            ("pfifo_fast", ":2"),
+            ("fq_codel", ":3"),
+            ("fq_codel", ":4"),
+        ]
+
+    def test_single_root(self):
+        root, children = srv._parse_tc_qdisc_output(
+            "qdisc fq 8001: root refcnt 2 limit 10240"
+        )
+        assert root == "fq"
+        assert children == []
+
+    def test_garbage_output(self):
+        root, children = srv._parse_tc_qdisc_output("command not found")
+        assert root is None
+        assert children == []

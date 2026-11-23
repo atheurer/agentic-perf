@@ -2211,6 +2211,32 @@ async def reset_flow_steering(
     return json.dumps(await _reset_flow_steering_one(host, interface))
 
 
+def _parse_tc_qdisc_output(output: str) -> tuple[str | None, list[tuple[str, str]]]:
+    """Parse `tc qdisc show` output into (root qdisc name, child list).
+
+    Children are (qdisc name, parent spec) pairs; clsact/ingress qdiscs
+    (parent ffff:fff) are excluded — they are not TX queue leaves and must
+    never be replaced by a queueing-discipline change.
+    """
+    root: str | None = None
+    children: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        tokens = line.split()
+        # Shape: "qdisc <name> <handle> root ..." or
+        # "qdisc <name> <handle> parent <X:Y> ..."
+        if len(tokens) < 4 or tokens[0] != "qdisc":
+            continue
+        name = tokens[1]
+        if "root" in tokens[3:]:
+            root = name
+        elif tokens[3] == "parent":
+            parent_spec = tokens[4]
+            if parent_spec.startswith("ffff:"):
+                continue  # clsact/ingress — not a TX queue leaf
+            children.append((name, parent_spec))
+    return root, children
+
+
 async def _tune_tcp_one(
     host: str,
     interface: str | None = None,
@@ -2219,6 +2245,7 @@ async def _tune_tcp_one(
     rmem_max: int | None = None,
     wmem_max: int | None = None,
     extra_sysctls: dict | None = None,
+    preserve_multiqueue: bool = True,
 ) -> dict:
     results = {}
     errors = []
@@ -2252,26 +2279,87 @@ async def _tune_tcp_one(
         results[key] = {"before": before, "after": after, "ok": after == value}
 
     # Apply the qdisc directly to existing interfaces via tc.
-    # sysctl net.core.default_qdisc only affects newly-created interfaces;
-    # tc qdisc is required to change the qdisc on an interface already up.
+    # sysctl net.core.default_qdisc only affects newly-created interfaces
+    # (and queues created later by ethtool -L channel changes, which inherit
+    # the then-current default — so a device can legitimately hold a mixed
+    # set of leaves); tc qdisc is required to change the qdisc on an
+    # interface already up.
     tc_result: dict = {}
     if qdisc and interface:
-        rt = await _ssh.run(host, f"tc qdisc replace dev {interface} root {qdisc} 2>&1")
-        if rt.exit_code == 0:
-            rv2 = await _ssh.run(host, f"tc qdisc show dev {interface} 2>&1")
-            tc_result = {
-                "interface": interface,
-                "qdisc": qdisc,
-                "ok": qdisc in rv2.stdout,
-                "output": rv2.stdout.strip(),
-            }
-        else:
-            errors.append(f"tc qdisc replace {interface}: {rt.stdout.strip()}")
+        # Inspect the hierarchy BEFORE touching it. On a multiqueue device
+        # the root is `mq` with one child qdisc per TX queue; a blind
+        # `tc qdisc replace ... root` destroys mq and every per-queue leaf,
+        # installing a single-queue qdisc on a 16-queue NIC — that changes
+        # the queueing and locking model, not just the algorithm (#1370).
+        ri = await _ssh.run(host, f"tc qdisc show dev {interface} 2>&1")
+        if ri.exit_code != 0:
+            # Fail closed: without knowing the hierarchy we could destroy
+            # an mq root we cannot rebuild.
+            errors.append(f"tc qdisc show {interface}: {ri.stdout.strip()}")
             tc_result = {
                 "interface": interface,
                 "qdisc": qdisc,
                 "ok": False,
-                "error": rt.stdout.strip(),
+                "error": (
+                    "qdisc hierarchy inspection failed; refusing to replace "
+                    "the root qdisc blind"
+                ),
+            }
+        else:
+            root, children = _parse_tc_qdisc_output(ri.stdout)
+            if root == "mq" and preserve_multiqueue:
+                # Keep the mq root; replace each per-queue leaf. Parent
+                # specs come from the live hierarchy, not assumed
+                # contiguous handles.
+                replace_errors = []
+                for _name, parent_spec in children:
+                    rc = await _ssh.run(
+                        host,
+                        f"tc qdisc replace dev {interface} "
+                        f"parent {parent_spec} {qdisc} 2>&1",
+                    )
+                    if rc.exit_code != 0:
+                        replace_errors.append(
+                            f"parent {parent_spec}: {rc.stdout.strip()}"
+                        )
+                errors.extend(replace_errors)
+            else:
+                rt = await _ssh.run(
+                    host,
+                    f"tc qdisc replace dev {interface} root {qdisc} 2>&1",
+                )
+                if rt.exit_code != 0:
+                    errors.append(f"tc qdisc replace {interface}: {rt.stdout.strip()}")
+            # Structured readback: ok only when the root survived (mq stays
+            # mq) and EVERY TX queue leaf matches the requested qdisc —
+            # never `qdisc in stdout`, which is true when even one queue
+            # has it.
+            rv2 = await _ssh.run(host, f"tc qdisc show dev {interface} 2>&1")
+            after_root, after_children = _parse_tc_qdisc_output(rv2.stdout)
+            leaf_map = {parent_spec: name for name, parent_spec in after_children}
+            if root == "mq" and preserve_multiqueue:
+                root_ok = after_root == "mq"
+                leaves_ok = bool(leaf_map) and all(
+                    name == qdisc for name in leaf_map.values()
+                )
+            else:
+                root_ok = after_root == qdisc
+                leaves_ok = True
+            readback_ok = rv2.exit_code == 0 and root_ok and leaves_ok
+            if not readback_ok:
+                # A readback mismatch is a real failure — surface it in the
+                # top-level errors so tune_hosts cannot report success.
+                errors.append(
+                    f"tc qdisc readback {interface}: root={after_root} "
+                    f"leaves={leaf_map} (requested {qdisc})"
+                )
+            tc_result = {
+                "interface": interface,
+                "qdisc": qdisc,
+                "root": after_root,
+                "leaves": leaf_map,
+                "ok": readback_ok,
+                "output": rv2.stdout.strip(),
             }
 
     return {
@@ -2292,10 +2380,11 @@ async def tune_tcp(
     rmem_max: int | None = None,
     wmem_max: int | None = None,
     extra_sysctls: dict | None = None,
+    preserve_multiqueue: bool = True,
     user: str = "root",
     ssh_key_path: str = "",
 ) -> str:
-    """Apply TCP/network stack settings on a host. Sets congestion control and qdisc via sysctl AND applies the qdisc directly to existing interfaces via 'tc qdisc replace' — the sysctl alone only affects newly-created interfaces. BBR requires fq (not fq_codel) for per-flow pacing; always set both. Optionally sets socket buffer sizes (rmem_max, wmem_max)."""
+    """Apply TCP/network stack settings on a host. Sets congestion control and qdisc via sysctl AND applies the qdisc directly to existing interfaces via tc — the sysctl alone only affects newly-created interfaces (and queues created later by ethtool -L, which inherit the then-current default). On multiqueue devices the mq root is preserved and the requested qdisc replaces every per-queue leaf (pass preserve_multiqueue=false to force a single root qdisc). BBR requires fq (not fq_codel) for per-flow pacing; always set both. Optionally sets socket buffer sizes (rmem_max, wmem_max)."""
     await _ensure_init()
     return json.dumps(
         await _tune_tcp_one(
@@ -2306,6 +2395,7 @@ async def tune_tcp(
             rmem_max,
             wmem_max,
             extra_sysctls,
+            preserve_multiqueue=preserve_multiqueue,
         )
     )
 
