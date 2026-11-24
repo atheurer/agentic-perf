@@ -12,6 +12,7 @@ from ..models import (
     ClaimRequest,
     CreateTicketRequest,
     ExtendIterationsRequest,
+    HarnessInstallsRequest,
     KernelControlRequest,
     TicketStatus,
     UpdateFieldsRequest,
@@ -550,3 +551,51 @@ def tickets_since(seq: int, request: Request):
     """Return tickets modified after the given sequence number."""
     store = _get_store(request)
     return store.get_tickets_since(seq)
+
+
+@router.post("/{ticket_id}/harness-installs")
+def record_harness_installs(
+    ticket_id: str,
+    body: HarnessInstallsRequest,
+    request: Request,
+):
+    """Record harness installs performed by THIS ticket (#1382).
+
+    Service-principal only. This provenance is the sole authorization for
+    harness removal at teardown — a ticket that never installed a harness
+    must never remove it, so the record is server-owned and rejected by
+    the generic fields PATCH.
+    """
+    store = _get_store(request)
+    principal = _get_principal(request)
+    if principal.kind != "service" and not principal.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Harness install provenance requires service authentication",
+        )
+    try:
+        ticket = store.get_ticket(ticket_id)
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    require_write_access(principal, ticket, _is_multi_user(request))
+    session_id, epoch, claim_id, _leader_only = mutation_fence(request)
+    try:
+        result = store.record_harness_installs(
+            ticket_id,
+            [record.model_dump() for record in body.records],
+            session_id=session_id,
+            epoch=epoch,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {
+        "status": "ok",
+        "recorded_hosts": sorted(
+            result.custom_fields.get("harness_install_provenance", {})
+        ),
+    }

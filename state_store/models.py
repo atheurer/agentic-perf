@@ -343,6 +343,24 @@ class ComparisonEvidenceSnapshot(BaseModel):
     benchmark_status: StrictStr | None
 
 
+class HarnessInstallRecord(BaseModel):
+    """A single host's harness install provenance entry (#1382)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    host: StrictStr
+    harness: StrictStr
+    install_path: StrictStr = ""
+
+
+class HarnessInstallsRequest(BaseModel):
+    """Server-owned record of harness installs performed by this ticket."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    records: list[HarnessInstallRecord]
+
+
 class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
     require_unsuperseded_validation_id: StrictStr | None = Field(
@@ -400,6 +418,11 @@ class ReleaseOrchestratorLeaseRequest(BaseModel):
     session_id: UUID
     epoch: int = Field(gt=0)
 
+
+# Server-owned harness install provenance (#1382): only this record
+# authorizes harness removal at teardown, so it must never be writable
+# through the generic fields PATCH.
+_HARNESS_PROVENANCE_FIELD = "harness_install_provenance"
 
 _VALIDATION_RESERVED_FIELDS = frozenset(
     {

@@ -1546,6 +1546,12 @@ class ResourceAgent(AgentBase):
                 cleanup_summary = []
                 if harness_name:
                     for host in teardown_hosts:
+                        allowed, why = self._harness_removal_allowed(
+                            ticket_id, fields, host, harness_name
+                        )
+                        if not allowed:
+                            cleanup_summary.append(f"Harness on {host}: {why}")
+                            continue
                         try:
                             result = await cleanup_harness(
                                 ssh,
@@ -1753,6 +1759,39 @@ class ResourceAgent(AgentBase):
             )
             return False
 
+    @staticmethod
+    def _harness_removal_allowed(
+        ticket_id: str, fields: dict, host: str, harness_name: str
+    ) -> tuple[bool, str]:
+        """Decide whether teardown may remove the harness from a host (#1382).
+
+        Removal requires THIS ticket's recorded install provenance — the
+        harness was installed on this host by this ticket for this harness
+        name. Everything else (pre-existing installs, user-provided hosts,
+        missing provenance on older tickets) is preserved, which is the
+        safe direction: a guest ticket must never uninstall something it
+        did not install.
+        """
+        provider = fields.get("resource_provider")
+        if provider == "user_provided":
+            return False, "preserved (user-provided host; tickets are guests)"
+        provenance = fields.get("harness_install_provenance")
+        record = (
+            provenance.get(host)
+            if isinstance(provenance, dict) and isinstance(provenance.get(host), dict)
+            else None
+        )
+        if record is None:
+            return False, "preserved (pre-existing or not installed by this ticket)"
+        if record.get("installed_by_ticket") != ticket_id:
+            return False, "preserved (installed by a different ticket)"
+        if record.get("harness") != harness_name:
+            return (
+                False,
+                "preserved (recorded install is a different harness)",
+            )
+        return True, "removal authorized"
+
     async def _run_host_cleanup(self, ticket_id: str, fields: dict) -> None:
         hw = fields.get("ssh_hardware_ips") or fields.get("assigned_hardware_ips", {})
         controller = hw.get("controller")
@@ -1798,6 +1837,17 @@ class ResourceAgent(AgentBase):
 
             if harness_name:
                 for host in all_hosts:
+                    allowed, why = self._harness_removal_allowed(
+                        ticket_id, fields, host, harness_name
+                    )
+                    if not allowed:
+                        cleanup_summary.append(f"Harness on {host}: {why}")
+                        logger.info(
+                            "[resource-agent] Harness cleanup on %s skipped: %s",
+                            host,
+                            why,
+                        )
+                        continue
                     try:
                         result = await cleanup_harness(ssh, host, harness_name)
                         cleanup_summary.append(
