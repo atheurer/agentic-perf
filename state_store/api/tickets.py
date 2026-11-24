@@ -11,6 +11,7 @@ from ..auth import Principal, require_write_access
 from ..models import (
     ClaimRequest,
     CreateTicketRequest,
+    ExecutionIntentRequest,
     ExtendIterationsRequest,
     KernelControlRequest,
     TicketStatus,
@@ -550,3 +551,47 @@ def tickets_since(seq: int, request: Request):
     """Return tickets modified after the given sequence number."""
     store = _get_store(request)
     return store.get_tickets_since(seq)
+
+
+@router.post("/{ticket_id}/execution-intents")
+def mint_execution_intent(
+    ticket_id: str,
+    body: ExecutionIntentRequest,
+    request: Request,
+):
+    """Mint the per-authorization attempt identity for an execution (#1378).
+
+    Service-principal only. Idempotent per (validation_id,
+    authorization_id): duplicate resumes of the same authorization receive
+    the canonical entry, so the operation key — and therefore replay — is
+    stable while a NEW authorization gets a NEW attempt.
+    """
+    store = _get_store(request)
+    principal = _get_principal(request)
+    if principal.kind != "service" and not principal.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Execution intent minting requires service authentication",
+        )
+    try:
+        ticket = store.get_ticket(ticket_id)
+    except TicketNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    require_write_access(principal, ticket, _is_multi_user(request))
+    session_id, epoch, _claim_id, _leader_only = mutation_fence(request)
+    try:
+        entry = store.mint_benchmark_execution_intent(
+            ticket_id,
+            body.validation_id,
+            body.authorization_id,
+            session_id=session_id,
+            epoch=epoch,
+        )
+    except ClaimFenceError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": e.reason, "message": str(e)},
+        ) from e
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"entry": entry}

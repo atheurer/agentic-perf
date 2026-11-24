@@ -101,6 +101,9 @@ class _FakeApprovalsAPI:
         self.fail_list_after_consume = fail_list_after_consume
         self.approval_seq = 0
         self.approvals: list[dict] = []
+        # In-memory execution-intent store (#1378), mirroring the real
+        # idempotent mint endpoint.
+        self.intents: dict[str, dict[str, dict]] = {}
 
     async def get(self, url: str, **kwargs) -> _Response:
         self.calls.append((str(url), {}))
@@ -122,6 +125,31 @@ class _FakeApprovalsAPI:
 
     async def post(self, url: str, json: dict | None = None, **kwargs) -> _Response:
         self.calls.append((str(url), dict(json or {})))
+        if str(url).endswith("/execution-intents"):
+            validation_id = (json or {}).get("validation_id", "")
+            authorization_id = (json or {}).get("authorization_id", "")
+            entries = self.intents.setdefault(validation_id, {})
+            if authorization_id not in entries:
+                attempt_no = (
+                    max((e.get("attempt_no", 0) for e in entries.values()), default=0)
+                    + 1
+                )
+                previous = next(
+                    (
+                        e.get("execution_intent_id")
+                        for e in entries.values()
+                        if e.get("attempt_no") == attempt_no - 1
+                    ),
+                    None,
+                )
+                entries[authorization_id] = {
+                    "authorization_id": authorization_id,
+                    "execution_intent_id": f"{validation_id}:{authorization_id}",
+                    "attempt_id": f"{validation_id}:attempt-{attempt_no}",
+                    "attempt_no": attempt_no,
+                    "previous_execution_intent_id": previous,
+                }
+            return _Response(200, {"entry": entries[authorization_id]})
         if str(url).endswith("/approvals"):
             if self.fail_create:
                 return _Response(409, {"detail": "approval rejected: claim_expired"})
@@ -136,6 +164,7 @@ class _FakeApprovalsAPI:
                     for key in (
                         "kind",
                         "validation_id",
+                        "execution_intent_id",
                         "presented_run_file_digest",
                         "execution_intent_digest",
                         "summary",
@@ -250,11 +279,14 @@ def _wire(
     *,
     directives: dict | None,
     launch=None,
+    statuses=None,
     **api_options,
 ):
     """Reuse the deterministic crucible fixture, then add directives and
     the fake approvals API."""
-    record, calls = _crucible_fixture(tmp_path, monkeypatch, launch=launch)
+    record, calls = _crucible_fixture(
+        tmp_path, monkeypatch, launch=launch, statuses=statuses
+    )
     record["execution_intent_digest"] = "e" * 64
     # A ticket-owned MCP server receives its causal context at launch;
     # restore the same environment so the trace context resolves.
@@ -486,7 +518,9 @@ async def test_malformed_2xx_create_without_readback_stays_reclaimable(
     assert not [call for call in calls if call[0] == "launch"]
     store = TraceStore(tmp_path / "trace.db")
     try:
-        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        operation = store.get_operation(
+            "benchmark-execution:T-788:val-788:auto-attempt-1"
+        )
         assert operation.state == "prepared"
         expiry = datetime.fromisoformat(operation.lease_expires_at)
     finally:
@@ -539,7 +573,9 @@ async def test_consume_commits_but_response_is_lost_launches_once(
     assert len([call for call in calls if call[0] == "launch"]) == 1
     store = TraceStore(tmp_path / "trace.db")
     try:
-        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        operation = store.get_operation(
+            "benchmark-execution:T-788:val-788:auto-attempt-1"
+        )
         assert operation.external_ids["approval_request_id"] == "apr-auto1"
     finally:
         store.close()
@@ -592,7 +628,9 @@ async def test_consume_409_without_bound_consumed_readback_rejects(
     assert not [call for call in calls if call[0] == "launch"]
     store = TraceStore(tmp_path / "trace.db")
     try:
-        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        operation = store.get_operation(
+            "benchmark-execution:T-788:val-788:auto-attempt-1"
+        )
         assert operation.state == "terminal"
         assert operation.terminal_outcome == "failure"
     finally:
@@ -642,7 +680,9 @@ async def test_cancel_after_consumed_approval_replays_without_second_consume(
     assert not [call for call in calls if call[0] == "launch"]
     store = TraceStore(tmp_path / "trace.db")
     try:
-        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        operation = store.get_operation(
+            "benchmark-execution:T-788:val-788:auto-attempt-1"
+        )
         assert operation.state == "prepared"
         assert operation.external_ids["approval_request_id"] == "apr-auto1"
         expiry = datetime.fromisoformat(operation.lease_expires_at)
@@ -688,7 +728,9 @@ async def test_uncertain_consume_readback_leaves_prepared_operation_reclaimable(
     assert first["reason_code"] == "approval_check_failed"
     store = TraceStore(tmp_path / "trace.db")
     try:
-        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        operation = store.get_operation(
+            "benchmark-execution:T-788:val-788:auto-attempt-1"
+        )
         assert operation.state == "prepared"
         assert operation.external_ids["approval_request_id"] == "apr-auto1"
         expiry = datetime.fromisoformat(operation.lease_expires_at)
@@ -852,7 +894,9 @@ async def test_cancel_after_resolve_reuses_approval_after_prepared_lease_expires
 
     store = TraceStore(tmp_path / "trace.db")
     try:
-        operation = store.get_operation("benchmark-execution:T-788:intent-1")
+        operation = store.get_operation(
+            "benchmark-execution:T-788:val-788:auto-attempt-1"
+        )
         assert operation is not None
         assert operation.state == "prepared"
         expiry = datetime.fromisoformat(operation.lease_expires_at)
@@ -894,6 +938,7 @@ async def test_preexisting_automatic_approval_is_reused_without_touching_manual_
         "ticket_id": "T-788",
         "kind": "benchmark_run_file",
         "validation_id": "val-788",
+        "execution_intent_id": "val-788:auto-attempt-1",
         "presented_run_file_digest": record["runfile_fingerprint"],
         "execution_intent_digest": record["execution_intent_digest"],
         "summary": "Automatic run-file approval (user_pre_run_approval=false)",
@@ -942,6 +987,7 @@ async def test_unrelated_consumed_automatic_approval_cannot_authorize_launch(
             "ticket_id": "T-788",
             "kind": "benchmark_run_file",
             "validation_id": "val-788",
+            "execution_intent_id": "val-788:auto-attempt-1",
             "presented_run_file_digest": record["runfile_fingerprint"],
             "execution_intent_digest": record["execution_intent_digest"],
             "summary": "Automatic run-file approval (user_pre_run_approval=false)",
@@ -973,6 +1019,7 @@ async def test_stale_automatic_approval_fence_fails_closed(tmp_path, monkeypatch
             "ticket_id": "T-788",
             "kind": "benchmark_run_file",
             "validation_id": "val-788",
+            "execution_intent_id": "val-788:auto-attempt-1",
             "presented_run_file_digest": benchmark_server._runfile_fingerprint(
                 {"benchmarks": [{"name": "uperf"}], "tags": {}}
             ),
@@ -1099,3 +1146,85 @@ async def test_autoapproval_creation_failure_rejected(tmp_path, monkeypatch):
         len([url for url, body in api.calls if url.endswith("/approvals") and body])
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_autoapproval_failure_retry_launches_new_attempt(tmp_path, monkeypatch):
+    """#1378: after a failed auto-approved execution, a new execute call
+    mints the next attempt and launches again instead of replaying the
+    cached failure."""
+    failed_statuses = [
+        {
+            "state": "completed",
+            "result_status": "unavailable",
+            "cdm_run_id": "cdm-run-1",
+            "rickshaw_run_id": "rickshaw-run-1",
+            "run_directory": "/var/lib/crucible/run/one",
+        }
+    ]
+    _, calls, api = _wire(
+        monkeypatch,
+        tmp_path,
+        directives={"user_pre_run_approval": False},
+        statuses=failed_statuses,
+    )
+
+    first = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert first["status"] == "unavailable"
+    assert first.get("existing_operation") is not True
+
+    # Persisted intent state, as a fresh process would read it back.
+    ticket = benchmark_server._ticket
+    ticket["custom_fields"]["benchmark_execution_intents"] = {
+        "val-788": api.intents["val-788"]
+    }
+
+    second = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    # The retry genuinely re-launched rather than replaying the failure.
+    launches = [c for c in calls if c[0] == "launch"]
+    assert len(launches) == 2
+    assert second.get("existing_operation") is not True
+    assert second["status"] == "unavailable"
+
+    entries = api.intents["val-788"]
+    assert len(entries) == 2
+    attempt_numbers = sorted(e["attempt_no"] for e in entries.values())
+    assert attempt_numbers == [1, 2]
+    second_entry = next(e for e in entries.values() if e["attempt_no"] == 2)
+    assert second_entry["previous_execution_intent_id"] == next(
+        e["execution_intent_id"] for e in entries.values() if e["attempt_no"] == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_autoapproval_duplicate_resume_same_attempt_replays(
+    tmp_path, monkeypatch
+):
+    """#1378: a duplicate submission of the SAME auto-approved attempt
+    replays the cached result and never launches twice."""
+    _, calls, api = _wire(
+        monkeypatch, tmp_path, directives={"user_pre_run_approval": False}
+    )
+
+    first = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    assert first["status"] == "completed"
+
+    ticket = benchmark_server._ticket
+    ticket["custom_fields"]["benchmark_execution_intents"] = {
+        "val-788": api.intents["val-788"]
+    }
+
+    second = json.loads(
+        await benchmark_server.execute_benchmark("controller", validation_id="val-788")
+    )
+    launches = [c for c in calls if c[0] == "launch"]
+    assert len(launches) == 1
+    assert second.get("existing_operation") is True
+    assert second["message"].startswith("[replayed cached result")
+    assert second["attempt_no"] == 1

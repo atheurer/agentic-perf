@@ -39,6 +39,7 @@ from providers.usage import summarize_usage_events
 from .audit import AuditLog, get_actor
 from .directives import parse_verbatim_directives
 from .models import (
+    _EXECUTION_INTENTS_FIELD,
     _VALIDATION_RESERVED_FIELDS,
     TERMINAL_STATUSES,
     VALID_TRANSITIONS,
@@ -1488,6 +1489,94 @@ class TicketStore:
             self._trace_mutation(ticket_id, "extend_iterations", attributes=details)
             return ticket.model_copy(deep=True)
 
+    def mint_benchmark_execution_intent(
+        self,
+        ticket_id: str,
+        validation_id: str,
+        authorization_id: str,
+        *,
+        session_id: uuid.UUID | None = None,
+        epoch: int | None = None,
+    ) -> dict:
+        """Mint (or return) the attempt identity for one execution (#1378).
+
+        The operation key of a benchmark execution is scoped to the
+        authorization that permits it, so a NEW approval (or a new
+        auto-approved attempt after a failure) executes again while a
+        duplicate submission of the SAME authorization replays the cached
+        result. Idempotent per (validation_id, authorization_id): the
+        first caller's entry is canonical and concurrent duplicates
+        receive it, which keeps duplicate resumes from minting a second
+        intent and double-running.
+        """
+        with self._lock:
+            ticket = self._resolve(ticket_id)
+            self._validate_claim_fence(session_id, epoch, ticket_id)
+            if not validation_id or not authorization_id:
+                raise ValueError(
+                    "execution intent minting requires validation_id and "
+                    "authorization_id"
+                )
+            intents = ticket.custom_fields.get(_EXECUTION_INTENTS_FIELD)
+            if not isinstance(intents, dict):
+                intents = {}
+            entries = intents.get(validation_id)
+            if not isinstance(entries, dict):
+                entries = {}
+            existing = entries.get(authorization_id)
+            if isinstance(existing, dict):
+                return dict(existing)
+            attempt_no = (
+                max(
+                    (
+                        entry.get("attempt_no", 0)
+                        for entry in entries.values()
+                        if isinstance(entry, dict)
+                    ),
+                    default=0,
+                )
+                + 1
+            )
+            previous = None
+            for entry in entries.values():
+                if (
+                    isinstance(entry, dict)
+                    and entry.get("attempt_no") == attempt_no - 1
+                ):
+                    previous = entry.get("execution_intent_id")
+                    break
+            entry = {
+                "authorization_id": authorization_id,
+                "execution_intent_id": f"{validation_id}:{authorization_id}",
+                "attempt_id": f"{validation_id}:attempt-{attempt_no}",
+                "attempt_no": attempt_no,
+                "previous_execution_intent_id": previous,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            entries[authorization_id] = entry
+            intents[validation_id] = entries
+            ticket.custom_fields[_EXECUTION_INTENTS_FIELD] = intents
+            ticket.updated_at = datetime.now(timezone.utc)
+            self._persist_ticket(ticket)
+            self._audit_log(
+                "execution_intent_minted",
+                ticket_id,
+                {
+                    "validation_id": validation_id,
+                    "authorization_id": authorization_id,
+                    "attempt_no": attempt_no,
+                },
+            )
+            self._trace_mutation(
+                ticket_id,
+                "execution_intent_minted",
+                attributes={
+                    "validation_id": validation_id,
+                    "attempt_no": attempt_no,
+                },
+            )
+            return dict(entry)
+
     def update_fields(
         self,
         ticket_id: str,
@@ -1579,6 +1668,11 @@ class TicketStore:
             if protected:
                 raise ValueError(
                     "benchmark validation fields are immutable; use the validations API"
+                )
+            if _EXECUTION_INTENTS_FIELD in fields:
+                raise ValueError(
+                    "benchmark execution intents are server-owned; use the "
+                    "execution-intents API"
                 )
             if self._contains_imported_fixture_reserved_field(fields):
                 raise ValueError(
@@ -2115,6 +2209,7 @@ class TicketStore:
                     existing.status == "pending"
                     and existing.kind == request.kind
                     and existing.validation_id == request.validation_id
+                    and existing.execution_intent_id == request.execution_intent_id
                     and existing.presented_run_file_digest
                     == request.presented_run_file_digest
                     and existing.execution_intent_digest

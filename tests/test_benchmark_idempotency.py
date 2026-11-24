@@ -96,6 +96,9 @@ def _crucible_fixture(
 
     class Approval:
         status_code = 200
+        # In-memory execution-intent store (#1378), mirroring the real
+        # idempotent mint endpoint.
+        intents: dict[str, dict[str, dict]] = {}
 
         def __init__(self, *args, **kwargs):
             pass
@@ -107,9 +110,46 @@ def _crucible_fixture(
             pass
 
         async def post(self, url, *args, **kwargs):
-            if "/transition" in str(url):
+            if "/execution-intents" in str(url):
+                body = kwargs.get("json") or {}
+                validation_id = body.get("validation_id", "")
+                authorization_id = body.get("authorization_id", "")
+                entries = self.intents.setdefault(validation_id, {})
+                if authorization_id not in entries:
+                    attempt_no = (
+                        max(
+                            (e.get("attempt_no", 0) for e in entries.values()),
+                            default=0,
+                        )
+                        + 1
+                    )
+                    entries[authorization_id] = {
+                        "authorization_id": authorization_id,
+                        "execution_intent_id": f"{validation_id}:{authorization_id}",
+                        "attempt_id": f"{validation_id}:attempt-{attempt_no}",
+                        "attempt_no": attempt_no,
+                        "previous_execution_intent_id": next(
+                            (
+                                e.get("execution_intent_id")
+                                for e in entries.values()
+                                if e.get("attempt_no") == attempt_no - 1
+                            ),
+                            None,
+                        ),
+                    }
+                self._payload = {"entry": entries[authorization_id]}
+            elif "/transition" in str(url):
                 calls.append(("pause", kwargs.get("json", {})))
+                self._payload = {}
+            else:
+                self._payload = {}
             return self
+
+        def json(self):
+            return getattr(self, "_payload", {})
+
+        def raise_for_status(self):
+            return None
 
     monkeypatch.setattr("providers.execution.AuditedAsyncHTTPClient", Approval)
     return record, calls
@@ -480,3 +520,215 @@ async def test_execute_terminal_failure_survives_restart_and_external_identity_i
     assert second["status"] == "failed"
     assert second["existing_operation"] is True
     assert len([c for c in calls if c[0] == "launch"]) == 1
+
+
+class TestAuthorizationScopedAttempts:
+    """#1378: the operation key is scoped to the authorization that
+    permits the run, so a new approval (or a new auto-approved attempt
+    after a failure) executes again while the same authorization replays."""
+
+    def test_minted_entry_scopes_operation_key(self) -> None:
+        record = {"runfile_fingerprint": "abc", "attempt_id": "attempt-1"}
+        entry = {
+            "execution_intent_id": "val-1:apr-new",
+            "attempt_id": "val-1:attempt-2",
+            "attempt_no": 2,
+        }
+        key, _, immutable = _benchmark_intent_identity(
+            "T-1",
+            "val-1",
+            benchmark_server._launch_record(record, entry),
+            "ctrl",
+            "crucible",
+            "crucible run",
+        )
+        assert key == "benchmark-execution:T-1:val-1:apr-new"
+        assert immutable["execution_intent_id"] == "val-1:apr-new"
+        assert immutable["attempt_id"] == "val-1:attempt-2"
+
+    def test_launch_record_without_entry_is_validation_identity(self) -> None:
+        record = {"runfile_fingerprint": "abc", "attempt_id": "attempt-1"}
+        assert benchmark_server._launch_record(record, None) is record
+
+    def test_mark_replayed_leads_with_marker(self) -> None:
+        marked = benchmark_server._mark_replayed(
+            {
+                "status": "failed",
+                "message": "Benchmark failed (exit 1)",
+                "run_id": "run-64c0565a",
+                "attempt_no": 1,
+            }
+        )
+        assert list(marked)[:2] == [
+            "existing_operation",
+            "replay_of_previous_execution",
+        ]
+        assert marked["message"].startswith("[replayed cached result")
+        assert "#1" in marked["message"]
+        # Idempotent: an already-marked result is not double-marked.
+        again = benchmark_server._mark_replayed(marked)
+        assert again is marked
+
+
+@pytest.mark.asyncio
+async def test_new_authorization_after_failure_launches_again(tmp_path, monkeypatch):
+    """#1378: approving the same validated run file again after a failed
+    execution starts a genuinely new run instead of replaying the cached
+    failure."""
+    failed_statuses = [
+        {
+            "state": "completed",
+            "result_status": "unavailable",
+            "cdm_run_id": "cdm-run-1",
+            "rickshaw_run_id": "rickshaw-run-1",
+            "run_directory": "/var/lib/crucible/run/one",
+        }
+    ]
+    record, calls = _crucible_fixture(tmp_path, monkeypatch, statuses=failed_statuses)
+
+    class _IntentStore:
+        """Fake state-store client serving the idempotent mint endpoint."""
+
+        status_code = 200
+        intents: dict[str, dict[str, dict]] = {}
+
+        def __init__(self, **kwargs) -> None:
+            self._payload: dict = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *args, json=None, **kwargs):
+            if "/execution-intents" in str(url):
+                validation_id = (json or {}).get("validation_id", "")
+                authorization_id = (json or {}).get("authorization_id", "")
+                entries = self.intents.setdefault(validation_id, {})
+                if authorization_id not in entries:
+                    attempt_no = (
+                        max(
+                            (e.get("attempt_no", 0) for e in entries.values()),
+                            default=0,
+                        )
+                        + 1
+                    )
+                    entries[authorization_id] = {
+                        "authorization_id": authorization_id,
+                        "execution_intent_id": f"{validation_id}:{authorization_id}",
+                        "attempt_id": f"{validation_id}:attempt-{attempt_no}",
+                        "attempt_no": attempt_no,
+                        "previous_execution_intent_id": next(
+                            (
+                                e.get("execution_intent_id")
+                                for e in entries.values()
+                                if e.get("attempt_no") == attempt_no - 1
+                            ),
+                            None,
+                        ),
+                    }
+                self._payload = {"entry": entries[authorization_id]}
+            else:
+                self._payload = {}
+            return self
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    monkeypatch.setattr("providers.execution.AuditedAsyncHTTPClient", _IntentStore)
+
+    first = await _execute_with_approval("approval-1")
+    assert first["status"] == "unavailable"
+    assert first.get("existing_operation") is not True
+
+    second = await _execute_with_approval("approval-2")
+    # The new authorization genuinely re-launched.
+    launches = [c for c in calls if c[0] == "launch"]
+    assert len(launches) == 2
+    assert second.get("existing_operation") is not True
+
+    entries = _IntentStore.intents["val-788"]
+    assert sorted(e["attempt_no"] for e in entries.values()) == [1, 2]
+
+
+async def _execute_with_approval(approval_id: str) -> dict:
+    return json.loads(
+        await benchmark_server.execute_benchmark(
+            "controller", validation_id="val-788", approval_request_id=approval_id
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_authorization_replays_failure_with_marker(
+    tmp_path, monkeypatch
+):
+    """#1378: a duplicate submission of the SAME authorization replays the
+    cached failure, unmistakably marked as a replay."""
+    failed_statuses = [
+        {
+            "state": "completed",
+            "result_status": "unavailable",
+            "cdm_run_id": "cdm-run-1",
+            "rickshaw_run_id": "rickshaw-run-1",
+            "run_directory": "/var/lib/crucible/run/one",
+        }
+    ]
+    record, calls = _crucible_fixture(tmp_path, monkeypatch, statuses=failed_statuses)
+
+    first = await _execute_with_approval("approval-1")
+    assert first["status"] == "unavailable"
+    second = await _execute_with_approval("approval-1")
+    launches = [c for c in calls if c[0] == "launch"]
+    assert len(launches) == 1
+    assert second.get("existing_operation") is True
+    assert second["message"].startswith("[replayed cached result")
+
+
+@pytest.mark.asyncio
+async def test_unreachable_intent_store_fails_closed(tmp_path, monkeypatch):
+    """#1378: when the intent mint cannot be confirmed, execution is
+    rejected rather than falling back to a different identity — the same
+    authorization must never acquire two operation keys."""
+
+    class _NoIntents:
+        status_code = 200
+
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *args, **kwargs):
+            if "/execution-intents" in str(url):
+                raise ConnectionError("state store unreachable")
+            return self
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {}
+
+    _crucible_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr("providers.execution.AuditedAsyncHTTPClient", _NoIntents)
+
+    result = await _execute_with_approval("approval-1")
+    assert result["status"] == "rejected"
+    assert result["reason_code"] == "execution_intent_unavailable"
+
+
+async def _execute_with_approval(approval_id: str) -> dict:
+    return json.loads(
+        await benchmark_server.execute_benchmark(
+            "controller", validation_id="val-788", approval_request_id=approval_id
+        )
+    )
