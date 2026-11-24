@@ -365,6 +365,7 @@ class EventBus:
         ticket_id: str,
         *,
         exclude_state_targets: tuple[str, ...] = (),
+        exclude_event_phases: tuple[str, ...] = (),
     ) -> float | None:
         """Return the last durable trace event time for a ticket.
 
@@ -372,7 +373,9 @@ class EventBus:
         store, so activity from MCP child processes is included.
         """
         return self._trace_store.latest_event_time(
-            ticket_id, exclude_state_targets=exclude_state_targets
+            ticket_id,
+            exclude_state_targets=exclude_state_targets,
+            exclude_event_phases=exclude_event_phases,
         )
 
     def register_ticket_owner(

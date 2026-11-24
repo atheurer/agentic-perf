@@ -2318,7 +2318,16 @@ async def _check_stale_tasks(
     now = time.time()
     # Claim renewal is a timer-driven store mutation, not agent
     # activity; counting it as activity would mask a stuck agent.
+    # llm_request is intent-to-call, emitted immediately before the
+    # await that can freeze on a stalled LLM connection — counting it
+    # would reset the staleness clock with the very event that
+    # precedes the freeze (#1341). llm_response and tool events remain
+    # the confirmed-progress signals; every LLM call is bounded by the
+    # provider timeout, and config validation ensures the stale
+    # threshold exceeds it, so a healthy in-flight call is not
+    # falsely expired.
     excluded_state_targets = ("renew_claim", "claim_fence")
+    excluded_event_phases = ("llm_request",)
     async with AuditedAsyncHTTPClient(timeout=5.0, headers=_auth_headers()) as client:
         for tid, task in list(dispatcher.active_tasks().items()):
             # Trace store: shared SQLite DB sees events from
@@ -2328,6 +2337,7 @@ async def _check_stale_tasks(
                     event_bus.latest_trace_event_time,
                     tid,
                     exclude_state_targets=excluded_state_targets,
+                    exclude_event_phases=excluded_event_phases,
                 )
             except Exception:
                 trace_ts = None

@@ -346,6 +346,26 @@ class OrchestratorConfig:
             "stale_task_timeout",
             3600.0,
         )
+        # The watchdog excludes llm_request events from the staleness clock
+        # (#1341), so a healthy in-flight LLM call — which can legitimately
+        # run as long as llm_timeout — must not be falsely expired: the
+        # stale threshold must exceed the LLM timeout with grace for the
+        # response event to land.
+        if (
+            self.stale_task_timeout > 0
+            and self.llm_timeout > 0
+            and self.stale_task_timeout <= self.llm_timeout
+        ):
+            clamped = self.llm_timeout + 300.0
+            logger.warning(
+                "STALE_TASK_TIMEOUT (%ss) must exceed LLM_TIMEOUT (%ss); "
+                "raising it to %ss so healthy in-flight LLM calls are not "
+                "falsely expired",
+                self.stale_task_timeout,
+                self.llm_timeout,
+                clamped,
+            )
+            self.stale_task_timeout = clamped
 
         # Per-user teardown default. When a ticket does not
         # explicitly set directives.skip_teardown, this value

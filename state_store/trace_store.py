@@ -618,6 +618,7 @@ class TraceStore:
         ticket_id: str,
         *,
         exclude_state_targets: tuple[str, ...] = (),
+        exclude_event_phases: tuple[str, ...] = (),
         scan_limit: int = 500,
     ) -> float | None:
         """Return the wall-clock time of the most recent trace event.
@@ -630,6 +631,13 @@ class TraceStore:
         mutations with those targets.  Claim renewal writes one
         every lease interval regardless of agent progress, so a
         staleness check must not treat it as activity.
+
+        ``exclude_event_phases`` skips events whose action phase
+        matches (legacy events like ``llm_request`` are stored with
+        action type ``state`` and the legacy event type as the
+        phase).  ``llm_request`` is emitted immediately BEFORE the
+        LLM await — counting it as activity resets the staleness
+        clock with the very event that precedes a freeze (#1341).
         """
         with self._lock:
             try:
@@ -647,12 +655,16 @@ class TraceStore:
                 return None
 
         for occurred_at, action_type, event_json in rows:
-            if exclude_state_targets and action_type == "state":
+            if (exclude_state_targets or exclude_event_phases) and action_type == (
+                "state"
+            ):
                 try:
                     action = (json.loads(event_json) or {}).get("action") or {}
                 except (TypeError, ValueError):
                     action = {}
                 if action.get("target") in exclude_state_targets:
+                    continue
+                if action.get("phase") in exclude_event_phases:
                     continue
             if not occurred_at:
                 continue
