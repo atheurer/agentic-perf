@@ -139,6 +139,13 @@ class OpenAICompatLLMProvider(LLMProvider):
                 self._client.chat.completions.create, **kwargs
             )
             return self._parse_response(response, model=self._model)
+        # An httpx-level read timeout on the request itself (#1341):
+        # asyncio.wait_for cannot interrupt a worker thread blocked in
+        # socket.recv(), so without this a stalled server that accepts the
+        # request but never responds freezes the agent task forever — the
+        # SDK forwards this timeout to httpx, which closes the socket inside
+        # the blocked thread.
+        kwargs["timeout"] = effective_timeout
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(self._client.chat.completions.create, **kwargs),
@@ -151,6 +158,13 @@ class OpenAICompatLLMProvider(LLMProvider):
             # check by name to avoid a hard import dependency here.
             if type(e).__name__ == "RateLimitError":
                 raise LLMRateLimitError(f"openai/{self._model}") from None
+            # The SDK raises APITimeoutError when its own httpx read timeout
+            # fires (inside the worker thread) — normalize it to the same
+            # structured LLMTimeoutError the agent loop already retries.
+            if type(e).__name__ == "APITimeoutError":
+                raise LLMTimeoutError(
+                    effective_timeout, f"openai/{self._model}"
+                ) from None
             raise
         return self._parse_response(response, model=self._model)
 
@@ -178,6 +192,8 @@ class OpenAICompatLLMProvider(LLMProvider):
         if effective_timeout == 0:
             response = await asyncio.to_thread(request, **kwargs)
             return self._parse_responses_response(response, model=self._model)
+        # httpx-level read timeout — see the chat-completions path (#1341).
+        kwargs["timeout"] = effective_timeout
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(request, **kwargs), timeout=effective_timeout
@@ -187,6 +203,10 @@ class OpenAICompatLLMProvider(LLMProvider):
         except Exception as e:
             if type(e).__name__ == "RateLimitError":
                 raise LLMRateLimitError(f"openai/{self._model}") from None
+            if type(e).__name__ == "APITimeoutError":
+                raise LLMTimeoutError(
+                    effective_timeout, f"openai/{self._model}"
+                ) from None
             raise
         return self._parse_responses_response(response, model=self._model)
 

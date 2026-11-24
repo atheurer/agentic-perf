@@ -190,3 +190,84 @@ async def test_closed_ticket_is_cleaned_up_without_events(tmp_path, stale_task) 
         )
 
     stale_task.cancel.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_llm_request_does_not_count_as_activity(tmp_path, stale_task) -> None:
+    """#1341: llm_request is emitted immediately BEFORE the LLM await — the
+    freeze point. Counting it resets the staleness clock with the very event
+    that precedes a freeze, so a frozen agent never looks stale."""
+    from orchestrator.main import _check_stale_tasks
+
+    ticket_id = "PERF-STALL"
+    events = EventBus(log_dir=str(tmp_path / "logs"))
+    # Real EventBus.emit path: legacy events are stored with action type
+    # STATE and the legacy event type as the action phase.
+    events.emit(ticket_id, "analyze-agent", "llm_request", {"iteration": 20})
+    # Age the event past the stale threshold — a frozen agent's request
+    # event must look stale.
+    events._trace_store._open_connection().execute(
+        "UPDATE trace_events SET occurred_at = ? WHERE ticket_id = ?",
+        ("2020-01-01T00:00:00+00:00", ticket_id),
+    )
+    events._trace_store._open_connection().commit()
+
+    dispatcher = MagicMock()
+    dispatcher.active_tasks.return_value = {ticket_id: stale_task}
+    dispatcher._claim_ids = {ticket_id: None}
+    dispatcher.task_started_at.return_value = 1.0
+
+    with patch("orchestrator.main.AuditedAsyncHTTPClient") as client_class:
+        client_class.return_value = _run_detector(
+            dispatcher, events, ticket_id=ticket_id
+        )
+        await _check_stale_tasks(
+            dispatcher, events, stale_timeout=900, store_url="http://store"
+        )
+
+    stale_task.cancel.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_llm_response_counts_as_activity(tmp_path, stale_task) -> None:
+    """A completed LLM call is confirmed progress and must keep the task
+    alive."""
+    from orchestrator.main import _check_stale_tasks
+
+    ticket_id = "PERF-RESPONSE"
+    events = EventBus(log_dir=str(tmp_path / "logs"))
+    events.emit(ticket_id, "analyze-agent", "llm_response", {"iteration": 20})
+
+    dispatcher = MagicMock()
+    dispatcher.active_tasks.return_value = {ticket_id: stale_task}
+    dispatcher._claim_ids = {ticket_id: None}
+
+    with patch("orchestrator.main.AuditedAsyncHTTPClient") as client_class:
+        client_class.return_value = _run_detector(
+            dispatcher, events, ticket_id=ticket_id
+        )
+        await _check_stale_tasks(
+            dispatcher, events, stale_timeout=900, store_url="http://store"
+        )
+
+    stale_task.cancel.assert_not_called()
+
+
+def test_latest_event_time_excludes_llm_request_phase(tmp_path) -> None:
+    events = EventBus(log_dir=str(tmp_path / "logs"))
+    events.emit("PERF-X", "analyze-agent", "llm_response", {"iteration": 1})
+    events._trace_store._open_connection().execute(
+        "UPDATE trace_events SET occurred_at = ? "
+        "WHERE ticket_id = ? AND action_type = 'state' "
+        "AND event_json LIKE '%llm_response%'",
+        ("2020-01-01T00:00:01+00:00", "PERF-X"),
+    )
+    events._trace_store._open_connection().commit()
+    # The request event is the NEWEST event — exactly the frozen-agent shape.
+    events.emit("PERF-X", "analyze-agent", "llm_request", {"iteration": 2})
+    excluded = events.latest_trace_event_time(
+        "PERF-X", exclude_event_phases=("llm_request",)
+    )
+    included = events.latest_trace_event_time("PERF-X")
+    assert excluded is not None and included is not None
+    assert excluded < included

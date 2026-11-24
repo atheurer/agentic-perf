@@ -839,3 +839,65 @@ class TestLLMFactory:
 
         with pytest.raises(ValueError, match="Unknown"):
             create_llm_provider("unknown_provider")
+
+
+class TestRequestTimeoutEnforcement:
+    """#1341: asyncio.wait_for cannot interrupt a worker thread blocked in
+    socket.recv(), so the request itself must carry an httpx-level timeout."""
+
+    def _provider_with_stalled_client(self, exception=None):
+        provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+        provider._model = "gpt-test"
+        provider._api = "chat_completions"
+        provider._auto_responses_for_gpt6 = False
+        provider.reasoning_effort = None
+        provider.default_timeout = 45.0
+
+        captured_kwargs = {}
+
+        def stalled_create(**kwargs):
+            captured_kwargs.update(kwargs)
+            if exception is not None:
+                raise exception
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(
+                            content="ok", tool_calls=None, refusal=None
+                        ),
+                    )
+                ],
+                usage=None,
+            )
+
+        provider._client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=stalled_create))
+        )
+        return provider, captured_kwargs
+
+    @pytest.mark.asyncio
+    async def test_chat_request_carries_http_timeout(self):
+        provider, captured = self._provider_with_stalled_client()
+        await provider.complete("sys", [{"role": "user", "content": "hi"}])
+        # The SDK forwards this to httpx as a request-level timeout that
+        # closes a stalled socket inside the blocked worker thread.
+        assert captured["timeout"] == 45.0
+
+    @pytest.mark.asyncio
+    async def test_sdk_api_timeout_error_normalized_to_llm_timeout(self):
+        class APITimeoutError(Exception):
+            pass
+
+        provider, _ = self._provider_with_stalled_client(exception=APITimeoutError())
+        from providers.llm.base import LLMTimeoutError
+
+        with pytest.raises(LLMTimeoutError):
+            await provider.complete("sys", [{"role": "user", "content": "hi"}])
+
+    @pytest.mark.asyncio
+    async def test_zero_timeout_disables_request_timeout(self):
+        provider, captured = self._provider_with_stalled_client()
+        provider.default_timeout = 0.0
+        await provider.complete("sys", [{"role": "user", "content": "hi"}])
+        assert "timeout" not in captured
