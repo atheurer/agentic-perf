@@ -219,6 +219,10 @@ class ApprovalRequest(BaseModel):
     resolved_by: str | None = None
     resolution_comment_id: str | None = None
     resolution_reason: str | None = None
+    # Canonical hash of the material resolution-request fields, recorded at
+    # resolution time so an identical replay after an ambiguous send can be
+    # recognized as idempotent instead of surfacing a raw 409 (#1386).
+    resolution_request_hash: str | None = None
     consumed_at: datetime | None = None
     expires_at: datetime | None = None
     ticket_attempt: str | None = None

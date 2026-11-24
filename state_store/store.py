@@ -2404,6 +2404,30 @@ class TicketStore:
                 if isinstance(value, dict)
             ]
 
+    @staticmethod
+    def _resolution_request_hash(request: ResolveApprovalRequest) -> str:
+        """Canonical hash of the material resolution-request fields (#1386).
+
+        A replay is idempotent only when the ENTIRE resolution request
+        matches — decision plus comment, reason, and intent bindings. A
+        same-decision replay with a different reason must not be told its
+        request succeeded when the recorded history says otherwise.
+        """
+        import hashlib
+
+        material = {
+            "decision": request.decision,
+            "comment_id": request.comment_id,
+            "comment": request.comment,
+            "reason": request.reason,
+            "validation_id": request.validation_id,
+            "presented_run_file_digest": request.presented_run_file_digest,
+            "execution_intent_digest": request.execution_intent_digest,
+        }
+        return hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
     def resolve_approval_request(
         self,
         ticket_id: str,
@@ -2412,7 +2436,16 @@ class TicketStore:
         *,
         resolved_by: str,
     ) -> ApprovalRequest:
-        """Resolve exactly once, checking the immutable intent with CAS semantics."""
+        """Resolve exactly once, checking the immutable intent with CAS semantics.
+
+        An identical replay of a resolution that was already recorded — the
+        client could not know it landed because the response was lost —
+        returns the resolved record instead of raising, so an ambiguous send
+        reconciles remote state rather than surfacing a raw 409 (#1386). A
+        DIFFERENT resolution request for an already-resolved approval
+        remains a conflict, and system-side expiry is never treated as a
+        client resolution.
+        """
         with self._lock:
             ticket = self._resolve(ticket_id)
             raw = ticket.custom_fields.get("approval_requests", {})
@@ -2429,6 +2462,18 @@ class TicketStore:
             if isinstance(current_raw, dict):
                 current = ApprovalRequest.model_validate(current_raw)
             if current.status != "pending":
+                # Idempotent replay (#1386): a client that lost the response
+                # retries the identical resolution. Accept it only when the
+                # full material request matches what was recorded and a
+                # client (not the expiry sweeper) recorded it.
+                if (
+                    current.status
+                    in ("approved", "changes_requested", "rejected", "cancelled")
+                    and current.resolved_by not in (None, "system")
+                    and current.resolution_request_hash
+                    == self._resolution_request_hash(request)
+                ):
+                    return current
                 raise ValueError(f"approval request is already {current.status}")
             if request.comment_id:
                 for item in raw.values():
@@ -2458,6 +2503,7 @@ class TicketStore:
                     "resolved_by": resolved_by,
                     "resolution_comment_id": resolution_comment_id,
                     "resolution_reason": request.reason,
+                    "resolution_request_hash": self._resolution_request_hash(request),
                     "record_version": current.record_version + 1,
                 }
             )

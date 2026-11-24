@@ -295,3 +295,189 @@ def test_approval_creation_rejects_expired_malformed_and_prior_claims(tmp_path):
     )
     with pytest.raises(ValueError, match="claim_owned_by_other_session"):
         store.create_approval_request(ticket.id, stale, created_by="benchmark")
+
+
+class TestApprovalResolutionIdempotency:
+    """#1386: replaying the identical approval decision after an ambiguous
+    send must return the resolved state, not a raw 409; a different decision
+    remains a conflict."""
+
+    def _store_with_approval(self, tmp_path):
+        store = TicketStore(persist_dir=tmp_path)
+        ticket = store.create_ticket(CreateTicketRequest(summary="s", description="d"))
+        session_id = uuid4()
+        store.acquire_orchestrator_lease(
+            AcquireOrchestratorLeaseRequest(
+                session_id=session_id,
+                instance_name="test",
+                host="localhost",
+                pid=1,
+                process_start_id="test",
+                ttl_seconds=60,
+            )
+        )
+        claim = store.claim_ticket(
+            ticket.id, "benchmark", session_id=session_id, epoch=1
+        )
+        claim_id = claim["claim_id"]
+        approval_body = _approval_request(session_id=str(session_id), claim_id=claim_id)
+        ticket.custom_fields["validated_run_file"] = {
+            "validation_id": approval_body.validation_id,
+            "state": "executable",
+            "runfile_fingerprint": approval_body.presented_run_file_digest,
+            "execution_intent_digest": approval_body.execution_intent_digest,
+        }
+        store._persist_ticket(ticket)
+        approval = store.create_approval_request(
+            ticket.id, approval_body, created_by="benchmark"
+        )
+        return store, ticket, approval
+
+    def test_identical_replay_returns_resolved_state(self, tmp_path):
+        store, ticket, approval = self._store_with_approval(tmp_path)
+        request = ResolveApprovalRequest(
+            decision="approved", comment="looks good", reason="LGTM"
+        )
+        first = store.resolve_approval_request(
+            ticket.id, approval.approval_request_id, request, resolved_by="alice"
+        )
+        assert first.status == "approved"
+        # The response was lost; the client retries the identical request.
+        replay = store.resolve_approval_request(
+            ticket.id, approval.approval_request_id, request, resolved_by="alice"
+        )
+        assert replay.status == "approved"
+        assert replay.approval_request_id == approval.approval_request_id
+        assert replay.validation_id == approval.validation_id
+        assert replay.resolved_at == first.resolved_at
+
+    def test_different_decision_remains_conflict(self, tmp_path):
+        store, ticket, approval = self._store_with_approval(tmp_path)
+        store.resolve_approval_request(
+            ticket.id,
+            approval.approval_request_id,
+            ResolveApprovalRequest(decision="approved"),
+            resolved_by="alice",
+        )
+        with pytest.raises(ValueError, match="already approved"):
+            store.resolve_approval_request(
+                ticket.id,
+                approval.approval_request_id,
+                ResolveApprovalRequest(decision="rejected"),
+                resolved_by="bob",
+            )
+
+    def test_same_decision_different_reason_is_not_a_replay(self, tmp_path):
+        store, ticket, approval = self._store_with_approval(tmp_path)
+        store.resolve_approval_request(
+            ticket.id,
+            approval.approval_request_id,
+            ResolveApprovalRequest(decision="approved", reason="first reason"),
+            resolved_by="alice",
+        )
+        with pytest.raises(ValueError, match="already approved"):
+            store.resolve_approval_request(
+                ticket.id,
+                approval.approval_request_id,
+                ResolveApprovalRequest(decision="approved", reason="other reason"),
+                resolved_by="alice",
+            )
+
+    def test_expired_approval_is_not_treated_as_client_resolution(self, tmp_path):
+        store, ticket, approval = self._store_with_approval(tmp_path)
+        # Force the expiry sweeper to mark it expired.
+        expired = approval.model_copy(
+            update={
+                "status": "expired",
+                "resolved_by": "system",
+                "resolved_at": datetime.now(timezone.utc),
+            }
+        )
+        raw = ticket.custom_fields.get("approval_requests", {})
+        raw[approval.approval_request_id] = expired.model_dump(mode="json")
+        store._persist_ticket(ticket)
+        with pytest.raises(ValueError, match="already expired"):
+            store.resolve_approval_request(
+                ticket.id,
+                approval.approval_request_id,
+                ResolveApprovalRequest(decision="approved"),
+                resolved_by="alice",
+            )
+
+    def test_comment_consumed_by_own_resolution_is_a_replay(self, tmp_path):
+        store, ticket, approval = self._store_with_approval(tmp_path)
+        request = ResolveApprovalRequest(decision="approved", comment_id="comment-9")
+        store.resolve_approval_request(
+            ticket.id, approval.approval_request_id, request, resolved_by="alice"
+        )
+        # The comment now appears consumed; the identical replay must still
+        # return the resolved record rather than a comment-conflict 409.
+        replay = store.resolve_approval_request(
+            ticket.id, approval.approval_request_id, request, resolved_by="alice"
+        )
+        assert replay.status == "approved"
+
+
+def test_resolve_replay_is_idempotent_over_http(tmp_path):
+    """#1386: an identical replay returns the resolved record (200) instead
+    of a raw 409 after an ambiguous send."""
+    from fastapi.testclient import TestClient
+
+    from state_store.main import create_app
+
+    application = create_app(initialize_immediately=True)
+    # Isolated store: the app's default store lives in the shared sandbox
+    # home, and acquiring an orchestrator lease on it would leak into other
+    # tests in this process.
+    application.state.store = TicketStore(persist_dir=tmp_path)
+    client = TestClient(application)
+    client.headers["Authorization"] = f"Bearer {application.state.api_token}"
+    store = application.state.store
+
+    ticket = store.create_ticket(CreateTicketRequest(summary="s", description="d"))
+    session_id = uuid4()
+    store.acquire_orchestrator_lease(
+        AcquireOrchestratorLeaseRequest(
+            session_id=session_id,
+            instance_name="test",
+            host="localhost",
+            pid=1,
+            process_start_id="test",
+            ttl_seconds=60,
+        )
+    )
+    claim = store.claim_ticket(ticket.id, "benchmark", session_id=session_id, epoch=1)
+    approval_body = _approval_request(
+        session_id=str(session_id), claim_id=claim["claim_id"]
+    )
+    ticket.custom_fields["validated_run_file"] = {
+        "validation_id": approval_body.validation_id,
+        "state": "executable",
+        "runfile_fingerprint": approval_body.presented_run_file_digest,
+        "execution_intent_digest": approval_body.execution_intent_digest,
+    }
+    store._persist_ticket(ticket)
+    approval = store.create_approval_request(
+        ticket.id, approval_body, created_by="benchmark"
+    )
+
+    body = {"decision": "approved", "reason": "LGTM"}
+    first = client.post(
+        f"/api/v1/tickets/{ticket.id}/approvals/{approval.approval_request_id}/resolve",
+        json=body,
+    )
+    assert first.status_code == 200, first.text
+    # Ambiguous send: the response was lost, the client retries identically.
+    replay = client.post(
+        f"/api/v1/tickets/{ticket.id}/approvals/{approval.approval_request_id}/resolve",
+        json=body,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["status"] == "approved"
+    assert replay.json()["approval_request_id"] == approval.approval_request_id
+    # A different decision is still a structured conflict.
+    conflict = client.post(
+        f"/api/v1/tickets/{ticket.id}/approvals/{approval.approval_request_id}/resolve",
+        json={"decision": "rejected"},
+    )
+    assert conflict.status_code == 409
