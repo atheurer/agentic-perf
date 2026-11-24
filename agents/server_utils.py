@@ -1233,7 +1233,7 @@ async def controller_context_gateway(
     if mcp_adapter is None:
         return failure(
             "unsupported_controller",
-            "The assigned Crucible controller does not support MCP contract v3.",
+            "The assigned controller has no MCP contract v3 endpoint; file-based controller context is not available on this path.",
             requested_ref=path,
             next_action=(
                 "Install or update Crucible to a controller with MCP contract v3."

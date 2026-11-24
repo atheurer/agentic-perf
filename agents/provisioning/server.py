@@ -941,9 +941,10 @@ async def _verify_harness_install_one(
             "else printf 'available=0\\n'; exit 1; fi"
         )
         context_result = await _ssh.run(host, context_probe, timeout=30)
+        # Controller context documents are served by the skill gateway; do not
+        # advertise a host path that callers might turn into a context ref.
         context = {
             "ready": context_result.exit_code == 0,
-            "bootstrap": bootstrap_path,
             "bytes": 0,
         }
         if context_result.stdout:
