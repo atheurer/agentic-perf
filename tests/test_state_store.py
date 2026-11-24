@@ -124,3 +124,108 @@ class TestDoubleRequestClarification:
         store.transition_ticket(tid, TransitionRequest(status="awaiting_teardown"))
         t = store.get_ticket(tid)
         assert t.status == TicketStatus.AWAITING_TEARDOWN
+
+
+class TestHarnessInstallProvenance:
+    """#1382: server-owned install provenance authorizes teardown removal."""
+
+    def test_record_and_merge(self, store, tmp_path):
+        from state_store.models import CreateTicketRequest
+
+        ticket = store.create_ticket(CreateTicketRequest(summary="s", description="d"))
+        store.record_harness_installs(
+            ticket.id,
+            [{"host": "10.0.0.1", "harness": "uperf", "install_path": ""}],
+        )
+        # Re-recording (idempotent re-run of provisioning) merges per host.
+        store.record_harness_installs(
+            ticket.id,
+            [
+                {"host": "10.0.0.1", "harness": "uperf"},
+                {"host": "10.0.0.2", "harness": "uperf"},
+            ],
+        )
+        fields = store.get_ticket(ticket.id).custom_fields
+        provenance = fields["harness_install_provenance"]
+        assert sorted(provenance) == ["10.0.0.1", "10.0.0.2"]
+        assert provenance["10.0.0.1"]["installed_by_ticket"] == ticket.id
+        assert provenance["10.0.0.1"]["harness"] == "uperf"
+
+        restarted = TicketStore(persist_dir=tmp_path)
+        assert (
+            restarted.get_ticket(ticket.id).custom_fields["harness_install_provenance"][
+                "10.0.0.2"
+            ]["installed_by_ticket"]
+            == ticket.id
+        )
+
+    def test_generic_fields_patch_cannot_write_provenance(self, store):
+        from state_store.models import CreateTicketRequest
+
+        ticket = store.create_ticket(CreateTicketRequest(summary="s", description="d"))
+        with pytest.raises(ValueError, match="harness install provenance"):
+            store.update_fields(ticket.id, {"harness_install_provenance": {"h": "x"}})
+
+    def test_records_require_host_and_harness(self, store):
+        from state_store.models import CreateTicketRequest
+
+        ticket = store.create_ticket(CreateTicketRequest(summary="s", description="d"))
+        with pytest.raises(ValueError, match="host and harness"):
+            store.record_harness_installs(ticket.id, [{"host": "", "harness": "x"}])
+
+
+def test_harness_installs_api_service_only_and_records(tmp_path):
+    """#1386-adjacent API surface: the provenance endpoint is service-only."""
+    from fastapi.testclient import TestClient
+
+    from state_store.auth import make_auth_dependency
+    from state_store.identity import UserStore
+    from state_store.main import create_app, mount_routers
+    from state_store.models import CreateTicketRequest
+    from state_store.store import TicketStore
+
+    application = create_app(initialize_immediately=True)
+    application.state.store = TicketStore(persist_dir=tmp_path)
+    token = application.state.api_token
+
+    users = UserStore(persist_path=tmp_path / "users.json")
+    _, user_token = users.create_user("alice")
+    application.state.multi_user = True
+    application.state.user_store = users
+    auth = make_auth_dependency(
+        token, multi_user=True, user_store=users, token_ttl_days=0
+    )
+    application.state.auth_dependency = auth
+    application.router.routes.clear()
+    mount_routers(application, auth)
+
+    client = TestClient(application)
+    store = application.state.store
+    ticket = store.create_ticket(CreateTicketRequest(summary="s", description="d"))
+    path = f"/api/v1/tickets/{ticket.id}/harness-installs"
+
+    unauthenticated = client.post(path, json={"records": []})
+    assert unauthenticated.status_code == 401
+
+    # A user principal must be rejected: harness provenance is
+    # service-owned.
+    forbidden = client.post(
+        path,
+        json={"records": [{"host": "10.0.0.1", "harness": "uperf"}]},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert forbidden.status_code == 403
+
+    ok = client.post(
+        path,
+        json={"records": [{"host": "10.0.0.1", "harness": "uperf"}]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["recorded_hosts"] == ["10.0.0.1"]
+    assert (
+        store.get_ticket(ticket.id).custom_fields["harness_install_provenance"][
+            "10.0.0.1"
+        ]["harness"]
+        == "uperf"
+    )

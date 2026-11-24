@@ -39,6 +39,7 @@ from providers.usage import summarize_usage_events
 from .audit import AuditLog, get_actor
 from .directives import parse_verbatim_directives
 from .models import (
+    _HARNESS_PROVENANCE_FIELD,
     _VALIDATION_RESERVED_FIELDS,
     TERMINAL_STATUSES,
     VALID_TRANSITIONS,
@@ -1488,6 +1489,55 @@ class TicketStore:
             self._trace_mutation(ticket_id, "extend_iterations", attributes=details)
             return ticket.model_copy(deep=True)
 
+    def record_harness_installs(
+        self,
+        ticket_id: str,
+        records: list[dict],
+        *,
+        session_id: uuid.UUID | None = None,
+        epoch: int | None = None,
+    ) -> Ticket:
+        """Record which hosts THIS ticket installed a harness on (#1382).
+
+        Only this server-owned provenance authorizes harness removal at
+        teardown — a ticket that never installed the harness must never
+        remove it. Written exclusively through the dedicated service API;
+        the generic fields PATCH rejects the field. Each record is
+        {host, harness, install_path}; entries merge per host so repeated
+        provisioning calls are idempotent.
+        """
+        with self._lock:
+            ticket = self._resolve(ticket_id)
+            self._validate_claim_fence(session_id, epoch, ticket_id)
+            provenance = ticket.custom_fields.get(_HARNESS_PROVENANCE_FIELD)
+            if not isinstance(provenance, dict):
+                provenance = {}
+            for record in records:
+                host = str(record.get("host") or "").strip()
+                harness = str(record.get("harness") or "").strip()
+                if not host or not harness:
+                    raise ValueError("harness install records require host and harness")
+                provenance[host] = {
+                    "harness": harness,
+                    "install_path": str(record.get("install_path") or ""),
+                    "installed_by_ticket": ticket_id,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ticket.custom_fields[_HARNESS_PROVENANCE_FIELD] = provenance
+            ticket.updated_at = datetime.now(timezone.utc)
+            self._persist_ticket(ticket)
+            self._audit_log(
+                "harness_installs_recorded",
+                ticket_id,
+                {"hosts": sorted(provenance), "records": len(records)},
+            )
+            self._trace_mutation(
+                ticket_id,
+                "harness_installs_recorded",
+                attributes={"hosts": sorted(r.get("host", "") for r in records)},
+            )
+            return ticket.model_copy(deep=True)
+
     def update_fields(
         self,
         ticket_id: str,
@@ -1579,6 +1629,11 @@ class TicketStore:
             if protected:
                 raise ValueError(
                     "benchmark validation fields are immutable; use the validations API"
+                )
+            if _HARNESS_PROVENANCE_FIELD in fields:
+                raise ValueError(
+                    "harness install provenance is server-owned; use the "
+                    "harness-installs API"
                 )
             if self._contains_imported_fixture_reserved_field(fields):
                 raise ValueError(

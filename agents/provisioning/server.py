@@ -3310,7 +3310,65 @@ async def ensure_harness_installed(
         install_path,
     )
     results.update(skipped)
+    await _record_harness_install_provenance(results, harness_name, install_path)
     return json.dumps(_summarize(results))
+
+
+async def _record_harness_install_provenance(
+    results: dict[str, dict], harness_name: str, install_path: str
+) -> None:
+    """Record which hosts THIS ticket freshly installed the harness on.
+
+    This provenance is the sole authorization for harness removal at
+    teardown (#1382). Hosts that were already installed are deliberately
+    NOT recorded — this ticket did not install them and must not remove
+    them. A recording failure is logged but not fatal: teardown then
+    preserves the harness, which is the safe direction.
+    """
+    ticket_id = os.environ.get("TICKET_ID", "")
+    state_store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    if not ticket_id:
+        return
+    installed_hosts = [
+        host
+        for host, result in results.items()
+        if isinstance(result, dict) and result.get("status") == "success"
+    ]
+    if not installed_hosts:
+        return
+    from agents.server_utils import AuditedAsyncHTTPClient, ticket_state_headers
+
+    body = {
+        "records": [
+            {
+                "host": host,
+                "harness": harness_name,
+                "install_path": install_path,
+            }
+            for host in sorted(installed_hosts)
+        ]
+    }
+    try:
+        async with AuditedAsyncHTTPClient(
+            timeout=15.0, headers=ticket_state_headers()
+        ) as client:
+            r = await client.post(
+                f"{state_store_url}/api/v1/tickets/{ticket_id}/harness-installs",
+                json=body,
+            )
+            r.raise_for_status()
+        logger.info(
+            "[provisioning] Recorded harness install provenance for %s on %d host(s)",
+            harness_name,
+            len(installed_hosts),
+        )
+    except Exception as exc:
+        logger.warning(
+            "[provisioning] Failed to record harness install provenance "
+            "for %s (teardown will preserve the installs): %s",
+            harness_name,
+            exc,
+        )
 
 
 @mcp.tool(description=SKILL_GATEWAY_TOOL_DESCRIPTION)

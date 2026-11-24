@@ -1,6 +1,6 @@
 """Tests for the resource agent."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -265,3 +265,127 @@ class TestTerminateProviderResourcesJumpstarter:
 
         assert result is True
         agent._add_comment.assert_called_once()
+
+
+class TestHarnessRemovalProvenance:
+    """#1382: teardown may only remove a harness that THIS ticket installed."""
+
+    def test_user_provided_host_is_never_a_removal_target(self):
+        from agents.resource.agent import ResourceAgent
+
+        allowed, why = ResourceAgent._harness_removal_allowed(
+            "PERF-1",
+            {
+                "resource_provider": "user_provided",
+                "harness_install_provenance": {
+                    "host-a": {
+                        "harness": "uperf",
+                        "installed_by_ticket": "PERF-1",
+                    }
+                },
+            },
+            "host-a",
+            "uperf",
+        )
+        assert not allowed
+        assert "user-provided" in why
+
+    def test_this_ticket_install_authorizes_removal(self):
+        from agents.resource.agent import ResourceAgent
+
+        allowed, why = ResourceAgent._harness_removal_allowed(
+            "PERF-1",
+            {
+                "resource_provider": "quads",
+                "harness_install_provenance": {
+                    "host-a": {
+                        "harness": "uperf",
+                        "installed_by_ticket": "PERF-1",
+                    }
+                },
+            },
+            "host-a",
+            "uperf",
+        )
+        assert allowed
+        assert why == "removal authorized"
+
+    def test_pre_existing_install_without_provenance_is_preserved(self):
+        from agents.resource.agent import ResourceAgent
+
+        allowed, why = ResourceAgent._harness_removal_allowed(
+            "PERF-1", {"resource_provider": "quads"}, "host-a", "uperf"
+        )
+        assert not allowed
+        assert "pre-existing" in why
+
+    def test_other_ticket_install_is_preserved(self):
+        from agents.resource.agent import ResourceAgent
+
+        allowed, _ = ResourceAgent._harness_removal_allowed(
+            "PERF-1",
+            {
+                "resource_provider": "quads",
+                "harness_install_provenance": {
+                    "host-a": {
+                        "harness": "uperf",
+                        "installed_by_ticket": "PERF-2",
+                    }
+                },
+            },
+            "host-a",
+            "uperf",
+        )
+        assert not allowed
+
+    def test_different_harness_provenance_is_preserved(self):
+        from agents.resource.agent import ResourceAgent
+
+        allowed, _ = ResourceAgent._harness_removal_allowed(
+            "PERF-1",
+            {
+                "resource_provider": "quads",
+                "harness_install_provenance": {
+                    "host-a": {
+                        "harness": "fio",
+                        "installed_by_ticket": "PERF-1",
+                    }
+                },
+            },
+            "host-a",
+            "uperf",
+        )
+        assert not allowed
+
+    def test_teardown_skips_cleanup_harness_without_provenance(self):
+        """The full-teardown loop must not call cleanup_harness when the
+        harness was not installed by this ticket."""
+        from agents.resource.agent import ResourceAgent
+
+        agent = ResourceAgent.__new__(ResourceAgent)
+        agent._add_comment = AsyncMock()
+        agent._secrets = MagicMock()
+        agent._registry = None
+
+        import agents.resource.agent as ra
+
+        fields = {
+            "resource_provider": "user_provided",
+            "ssh_hardware_ips": {"controller": "host-a", "targets": ["host-b"]},
+            "ssh_key_path": None,
+            "harness_name": "uperf",
+        }
+        with (
+            patch.object(ra, "resolve_ssh_key") as resolve_key,
+            patch.object(ra, "cleanup_harness") as cleanup,
+        ):
+            resolve_key.return_value.__aenter__ = AsyncMock(return_value="key")
+            resolve_key.return_value.__aexit__ = AsyncMock(return_value=False)
+            with patch.object(ra, "make_traced_ssh"):
+                agent._run_host_cleanup_sync = None  # unused marker
+                import asyncio
+
+                asyncio.run(agent._run_host_cleanup("PERF-1", fields))
+        cleanup.assert_not_awaited()
+        comment = agent._add_comment.call_args[0][1]
+        assert "user-provided" in comment
