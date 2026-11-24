@@ -4,6 +4,7 @@ import asyncio
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1834,3 +1835,34 @@ async def test_benchmark_gateway_serves_investigation_and_jumpstarter_local_docs
         assert any(
             item["path"].endswith(expected_document) for item in result["documents"]
         ), (subject, result["documents"])
+
+
+class _ProbeSSH:
+    def __init__(self, exit_code: int = 0, *, raise_exc: bool = False):
+        self.exit_code = exit_code
+        self.raise_exc = raise_exc
+        self.calls: list[tuple[str, str]] = []
+
+    async def run(self, host: str, command: str, timeout: int = 30):
+        self.calls.append((host, command))
+        if self.raise_exc:
+            raise RuntimeError("ssh failure")
+        return SimpleNamespace(stdout="", stderr="", exit_code=self.exit_code)
+
+
+@pytest.mark.asyncio
+async def test_controller_has_crucible_probe():
+    from agents.skill_gateway import _controller_has_crucible
+
+    installed = _ProbeSSH(0)
+    assert await _controller_has_crucible(installed, "controller.example") is True
+    assert installed.calls and "/opt/crucible/bin/crucible" in installed.calls[0][1]
+
+    missing = _ProbeSSH(1)
+    assert await _controller_has_crucible(missing, "controller.example") is False
+
+    broken = _ProbeSSH(0, raise_exc=True)
+    assert await _controller_has_crucible(broken, "controller.example") is False
+
+    assert await _controller_has_crucible(None, "controller.example") is False
+    assert await _controller_has_crucible(installed, None) is False

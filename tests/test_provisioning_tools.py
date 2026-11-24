@@ -249,7 +249,6 @@ async def test_verify_crucible_is_read_only_and_reports_context(mock_ssh, monkey
     assert "warning" not in result["message"]
     assert result["context"] == {
         "ready": True,
-        "bootstrap": "/opt/crucible/AGENTS.md",
         "bytes": 1234,
     }
     assert all(

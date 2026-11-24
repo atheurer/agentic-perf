@@ -910,6 +910,21 @@ def _capture_local_tree(local_skills_dir: Path | None, subject: str) -> dict[str
     }
 
 
+async def _controller_has_crucible(ssh: Any, controller_host: str | None) -> bool:
+    """Return True when the controller has a usable Crucible installation."""
+    if ssh is None or not controller_host:
+        return False
+    try:
+        result = await ssh.run(
+            controller_host,
+            "test -x /opt/crucible/bin/crucible",
+            timeout=15,
+        )
+    except Exception:
+        return False
+    return getattr(result, "exit_code", 1) == 0
+
+
 async def _ticket_source_snapshot(
     provider: Any,
     *,
@@ -2973,7 +2988,10 @@ async def skill_context_gateway(
                         )
                     documents.extend(upstream_documents)
             if software_allowed:
-                if not controller_host:
+                controller_installed = mcp_adapter is not None or (
+                    await _controller_has_crucible(ssh, controller_host)
+                )
+                if not controller_installed:
                     try:
                         (
                             upstream_snapshot,
