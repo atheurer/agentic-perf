@@ -2160,3 +2160,120 @@ esac
     finally:
         orch_process.kill()
         subprocess.run([str(SCRIPT), "stop"], cwd=REPO, env=env, check=False)
+
+
+def test_restart_waits_for_supervisor_lock_ownership(tmp_path: Path) -> None:
+    """#1399: restart must not report success before the replacement
+    supervisor owns its lock — a stop issued in that window would skip the
+    supervisor, and the late supervisor would relaunch an orchestrator the
+    user believes was stopped."""
+    home = tmp_path / "home"
+    (home / "logs").mkdir(parents=True)
+    (home / "secrets").mkdir()
+    store_id = str(uuid.uuid4())
+    (home / "state-store.id").write_text(store_id + "\n")
+    (home / "config.json").write_text(json.dumps({"state_store": {"port": 18903}}))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    curl = fake_bin / "curl"
+    curl.write_text(
+        f"#!/usr/bin/env bash\n{_FAKE_LEASE_RESPONSE}"
+        'if [[ "$*" == *"/control/orchestrator-lease"* ]]; then\n'
+        '  pid_file="$AGENTIC_PERF_HOME/orchestrator.pid"\n'
+        '  if [ -f "$pid_file" ]; then\n'
+        '    pid="$(tr -d \'[:space:]\' < "$pid_file")"\n'
+        '    lease_response "$pid"\n'
+        "  else\n"
+        "    printf '{\"lease\":null}\\n'\n"
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
+        'exec 9>>"$AGENTIC_PERF_HOME/state-store.lock"\n'
+        "if flock -n 9; then flock -u 9; exit 7; fi\n"
+        f"printf '%s\\n' '{{\"store_id\":\"{store_id}\"}}'\n"
+    )
+    curl.chmod(curl.stat().st_mode | stat.S_IXUSR)
+
+    store_holder = tmp_path / "store-holder"
+    orch_holder = tmp_path / "orch-holder"
+    _holder(
+        store_holder,
+        role="store",
+        lock_path=home / "state-store.lock",
+        store_id=store_id,
+    )
+    _holder(
+        orch_holder,
+        role="orchestrator",
+        lock_path=home / "orchestrator.pid",
+        store_id=store_id,
+    )
+    # A supervisor that exists immediately but acquires its lock 2s later —
+    # the exact race window from #1399.
+    slow_supervisor = tmp_path / "slow-supervisor"
+    slow_supervisor.write_text(
+        "#!/usr/bin/env bash\n"
+        "sleep 2\n"
+        'exec 9>>"$AGENTIC_PERF_HOME/orchestrator-supervisor.lock"\n'
+        "flock -n 9 || exit 0\n"
+        'printf \'%s\\n\' "$$" > "$AGENTIC_PERF_HOME/orchestrator-supervisor.lock"\n'
+        'exec -a "bash start-bg.sh __supervise-orchestrator" '
+        "sleep 600\n"
+    )
+    slow_supervisor.chmod(slow_supervisor.stat().st_mode | stat.S_IXUSR)
+    nohup = fake_bin / "nohup"
+    nohup.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = bash ] && [ "$3" = __supervise-orchestrator ]; then\n'
+        f"    exec {slow_supervisor}\n"
+        'elif [ "$1" = python3 ] && [ "$2" = -m ] && [ "$3" = uvicorn ]; then\n'
+        f'    exec {store_holder} "$AGENTIC_PERF_HOME/state-store.lock" "{store_id}"\n'
+        'elif [ "$1" = python3 ] && [ "$2" = -m ] && [ "$3" = orchestrator.main ]; then\n'
+        f'    exec {orch_holder} "$AGENTIC_PERF_HOME/orchestrator.pid"\n'
+        "fi\n"
+        'exec "$@"\n'
+    )
+    nohup.chmod(nohup.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env.update(
+        {
+            "AGENTIC_PERF_HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "TEST_STORE_ID": store_id,
+            "START_BG_STORE_TIMEOUT": "2",
+            "START_BG_ORCH_TIMEOUT": "2",
+        }
+    )
+
+    def run_launcher(command: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(SCRIPT), command],
+            cwd=REPO,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+
+    first_start = run_launcher("start")
+    assert first_start.returncode == 0, first_start.stdout + first_start.stderr
+    assert "Orchestrator started" in first_start.stdout
+
+    # The supervisor exists (process matches) but has NOT acquired its lock
+    # yet; restart must block until it does.
+    restarted = run_launcher("restart")
+    assert restarted.returncode == 0, restarted.stdout + restarted.stderr
+    assert "Services stopped" in restarted.stdout
+    # By the time restart reports success, the new supervisor must own its
+    # lock, so an immediate stop reaches it.
+    stopped = run_launcher("stop")
+    assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+    assert "Services stopped" in stopped.stdout
+
+    # Wait past the delayed-lock window: no supervisor may come back and
+    # relaunch an orchestrator the user believes was stopped.
+    time.sleep(3)
+    status = run_launcher("status")
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert "Orchestrator: STOPPED" in status.stdout, status.stdout + status.stderr

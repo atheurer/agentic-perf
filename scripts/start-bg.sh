@@ -997,7 +997,7 @@ start_orchestrator() {
 }
 
 start_orchestrator_supervisor() {
-    local pid="" deadline
+    local pid="" deadline lock_pid
     pid="$(active_supervisor_pid || true)"
     if [ -n "$pid" ]; then
         if [ "$(supervisor_pid)" != "$pid" ]; then
@@ -1018,11 +1018,21 @@ start_orchestrator_supervisor() {
     START_BG_CRASH_LOOP_THRESHOLD="$CRASH_LOOP_THRESHOLD" \
         nohup bash "$SCRIPT_DIR/start-bg.sh" __supervise-orchestrator \
         >> "$ORCH_SUPERVISOR_LOG" 2>&1 &
-    pid=$!
+    local launched=$!
+    pid=$launched
     write_pid_file "$ORCH_SUPERVISOR_PID_FILE" "$pid"
-    deadline=$((SECONDS + 5))
+    # Success requires VERIFIED lock ownership, not just a process that
+    # matches the expected command line (#1399): the supervisor acquires
+    # its lock after launch, and a stop issued in that window sees no held
+    # lock, skips the supervisor, and the late supervisor relaunches an
+    # orchestrator the user believes was stopped.
+    deadline=$((SECONDS + 10))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        supervisor_owner_valid "$pid" && return 0
+        if supervisor_owner_valid "$pid" \
+            && lock_is_held "$ORCH_SUPERVISOR_LOCK" \
+            && [ "$(supervisor_lock_pid || true)" = "$pid" ]; then
+            return 0
+        fi
         process_alive "$pid" || break
         sleep 0.05
     done
@@ -1036,6 +1046,19 @@ start_orchestrator_supervisor() {
         error "orchestrator supervisor lock is held by an unverifiable process; see $ORCH_SUPERVISOR_LOG"
         return 3
     fi
+    # The launched supervisor may still acquire its lock after this point
+    # and relaunch an orchestrator the caller believes failed to start.
+    # Terminate it and wait for the lock to be released before reporting
+    # failure (#1399).
+    if process_alive "$launched" 2>/dev/null; then
+        kill "$launched" 2>/dev/null || true
+        local wait_deadline=$((SECONDS + 5))
+        while [ "$SECONDS" -lt "$wait_deadline" ] && process_alive "$launched"; do
+            sleep 0.05
+        done
+        process_alive "$launched" && kill -9 "$launched" 2>/dev/null || true
+    fi
+    wait_for_lock_release "$ORCH_SUPERVISOR_LOCK" "orchestrator supervisor" || true
     error "orchestrator supervisor failed to start; see $ORCH_SUPERVISOR_LOG"
     rm -f "$ORCH_SUPERVISOR_PID_FILE"
     return 1
