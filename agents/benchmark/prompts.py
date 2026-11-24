@@ -163,7 +163,17 @@ APPROVAL_STEP_PAUSE = """\
 `present_runfile_for_approval` pauses and returns the user's reply.
 Interpret it semantically — natural approvals include "go for it" or
 "looks good." If authorized, resolve as `approved`; if edits requested,
-resolve as `changes_requested`.\
+resolve as `changes_requested`.
+
+### Retrying a failed execution
+
+A failed execution can be retried on the same ticket: once the cause is
+fixed (for example, an environment problem corrected out of band),
+present the run file for approval again. Each new authorization starts a
+genuinely new execution with a new run id. A result whose message begins
+with "[replayed cached result" is a cached replay of a previous attempt,
+not a new run — do not report it as a new execution.
+\
 """
 
 APPROVAL_STEP_AUTO = """\

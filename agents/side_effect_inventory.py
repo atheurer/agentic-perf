@@ -50,6 +50,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("agents/benchmark/server.py", "_persist_validated_runfile", "mutating_http_state"),
     (
         "agents/benchmark/server.py",
+        "_mint_execution_intent",
+        "mutating_http_state",
+    ),
+    (
+        "agents/benchmark/server.py",
         "_autoconsume_runfile_approval",
         "mutating_http_state",
     ),
@@ -882,6 +887,11 @@ INVENTORIED_SIDE_EFFECTS = (
     ("state_store/api/tickets.py", "claim_ticket", "mutating_http_state"),
     ("state_store/api/tickets.py", "create_ticket", "mutating_http_state"),
     ("state_store/api/tickets.py", "extend_iterations", "mutating_http_state"),
+    (
+        "state_store/api/tickets.py",
+        "mint_execution_intent",
+        "mutating_http_state",
+    ),
     ("state_store/api/tickets.py", "kernel_control", "mutating_http_state"),
     ("state_store/api/tickets.py", "release_claim", "mutating_http_state"),
     ("state_store/api/tickets.py", "renew_claim", "mutating_http_state"),
@@ -1162,6 +1172,16 @@ INVENTORY_DISPOSITIONS = {
         "audited",
         "observability-maintainers",
         "agents/benchmark/server.py:_autoconsume_runfile_approval",
+        "2027-12-31",
+    ),
+    (
+        "agents/benchmark/server.py",
+        "_mint_execution_intent",
+        "mutating_http_state",
+    ): (
+        "audited",
+        "observability-maintainers",
+        "agents/benchmark/server.py:_mint_execution_intent",
         "2027-12-31",
     ),
     (
@@ -4754,6 +4774,16 @@ INVENTORY_DISPOSITIONS = {
         "system_only",
         "state-store-maintainers",
         "state_store/api/tickets.py:claim_ticket",
+        "2027-12-31",
+    ),
+    (
+        "state_store/api/tickets.py",
+        "mint_execution_intent",
+        "mutating_http_state",
+    ): (
+        "system_only",
+        "state-store-maintainers",
+        "state_store/api/tickets.py:mint_execution_intent",
         "2027-12-31",
     ),
     ("state_store/api/tickets.py", "create_ticket", "mutating_http_state"): (

@@ -209,6 +209,8 @@ class ApprovalRequest(BaseModel):
     session_id: str | None = None
     session_epoch: str | None = None
     validation_id: str
+    # Attempt-scoped execution identity this approval authorizes (#1378).
+    execution_intent_id: str | None = None
     presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     summary: str = ""
@@ -229,6 +231,10 @@ class ApprovalRequest(BaseModel):
 class CreateApprovalRequest(BaseModel):
     kind: Literal["benchmark_run_file", "kernel_change"] = "benchmark_run_file"
     validation_id: str = Field(min_length=1, max_length=255)
+    # Attempt-scoped identity of the execution this approval authorizes
+    # (#1378): a retry after failure is a NEW authorization, so the
+    # automatic-approval dedupe must not collapse attempts.
+    execution_intent_id: str | None = Field(default=None, max_length=255)
     presented_run_file_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     execution_intent_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     summary: str = Field(default="", max_length=4096)
@@ -343,6 +349,15 @@ class ComparisonEvidenceSnapshot(BaseModel):
     benchmark_status: StrictStr | None
 
 
+class ExecutionIntentRequest(BaseModel):
+    """Mint the attempt identity for one authorized execution (#1378)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    validation_id: StrictStr
+    authorization_id: StrictStr
+
+
 class UpdateFieldsRequest(BaseModel):
     fields: dict[str, Any]
     require_unsuperseded_validation_id: StrictStr | None = Field(
@@ -400,6 +415,11 @@ class ReleaseOrchestratorLeaseRequest(BaseModel):
     session_id: UUID
     epoch: int = Field(gt=0)
 
+
+# Server-owned execution-intent records (#1378): per-authorization attempt
+# identity for benchmark executions. Reserved so the generic fields PATCH
+# cannot forge or rewind an attempt.
+_EXECUTION_INTENTS_FIELD = "benchmark_execution_intents"
 
 _VALIDATION_RESERVED_FIELDS = frozenset(
     {

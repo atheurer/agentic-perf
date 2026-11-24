@@ -308,8 +308,11 @@ def _wire_execute(monkeypatch, tmp_path, *, plan_ticket, record_run_file):
     carrying *record_run_file*."""
 
     # These tests use the local operation registry, even if another test or
-    # the surrounding environment configured a state-store API token.
+    # the surrounding environment configured a state-store API token. The
+    # token resolver would otherwise fall back to the token FILE and
+    # re-populate the env var mid-test (#1378's intent minting calls it).
     monkeypatch.setenv("AGENTIC_PERF_API_TOKEN", "")
+    monkeypatch.setattr(server_utils, "_state_store_token", lambda: "")
 
     record = {
         "validation_id": "val-788",
@@ -343,13 +346,20 @@ def _wire_execute(monkeypatch, tmp_path, *, plan_ticket, record_run_file):
     class _Result:
         status_code = 200
 
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
         def json(self):
-            return {}
+            return self._payload
 
         def raise_for_status(self):
             return None
 
     class _Client:
+        # In-memory execution-intent store (#1378), mirroring the real
+        # idempotent mint endpoint.
+        intents: dict[str, dict[str, dict]] = {}
+
         def __init__(self, **kwargs):
             pass
 
@@ -360,6 +370,27 @@ def _wire_execute(monkeypatch, tmp_path, *, plan_ticket, record_run_file):
             return None
 
         async def post(self, url, *args, **kwargs):
+            if "/execution-intents" in str(url):
+                body = kwargs.get("json") or {}
+                validation_id = body.get("validation_id", "")
+                authorization_id = body.get("authorization_id", "")
+                entries = self.intents.setdefault(validation_id, {})
+                if authorization_id not in entries:
+                    attempt_no = (
+                        max(
+                            (e.get("attempt_no", 0) for e in entries.values()),
+                            default=0,
+                        )
+                        + 1
+                    )
+                    entries[authorization_id] = {
+                        "authorization_id": authorization_id,
+                        "execution_intent_id": f"{validation_id}:{authorization_id}",
+                        "attempt_id": f"{validation_id}:attempt-{attempt_no}",
+                        "attempt_no": attempt_no,
+                        "previous_execution_intent_id": None,
+                    }
+                return _Result({"entry": entries[authorization_id]})
             return _Result()
 
         async def get(self, url, *args, **kwargs):

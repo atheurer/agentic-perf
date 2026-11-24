@@ -909,7 +909,10 @@ def test_large_result_uses_bounded_audited_blob_reference(monkeypatch, tmp_path)
     }
     compact, safe = benchmark_server._prepare_operation_result("PERF-TEST", original)
     assert len(json.dumps(compact).encode()) <= 3000
-    assert benchmark_server._replay_operation_result("PERF-TEST", compact) == safe
+    # #1378: a replayed result is unmistakably marked as a replay.
+    assert benchmark_server._replay_operation_result(
+        "PERF-TEST", compact
+    ) == benchmark_server._mark_replayed(safe)
 
 
 @pytest.mark.asyncio

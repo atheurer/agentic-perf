@@ -141,11 +141,126 @@ def _prepare_operation_result(
     return compact, safe
 
 
+def _execution_intent_entries(
+    ticket: dict[str, Any] | None, validation_id: str | None
+) -> dict[str, dict[str, Any]]:
+    """Read this ticket's minted execution-intent entries for a validation."""
+    if not ticket or not validation_id:
+        return {}
+    intents = (ticket.get("custom_fields") or {}).get("benchmark_execution_intents")
+    entries = (
+        intents.get(validation_id)
+        if isinstance(intents, dict) and isinstance(intents.get(validation_id), dict)
+        else {}
+    )
+    return {key: value for key, value in entries.items() if isinstance(value, dict)}
+
+
+def _latest_execution_intent(
+    entries: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return the highest-attempt minted entry, if any."""
+    if not entries:
+        return None
+    return max(
+        entries.values(),
+        key=lambda entry: entry.get("attempt_no", 0),
+    )
+
+
+class _ExecutionIntentUnavailable(Exception):
+    """The ticket-bound intent mint could not be confirmed (#1378)."""
+
+
+async def _mint_execution_intent(
+    validation_id: str, authorization_id: str
+) -> dict[str, Any] | None:
+    """Mint (or fetch) the attempt entry for one authorization (#1378).
+
+    Returns None only for ticket-less (external) runs, which keep the
+    validation-level identity. When a ticket exists but the mint cannot
+    be confirmed, the call FAILS CLOSED: falling back to the
+    validation-level identity would let the same authorization acquire
+    two different operation keys across a transient outage and run twice.
+    """
+    ticket_id = os.environ.get("TICKET_ID", "")
+    if not ticket_id:
+        return None
+    from agents.server_utils import ticket_state_headers
+    from providers.execution import AuditedAsyncHTTPClient
+
+    store_url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+    try:
+        async with AuditedAsyncHTTPClient(
+            timeout=15.0, headers=ticket_state_headers()
+        ) as client:
+            r = await client.post(
+                f"{store_url}/api/v1/tickets/{ticket_id}/execution-intents",
+                json={
+                    "validation_id": validation_id,
+                    "authorization_id": authorization_id,
+                },
+            )
+            r.raise_for_status()
+            entry = r.json().get("entry")
+            if not isinstance(entry, dict):
+                raise ValueError("mint endpoint returned no entry")
+    except Exception as exc:
+        logger.warning(
+            "[benchmark] Failed to mint execution intent for %s/%s "
+            "(failing closed; the same authorization must never acquire "
+            "two operation keys): %s",
+            validation_id,
+            authorization_id,
+            exc,
+        )
+        raise _ExecutionIntentUnavailable(str(exc)) from exc
+    # Keep the in-process ticket view current so same-process replays
+    # resolve the entry they just minted (#1378).
+    if isinstance(_ticket, dict) and _ticket.get("id") == ticket_id:
+        fields = _ticket.setdefault("custom_fields", {})
+        intents = fields.setdefault("benchmark_execution_intents", {})
+        entries = intents.setdefault(validation_id, {})
+        entries[authorization_id] = entry
+    return entry
+
+
+def _launch_record(
+    record: dict[str, Any], entry: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Overlay a minted attempt entry onto a validation record.
+
+    benchmark_intent_identity prefers the record's attempt_id and
+    execution_intent_id, so overlaying the minted per-authorization
+    values scopes the operation key to the authorization (#1378).
+    """
+    if not entry:
+        return record
+    return {
+        **record,
+        "attempt_id": entry.get("attempt_id") or record.get("attempt_id"),
+        "execution_intent_id": entry.get("execution_intent_id")
+        or record.get("execution_intent_id"),
+        "attempt_no": entry.get("attempt_no", 1),
+    }
+
+
 def _replay_operation_result(ticket_id: str, cached: dict[str, Any]) -> dict[str, Any]:
-    """Recover the full cached result without relaunching a benchmark."""
+    """Recover the full cached result without relaunching a benchmark.
+
+    A replay must be unmistakable (#1378): the marker keys lead the payload
+    and the message says so — in the motivating incident a replayed failure
+    was visually identical to a fresh one and was reported as a new run.
+    """
     reference = cached.get("result_blob_ref")
-    if not reference:
-        return cached
+    if reference:
+        cached = _load_result_blob(ticket_id, cached, reference)
+    return _mark_replayed(cached)
+
+
+def _load_result_blob(
+    ticket_id: str, cached: dict[str, Any], reference: str
+) -> dict[str, Any]:
     try:
         payload = _execution_result_blob_store(ticket_id).get(
             reference, max_bytes=_OPERATION_RESULT_BLOB_MAX_BYTES
@@ -164,6 +279,27 @@ def _replay_operation_result(ticket_id: str, cached: dict[str, Any]) -> dict[str
             "reason_code": "cached_result_unavailable",
             "message": "The recorded benchmark result payload could not be recovered.",
         }
+
+
+def _mark_replayed(result: dict[str, Any]) -> dict[str, Any]:
+    """Lead with the replay marker and say so in the message (#1378)."""
+    if result.get("existing_operation"):
+        return result
+    message = str(result.get("message") or result.get("status") or "")
+    attempt_no = result.get("attempt_no")
+    attempt_label = f" #{attempt_no}" if attempt_no is not None else ""
+    marked = {
+        "existing_operation": True,
+        "replay_of_previous_execution": True,
+    }
+    if attempt_no is not None:
+        marked["attempt_no"] = attempt_no
+    marked.update(result)
+    marked["message"] = (
+        f"[replayed cached result of a previous execution attempt"
+        f"{attempt_label}] {message}"
+    )
+    return marked
 
 
 def _write_ticket_staging_file(
@@ -1908,6 +2044,7 @@ async def _autoconsume_runfile_approval(
     ticket: dict[str, Any],
     validation_id: str | None,
     persisted_approval_id: str | None = None,
+    execution_intent: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create, approve, and consume a run-file approval without a pause.
 
@@ -1969,13 +2106,25 @@ async def _autoconsume_runfile_approval(
         or ""
     )
     automatic_summary = "Automatic run-file approval (user_pre_run_approval=false)"
+    # #1378: bind the automatic approval to the attempt-scoped execution
+    # intent, so a retry after failure is a NEW authorization rather than
+    # a duplicate of the consumed one.
+    intent_id = (
+        execution_intent.get("execution_intent_id")
+        if execution_intent
+        else record.get("execution_intent_id")
+    )
     create_body = {
         "kind": "benchmark_run_file",
         "validation_id": validation_id,
         "presented_run_file_digest": record.get("runfile_fingerprint"),
         "execution_intent_digest": record.get("execution_intent_digest"),
-        "execution_intent_id": record.get("execution_intent_id"),
-        "attempt_id": record.get("attempt_id"),
+        "execution_intent_id": intent_id,
+        "attempt_id": (
+            execution_intent.get("attempt_id")
+            if execution_intent
+            else record.get("attempt_id")
+        ),
         "summary": automatic_summary,
         "invocation_id": invocation_id or None,
         "tool_call_id": tool_call_id or None,
@@ -1998,6 +2147,8 @@ async def _autoconsume_runfile_approval(
             )
         }
     )
+    if intent_id is not None:
+        intent_binding["execution_intent_id"] = intent_id
     fence_binding = {
         key: create_body[key]
         for key in ("session_id", "session_epoch", "claim_id", "ticket_attempt")
@@ -2535,10 +2686,18 @@ async def execute_benchmark(
         records = fields.get("benchmark_validations", {}).get("records", {})
         replay_record = records.get(validation_id, {}) if validation_id else {}
         if validation_id and isinstance(replay_record, dict):
+            # #1378: the operation key is scoped to the authorization that
+            # permitted the run. Prefer the caller's approval, then the
+            # latest minted attempt, so a reconnect finds the terminal
+            # operation it is resuming instead of an older attempt's.
+            replay_entries = _execution_intent_entries(_ticket, validation_id)
+            replay_entry = (
+                replay_entries.get(approval_request_id) if approval_request_id else None
+            ) or _latest_execution_intent(replay_entries)
             replay_key, replay_hash, _ = _benchmark_intent_identity(
                 ticket_id,
                 validation_id,
-                replay_record,
+                _launch_record(replay_record, replay_entry),
                 controller,
                 harness_name,
                 replay_record.get("run_command", "crucible run"),
@@ -2556,6 +2715,11 @@ async def execute_benchmark(
                         "result"
                     )
                     if isinstance(cached, dict):
+                        if replay_entry:
+                            cached = {
+                                **cached,
+                                "attempt_no": replay_entry.get("attempt_no"),
+                            }
                         cached = _replay_operation_result(ticket_id, cached)
                         return json.dumps(
                             {
@@ -2834,6 +2998,7 @@ async def execute_benchmark(
     operation_record: dict[str, Any] | None = None
     operation_owned = False
     approval_already_consumed = False
+    launch_entry: dict[str, Any] | None = None
     autoapproval_eligible = (
         harness_name == "crucible"
         and bool(active_check.get("id") or os.environ.get("TICKET_ID"))
@@ -2845,7 +3010,37 @@ async def execute_benchmark(
     )
     if validation_id and (approval_request_id or autoapproval_eligible):
         ticket_id = os.environ.get("TICKET_ID", "")
-        preclaim_record = record
+        # Resolve the authorization-scoped attempt identity (#1378): a NEW
+        # approval executes again, while a duplicate submission of the SAME
+        # authorization replays the cached result. Auto-approved runs mint
+        # a persisted "auto-attempt-N" token instead of an approval id.
+        try:
+            if approval_request_id:
+                launch_entry = await _mint_execution_intent(
+                    validation_id, approval_request_id
+                )
+            else:
+                latest = _latest_execution_intent(
+                    _execution_intent_entries(active_check, validation_id)
+                )
+                launch_entry = latest or await _mint_execution_intent(
+                    validation_id, "auto-attempt-1"
+                )
+        except _ExecutionIntentUnavailable:
+            # Fail closed: the approval consume itself needs the state
+            # store, so retrying once it recovers loses nothing, while a
+            # fallback identity could double-run the authorization.
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "reason_code": "execution_intent_unavailable",
+                    "message": (
+                        "Execution intent could not be recorded; retry once "
+                        "the state store is reachable."
+                    ),
+                }
+            )
+        preclaim_record = _launch_record(record, launch_entry)
         intent_key, intent_hash, immutable_intent = _benchmark_intent_identity(
             ticket_id,
             validation_id,
@@ -2860,12 +3055,70 @@ async def execute_benchmark(
             os.environ.get("AGENTIC_PERF_INSTANCE_NAME", socket.gethostname()),
         )
         operation_record, acquisition = await operation_guard.acquire()
+        if acquisition == "terminal" and not approval_request_id:
+            # Auto-approved retry after a failed attempt (#1378): mint the
+            # next attempt and execute it. A human re-authorization arrives
+            # as a NEW approval id, which mints its own attempt above, so
+            # only the auto-approved path advances here. Terminal successes
+            # and in-doubt outcomes still replay below.
+            terminal_descriptor = operation_record.get("result_descriptor") or {}
+            # Only a genuine benchmark-execution failure advances to a new
+            # attempt. Pre-execution rejections (approval_required, drift,
+            # binding mismatches) carry an "outcome" marker in their
+            # descriptor and must replay deterministically instead of
+            # minting endless attempts.
+            benchmark_execution_failed = (
+                launch_entry is not None
+                and operation_record.get("terminal_outcome") in ("fail", "failure")
+                and isinstance(terminal_descriptor.get("benchmark_result"), dict)
+                and "outcome" not in terminal_descriptor
+            )
+            if benchmark_execution_failed:
+                next_no = int(launch_entry.get("attempt_no", 1)) + 1
+                await operation_guard.close()
+                try:
+                    launch_entry = await _mint_execution_intent(
+                        validation_id, f"auto-attempt-{next_no}"
+                    )
+                except _ExecutionIntentUnavailable:
+                    # The failed attempt stays terminal; a later call can
+                    # mint the retry once the store recovers.
+                    return json.dumps(
+                        {
+                            "status": "rejected",
+                            "reason_code": "execution_intent_unavailable",
+                            "message": (
+                                "Retry attempt could not be recorded; retry "
+                                "once the state store is reachable."
+                            ),
+                        }
+                    )
+                preclaim_record = _launch_record(record, launch_entry)
+                intent_key, intent_hash, immutable_intent = _benchmark_intent_identity(
+                    ticket_id,
+                    validation_id,
+                    preclaim_record,
+                    controller,
+                    harness_name,
+                    run_command or "crucible run",
+                )
+                operation_guard = _BenchmarkOperation(
+                    intent_key,
+                    intent_hash,
+                    os.environ.get("AGENTIC_PERF_INSTANCE_NAME", socket.gethostname()),
+                )
+                operation_record, acquisition = await operation_guard.acquire()
         if acquisition == "terminal":
             cached = (operation_record.get("result_descriptor") or {}).get(
                 "benchmark_result"
             )
             await operation_guard.close()
             if isinstance(cached, dict):
+                if launch_entry:
+                    cached = {
+                        **cached,
+                        "attempt_no": launch_entry.get("attempt_no"),
+                    }
                 cached = _replay_operation_result(ticket_id, cached)
                 _emit_context_audit_event(
                     ticket_id,
@@ -3021,7 +3274,7 @@ async def execute_benchmark(
             else None
         )
         autoapproval = await _autoconsume_runfile_approval(
-            active_check, validation_id, persisted_approval_id
+            active_check, validation_id, persisted_approval_id, launch_entry
         )
         if autoapproval.get("status") == "ok":
             approval_request_id = autoapproval["approval_request_id"]
@@ -4314,10 +4567,18 @@ async def execute_benchmark(
 
     ticket_id = os.environ.get("TICKET_ID", "")
     if validation_id and operation_guard is None:
+        # #1378: the preclaim normally resolved the authorization-scoped
+        # intent already. When execution reaches here without it, prefer
+        # the caller's approval token, then the latest minted attempt, so
+        # the key matches what the preclaim would have computed.
+        _fallback_entries = _execution_intent_entries(active_check, validation_id)
+        _fallback_entry = (
+            _fallback_entries.get(approval_request_id) if approval_request_id else None
+        ) or _latest_execution_intent(_fallback_entries)
         intent_key, intent_hash, immutable_intent = _benchmark_intent_identity(
             ticket_id,
             validation_id,
-            record,
+            _launch_record(record, _fallback_entry),
             controller,
             harness_name,
             run_command or "crucible run",
@@ -4340,6 +4601,11 @@ async def execute_benchmark(
                 }
             )
             if isinstance(duplicate_result, dict):
+                if _fallback_entry:
+                    duplicate_result = {
+                        **duplicate_result,
+                        "attempt_no": _fallback_entry.get("attempt_no"),
+                    }
                 duplicate_result = _replay_operation_result(ticket_id, duplicate_result)
                 duplicate_result = {
                     **duplicate_result,
@@ -4396,6 +4662,13 @@ async def execute_benchmark(
             )
 
     idempotency_key = str(record.get("crucible_idempotency_key"))
+    if launch_entry is not None:
+        # #1378: the controller-side idempotency key is attempt-scoped so
+        # a newly authorized retry starts a genuinely new controller job
+        # instead of receiving the previous attempt's cached one.
+        idempotency_key = (
+            f"{idempotency_key}:attempt-{launch_entry.get('attempt_no', 1)}"
+        )
     launch_attempted = False
 
     def decode_mcp_result(raw: str) -> dict[str, Any]:
