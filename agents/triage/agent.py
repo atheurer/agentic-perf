@@ -373,6 +373,132 @@ async def _validate_harness_and_suite(
     return None
 
 
+def _identity_family_candidates(submitted: str, candidates: set[str]) -> list[str]:
+    """Candidates plausibly related to a submitted identity.
+
+    Evidence that the ticket text names hosts in this identity's family:
+    a shared first label, or a shared last two labels (the site suffix).
+    Used only to decide whether a mismatch is a bad transcription worth
+    rejecting (#1381) — never to pick a match.
+    """
+    sub_labels = submitted.lower().split(".")
+    related = []
+    for candidate in candidates:
+        cand_labels = candidate.lower().split(".")
+        if not sub_labels or not cand_labels:
+            continue
+        shares_first = cand_labels[0] == sub_labels[0]
+        shares_suffix = cand_labels[-2:] == sub_labels[-2:]
+        if shares_first or shares_suffix:
+            related.append(candidate)
+    return related
+
+
+def _apply_host_identity_corrections(
+    required_hosts: list[dict[str, Any]],
+    result: dict[str, Any],
+    ticket: dict[str, Any],
+) -> tuple[str | None, str]:
+    """Validate triage's host transcriptions against the ticket text (#1381).
+
+    Triage is the only stage that copies user-named hosts out of prose; a
+    dropped DNS label used to travel to every later handoff and wedge the
+    ticket permanently. The ticket text is authoritative:
+
+    - exact (case-insensitive) matches pass untouched;
+    - unambiguously recoverable submissions (one omitted interior label)
+      are rewritten to the authoritative string, in required_hosts and in
+      matching parsed_specs/scoped_context values;
+    - submissions with near-miss evidence but no unambiguous match reject
+      the triage result with a per-host diff — the bad string must not
+      travel;
+    - submissions with no related host in the text at all are left alone:
+      the identity may legitimately come from a clarification comment or
+      structured field the extraction cannot see.
+
+    Returns (rejection_message, correction_note); both None when nothing
+    to do.
+    """
+    from providers.host_identity import (
+        extract_host_identities,
+        resolve_submitted_host,
+    )
+
+    description = ticket.get("description") or ""
+    summary = ticket.get("summary") or ""
+    candidates = extract_host_identities(description) | extract_host_identities(summary)
+    # User clarification comments are authoritative too: a comment may
+    # legitimately correct or introduce a host after the description was
+    # written, and those identities must not be rejected as transcription
+    # failures for not appearing in the description.
+    for comment in ticket.get("comments") or []:
+        if isinstance(comment, dict) and comment.get("author") not in (
+            "system",
+            "orchestrator",
+        ):
+            body = comment.get("body")
+            if isinstance(body, str):
+                candidates |= extract_host_identities(body)
+    if not candidates:
+        return None, ""
+    lowered = {candidate.lower() for candidate in candidates}
+    corrections: dict[str, str] = {}
+    problems: list[str] = []
+    for host in required_hosts:
+        if not isinstance(host, dict):
+            continue
+        submitted = host.get("host")
+        if not isinstance(submitted, str) or not submitted.strip():
+            continue
+        submitted = submitted.strip()
+        if submitted.lower() in lowered:
+            continue
+        canonical, _reason = resolve_submitted_host(submitted, candidates)
+        if canonical is not None:
+            corrections[submitted] = canonical
+            continue
+        family = _identity_family_candidates(submitted, candidates)
+        if family:
+            closest = ", ".join(sorted(family)[:3])
+            problems.append(
+                f"- {submitted!r}: no unambiguous match in the ticket text "
+                f"(closest: {closest})"
+            )
+    if problems:
+        return (
+            "triage could not transcribe every user-named host verbatim. "
+            "The ticket description is authoritative — copy these "
+            "identities character for character:\n" + "\n".join(problems),
+            "",
+        )
+    if not corrections:
+        return None, ""
+    for host in required_hosts:
+        if isinstance(host, dict) and isinstance(host.get("host"), str):
+            replacement = corrections.get(host["host"].strip())
+            if replacement is not None:
+                host["host"] = replacement
+
+    def _correct_nested(value: Any) -> Any:
+        if isinstance(value, str):
+            return corrections.get(value.strip(), value)
+        if isinstance(value, list):
+            return [_correct_nested(item) for item in value]
+        if isinstance(value, dict):
+            return {key: _correct_nested(item) for key, item in value.items()}
+        return value
+
+    for field_name in ("parsed_specs", "scoped_context"):
+        section = result.get(field_name)
+        if isinstance(section, (dict, list)):
+            result[field_name] = _correct_nested(section)
+    note = "; ".join(
+        f"{submitted!r} -> {canonical!r}"
+        for submitted, canonical in sorted(corrections.items())
+    )
+    return None, note
+
+
 def _filter_direct_required_hosts(
     required_hosts: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1447,6 +1573,33 @@ class TriageAgent(AgentBase):
                 else host
                 for host in required_hosts
             ]
+
+        # #1381: the ticket text is authoritative for user-named hosts.
+        # Validate triage's transcription before anything is stored: a
+        # dropped DNS label here wedges every later handoff.
+        host_error, host_correction_note = _apply_host_identity_corrections(
+            required_hosts, result, ticket
+        )
+        if host_error:
+            await self._add_comment(
+                ticket_id,
+                f"**Triage validation failed:** {host_error}",
+            )
+            await self._transition_ticket(
+                ticket_id,
+                "awaiting_customer_guidance",
+                comment=(
+                    "Triage validation failed; user-named host identities "
+                    "could not be transcribed verbatim from the ticket text."
+                ),
+            )
+            return
+        if host_correction_note:
+            await self._add_comment(
+                ticket_id,
+                "Corrected host identity transcription against the ticket "
+                f"text: {host_correction_note}",
+            )
 
         fields: dict[str, Any] = {
             "parsed_specs": result.get("parsed_specs", {}),
