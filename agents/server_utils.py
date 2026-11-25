@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import posixpath
+import shlex
 import sys
 import weakref
 from collections.abc import AsyncIterator
@@ -1085,6 +1086,176 @@ def _controller_metadata_snapshot_path(relative: str) -> str | None:
     return None
 
 
+# Component-aware exclusions: a pattern like ``*/secrets`` alone only
+# matches the directory itself; anything beneath it (reachable through a
+# benign-looking in-root symlink such as ``docs/private -> ../secrets``)
+# must be excluded too, since realpath resolves the alias away.
+def crucible_controller_root() -> str:
+    """The installed Crucible controller tree on the assigned controller.
+
+    #1422: CRUCIBLE_HOME is the same variable the controller contract
+    itself resolves (see the catalog adapter), so it is the
+    provider-owned definition of where installed documents live — not a
+    copy of harness knowledge into agent code.
+    """
+    return os.environ.get("CRUCIBLE_HOME", "/opt/crucible")
+
+
+_CONTROLLER_PATH_EXCLUSION_CASE = (
+    'case "$candidate" in '
+    "*/.ssh|*/.ssh/*|*.git*|*/secrets|*/secrets/*|*token*|*.pem|*.key|"
+    "*credentials*|*password*) "
+    "exit 27;; esac"
+)
+
+
+def _controller_ssh_script(root: str, target: str, body: str) -> str:
+    """Build a confined controller-path shell script.
+
+    Restores the host-reader semantics removed with the MCP conversion
+    (#1422): realpath resolution of the install root and the candidate,
+    confinement of the candidate under the root, and secret/VCS path
+    exclusions — all before any content is touched. Exit codes 20-27 are
+    the stable contract the reason mapping consumes.
+    """
+    quoted_root = shlex.quote(root)
+    quoted_target = shlex.quote(target)
+    return (
+        f"root=$(realpath -e -- {quoted_root}) || exit 20\n"
+        f"candidate=$(LC_ALL=C realpath -e -- {quoted_target}) || exit 21\n"
+        'case "$candidate" in "$root"|"$root"/*) ;; *) exit 22;; esac\n'
+        f"{_CONTROLLER_PATH_EXCLUSION_CASE}\n"
+        f"{body}\n"
+    )
+
+
+async def _read_controller_document_ssh(
+    ssh: Any,
+    host: str,
+    install_root: str,
+    relative: str,
+) -> SimpleNamespace:
+    """Read one document from the controller's installed tree over SSH.
+
+    Same result contract as ``_read_controller_document_mcp``: a
+    SimpleNamespace whose exit code selects the structured reason.
+    """
+    target = (
+        f"{install_root.rstrip('/')}/{relative.lstrip('/')}"
+        if relative
+        else (install_root)
+    )
+    body = (
+        '[ -d "$candidate" ] && exit 23\n'
+        '[ ! -f "$candidate" ] && exit 24\n'
+        '[ ! -r "$candidate" ] && exit 25\n'
+        'cat -- "$candidate" || exit 26'
+    )
+    result = await ssh.run(
+        host, _controller_ssh_script(install_root, target, body), timeout=30
+    )
+    return SimpleNamespace(
+        stdout=result.stdout or "",
+        stderr=result.stderr or "",
+        exit_code=result.exit_code,
+    )
+
+
+async def _inspect_controller_path_ssh(
+    ssh: Any,
+    host: str,
+    install_root: str,
+    relative: str,
+) -> SimpleNamespace:
+    """Classify a controller path (file/directory) over SSH.
+
+    Same result contract as ``_inspect_controller_path_mcp``.
+    """
+    target = (
+        f"{install_root.rstrip('/')}/{relative.lstrip('/')}"
+        if relative
+        else (install_root)
+    )
+    body = (
+        "if [ -d \"$candidate\" ]; then printf 'directory'; exit 0; fi\n"
+        "if [ -f \"$candidate\" ]; then printf 'file'; exit 0; fi\n"
+        "exit 24"
+    )
+    result = await ssh.run(
+        host, _controller_ssh_script(install_root, target, body), timeout=30
+    )
+    return SimpleNamespace(
+        stdout=result.stdout or "",
+        stderr=result.stderr or "",
+        exit_code=result.exit_code,
+    )
+
+
+async def _list_controller_directory_ssh(
+    ssh: Any,
+    host: str,
+    install_root: str,
+    relative: str,
+) -> dict[str, Any]:
+    """List immediate children of a controller directory over SSH.
+
+    Same result contract as ``_list_controller_directory_mcp``.
+    """
+    target = (
+        f"{install_root.rstrip('/')}/{relative.lstrip('/')}"
+        if relative
+        else (install_root)
+    )
+    body = (
+        '[ ! -d "$candidate" ] && exit 24\n'
+        'for entry in "$candidate"/*; do\n'
+        '  [ -e "$entry" ] || continue\n'
+        '  name=$(basename -- "$entry")\n'
+        '  child=$(LC_ALL=C realpath -e -- "$entry") || continue\n'
+        '  case "$child" in "$root"/*) ;; *) continue;; esac\n'
+        '  case "$child" in '
+        "*/.ssh|*/.ssh/*|*.git*|*/secrets|*/secrets/*|*token*|*.pem|*.key|"
+        "*credentials*|*password*) continue;; esac\n"
+        '  if [ -d "$entry" ]; then printf \'directory %s\\n\' "$name"; '
+        "else printf 'file %s\\n' \"$name\"; fi\n"
+        "done"
+    )
+    result = await ssh.run(
+        host, _controller_ssh_script(install_root, target, body), timeout=30
+    )
+    if result.exit_code != 0:
+        # Classify so the gateway can treat structured path verdicts as
+        # final rather than discarding them in favor of MCP.
+        error = {
+            20: "root_unavailable",
+            21: "missing",
+            22: "outside_root",
+            24: "not_directory",
+            25: "inaccessible",
+            27: "excluded",
+        }.get(result.exit_code)
+        if error is None:
+            # Transport-level failure; the caller may fall back to MCP.
+            return {"entries": [], "complete": False, "resolved_path": relative}
+        return {
+            "entries": [],
+            "complete": False,
+            "resolved_path": relative,
+            "error": error,
+        }
+    entries = []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if " " not in line:
+            continue
+        kind, name = line.split(" ", 1)
+        if kind not in {"file", "directory"} or not name:
+            continue
+        child_path = f"{relative.rstrip('/')}/{name}" if relative else name
+        entries.append({"path": child_path, "type": kind, "size_bytes": None})
+    return {"entries": entries, "complete": True, "resolved_path": relative}
+
+
 async def _read_controller_metadata_mcp(
     adapter: Any,
     relative: str,
@@ -1119,6 +1290,7 @@ async def controller_context_gateway(
     ssh: Any,
     controller_host: str | None,
     mcp_adapter: Any | None = None,
+    install_root: str = "",
     ticket_id: str,
     agent_name: str,
     phase: str,
@@ -1230,13 +1402,19 @@ async def controller_context_gateway(
             requested_ref=path,
             next_action="Use the configured controller-backed context source.",
         )
-    if mcp_adapter is None:
+    # #1422: host reads of the installed tree work without any MCP
+    # server; only the structured metadata selectors (endpoints, tools,
+    # benchmarks) genuinely require the adapter.
+    host_reads_available = bool(install_root) and ssh is not None
+    if mcp_adapter is None and not host_reads_available:
         return failure(
             "unsupported_controller",
-            "The assigned Crucible controller does not support MCP contract v3.",
+            "The assigned controller does not support MCP contract v3 and no "
+            "installed controller document root is configured.",
             requested_ref=path,
             next_action=(
-                "Install or update Crucible to a controller with MCP contract v3."
+                "Install or update the controller harness, or configure its "
+                "installed document root."
             ),
         )
 
@@ -1249,9 +1427,22 @@ async def controller_context_gateway(
                 "The origin must be a returned controller reference.",
                 next_action="Use a controller ref from bootstrap, list, or search.",
             )
-        try:
-            origin_result = await _inspect_controller_path_mcp(mcp_adapter, origin)
-        except Exception:
+        # #1422: the host read is the source of truth for the origin's
+        # path type; MCP is a fallback, not a requirement.
+        origin_result = None
+        if host_reads_available:
+            try:
+                origin_result = await _inspect_controller_path_ssh(
+                    ssh, controller_host, install_root, origin
+                )
+            except Exception:
+                origin_result = None
+        if origin_result is None and mcp_adapter is not None:
+            try:
+                origin_result = await _inspect_controller_path_mcp(mcp_adapter, origin)
+            except Exception:
+                origin_result = None
+        if origin_result is None:
             return failure(
                 "controller_transport_error",
                 "The controller could not be reached while checking the origin.",
@@ -1397,12 +1588,40 @@ async def controller_context_gateway(
                 "path_type": "metadata",
             }
             return finish(document_result)
-        try:
-            result = await _read_controller_document_mcp(
-                mcp_adapter,
-                relative,
-            )
-        except Exception:
+        # #1422: host read first — the installed tree is the
+        # documentation source; MCP resources are an enrichment channel
+        # whose absence must not fail a read the filesystem can serve
+        # (PERF-C44A3908: AGENTS.md existed on the controller but was
+        # not among the 15 exposed crucible://docs/* resources, and the
+        # agent got a misleading controller_transport_error).
+        result = None
+        if host_reads_available:
+            try:
+                result = await _read_controller_document_ssh(
+                    ssh, controller_host, install_root, relative
+                )
+                # A transport-level SSH failure (e.g. exit 255) is not a
+                # structured path verdict; let MCP try.
+                if result.exit_code not in {0, 20, 21, 22, 23, 24, 25, 26, 27}:
+                    result = None
+            except Exception:
+                result = None
+        # A structured host verdict (including security denials such as
+        # outside-root and excluded-path) is final: falling back to MCP
+        # after one would let an MCP resource exposed under an alias
+        # override the confinement guard. MCP is only a fallback when the
+        # host read itself could not classify the path.
+        if result is None and mcp_adapter is not None:
+            try:
+                mcp_result = await _read_controller_document_mcp(
+                    mcp_adapter,
+                    relative,
+                )
+            except Exception:
+                mcp_result = None
+            if mcp_result is not None and (result is None or mcp_result.exit_code == 0):
+                result = mcp_result
+        if result is None:
             return failure(
                 "controller_transport_error",
                 "The controller could not be reached while reading the document.",
@@ -1596,12 +1815,30 @@ async def controller_context_gateway(
                 path_type="invalid_pointer" if from_ref and path else "invalid_path",
                 next_action="Use a returned controller directory ref.",
             )
-        try:
-            listing = await _list_controller_directory_mcp(
-                mcp_adapter,
-                relative,
-            )
-        except Exception:
+        # #1422: list from the installed tree when host reads are
+        # available; MCP is only a fallback when the host listing could
+        # not classify the path. A structured verdict (outside root,
+        # excluded, not a directory) is final — MCP must not override
+        # the host's path policy.
+        listing = None
+        if host_reads_available:
+            try:
+                listing = await _list_controller_directory_ssh(
+                    ssh, controller_host, install_root, relative
+                )
+                if not listing.get("complete") and not listing.get("error"):
+                    listing = None
+            except Exception:
+                listing = None
+        if listing is None and mcp_adapter is not None:
+            try:
+                listing = await _list_controller_directory_mcp(
+                    mcp_adapter,
+                    relative,
+                )
+            except Exception:
+                listing = {"error": "controller_transport_error"}
+        if listing is None:
             listing = {"error": "controller_transport_error"}
         if listing.get("error"):
             reason = {

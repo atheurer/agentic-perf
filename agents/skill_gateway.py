@@ -148,6 +148,43 @@ def organization_manages_harness(provider: Any, harness: str) -> bool:
     return bool(resolver and resolver.has_runtime_config(f"harness/{harness}"))
 
 
+async def _controller_install_root(provider: Any, subject: str) -> str:
+    """Resolve the installed controller document root for a harness subject.
+
+    #1422: the root is provider-owned configuration
+    (provisioning.install_target_path — the same key the provisioning
+    verifier uses), never inferred from the subject string. Crucible
+    resolves through the same key: its MCP resources are an enrichment
+    channel, and the PERF-C44A3908 incident was exactly an installed
+    document the MCP contract did not expose. An empty result means the
+    harness has no known installed root and no controller document
+    source.
+    """
+    if not subject.startswith("harness/"):
+        return ""
+    harness = subject.removeprefix("harness/")
+    if not harness or "/" in harness:
+        return ""
+    if harness == "crucible":
+        # Crucible's install location is defined by the controller
+        # contract (CRUCIBLE_HOME), the same source the catalog adapter
+        # resolves — not by agent-prompt knowledge.
+        from agents.server_utils import crucible_controller_root
+
+        return crucible_controller_root()
+    try:
+        config = await provider.get_all_private_config(harness)
+    except Exception:
+        return ""
+    if not isinstance(config, dict):
+        return ""
+    provisioning = config.get("provisioning")
+    if not isinstance(provisioning, dict):
+        return ""
+    root = provisioning.get("install_target_path")
+    return root.strip() if isinstance(root, str) else ""
+
+
 async def skill_config_view(
     provider: Any,
     harness: str,
@@ -2192,7 +2229,9 @@ async def _skill_context_list_search(
             )
             continue
         if operation == "list" and source_kind == "controller":
-            if subject != "harness/crucible" or phase not in {"benchmark", "review"}:
+            install_root = await _controller_install_root(provider, subject)
+            controller_source = subject == "harness/crucible" or bool(install_root)
+            if not controller_source or phase not in {"benchmark", "review"}:
                 raise SkillGatewayError(
                     "source_unavailable", "Software source is unavailable in this phase"
                 )
@@ -2203,6 +2242,7 @@ async def _skill_context_list_search(
                         ssh=ssh,
                         controller_host=controller_host,
                         mcp_adapter=mcp_adapter,
+                        install_root=install_root,
                         ticket_id=ticket_id,
                         agent_name=agent_name,
                         phase=phase,
@@ -2218,6 +2258,7 @@ async def _skill_context_list_search(
                         ssh=ssh,
                         controller_host=controller_host,
                         mcp_adapter=mcp_adapter,
+                        install_root=install_root,
                         ticket_id=ticket_id,
                         agent_name=agent_name,
                         phase=phase,
@@ -2523,7 +2564,9 @@ async def _skill_context_list_search(
             )
             continue
         if source_kind == "controller":
-            if subject != "harness/crucible" or phase not in {"benchmark", "review"}:
+            install_root = await _controller_install_root(provider, subject)
+            controller_source = subject == "harness/crucible" or bool(install_root)
+            if not controller_source or phase not in {"benchmark", "review"}:
                 raise SkillGatewayError(
                     "source_unavailable", "Software source is unavailable in this phase"
                 )
@@ -2534,6 +2577,7 @@ async def _skill_context_list_search(
                         ssh=ssh,
                         controller_host=controller_host,
                         mcp_adapter=mcp_adapter,
+                        install_root=install_root,
                         ticket_id=ticket_id,
                         agent_name=agent_name,
                         phase=phase,
@@ -2549,6 +2593,7 @@ async def _skill_context_list_search(
                         ssh=ssh,
                         controller_host=controller_host,
                         mcp_adapter=mcp_adapter,
+                        install_root=install_root,
                         ticket_id=ticket_id,
                         agent_name=agent_name,
                         phase=phase,
@@ -2843,7 +2888,10 @@ async def skill_context_gateway(
                 }
             )
         revision = organization.get("revision", "legacy")
-        software_allowed = subject == "harness/crucible" and phase in {
+        controller_install_root = await _controller_install_root(provider, subject)
+        software_allowed = (
+            subject == "harness/crucible" or bool(controller_install_root)
+        ) and phase in {
             "benchmark",
             "review",
         }
@@ -3026,6 +3074,7 @@ async def skill_context_gateway(
                             ssh=ssh,
                             controller_host=controller_host,
                             mcp_adapter=mcp_adapter,
+                            install_root=controller_install_root,
                             ticket_id=ticket_id,
                             agent_name=agent_name,
                             phase=phase,
@@ -3341,6 +3390,7 @@ async def skill_context_gateway(
                     ssh=ssh,
                     controller_host=controller_host,
                     mcp_adapter=mcp_adapter,
+                    install_root=controller_install_root,
                     ticket_id=ticket_id,
                     agent_name=agent_name,
                     phase=phase,
