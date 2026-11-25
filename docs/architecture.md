@@ -421,6 +421,9 @@ the triage agent produces an execution plan:
   "steps": [
     {"id": 0, "agent_type": "benchmark", "status": "in_progress",
      "params": {"label": "wsize-64B", "mv_params": {"wsize": "64"}}},
+     // A plan entry may carry "role" (client/server/all) when the user
+     // explicitly assigns multiplex roles; the benchmark run file is
+     // validated mechanically against them (#1385).
     {"id": 1, "agent_type": "benchmark", "status": "pending",
      "params": {"label": "wsize-16384B", "mv_params": {"wsize": "16384"}}},
     {"id": 2, "agent_type": "review", "status": "pending", "params": {}}
