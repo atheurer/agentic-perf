@@ -6,7 +6,13 @@ agentic-perf validator enforces its own run-file contract; pass the exact file
 that validated to execute_benchmark, and do not modify it between validation
 and execution.
 
-Set mv-params explicitly from the plan step's `mv_params`. Every multiplex
+Set mv-params explicitly from the plan step's `mv_params`. Every mv-param in a
+run file whose endpoints bind a client to a server must also declare
+`role=client`, `role=server`, or `role=all` — validation rejects roleless
+entries, because a roleless parameter cannot bind the client to its peer
+endpoint and execution fails in every iteration with `remotehost is not set`.
+Each parameter set must include at least one client-role (or `all`) and one
+server-role (or `all`) parameter. Every multiplex
 parameter the plan names must appear in the run file's
 `benchmarks[0].mv-params.sets[0].params` with the same values — execute_benchmark
 rejects the run otherwise (`runfile_params_mismatch`). Omitting a parameter is

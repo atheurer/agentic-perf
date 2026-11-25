@@ -2373,3 +2373,251 @@ async def test_software_mcp_metadata_refs_stay_behind_skill_gateway(
         "uperf"
     )
     assert ("list_benchmarks", {}) in adapter.calls
+
+
+class TestMvParamsRoleContract:
+    """#1432: paired run files must carry role-scoped mv-params.
+
+    A roleless mv-param in a client/server run file validates cleanly but
+    fails at execution in every iteration with 'remotehost is not set'."""
+
+    @staticmethod
+    def _paired_run_file(params):
+        return {
+            "tags": {},
+            "endpoints": [
+                {"host": "10.0.0.1", "engines": ["client"]},
+                {"host": "10.0.0.2", "engines": ["server"]},
+            ],
+            "benchmarks": [
+                {"name": "uperf", "mv-params": {"sets": [{"params": params}]}}
+            ],
+        }
+
+    def test_roleless_params_in_paired_run_file_are_rejected(self):
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        run_file = self._paired_run_file([{"arg": "ifname", "vals": ["eth0"]}])
+        errors = crucible_runfile_contract_errors(run_file)
+        assert len(errors) == 1
+        assert "ifname" in errors[0]
+        assert "remotehost is not set" in errors[0]
+        assert "role=client" in errors[0]
+
+    def test_invalid_role_value_is_rejected(self):
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        run_file = self._paired_run_file(
+            [{"arg": "ifname", "vals": ["eth0"], "role": "controller"}]
+        )
+        errors = crucible_runfile_contract_errors(run_file)
+        assert len(errors) == 1
+        assert "ifname" in errors[0]
+
+    def test_client_and_server_roles_pass(self):
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        run_file = self._paired_run_file(
+            [
+                {"arg": "ifname", "vals": ["eth0"], "role": "server"},
+                {"arg": "seconds", "vals": ["30"], "role": "client"},
+            ]
+        )
+        assert crucible_runfile_contract_errors(run_file) == []
+
+    def test_role_all_satisfies_coverage_alone(self):
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        run_file = self._paired_run_file(
+            [{"arg": "seconds", "vals": ["30"], "role": "all"}]
+        )
+        assert crucible_runfile_contract_errors(run_file) == []
+
+    def test_one_sided_roles_are_rejected_per_set(self):
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        run_file = self._paired_run_file(
+            [
+                {"arg": "ifname", "vals": ["eth0"], "role": "server"},
+                {"arg": "seconds", "vals": ["30"], "role": "server"},
+            ]
+        )
+        errors = crucible_runfile_contract_errors(run_file)
+        assert len(errors) == 1
+        assert "client" in errors[0]
+
+    def test_roles_split_across_sets_do_not_satisfy_coverage(self):
+        """Each set executes independently, so coverage is per set (#1432)."""
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        run_file = {
+            "tags": {},
+            "endpoints": [
+                {"host": "10.0.0.1", "engines": ["client"]},
+                {"host": "10.0.0.2", "engines": ["server"]},
+            ],
+            "benchmarks": [
+                {
+                    "name": "uperf",
+                    "mv-params": {
+                        "sets": [
+                            {
+                                "params": [
+                                    {
+                                        "arg": "seconds",
+                                        "vals": ["30"],
+                                        "role": "client",
+                                    }
+                                ]
+                            },
+                            {
+                                "params": [
+                                    {
+                                        "arg": "ifname",
+                                        "vals": ["eth0"],
+                                        "role": "server",
+                                    }
+                                ]
+                            },
+                        ]
+                    },
+                }
+            ],
+        }
+        errors = crucible_runfile_contract_errors(run_file)
+        assert len(errors) == 2
+
+    def test_single_role_benchmark_does_not_require_roles(self):
+        """Controller-local / single-role benchmarks (e.g. sleep) may carry
+        roleless mv-params — there is no peer binding to lose."""
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        run_file = {
+            "tags": {},
+            "endpoints": [{"host": "10.0.0.1", "engines": ["client"]}],
+            "benchmarks": [
+                {
+                    "name": "sleep",
+                    "mv-params": {
+                        "sets": [{"params": [{"arg": "seconds", "vals": ["30"]}]}]
+                    },
+                }
+            ],
+        }
+        assert crucible_runfile_contract_errors(run_file) == []
+
+    def test_run_file_without_endpoints_does_not_require_roles(self):
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        run_file = {
+            "tags": {},
+            "benchmarks": [
+                {
+                    "name": "sleep",
+                    "mv-params": {
+                        "sets": [{"params": [{"arg": "seconds", "vals": ["30"]}]}]
+                    },
+                }
+            ],
+        }
+        assert crucible_runfile_contract_errors(run_file) == []
+
+    @staticmethod
+    def _remotehosts_run_file(params):
+        # The shape this provider actually generates for remotehost
+        # endpoints: engines live under remotes[].engines as objects.
+        return {
+            "tags": {},
+            "endpoints": [
+                {
+                    "type": "remotehosts",
+                    "settings": {"user": "root", "userenv": "default"},
+                    "remotes": [
+                        {
+                            "engines": [{"role": "client", "ids": [1]}],
+                            "config": {"host": "10.0.0.1", "settings": {}},
+                        },
+                        {
+                            "engines": [{"role": "server", "ids": [1]}],
+                            "config": {"host": "10.0.0.2", "settings": {}},
+                        },
+                    ],
+                }
+            ],
+            "benchmarks": [
+                {"name": "uperf", "mv-params": {"sets": [{"params": params}]}}
+            ],
+        }
+
+    def test_remotehosts_endpoint_shape_is_recognized_as_paired(self):
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        # Generated remotehost run files must be treated as paired, so
+        # roleless parameters in them are rejected (#1432 review finding).
+        run_file = self._remotehosts_run_file([{"arg": "ifname", "vals": ["eth0"]}])
+        errors = crucible_runfile_contract_errors(run_file)
+        assert len(errors) == 1
+        assert "ifname" in errors[0]
+
+    def test_kube_endpoint_shape_is_recognized_as_paired(self):
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        run_file = {
+            "tags": {},
+            "endpoints": [
+                {
+                    "type": "kube",
+                    "host": "kube.example",
+                    "engines": {"client": "1", "server": "1"},
+                }
+            ],
+            "benchmarks": [
+                {
+                    "name": "uperf",
+                    "mv-params": {
+                        "sets": [{"params": [{"arg": "ifname", "vals": ["eth0"]}]}]
+                    },
+                }
+            ],
+        }
+        errors = crucible_runfile_contract_errors(run_file)
+        assert len(errors) == 1
+        assert "ifname" in errors[0]
+
+    def test_included_global_options_are_checked(self):
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        # A set that only includes a global-options group still executes
+        # the group's parameters; roleless ones there must be caught.
+        run_file = self._paired_run_file([])
+        run_file["benchmarks"][0]["mv-params"] = {
+            "global-options": [
+                {
+                    "name": "global",
+                    "params": [{"arg": "ifname", "vals": ["eth0"]}],
+                }
+            ],
+            "sets": [{"include": "global", "params": []}],
+        }
+        errors = crucible_runfile_contract_errors(run_file)
+        assert len(errors) == 1
+        assert "ifname" in errors[0]
+
+    def test_included_global_options_coverage_counts(self):
+        from providers.skills.crucible import crucible_runfile_contract_errors
+
+        # Client-only globals included by a set: coverage error, not a
+        # roleless error.
+        run_file = self._paired_run_file([])
+        run_file["benchmarks"][0]["mv-params"] = {
+            "global-options": [
+                {
+                    "name": "global",
+                    "params": [{"arg": "ifname", "vals": ["eth0"], "role": "client"}],
+                }
+            ],
+            "sets": [{"include": "global", "params": []}],
+        }
+        errors = crucible_runfile_contract_errors(run_file)
+        assert len(errors) == 1
+        assert "server" in errors[0]
