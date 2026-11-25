@@ -110,7 +110,12 @@ query strings, and fragments are rejected. A private-key secret must be usable
 non-interactively; passphrase-protected keys can use the existing SSH agent.
 
 For an anonymously readable token file stored in GitLab, `secret_ref` may use a
-`git-secret+https://gitlab.cee.redhat.com/group/repo.git?ref=branch&path=relative/file`
+`git-secret+https://gitlab.example.com/group/repo.git?ref=branch&path=relative/file`
+
+The host of a `git-secret+https` reference must be permitted by this
+installation: set `git_secret_hosts` in the configuration file or the
+`AGENTIC_PERF_GIT_SECRET_HOSTS` environment variable (see
+[secrets](secrets.md)). No hosts are permitted by default.
 pointer. It reads one file through the GitLab API v4 at the host root, over
 verified HTTPS, with no SSH, Git, or `.netrc` credentials. Other Git hosts and
 GitLab URL-prefix installations are unsupported. See

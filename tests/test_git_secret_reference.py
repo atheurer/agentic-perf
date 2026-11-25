@@ -26,6 +26,16 @@ _POINTER = (
 _TOKEN = "mocked-git-secret-value"
 
 
+@pytest.fixture(autouse=True)
+def _permitted_hosts(monkeypatch):
+    """#1421: permitted git-secret hosts are installation configuration.
+
+    The vendor host in _POINTER is permitted only through this explicit
+    test configuration — base code carries no default hosts.
+    """
+    monkeypatch.setenv("AGENTIC_PERF_GIT_SECRET_HOSTS", "gitlab.cee.redhat.com")
+
+
 class _EmptySecrets(SecretsProvider):
     async def get_secret(self, path: str) -> str | None:
         return None
@@ -520,3 +530,101 @@ async def test_install_harness_tool_surfaces_git_secret_source_failure(
     assert "GitLab HTTPS secret source" in message
     assert "anonymous HTTPS read access" in message
     assert "HTTP 404" in message
+
+
+class TestPermittedHostConfiguration:
+    """#1421: permitted git-secret hosts are installation configuration,
+    never vendor constants in code. Default is deny-all with actionable
+    guidance."""
+
+    def test_no_permitted_hosts_rejects_with_configuration_guidance(self, monkeypatch):
+        monkeypatch.delenv("AGENTIC_PERF_GIT_SECRET_HOSTS", raising=False)
+        monkeypatch.setattr(
+            "paths.CONFIG_PATH",
+            Path("/nonexistent-agentic-perf-config.json"),
+        )
+        with pytest.raises(GitSecretReferenceError, match="git_secret_hosts"):
+            parse_git_secret_reference(_POINTER)
+
+    def test_arbitrary_configured_host_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("AGENTIC_PERF_GIT_SECRET_HOSTS", "git.example.internal")
+        reference = parse_git_secret_reference(
+            "git-secret+https://git.example.internal/group/repo.git?ref=main&path=token"
+        )
+        assert reference is not None
+        assert reference.repository.startswith("git.example.internal/")
+
+    def test_unconfigured_host_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("AGENTIC_PERF_GIT_SECRET_HOSTS", "git.example.internal")
+        with pytest.raises(
+            GitSecretReferenceError, match="Unsupported Git secret host"
+        ):
+            parse_git_secret_reference(_POINTER)
+
+    def test_multiple_hosts_and_case_insensitivity(self, monkeypatch):
+        monkeypatch.setenv(
+            "AGENTIC_PERF_GIT_SECRET_HOSTS", "Git.One.example, git.two.example"
+        )
+        for host in ("git.one.example", "GIT.TWO.EXAMPLE"):
+            reference = parse_git_secret_reference(
+                f"git-secret+https://{host}/group/repo.git?ref=main&path=token"
+            )
+            assert reference is not None
+
+    def test_configuration_file_source(self, tmp_path, monkeypatch):
+        import json as _json
+
+        config = tmp_path / "config.json"
+        config.write_text(
+            _json.dumps({"git_secret_hosts": ["git.example.internal"]}),
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("AGENTIC_PERF_GIT_SECRET_HOSTS", raising=False)
+        monkeypatch.setattr("paths.CONFIG_PATH", config)
+        reference = parse_git_secret_reference(
+            "git-secret+https://git.example.internal/group/repo.git?ref=main&path=token"
+        )
+        assert reference is not None
+
+    def test_environment_overrides_configuration_file(self, tmp_path, monkeypatch):
+        import json as _json
+
+        config = tmp_path / "config.json"
+        config.write_text(
+            _json.dumps({"git_secret_hosts": ["git.file.example"]}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("paths.CONFIG_PATH", config)
+        monkeypatch.setenv("AGENTIC_PERF_GIT_SECRET_HOSTS", "git.env.example")
+        assert parse_git_secret_reference(
+            "git-secret+https://git.env.example/group/repo.git?ref=main&path=token"
+        )
+        with pytest.raises(
+            GitSecretReferenceError, match="Unsupported Git secret host"
+        ):
+            parse_git_secret_reference(
+                "git-secret+https://git.file.example/group/repo.git?ref=main&path=token"
+            )
+
+
+class TestExplicitEmptyEnvOverride:
+    """#1421: an explicitly empty environment variable is an emergency
+    deny-all, not a fallback to the configuration file."""
+
+    def test_empty_env_denies_all_even_with_config_hosts(self, monkeypatch, tmp_path):
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"git_secret_hosts": ["git.example.com"]}))
+        monkeypatch.setattr("paths.CONFIG_PATH", config)
+        monkeypatch.setenv("AGENTIC_PERF_GIT_SECRET_HOSTS", "")
+        from providers.secrets.git_reference import permitted_git_secret_hosts
+
+        assert permitted_git_secret_hosts() == frozenset()
+
+    def test_absent_env_uses_config_hosts(self, monkeypatch, tmp_path):
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"git_secret_hosts": ["git.example.com"]}))
+        monkeypatch.setattr("paths.CONFIG_PATH", config)
+        monkeypatch.delenv("AGENTIC_PERF_GIT_SECRET_HOSTS", raising=False)
+        from providers.secrets.git_reference import permitted_git_secret_hosts
+
+        assert permitted_git_secret_hosts() == frozenset({"git.example.com"})

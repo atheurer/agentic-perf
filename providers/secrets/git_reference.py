@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
 import ssl
 import tempfile
@@ -18,11 +20,20 @@ from providers.execution import AuditedFilesystem
 
 from .base import SecretsBackendError, SecretsProvider
 
+logger = logging.getLogger(__name__)
+
 _MAX_REFERENCE_LENGTH = 2048
 _MAX_SECRET_BYTES = 64 * 1024
 _MAX_SOCKET_TIMEOUT = 10
 _MAX_TOTAL_TIMEOUT = 30
-_SUPPORTED_GITLAB_HOST = "gitlab.cee.redhat.com"
+# Permitted git-secret hosts are installation configuration, not code:
+# base agentic-perf carries no vendor or deployment hostnames (#1421).
+# Sources: the ``git_secret_hosts`` key of the instance configuration
+# file, overridden by the AGENTIC_PERF_GIT_SECRET_HOSTS environment
+# variable (comma- or space-separated). An empty set rejects every
+# git-secret+https reference with configuration guidance.
+_GIT_SECRET_HOSTS_ENV = "AGENTIC_PERF_GIT_SECRET_HOSTS"
+_GIT_SECRET_HOSTS_CONFIG_KEY = "git_secret_hosts"
 _REF_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
@@ -39,6 +50,55 @@ class GitSecretReference:
     repository: str
     ref: str
     path: str
+
+
+def permitted_git_secret_hosts() -> frozenset[str]:
+    """Return the hosts this installation permits for git-secret+https.
+
+    Configuration-driven (#1421): the instance configuration file's
+    ``git_secret_hosts`` key, overridden by the
+    ``AGENTIC_PERF_GIT_SECRET_HOSTS`` environment variable. No hosts are
+    permitted by default — vendor or deployment hostnames must never live
+    in base code.
+    """
+    import os
+
+    # An explicitly set (even empty) environment variable is authoritative:
+    # ``AGENTIC_PERF_GIT_SECRET_HOSTS=`` is an emergency deny-all that must
+    # not fall back to hosts inherited from the configuration file.
+    if _GIT_SECRET_HOSTS_ENV in os.environ:
+        raw = os.environ.get(_GIT_SECRET_HOSTS_ENV, "")
+        source = "environment"
+        from_config = False
+    else:
+        raw = ""
+        source = "configuration file"
+        from_config = True
+    if from_config and not raw.strip():
+        try:
+            from paths import CONFIG_PATH
+
+            if CONFIG_PATH.exists():
+                loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    value = loaded.get(_GIT_SECRET_HOSTS_CONFIG_KEY)
+                    if isinstance(value, list):
+                        raw = " ".join(str(item) for item in value)
+                        source = "configuration file"
+                    elif isinstance(value, str):
+                        raw = value
+                        source = "configuration file"
+        except (OSError, ValueError):
+            raise GitSecretReferenceError(
+                "The agentic-perf configuration could not be read; git-secret "
+                "host permissions are unknown"
+            ) from None
+    hosts = frozenset(
+        item.strip().lower() for item in re.split(r"[,\s]+", raw) if item.strip()
+    )
+    if hosts:
+        logger.debug("git-secret+https permitted hosts (%s): %s", source, sorted(hosts))
+    return hosts
 
 
 def parse_git_secret_reference(value: object) -> GitSecretReference | None:
@@ -72,12 +132,17 @@ def parse_git_secret_reference(value: object) -> GitSecretReference | None:
         or _BAD_PERCENT_ESCAPE.search(parsed.path)
     ):
         raise GitSecretReferenceError("Invalid Git secret repository URI")
-    if parsed.hostname.lower() != _SUPPORTED_GITLAB_HOST or (
-        port is not None and port != 443
-    ):
+    permitted = permitted_git_secret_hosts()
+    hostname = parsed.hostname.lower()
+    if hostname not in permitted or (port is not None and port != 443):
         raise GitSecretReferenceError(
-            "Unsupported Git secret host; only GitLab HTTPS repository URLs on "
-            f"{_SUPPORTED_GITLAB_HOST} are supported"
+            "Unsupported Git secret host; only GitLab HTTPS repository URLs "
+            "on hosts permitted by this installation's configuration are "
+            "supported. Configure "
+            f"{_GIT_SECRET_HOSTS_CONFIG_KEY!r} in the agentic-perf "
+            "configuration file or set "
+            f"{_GIT_SECRET_HOSTS_ENV} (comma- or space-separated hostnames) "
+            "to permit git-secret+https hosts."
         )
 
     repo_parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
