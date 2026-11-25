@@ -766,6 +766,10 @@ async def test_all_tools_use_hosts_or_targets():
             "pin_irq",
             "reset_irq_pinning",
             "verify_host_tuning",
+            # Per-host read-only state getters — mirror the setters'
+            # single-host interface (#1431)
+            "get_irq_affinity",
+            "get_qdisc",
             # Per-host flow steering — rules vary per host/interface
             "configure_flow_steering",
             "reset_flow_steering",

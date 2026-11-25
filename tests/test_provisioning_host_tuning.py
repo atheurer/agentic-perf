@@ -936,3 +936,160 @@ class TestVerifyHostTuning:
         # With no expected values, all checks are unconstrained — all_ok stays True
         assert result["all_ok"] is True
         assert "checks" in result
+
+
+class TestGetIrqAffinity:
+    """#1431: read-only IRQ affinity read-back."""
+
+    @pytest.mark.asyncio
+    async def test_readback_reports_requested_and_effective(self):
+        async def run(host, command, timeout=300):
+            if "msi_irqs" in command:
+                return SSHResult(stdout="42\n43\n")
+            if "smp_affinity_list" in command:
+                # The read-back command reads both files with an echo
+                # separator; affinity lists never contain whitespace.
+                return SSHResult(stdout="194\n---\n195\n")
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh = MockSSHExecutor()
+        ssh.run = run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["get_irq_affinity"](
+            host="10.0.0.1", interface="eno16695np0"
+        )
+        assert result["status"] == "ok"
+        assert result["irq_count"] == 2
+        by_irq = {e["irq"]: e for e in result["affinities"]}
+        assert by_irq[42]["requested_affinity"] == "194"
+        assert by_irq[42]["effective_affinity"] == "195"
+
+    @pytest.mark.asyncio
+    async def test_malformed_interface_is_rejected(self):
+        """Interface names are interpolated into root SSH commands; a
+        metacharacter payload must be rejected, not executed."""
+        ssh = MockSSHExecutor()
+        commands = []
+
+        async def run(host, command, timeout=300):
+            commands.append(command)
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh.run = run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["get_irq_affinity"](
+            host="10.0.0.1", interface="eth0; rm -rf /"
+        )
+        assert result["status"] == "error"
+        assert "invalid interface name" in result["errors"][0]
+        assert commands == []
+
+    @pytest.mark.asyncio
+    async def test_malformed_pci_is_rejected_in_pin_irq(self):
+        ssh = MockSSHExecutor()
+        commands = []
+
+        async def run(host, command, timeout=300):
+            commands.append(command)
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh.run = run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](
+            host="10.0.0.1", pci="0000:21:00.0; reboot", cpus=[2]
+        )
+        assert result["status"] == "error"
+        assert "invalid PCI address" in result["errors"][0]
+        assert commands == []
+
+    @pytest.mark.asyncio
+    async def test_irq_cap(self):
+        async def run(host, command, timeout=300):
+            if "msi_irqs" in command:
+                return SSHResult(stdout="\n".join(str(i) for i in range(200)) + "\n")
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh = MockSSHExecutor()
+        ssh.run = run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["get_irq_affinity"](
+            host="10.0.0.1", interface="ens1f0np0"
+        )
+        assert result["status"] == "error"
+        assert "cap is 128" in result["errors"][0]
+
+
+class TestGetQdisc:
+    """#1431: read-only qdisc read-back."""
+
+    @pytest.mark.asyncio
+    async def test_qdisc_read(self):
+        async def run(host, command, timeout=300):
+            assert "tc qdisc show dev ens1f0np0" in command
+            assert "ens1f0np0" in command
+            return SSHResult(
+                exit_code=0,
+                stdout=("qdisc mq 0: root\nqdisc fq 80: parent :4 limit 10000p\n"),
+            )
+
+        ssh = MockSSHExecutor()
+        ssh.run = run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["get_qdisc"](host="10.0.0.1", iface="ens1f0np0")
+        assert result["status"] == "ok"
+        assert len(result["qdiscs"]) == 2
+        assert "mq 0: root" in result["qdiscs"][0]
+
+    @pytest.mark.asyncio
+    async def test_qdisc_stats_flag(self):
+        commands = []
+
+        async def run(host, command, timeout=300):
+            commands.append(command)
+            return SSHResult(exit_code=0, stdout="qdisc mq 0: root\n")
+
+        ssh = MockSSHExecutor()
+        ssh.run = run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["get_qdisc"](
+            host="10.0.0.1", iface="ens1f0np0", stats=True
+        )
+        assert result["status"] == "ok"
+        assert any("tc -s " in c for c in commands)
+
+    @pytest.mark.asyncio
+    async def test_qdisc_malformed_iface_rejected(self):
+        ssh = MockSSHExecutor()
+        commands = []
+
+        async def run(host, command, timeout=300):
+            commands.append(command)
+            return SSHResult(exit_code=0, stdout="")
+
+        ssh.run = run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["get_qdisc"](host="10.0.0.1", iface="eth0 & reboot")
+        assert result["status"] == "error"
+        assert commands == []
+
+    @pytest.mark.asyncio
+    async def test_explicit_irqs_do_not_bypass_selector_validation(self):
+        """pin_irq accepts irqs and an interface together; the interface is
+        still interpolated into root SSH commands on the CPU-resolution
+        path, so a metacharacter payload must be rejected even when irqs
+        are explicit."""
+        ssh = MockSSHExecutor()
+        commands = []
+
+        async def run(host, command, timeout=300):
+            commands.append(command)
+            return SSHResult(stdout="", exit_code=0)
+
+        ssh.run = run  # type: ignore[method-assign]
+        handlers = make_handlers(ssh)
+        result = await handlers["pin_irq"](
+            host="10.0.0.1", irqs=[42], interface="eth0; reboot", cpus=[2]
+        )
+        assert result["status"] == "error"
+        assert "invalid interface name" in result["errors"][0]
+        assert commands == []

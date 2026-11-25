@@ -2148,6 +2148,149 @@ async def configure_flow_steering(
     )
 
 
+_MAX_IRQ_READBACK = 128
+
+
+@mcp.tool()
+async def get_irq_affinity(
+    host: str,
+    interface: str = "",
+    pci: str = "",
+    irqs: list[int] | None = None,
+) -> str:
+    """Read the current CPU affinity of a device's interrupts (read-only).
+
+    The read-back counterpart of pin_irq: resolves the device's IRQs the
+    same way (msi_irqs with a /proc/interrupts fallback), then reports each
+    IRQ's requested affinity (/proc/irq/N/smp_affinity_list) and the
+    kernel's effective affinity (effective_affinity_list) — the effective
+    value is what actually runs when irqbalance or CPU isolation constrains
+    the request. Device selection matches pin_irq: `interface`, `pci`, or
+    explicit `irqs`. At most 128 IRQs are read back per call.
+    """
+    await _ensure_init()
+    if not host:
+        return json.dumps({"status": "error", "errors": ["host must not be empty"]})
+    if not interface and not pci and not irqs:
+        return json.dumps(
+            {
+                "status": "error",
+                "errors": [
+                    "Must provide interface, pci, or irqs to identify the device"
+                ],
+            }
+        )
+    invalid = _validate_device_selector(interface, pci)
+    if invalid:
+        return json.dumps({"status": "error", "errors": [invalid]})
+    try:
+        irq_numbers, resolved_pci = await _discover_irqs(host, interface, pci, irqs)
+    except ValueError as exc:
+        return json.dumps({"status": "error", "errors": [str(exc)]})
+    if not irq_numbers:
+        ident = interface or pci or "device"
+        return json.dumps(
+            {
+                "status": "error",
+                "errors": [f"No IRQs found for {ident}"],
+            }
+        )
+    if len(irq_numbers) > _MAX_IRQ_READBACK:
+        return json.dumps(
+            {
+                "status": "error",
+                "errors": [
+                    f"device has {len(irq_numbers)} IRQs; the read-back cap is "
+                    f"{_MAX_IRQ_READBACK} — pass an explicit subset via irqs"
+                ],
+            }
+        )
+    entries: list[dict] = []
+    for irq in irq_numbers:
+        # The echo separator keeps the two reads distinguishable even
+        # when one file is missing on older kernels (empty field instead
+        # of interleaved cat error text).
+        ra = await _ssh.run(
+            host,
+            f"cat /proc/irq/{int(irq)}/smp_affinity_list 2>/dev/null; echo ---; "
+            f"cat /proc/irq/{int(irq)}/effective_affinity_list 2>/dev/null",
+            timeout=15,
+        )
+        fields = (ra.stdout or "").split("---")
+        requested = fields[0].strip() if fields else ""
+        effective = fields[1].strip() if len(fields) > 1 else ""
+        entries.append(
+            {
+                "irq": int(irq),
+                "requested_affinity": requested,
+                "effective_affinity": effective,
+            }
+        )
+    return json.dumps(
+        {
+            "status": "ok",
+            "host": host,
+            "interface": interface,
+            "pci": resolved_pci,
+            "irq_count": len(entries),
+            "affinities": entries,
+        }
+    )
+
+
+@mcp.tool()
+async def get_qdisc(host: str, iface: str, stats: bool = False) -> str:
+    """Read the qdisc configuration of an interface (read-only).
+
+    The read-back counterpart of tune_tcp's qdisc changes: returns the
+    root and per-queue leaf qdiscs (`tc qdisc show dev <iface>`), including
+    per-queue leaf discipline — what multiqueue hardware actually enforces
+    per TX queue. With stats=True, includes `tc -s` byte/packet/drop
+    counters per qdisc. Output is returned structured (one entry per qdisc
+    line) plus the raw command output.
+    """
+    await _ensure_init()
+    if not host or not iface:
+        return json.dumps(
+            {"status": "error", "errors": ["host and iface must not be empty"]}
+        )
+    invalid = _validate_device_selector(iface, "")
+    if invalid:
+        return json.dumps({"status": "error", "errors": [invalid]})
+    quoted = shlex.quote(iface)
+    stats_flag = "-s " if stats else ""
+    result = await _ssh.run(
+        host,
+        f"tc {stats_flag}qdisc show dev {quoted}",
+        timeout=15,
+    )
+    raw = (result.stdout or "") + (result.stderr or "")
+    if result.exit_code != 0:
+        return json.dumps(
+            {
+                "status": "error",
+                "host": host,
+                "iface": iface,
+                "exit_code": result.exit_code,
+                "errors": [f"tc qdisc show failed: {raw.strip()[:500]}"],
+            }
+        )
+    qdiscs = []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if line:
+            qdiscs.append(line)
+    return json.dumps(
+        {
+            "status": "ok",
+            "host": host,
+            "iface": iface,
+            "qdiscs": qdiscs,
+            "raw": result.stdout,
+        }
+    )
+
+
 @mcp.tool()
 async def get_flow_steering_rules(targets: list[FlowSteeringTarget]) -> str:
     """Read the active RX ntuple flow-steering rules from a NIC.
@@ -2310,6 +2453,31 @@ async def tune_tcp(
     )
 
 
+_INTERFACE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_PCI_BDF_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
+
+
+def _validate_device_selector(interface: str, pci: str) -> str | None:
+    """Reject device selectors that are not safe to interpolate into SSH.
+
+    Interface names and PCI bus addresses arrive from model output and are
+    interpolated into root remote shell commands throughout the NIC tuning
+    tools; a metacharacter payload in either field is remote command
+    execution. Both have strict grammars — enforce them once here.
+    """
+    if interface and not _INTERFACE_NAME_RE.fullmatch(interface):
+        return (
+            f"invalid interface name {interface!r}: expected a Linux interface "
+            "name (letters, digits, '.', '_', '-')"
+        )
+    if pci and not _PCI_BDF_RE.fullmatch(pci):
+        return (
+            f"invalid PCI address {pci!r}: expected a bus:device.function "
+            "address like 0000:21:00.0"
+        )
+    return None
+
+
 def _device_path(interface: str, pci: str) -> str:
     if interface:
         return f"/sys/class/net/{interface}/device"
@@ -2351,6 +2519,13 @@ async def _discover_irqs(
     Falls back to a /proc/interrupts substring match (interface name and/or
     PCI address) only if msi_irqs is unavailable (legacy INTx devices).
     """
+    # Validate before the explicit-IRQ early return: pin_irq accepts both
+    # irqs and an interface/pci selector in one call, and the selector is
+    # still interpolated into root SSH commands on the CPU-resolution path.
+    invalid = _validate_device_selector(interface, pci)
+    if invalid:
+        raise ValueError(invalid)
+
     if irqs:
         return sorted(int(i) for i in irqs), pci
 
@@ -2456,7 +2631,10 @@ async def _pin_irq_one(
             "errors": ["Must provide interface, pci, or irqs to identify the device"],
         }
 
-    irq_numbers, resolved_pci = await _discover_irqs(host, interface, pci, irqs)
+    try:
+        irq_numbers, resolved_pci = await _discover_irqs(host, interface, pci, irqs)
+    except ValueError as exc:
+        return {"host": host, "status": "error", "errors": [str(exc)]}
     if not irq_numbers:
         ident = interface or pci or "device"
         return {
@@ -2671,7 +2849,10 @@ async def _reset_irq_pinning_one(
             "errors": ["Must provide interface, pci, or irqs to identify the device"],
         }
 
-    irq_numbers, resolved_pci = await _discover_irqs(host, interface, pci, irqs)
+    try:
+        irq_numbers, resolved_pci = await _discover_irqs(host, interface, pci, irqs)
+    except ValueError as exc:
+        return {"host": host, "status": "error", "errors": [str(exc)]}
     if not irq_numbers:
         ident = interface or pci or "device"
         return {
@@ -2887,7 +3068,10 @@ async def _verify_host_tuning_one(
     # IRQ affinity — verify every assigned IRQ, not just one. `msi_irqs`
     # discovery (via _discover_irqs) works for drivers that don't put the
     # interface name in /proc/interrupts (e.g. mlx5).
-    irq_numbers, _resolved_pci = await _discover_irqs(host, interface=interface)
+    try:
+        irq_numbers, _resolved_pci = await _discover_irqs(host, interface=interface)
+    except ValueError as exc:
+        return {"host": host, "status": "error", "errors": [str(exc)]}
 
     irq_check: dict = {"irq_numbers": irq_numbers}
     expected_assignments = exp.get("irq_assignments")

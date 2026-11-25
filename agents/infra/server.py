@@ -478,6 +478,68 @@ def _parse_ethtool_output(stdout: str, mode: str) -> dict[str, Any]:
     return data
 
 
+def _parse_ethtool_channels(stdout: str) -> dict[str, Any]:
+    """Parse ``ethtool -l`` output into separate maximums/current objects.
+
+    Text output has two sections — "Pre-set maximums" and "Current hardware
+    settings" — with duplicate RX/TX/Other/Combined keys; a generic
+    key:value parse would overwrite the maximums with the current values.
+    JSON output carries both under ``max``/``combined``-style keys and is
+    normalized to the same shape.
+    """
+    try:
+        parsed = json.loads(stdout)
+        if isinstance(parsed, list):
+            # ethtool emits a one-element list for native JSON output.
+            merged: dict[str, Any] = {}
+            for item in parsed:
+                if isinstance(item, dict):
+                    merged.update(item)
+            parsed = merged
+        if isinstance(parsed, dict):
+            maximums = parsed.get("max") or parsed.get("maximums") or {}
+            current = {
+                key: value
+                for key, value in parsed.items()
+                if key not in {"max", "maximums"}
+            }
+            return {
+                "maximums": dict(maximums) if isinstance(maximums, dict) else {},
+                "current": current,
+            }
+    except Exception:
+        pass
+
+    sections: dict[str, dict[str, Any]] = {}
+    section = ""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if "pre-set maximums" in lowered:
+            section = "maximums"
+            sections.setdefault(section, {})
+            continue
+        if "current hardware settings" in lowered:
+            section = "current"
+            sections.setdefault(section, {})
+            continue
+        if ":" in line and section:
+            key, val = line.split(":", 1)
+            key = key.strip()
+            val = val.strip()
+            try:
+                val = int(val)
+            except ValueError:
+                pass
+            sections[section][key] = val
+    return {
+        "maximums": sections.get("maximums", {}),
+        "current": sections.get("current", {}),
+    }
+
+
 def _filter_ethtool_data(
     data: dict[str, Any],
     mode: str,
@@ -510,7 +572,11 @@ async def get_ethtool_info(
     """Get ethtool information for a network interface as structured JSON.
 
     mode='features' returns offload feature flags (ethtool -k / ethtool --json -k),
-    mode='stats' returns NIC statistics (ethtool -S / ethtool --json -S), and
+    mode='stats' returns NIC statistics (ethtool -S / ethtool --json -S),
+    mode='channels' returns channel counts with separate pre-set maximums and
+    current hardware settings (ethtool -l / ethtool --json -l),
+    mode='coalesce' returns interrupt coalescing settings (ethtool -c /
+    ethtool --json -c), and
     mode='flow_rules' returns RX ntuple flow rules (ethtool -u), preserving
     the original flow-type/action text and each qualifier's label, value, and
     mask alongside the unmodified command output. Partial or unsupported rule
@@ -519,7 +585,7 @@ async def get_ethtool_info(
     Args:
         host: IP to SSH into
         iface: Network interface name (e.g. eth0)
-        mode: 'features', 'stats', or 'flow_rules'
+        mode: 'features', 'stats', 'channels', 'coalesce', or 'flow_rules'
         pattern: Case-insensitive regex to filter feature/stat keys (e.g.
             'rx|tx' returns only keys matching that pattern). Empty = all keys.
         active_only: (features mode only) When True (the default), return
@@ -552,6 +618,10 @@ async def get_ethtool_info(
         flag = "-k"
     elif mode == "stats":
         flag = "-S"
+    elif mode == "channels":
+        flag = "-l"
+    elif mode == "coalesce":
+        flag = "-c"
     elif mode == "flow_rules":
         flag = "-u"
     else:
@@ -559,7 +629,8 @@ async def get_ethtool_info(
             {
                 "success": False,
                 "error": (
-                    f"Unknown mode {mode!r}. Use 'features', 'stats', or 'flow_rules'."
+                    f"Unknown mode {mode!r}. Use 'features', 'stats', "
+                    f"'channels', 'coalesce', or 'flow_rules'."
                 ),
             }
         )
@@ -579,6 +650,8 @@ async def get_ethtool_info(
     try:
         if mode == "flow_rules":
             parsed_data = {"rules": parse_ethtool_flow_rules(result.stdout)}
+        elif mode == "channels":
+            parsed_data = _parse_ethtool_channels(result.stdout)
         else:
             parsed_data = _parse_ethtool_output(result.stdout, mode)
     except ValueError as exc:

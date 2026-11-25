@@ -671,3 +671,72 @@ class TestGetHardwareTopology:
         assert data["nic"]["iface"] == "eth0"
         assert data["nic"]["numa_node_int"] == 0
         assert data["nic"]["pci_address"] == "0000:c1:00.0"
+
+
+class TestEthtoolChannelsCoalesce:
+    """#1431: channels (-l) and coalesce (-c) read modes."""
+
+    @pytest.mark.asyncio
+    async def test_channels_text_sections_are_not_collapsed(self, patch_ssh):
+        patch_ssh._results["ethtool -l"] = SSHResult(
+            exit_code=0,
+            stdout=(
+                "Channel parameters for ens1f0np0:\n"
+                "Pre-set maximums:\n"
+                "RX:              0\n"
+                "TX:              0\n"
+                "Other:           1\n"
+                "Combined:        8\n"
+                "Current hardware settings:\n"
+                "RX:              0\n"
+                "TX:              0\n"
+                "Other:           1\n"
+                "Combined:        4\n"
+            ),
+        )
+        result = json.loads(
+            await srv.get_ethtool_info("10.0.0.1", "ens1f0np0", mode="channels")
+        )
+        assert result["exit_code"] == 0
+        assert result["data"]["maximums"]["Combined"] == 8
+        assert result["data"]["current"]["Combined"] == 4
+        assert result["data"]["maximums"]["Other"] == 1
+
+    @pytest.mark.asyncio
+    async def test_channels_json_normalized(self, patch_ssh):
+        patch_ssh._results["ethtool --json -l"] = SSHResult(
+            exit_code=0,
+            stdout=(
+                '[{"ifname": "ens1f0np0", "max": {"rx": 0, "tx": 0, "other": 1,'
+                ' "combined": 8}, "rx": 0, "tx": 0, "other": 1, "combined": 4}]'
+            ),
+        )
+        result = json.loads(
+            await srv.get_ethtool_info("10.0.0.1", "ens1f0np0", mode="channels")
+        )
+        assert result["exit_code"] == 0
+        assert result["data"]["maximums"]["combined"] == 8
+        assert result["data"]["current"]["combined"] == 4
+
+    @pytest.mark.asyncio
+    async def test_coalesce_mode(self, patch_ssh):
+        patch_ssh._results["ethtool -c"] = SSHResult(
+            exit_code=0,
+            stdout=(
+                "Coalesce parameters for ens1f0np0:\n"
+                "Adaptive RX:      off  TX:     off\n"
+                "rx-usecs: 3\n"
+                "rx-frames: 8\n"
+                "cqe-mode-rx: off\n"
+            ),
+        )
+        patch_ssh._results["ethtool --json -c"] = SSHResult(exit_code=1, stdout="")
+        result = json.loads(
+            await srv.get_ethtool_info("10.0.0.1", "ens1f0np0", mode="coalesce")
+        )
+        assert result["exit_code"] == 0
+        assert result["data"]["rx-usecs"] == "3"
+        assert result["data"]["rx-frames"] == "8"
+        # Text coalesce values are kept as strings (mixed int/bool text);
+        # consumers treat them as reported.
+        assert result["data"]["cqe-mode-rx"] == "off"
