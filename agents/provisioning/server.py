@@ -979,8 +979,32 @@ async def _verify_harness_install_one(
                 if probe_lines and probe_lines[-1] in {"identity=0", "identity=1"}:
                     identity_ready = probe_lines[-1] == "identity=1"
 
+    containers: list[dict] | None = None
+    container_inventory_error: str | None = None
+    if harness_name == "crucible":
+        # #1356: a bind mount captures the directory inode at container
+        # start. When the installer replaces the install tree (rm + clone),
+        # running crucible-* containers keep the emptied old inode: every
+        # path check inside the container fails while the same paths look
+        # healthy from the host. Verification is read-only — it reports the
+        # divergence and never restarts anything (remediation belongs to the
+        # mutating install path). An inventory that cannot be established
+        # fails verification: passing with an unverified container set is
+        # the fail-open disease this check exists to cure.
+        try:
+            containers = await _inspect_crucible_containers(host, path)
+        except ContainerInspectionError as exc:
+            container_inventory_error = str(exc)
+            containers = None
+
     context_ready = context is None or context["ready"]
-    verified = harness_verified and context_ready
+    stale_containers = [c for c in (containers or []) if c.get("state") != "healthy"]
+    verified = (
+        harness_verified
+        and context_ready
+        and not stale_containers
+        and container_inventory_error is None
+    )
     # A changed remote host key (lab reimage) surfaces here as a failed
     # verification; annotate the stderr with the refresh recipe so the
     # operator guidance reaches the agent and the comment verbatim.
@@ -994,6 +1018,19 @@ async def _verify_harness_install_one(
             else f"Verification failed: {error_output[:200]}"
         )
     )
+    if harness_name == "crucible" and container_inventory_error is not None:
+        message += (
+            f" (warning: the crucible container inventory could not be "
+            f"verified — {container_inventory_error})"
+        )
+    if harness_name == "crucible" and stale_containers:
+        names = ", ".join(c["name"] for c in stale_containers[:5])
+        message += (
+            f" (warning: stale bind mount detected in container(s) {names} — "
+            "the container sees an empty or missing install tree while the "
+            "host-side path is present; the container predates the current "
+            "install and must be restarted)"
+        )
     if harness_name == "crucible" and verified:
         if identity_ready is False:
             message += (
@@ -1016,8 +1053,117 @@ async def _verify_harness_install_one(
         "output": result.stdout[:500] if result.stdout else "",
         "error": error_output[:500] if error_output else "",
         "context": context,
+        "containers": containers,
         "message": message,
     }
+
+
+_MAX_CONTAINER_INSPECT = 16
+
+
+class ContainerInspectionError(Exception):
+    """The crucible container inventory could not be established."""
+
+
+async def _list_crucible_containers(host: str) -> list[str]:
+    """Names of running crucible-* containers, fail-closed.
+
+    Raises ContainerInspectionError when podman cannot be queried or the
+    container count exceeds the inspection cap: an unverifiable inventory
+    must fail verification, not pass it with an incomplete container set.
+    """
+    listing = await _ssh.run(
+        host,
+        "podman ps --format '{{.Names}}'",
+        timeout=30,
+    )
+    if listing.exit_code != 0:
+        raise ContainerInspectionError(
+            f"podman ps failed (exit {listing.exit_code}): "
+            f"{(listing.stderr or '').strip()[:200]}"
+        )
+    names = [
+        name.strip()
+        for name in (listing.stdout or "").splitlines()
+        if name.strip().startswith("crucible-")
+    ]
+    if len(names) > _MAX_CONTAINER_INSPECT:
+        raise ContainerInspectionError(
+            f"{len(names)} crucible containers exceed the inspection cap of "
+            f"{_MAX_CONTAINER_INSPECT}; the inventory cannot be verified"
+        )
+    return names
+
+
+async def _inspect_crucible_containers(
+    host: str,
+    install_path: str,
+) -> list[dict]:
+    """Read-only in-container check of running crucible service containers.
+
+    Returns one entry per running ``crucible-*`` container with its state:
+    ``healthy`` (the in-container install tree is present and non-empty) or
+    ``stale_bind_mount`` (host-side path exists but the container sees an
+    empty or missing tree — the bind mount predates a reinstall). Raises
+    ContainerInspectionError when the inventory itself cannot be
+    established — never a silently truncated or empty container set.
+    """
+    names = await _list_crucible_containers(host)
+    results: list[dict] = []
+    quoted_path = shlex.quote(install_path)
+    for name in names:
+        quoted_name = shlex.quote(name)
+        # The stale-bind-mount signature: the bind-mounted root stays a
+        # directory, but its contents belong to the replaced inode — the
+        # incident (PERF-DBE37C84) showed `ls` inside the container
+        # returning empty while the host path was fully populated. Also
+        # check a subtree that every crucible install carries
+        # (subprojects/core/toolbox/python) — its absence inside a
+        # container that has the install tree mounted is the same disease.
+        probe = (
+            f"podman exec {quoted_name} sh -c "
+            f"'test -d {quoted_path} "
+            f'&& test -n "$(ls -A {quoted_path})" '
+            f"&& test -d {quoted_path}/subprojects/core/toolbox/python' "
+            "2>/dev/null"
+        )
+        check = await _ssh.run(host, probe, timeout=30)
+        state = "healthy" if check.exit_code == 0 else "stale_bind_mount"
+        results.append({"name": name, "state": state})
+    return results
+
+
+async def _restart_crucible_containers(
+    host: str,
+    install_path: str,
+) -> list[str]:
+    """Restart running crucible containers after an install (mutating).
+
+    An install that replaces the install tree (rm + clone) invalidates every
+    pre-existing container bind mount by construction — the mounts captured
+    the old directory inode. Called only from the mutating install paths
+    (_ensure_harness_one / install_harness), never from verification.
+    Returns the restarted container names.
+    """
+    containers = await _inspect_crucible_containers(host, install_path)
+    restarted: list[str] = []
+    for container in containers:
+        quoted_name = shlex.quote(container["name"])
+        result = await _ssh.run(
+            host,
+            f"podman restart {quoted_name}",
+            timeout=120,
+        )
+        if result.exit_code == 0:
+            restarted.append(container["name"])
+        else:
+            logger.warning(
+                "[provision] Failed to restart stale container %s on %s: %s",
+                container["name"],
+                host,
+                (result.stderr or "")[:200],
+            )
+    return restarted
 
 
 def _crucible_identity_probe_command(
@@ -1256,14 +1402,34 @@ async def _ensure_harness_one(
     if install_result.get("status") not in ("success", "ready"):
         return install_result
 
+    # #1356: the install replaced the install-tree inode; any container
+    # started before it holds a bind mount to the emptied old directory.
+    # Restarting is a side effect, so it lives here — on the mutating
+    # install path — and never in read-only verification.
+    restarted: list[str] = []
+    if harness_name == "crucible":
+        install_path_resolved = install_path or provisioning.get(
+            "install_target_path", f"/opt/{harness_name}"
+        )
+        restarted = await _restart_crucible_containers(host, install_path_resolved)
+        if restarted:
+            install_result.setdefault("restarted_containers", []).extend(restarted)
+
     verify_result = await _verify_harness_install_one(
         host, harness_name, provisioning, install_path
     )
     if not verify_result.get("verified"):
         verify_result["status"] = "install_succeeded_verify_failed"
+        if restarted:
+            verify_result.setdefault("restarted_containers", []).extend(restarted)
         return verify_result
 
     verify_result["status"] = "success"
+    if restarted:
+        verify_result.setdefault("restarted_containers", []).extend(restarted)
+        verify_result["message"] += (
+            f" (restarted {len(restarted)} stale container(s) after reinstall)"
+        )
     return verify_result
 
 
@@ -1376,6 +1542,27 @@ async def install_harness(
         constraints,
         branch,
     )
+
+    # #1356: a reinstall replaces the install-tree inode; containers
+    # started before it hold stale bind mounts. Restarting is a mutating
+    # side effect and belongs on this mutating path only.
+    if harness_name == "crucible":
+        for host, result in list(results.items()):
+            if isinstance(result, dict) and result.get("status") in (
+                "success",
+                "ready",
+            ):
+                path = result.get("install_path") or provisioning.get(
+                    "install_target_path", f"/opt/{harness_name}"
+                )
+                restarted = await _restart_crucible_containers(host, path)
+                if restarted:
+                    result.setdefault("restarted_containers", []).extend(restarted)
+                    result["message"] = (
+                        f"{result.get('message', '')} "
+                        f"(restarted {len(restarted)} stale container(s) "
+                        "after reinstall)"
+                    ).strip()
     results.update(skipped)
     return json.dumps(_summarize(results))
 
