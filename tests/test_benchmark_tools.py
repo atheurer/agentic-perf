@@ -1222,6 +1222,8 @@ async def test_get_tool_params_found():
     res = await h["get_tool_params"](tool="sysstat", harness="crucible")
     assert res["found"] is False
     assert "controller-sourced context" in res["message"]
+    assert "tools/<tool>" in res["message"]
+    assert "docs/tool-collection" in res["message"]
 
 
 @pytest.mark.asyncio
