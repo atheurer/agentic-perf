@@ -71,7 +71,10 @@ from providers.execution import (
     RootedPath,
     durable_filesystem_emitter,
 )
-from providers.skills.crucible import crucible_runfile_contract_errors
+from providers.skills.crucible import (
+    crucible_failure_probe,
+    crucible_runfile_contract_errors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -536,6 +539,58 @@ SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 # Module-level globals — lazily initialized by _ensure_init()
 _initialized = False
 _crucible_mcp: CrucibleMCPAdapter | None = None
+
+
+async def _endpoint_failure_diagnostics(run_file: dict[str, Any]) -> dict[str, Any]:
+    """Run harness-declared read-only probes on endpoint hosts (#1359).
+
+    When a crucible run fails, the harness may declare read-only probe
+    commands (providers/skills/crucible.py::crucible_failure_probe) whose
+    output distinguishes the real failure mode — e.g. a leftover uperf
+    server holding the data port — from the generic client-connection
+    symptom. Bounded: SSH-reachable hosts only, at most three hosts, ten
+    seconds per command, marked non-mutating, output capped per host.
+    Probe failures are non-fatal and reported as such.
+    """
+    probe = crucible_failure_probe(run_file)
+    if probe is None or _ssh is None:
+        return {}
+    fields = _ticket.get("custom_fields", {}) if _ticket else {}
+    hw = fields.get("ssh_hardware_ips") or fields.get("assigned_hardware_ips") or {}
+    hosts: list[str] = []
+    controller = hw.get("controller")
+    if isinstance(controller, str) and controller:
+        hosts.append(controller)
+    targets = hw.get("targets")
+    if isinstance(targets, list):
+        hosts.extend(str(target) for target in targets if target)
+    hosts = list(dict.fromkeys(hosts))[:3]
+    if not hosts:
+        return {}
+    results: dict[str, str] = {}
+    for host in hosts:
+        lines: list[str] = []
+        for command in probe["commands"]:
+            try:
+                result = await _ssh.run(
+                    host,
+                    command,
+                    timeout=10,
+                    mutating=False,
+                )
+                output = (result.stdout or "").strip()
+                # Cap per command: diagnostics, not a firehose.
+                lines.append(output[:2000] if output else "(no output)")
+            except Exception as exc:
+                lines.append(f"(probe failed: {exc})")
+        results[host] = "\n".join(lines)[:4000]
+    return {
+        "failure_diagnostics": {
+            "name": probe["name"],
+            "guidance": probe["guidance"],
+            "hosts": results,
+        }
+    }
 
 
 def _truncated_output_guidance(
@@ -4831,6 +4886,12 @@ async def execute_benchmark(
                     response["run_log"] = (await fetch_logs())[-50_000:]
                 except Exception:
                     response["log_status"] = "unavailable"
+                # #1359: harness-declared endpoint probes turn "client
+                # could not connect" into "port 20000 was held by PID X".
+                try:
+                    response.update(await _endpoint_failure_diagnostics(run_file))
+                except Exception:
+                    logger.exception("endpoint failure diagnostics failed")
                 return await finish_execution(response, "fail")
 
             if state != "completed":
