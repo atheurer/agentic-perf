@@ -352,6 +352,24 @@ class TraceClient:
             },
         )
 
+    def operation_get(self, operation_key: str) -> dict:
+        """Read one durable operation without claiming it (#1425 replay)."""
+        if self._closed:
+            raise TraceDeliveryError("trace client is closed")
+        try:
+            response = self._client.get(
+                self.url.removesuffix("/events") + "/traces/operations",
+                headers=self._headers,
+                params={"operation_key": operation_key},
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, dict) or "operation" not in body:
+                raise ValueError("invalid operation response")
+            return body
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            raise TraceDeliveryError("operation request was not accepted") from exc
+
     def operation_transition(
         self,
         operation_key: str,

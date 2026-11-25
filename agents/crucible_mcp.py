@@ -305,34 +305,40 @@ class CrucibleMCPAdapter:
                 self.RESOURCE_URI_PREFIXES,
             )
             raw_info = await self._client.call_tool("crucible_info", {})
-            info = json.loads(raw_info)
-        except (TypeError, json.JSONDecodeError) as exc:
-            await self._client.disconnect()
-            raise CrucibleMCPError(
-                "invalid_contract_response",
-                "Crucible MCP contract information is not valid JSON",
-            ) from exc
-        except Exception:
-            await self._client.disconnect()
-            raise
-        try:
-            if not isinstance(info, dict):
-                raise CrucibleMCPError(
-                    "invalid_contract_response",
-                    "Crucible MCP contract information is invalid",
-                )
-            contract_version = str(info.get("mcp_contract_version", ""))
-            execution_supported = info.get("execution_supported")
-            if contract_version != "3" or execution_supported is not True:
-                raise CrucibleMCPError(
-                    "unsupported_controller",
-                    "The Crucible controller does not support MCP contract v3 execution",
-                )
+            info = self._validate_contract_info(raw_info)
         except Exception:
             await self._client.disconnect()
             raise
         self.contract_info = info
         self._connected = True
+
+    def _validate_contract_info(self, raw_info: str) -> dict[str, Any]:
+        """Parse and enforce the contract-v3 probe response.
+
+        Shared by ``connect`` and ``health_check`` so a cached connection
+        that starts returning a downgraded or malformed contract is
+        detected, not just a dead one (#1425).
+        """
+        try:
+            info = json.loads(raw_info)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise CrucibleMCPError(
+                "invalid_contract_response",
+                "Crucible MCP contract information is not valid JSON",
+            ) from exc
+        if not isinstance(info, dict):
+            raise CrucibleMCPError(
+                "invalid_contract_response",
+                "Crucible MCP contract information is invalid",
+            )
+        contract_version = str(info.get("mcp_contract_version", ""))
+        execution_supported = info.get("execution_supported")
+        if contract_version != "3" or execution_supported is not True:
+            raise CrucibleMCPError(
+                "unsupported_controller",
+                "The Crucible controller does not support MCP contract v3 execution",
+            )
+        return info
 
     def _require_client(self) -> AgentMCPClient:
         if self._client is None or not self._connected:
@@ -341,6 +347,32 @@ class CrucibleMCPAdapter:
                 "The Crucible MCP adapter is not connected",
             )
         return self._client
+
+    async def health_check(self) -> None:
+        """Call ``crucible_info`` regardless of cached connection state.
+
+        A cached connection can be stale — the controller service may have
+        been stopped after an earlier successful connect (#1425: a
+        ``crucible update`` stopped crucible-mcp-server while the agent
+        held an established connection). This check actually round-trips
+        the contract probe, discarding a connection that no longer works
+        before reconnecting, so callers can distinguish a stopped service
+        from a healthy one.
+        """
+        if self._client is not None and self._connected:
+            try:
+                raw_info = await self._client.call_tool("crucible_info", {})
+                self.contract_info = self._validate_contract_info(raw_info)
+                return
+            except Exception:
+                # The cached connection is dead or the contract has
+                # changed; discard it and reconnect fresh.
+                self._connected = False
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    pass
+        await self.connect()
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         """Call one Crucible MCP tool through the private client."""

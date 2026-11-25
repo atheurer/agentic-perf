@@ -267,11 +267,18 @@ class BenchmarkMCP:
 class ReusableOperationGuard:
     records: dict[str, dict] = {}
 
-    def __init__(self, key: str, _request_hash: str, _owner: str) -> None:
+    def __init__(self, key: str, request_hash: str, _owner: str) -> None:
         self.key = key
+        self.request_hash = request_hash
 
     async def acquire(self) -> tuple[dict, str]:
         return self.records.get(self.key, {"external_ids": {}}), "acquired"
+
+    async def peek_terminal(self) -> dict | None:
+        record = self.records.get(self.key)
+        if record is not None and record.get("result_descriptor") is not None:
+            return {"request_hash": self.request_hash, **record}
+        return None
 
     async def transition(self, _action: str, record: dict, **kwargs: object) -> dict:
         updated = dict(record)
@@ -851,8 +858,11 @@ async def test_duplicate_start_returns_existing_job(monkeypatch, benchmark_mcp):
     starts = [
         arguments for name, arguments in benchmark_mcp.calls if name == "start_run"
     ]
-    assert len(starts) == 2
-    assert starts[0] == starts[1]
+    # The duplicate start is answered by the durable terminal replay
+    # (#1425 peek): no second launch reaches Crucible — its idempotency
+    # key never gets the chance to matter, matching production replay
+    # semantics for completed runs.
+    assert len(starts) == 1
 
 
 @pytest.mark.asyncio

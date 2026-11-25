@@ -41,6 +41,11 @@ _MAX_CONTEXT_DOCUMENTS = 256
 _MAX_CONTEXT_PACKAGE_BYTES = 32 * 1024 * 1024
 
 
+# Service management for the controller's MCP endpoint (#1425): harness
+# knowledge lives with the harness, not in the agent or its prompt.
+CRUCIBLE_MCP_SERVICE_START_COMMAND = "crucible start mcp-server"
+
+
 def crucible_runfile_contract_errors(run_file: dict[str, Any]) -> list[str]:
     """Return deterministic violations of Crucible's required top-level fields."""
     if "tags" not in run_file:
