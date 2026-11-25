@@ -99,14 +99,25 @@ file (mode 0600 in a 0700 tmpdir) and deletes it on exit.
 A secret path can point to one file in a Git repository with this marker URI:
 
 ```text
-git-secret+https://gitlab.cee.redhat.com/group/repo.git?ref=master&path=secret.json
+git-secret+https://gitlab.example.com/group/repo.git?ref=master&path=secret.json
 ```
 
 `ref` names a branch and `path` is one repository-relative file path. This
-currently supports repositories on the exact host `gitlab.cee.redhat.com`,
-with GitLab API v4 available at the host root (`/api/v4`). Other GitLab hosts,
-Git hosting services, custom ports, and GitLab instances mounted below a URL
-prefix are not supported.
+supports GitLab repositories on hosts **permitted by this installation's
+configuration** — base agentic-perf carries no hostnames of its own. Permit
+hosts either through the instance configuration file:
+
+```json
+{ "git_secret_hosts": ["gitlab.example.com"] }
+```
+
+or through the `AGENTIC_PERF_GIT_SECRET_HOSTS` environment variable
+(comma- or space-separated; the environment overrides the file). With no
+permitted hosts configured, every `git-secret+https` reference is rejected
+with an error naming the configuration keys. Each host must serve GitLab
+API v4 at the host root (`/api/v4`). Git hosting services other than
+GitLab, custom ports, and GitLab instances mounted below a URL prefix are
+not supported.
 
 The provider resolves exactly that project/ref/file through GitLab's
 repository-files raw API. It does not fetch a Git pack or other repository
