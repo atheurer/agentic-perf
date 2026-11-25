@@ -741,3 +741,189 @@ def test_blocked_spool_io_cannot_exceed_flush_or_close_deadline(
 
     assert flush_elapsed < 0.2
     assert close_elapsed < 0.2
+
+
+def test_abandoned_drain_batches_and_acks_once_per_batch(tmp_path) -> None:
+    """#1364: orphan replay uses one ingestion request per bounded batch,
+    acknowledging the orphan spool at the batch's final offset."""
+    producer = TraceSpool(tmp_path, name="orphan")
+    events = [event() for _ in range(5)]
+    for item in events:
+        producer.append(item)
+    producer.close()
+
+    batch_sizes: list[int] = []
+
+    def deliver_batch(items) -> None:
+        batch_sizes.append(len(items))
+
+    count = drain_abandoned_spools(
+        tmp_path, lambda item: None, deliver_batch=deliver_batch, batch_limit=2
+    )
+    assert count == 5
+    assert batch_sizes == [2, 2, 1]
+    # The orphan spool is fully acknowledged and compacted away (compaction
+    # removes the emptied file).
+    assert not (tmp_path / "orphan.spool").exists()
+
+
+def test_abandoned_drain_deadline_yields_partial_progress(tmp_path) -> None:
+    """#1364: hitting the wall-clock budget stops the sweep with the
+    acknowledged offsets kept; the next sweep continues."""
+    producer = TraceSpool(tmp_path, name="orphan")
+    for _ in range(4):
+        producer.append(event())
+    producer.close()
+
+    batches: list[list] = []
+
+    def deliver_batch(items) -> None:
+        batches.append(items)
+        if len(batches) >= 2:
+            # Simulate the budget expiring mid-sweep.
+            raise KeyboardInterrupt
+
+    count = drain_abandoned_spools(
+        tmp_path,
+        lambda item: None,
+        deliver_batch=deliver_batch,
+        batch_limit=2,
+        deadline=time.monotonic() - 1,
+    )
+    # The deadline had already passed: nothing was delivered.
+    assert count == 0
+    assert batches == []
+    # The orphan spool still has all frames pending.
+    swept = TraceSpool(tmp_path, name="orphan", create=False)
+    assert len(list(swept.pending())) == 4
+
+
+def test_client_periodic_flush_drains_without_close(tmp_path, monkeypatch) -> None:
+    """#1364: a long-lived client's spool is flushed on an interval, not
+    only at init and close."""
+    import threading
+
+    delivered = threading.Event()
+    batch_count = {"n": 0}
+
+    def accepted(request: httpx.Request) -> httpx.Response:
+        events = json.loads(request.content)["events"]
+        batch_count["n"] += len(events)
+        delivered.set()
+        return httpx.Response(
+            200,
+            json={
+                "acknowledgements": [
+                    {
+                        "event_id": item["event_id"],
+                        "accepted": True,
+                        "status": "stored",
+                    }
+                    for item in events
+                ]
+            },
+        )
+
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(accepted)),
+        flush_interval_seconds=0.05,
+    )
+    try:
+        client.record(event())
+        assert delivered.wait(timeout=5.0), "periodic flush did not drain the spool"
+        # The ack lands just after the response; wait for the durable side.
+        for _ in range(100):
+            if client.spool.bytes_pending() == 0:
+                break
+            time.sleep(0.05)
+        assert client.spool.bytes_pending() == 0
+        assert batch_count["n"] >= 1
+    finally:
+        client.close(flush_timeout=0)
+
+
+def test_client_close_joins_periodic_flusher(tmp_path) -> None:
+    client = TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        flush_interval_seconds=0.05,
+    )
+    thread = client._periodic_thread
+    assert thread is not None and thread.is_alive()
+    client.close(flush_timeout=0)
+    assert not thread.is_alive()
+
+
+def test_orphan_batch_split_by_encoded_size(tmp_path, monkeypatch) -> None:
+    """#1364: pending_batch's byte budget counts raw frame payloads, but
+    the encoded body adds the JSON envelope wrapper. A near-limit orphan
+    batch must be split by encoded size (like the live spool path) or it
+    fails on every sweep and stays permanently undrainable."""
+    import providers.tracing.client as client_mod
+    import providers.tracing.spool as spool_mod
+
+    # Shrink the limits so the raw-vs-encoded discrepancy is reachable
+    # with small fixtures.
+    # Two raw frames (2 x 964 bytes) fit the budget; their encoded body
+    # (wrapper + comma) exceeds it, so each raw batch must be split.
+    small_limit = 2 * 964 + 4
+    monkeypatch.setattr(
+        client_mod, "MAX_TRACE_INGEST_BODY_BYTES", small_limit, raising=True
+    )
+    monkeypatch.setattr(
+        spool_mod, "MAX_TRACE_INGEST_BODY_BYTES", small_limit, raising=True
+    )
+
+    producer = TraceSpool(tmp_path, name="orphan")
+    # Each event serializes to well under half the limit; a raw pair fits
+    # pending_batch's budget while the encoded two-event body does not.
+    events = [event() for _ in range(6)]
+    for item in events:
+        producer.append(item)
+    producer.close()
+
+    post_bodies: list[bytes] = []
+
+    def accepted(request: httpx.Request) -> httpx.Response:
+        post_bodies.append(request.content)
+        items = json.loads(request.content)["events"]
+        return httpx.Response(
+            200,
+            json={
+                "acknowledgements": [
+                    {
+                        "event_id": item["event_id"],
+                        "accepted": True,
+                        "status": "stored",
+                    }
+                    for item in items
+                ]
+            },
+        )
+
+    client = client_mod.TraceClient(
+        "http://store",
+        "token",
+        spool_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(accepted)),
+    )
+    try:
+        # Keep the live spool out of the way; sweep only orphans.
+        client.spool.close()
+        count = client.sweep_abandoned()
+    finally:
+        client.close(flush_timeout=0)
+
+    assert count == 6
+    assert post_bodies, "no orphan batches posted"
+    for body in post_bodies:
+        assert len(body) <= small_limit
+    # The raw budget admitted batches of >= 2 events; the encoded body
+    # limit forced the split the fix guarantees.
+    assert len(post_bodies) > 3
+    # The orphan spool was fully drained and compacted away.
+    assert not (tmp_path / "orphan.spool").exists()

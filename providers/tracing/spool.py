@@ -21,6 +21,7 @@ from typing import BinaryIO, Callable, Iterator
 
 from paths import TRACE_SPOOL_DIR
 
+from .limits import MAX_TRACE_INGEST_BODY_BYTES
 from .models import TraceEventV1
 
 _HEADER = struct.Struct("!I")
@@ -522,12 +523,23 @@ def prune_spool_directory(
 def drain_abandoned_spools(
     directory: Path,
     deliver: Callable[[TraceEventV1], None],
+    *,
+    deliver_batch: Callable[[list[TraceEventV1]], None] | None = None,
+    deadline: float | None = None,
+    batch_limit: int = 100,
 ) -> int:
     """Drain regular orphan spool files; symlinks are never followed.
 
     This intentionally only acknowledges a frame after the supplied central
     delivery callback returns.  It is suitable for the orchestrator restart
     sweeper as well as a supervisor that reaps MCP subprocesses.
+
+    #1364: when ``deliver_batch`` is supplied, frames are delivered in
+    bounded batches (one ingestion request per batch instead of one per
+    event) and the orphan spool is acknowledged at the batch's final
+    offset after the whole batch is accepted. ``deadline`` bounds the
+    sweep's wall clock; hitting it stops with the partial progress kept
+    (acknowledged offsets persist), which is normal for large backlogs.
     """
     root = Path(directory)
     if not root.exists():
@@ -545,10 +557,24 @@ def drain_abandoned_spools(
         except (BlockingIOError, FileNotFoundError):
             continue
         try:
-            for offset, event in spool.pending():
-                deliver(event)
-                spool.acknowledge(offset)
-                count += 1
+            if deliver_batch is not None:
+                while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return count
+                    batch = spool.pending_batch(
+                        batch_limit,
+                        max_payload_bytes=MAX_TRACE_INGEST_BODY_BYTES,
+                    )
+                    if not batch:
+                        break
+                    deliver_batch([event for _, event in batch])
+                    spool.acknowledge(batch[-1][0])
+                    count += len(batch)
+            else:
+                for offset, event in spool.pending():
+                    deliver(event)
+                    spool.acknowledge(offset)
+                    count += 1
             spool.compact()
         except SpoolCorruption as exc:
             logger.warning("Quarantined corrupt trace spool %s: %s", path, exc)

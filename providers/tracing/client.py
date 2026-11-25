@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import socket
 import threading
 import time
@@ -12,6 +14,8 @@ from typing import Any
 import httpx
 
 from paths import TRACE_SPOOL_DIR
+
+logger = logging.getLogger(__name__)
 
 from .limits import MAX_TRACE_INGEST_BODY_BYTES
 from .models import TraceEventV1
@@ -46,7 +50,15 @@ class TraceClient:
         instance_id: str | None = None,
         max_spool_bytes: int = DEFAULT_TRACE_SPOOL_MAX_BYTES,
         client: httpx.Client | None = None,
+        flush_interval_seconds: float | None = None,
     ) -> None:
+        if flush_interval_seconds is None:
+            try:
+                flush_interval_seconds = float(
+                    os.environ.get("AGENTIC_PERF_TRACE_FLUSH_INTERVAL_SECONDS", "30")
+                )
+            except ValueError:
+                flush_interval_seconds = 30.0
         self.url = url.rstrip("/") + "/api/v1/traces/events"
         self.instance_id = instance_id or socket.gethostname()
         self.spool = TraceSpool(spool_dir, max_bytes=max_spool_bytes)
@@ -61,12 +73,42 @@ class TraceClient:
         self._flush_thread: threading.Thread | None = None
         self._resources_closed = False
         self._resource_close_lock = threading.Lock()
+        self._flush_interval_seconds = flush_interval_seconds
+        self._periodic_stop = threading.Event()
+        self._periodic_thread: threading.Thread | None = None
+        if self._flush_interval_seconds > 0:
+            # #1364: flush() used to run only here and in close(), so a
+            # long-lived process buffered every event it produced for its
+            # entire life and delivered once at shutdown. A distinct
+            # periodic worker (never _flush_thread, which belongs to the
+            # one-shot deadline path) drains the spool on an interval.
+            self._periodic_thread = threading.Thread(
+                target=self._run_periodic_flush,
+                name="trace-flush-periodic",
+                daemon=True,
+            )
+            self._periodic_thread.start()
         # Best effort at startup: an outage must not prevent the caller from
         # recording new durable events, which can be replayed on a later flush.
         try:
             self.flush(deadline=time.monotonic() + 5.0)
         except TraceDeliveryError:
             pass
+
+    def _run_periodic_flush(self) -> None:
+        while not self._periodic_stop.wait(self._flush_interval_seconds):
+            if self._closed:
+                return
+            try:
+                if self.spool.bytes_pending() > 0:
+                    # Bounded so a wedged store cannot pin the worker; a
+                    # failure degrades and retries on the next interval.
+                    self._flush_until_deadline(time.monotonic() + 10.0)
+            except Exception:
+                logger.debug(
+                    "periodic trace flush failed; will retry next interval",
+                    exc_info=True,
+                )
 
     def record(self, event: TraceEventV1) -> None:
         if self._closed:
@@ -192,6 +234,32 @@ class TraceClient:
         def check_cancelled() -> None:
             _check_deadline(deadline)
 
+        self._deliver_batch(batch, deadline=deadline)
+        # Acknowledge the batch's final offset once instead of per frame:
+        # every acknowledge() performs a validated durable write under the
+        # spool mutex, and per-frame acks stall producers in record() for
+        # the whole batch length (#1364).
+        self.spool.acknowledge(batch[-1][0], check_cancelled=check_cancelled)
+        return len(batch)
+
+    def _deliver_batch(
+        self,
+        batch: list[tuple[int, TraceEventV1]],
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        """Transport one batch to the ingestion endpoint and validate acks.
+
+        Acknowledgement is deliberately NOT performed here: the orphan
+        spool drain (#1364) reuses this transport with frames belonging to
+        a different spool, and must acknowledge that spool — never the
+        live client's own.
+        """
+        _check_deadline(deadline)
+
+        def check_cancelled() -> None:
+            _check_deadline(deadline)
+
         body = self._encode_batch(batch)
         headers = {**self._headers, "Content-Type": "application/json"}
         if deadline is None:
@@ -226,7 +294,6 @@ class TraceClient:
         acks = payload["acknowledgements"]
         if len(acks) != len(batch):
             raise TraceDeliveryError("incomplete trace batch acknowledgement")
-        delivered = 0
         for (offset, event), ack in zip(batch, acks, strict=True):
             _check_deadline(deadline)
             if (
@@ -235,9 +302,6 @@ class TraceClient:
                 or ack.get("status") not in {"stored", "duplicate"}
             ):
                 raise TraceDeliveryError("trace batch event was not acknowledged")
-            self.spool.acknowledge(offset, check_cancelled=check_cancelled)
-            delivered += 1
-        return delivered
 
     @staticmethod
     def _encode_batch(batch: list[tuple[int, TraceEventV1]]) -> bytes:
@@ -280,6 +344,12 @@ class TraceClient:
         if self._closed:
             return
         self._closed = True
+        # Stop the periodic flusher before the final flush and resource
+        # shutdown so it cannot race either.
+        self._periodic_stop.set()
+        periodic = self._periodic_thread
+        if periodic is not None and periodic is not threading.current_thread():
+            periodic.join(min(5.0, self._flush_interval_seconds))
         failure: BaseException | None = None
         try:
             deadline = (
@@ -325,13 +395,37 @@ class TraceClient:
             finally:
                 self.spool.close()
 
-    def sweep_abandoned(self) -> int:
-        """Drain other producer spools using this authenticated transport."""
+    def sweep_abandoned(self, *, deadline: float | None = None) -> int:
+        """Drain other producer spools using this authenticated transport.
+
+        #1364: orphan spools are replayed through the batched ingestion
+        endpoint instead of one POST per event, and the sweep honors a
+        wall-clock budget — partial progress at the deadline is normal and
+        the next sweep continues from the acknowledged offset.
+        """
 
         def deliver(event: TraceEventV1) -> None:
             self.record_critical(event)
 
-        return drain_abandoned_spools(self.spool.directory, deliver)
+        def deliver_batch(events: list[TraceEventV1]) -> None:
+            # Offsets are irrelevant to the transport; the drain
+            # acknowledges the orphan spool itself after batch success.
+            # Split by encoded size exactly like the live-spool path:
+            # pending_batch's byte budget counts raw payloads, and the
+            # encoded body adds the JSON envelope — a near-limit batch
+            # would otherwise fail _encode_batch on every sweep and stay
+            # permanently undrainable.
+            remaining = [(0, event) for event in events]
+            while remaining:
+                sendable, remaining = self._split_batch(remaining)
+                self._deliver_batch(sendable, deadline=deadline)
+
+        return drain_abandoned_spools(
+            self.spool.directory,
+            deliver,
+            deliver_batch=deliver_batch,
+            deadline=deadline,
+        )
 
     def operation_register(self, operation_key: str, request_hash: str) -> dict:
         """Register immutable operation input through authenticated service API."""

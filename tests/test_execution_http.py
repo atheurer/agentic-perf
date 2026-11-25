@@ -502,3 +502,50 @@ def test_sync_client_disables_constructor_redirect_default() -> None:
         reset_trace_context(token)
     assert response.status_code == 302
     assert seen == ["https://api.example/redirect"]
+
+
+@pytest.mark.asyncio
+async def test_trace_api_events_false_suppresses_reads_not_mutations() -> None:
+    """#1364: observational readers can suppress read events; mutating
+    requests keep their mandatory trace."""
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    token = _context()
+    try:
+        async with AuditedAsyncHTTPClient(
+            client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            emit=emit,
+            trace_api_events=False,
+        ) as client:
+            await client.get("http://store/api/v1/tickets/T1")
+            assert events == []
+            # A mutating request on the same client still traces.
+            await client.patch("http://store/api/v1/tickets/T1/fields", json={})
+            assert len(events) >= 1
+            assert events[0].action.type == execution_http.ActionType.API
+    finally:
+        reset_trace_context(token)
+
+
+@pytest.mark.asyncio
+async def test_mutating_request_without_context_still_fails_when_suppressed(
+    monkeypatch,
+) -> None:
+    """Suppression must not weaken the mutating-requires-context guard."""
+    execution_http._AuditedHTTPBase.reset_default_recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    async with AuditedAsyncHTTPClient(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        trace_api_events=False,
+    ) as client:
+        with pytest.raises(execution_http.TraceDeliveryError):
+            await client.patch("http://store/api/v1/tickets/T1/fields", json={})

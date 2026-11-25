@@ -2319,7 +2319,16 @@ async def _check_stale_tasks(
     # Claim renewal is a timer-driven store mutation, not agent
     # activity; counting it as activity would mask a stuck agent.
     excluded_state_targets = ("renew_claim", "claim_fence")
-    async with AuditedAsyncHTTPClient(timeout=5.0, headers=_auth_headers()) as client:
+    # #1364: this watchdog polls every active ticket on every cycle; its
+    # read-only GETs are observations of state the orchestrator already
+    # holds, and one trace event per poll dominated the spool backlog
+    # (74% of a 24-hour run's 51,720 undelivered events). Suppress the
+    # read events; any mutating request on this client still traces.
+    async with AuditedAsyncHTTPClient(
+        timeout=5.0,
+        headers=_auth_headers(),
+        trace_api_events=False,
+    ) as client:
         for tid, task in list(dispatcher.active_tasks().items()):
             # Trace store: shared SQLite DB sees events from
             # both parent and child processes.
@@ -4867,6 +4876,9 @@ def _mutation_headers(claim_id: str | None) -> dict[str, str]:
 
 
 _SWEEP_WARN_INTERVAL = 300.0  # log sweep failures at most once per 5 min
+# Wall-clock budget for one orphan-spool sweep; partial progress at the
+# deadline is normal and the next sweep continues (#1364).
+_TRACE_SWEEP_BUDGET_SECONDS = 60.0
 _last_sweep_warning: float = -_SWEEP_WARN_INTERVAL
 
 
@@ -4894,7 +4906,12 @@ def _sweep_trace_spools() -> None:
     url, _ = resolve_state_store()
     client = TraceClient(url, token, spool_dir=TRACE_SPOOL_DIR)
     try:
-        count = client.sweep_abandoned()
+        # #1364: bound the sweep's wall clock so a large backlog (or a slow
+        # store) yields partial progress instead of pinning the sweep task;
+        # the next sweep continues from the acknowledged offsets.
+        count = client.sweep_abandoned(
+            deadline=time.monotonic() + _TRACE_SWEEP_BUDGET_SECONDS
+        )
         if count:
             logger.info("Drained %d abandoned trace spool event(s)", count)
     except TraceDeliveryError:
