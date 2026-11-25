@@ -161,6 +161,7 @@ class _AuditedHTTPBase:
         retries: int = 0,
         retry_statuses: set[int] | None = None,
         supports_idempotency: bool = False,
+        trace_api_events: bool = True,
     ) -> None:
         self._client = client
         self._emit = emit
@@ -168,6 +169,12 @@ class _AuditedHTTPBase:
         self.retries = retries
         self.retry_statuses = retry_statuses or {429, 502, 503, 504}
         self.supports_idempotency = supports_idempotency
+        # #1364: a measured high-frequency observational reader (the
+        # orchestrator's stale-task watchdog polls every active ticket on
+        # every cycle) can disable read-event recording so its own polling
+        # does not dominate the trace volume. Mutating requests always
+        # keep their mandatory trace.
+        self._trace_api_events = trace_api_events
 
     @classmethod
     def reset_default_recorder(cls) -> None:
@@ -306,6 +313,11 @@ class _AuditedHTTPBase:
     async def _record(
         self, event: TraceEventV1 | None, *, critical: bool = False
     ) -> None:
+        if not self._trace_api_events and not critical:
+            # Read-event suppression (#1364): mutating requests keep their
+            # mandatory trace (critical=True); only observational reads are
+            # dropped.
+            return
         if event is None:
             if critical:
                 raise TraceDeliveryError(
@@ -407,6 +419,7 @@ class AuditedAsyncHTTPClient(_AuditedHTTPBase):
                 "retries",
                 "retry_statuses",
                 "supports_idempotency",
+                "trace_api_events",
             )
             if key in kwargs
         }
@@ -713,6 +726,7 @@ class AuditedHTTPClient(_AuditedHTTPBase):
                 "retries",
                 "retry_statuses",
                 "supports_idempotency",
+                "trace_api_events",
             )
             if key in kwargs
         }
