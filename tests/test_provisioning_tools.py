@@ -1223,3 +1223,219 @@ async def test_verify_annotates_changed_host_key_with_tool_guidance(
     assert "10.6.60.88" in result["error"]
     assert "host-key replacement tool" in result["error"]
     assert "ssh-keygen" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_verify_crucible_detects_stale_bind_mount_without_restarting(
+    mock_ssh, monkeypatch
+):
+    """#1356: verification reports a stale container bind mount read-only —
+    the container sees an empty install tree while the host path is fine —
+    and never restarts anything."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
+        "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+        "/root/.crucible/identity": SSHResult(stdout="identity=1"),
+        "podman ps": SSHResult(stdout="crucible-image-sourcing-x86_64\n"),
+        "podman exec": SSHResult(exit_code=1, stdout="", stderr=""),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["harness_verified"] is True
+    assert result["context_ready"] is True
+    # The stale container fails verification with a named warning.
+    assert result["verified"] is False
+    assert result["containers"] == [
+        {"name": "crucible-image-sourcing-x86_64", "state": "stale_bind_mount"}
+    ]
+    assert "stale bind mount" in result["message"]
+    assert "crucible-image-sourcing-x86_64" in result["message"]
+    # Read-only: no restart was issued.
+    assert not any("restart" in call["command"] for call in mock_ssh.calls)
+
+
+@pytest.mark.asyncio
+async def test_verify_crucible_healthy_containers_pass(mock_ssh, monkeypatch):
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
+        "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+        "/root/.crucible/identity": SSHResult(stdout="identity=1"),
+        "podman ps": SSHResult(stdout="crucible-cdm\ncrucible-valkey\n"),
+        "podman exec": SSHResult(exit_code=0, stdout=""),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is True
+    assert all(c["state"] == "healthy" for c in result["containers"])
+    assert "warning" not in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_install_path_restarts_stale_containers(mock_ssh, monkeypatch):
+    """#1356: the mutating install path restarts pre-existing crucible
+    containers — an install that replaces the install tree invalidates
+    every prior bind mount by construction."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+
+    async def fake_install(
+        host, harness_name, private_config, provisioning, constraints, branch=""
+    ):
+        return {
+            "host": host,
+            "harness": harness_name,
+            "status": "success",
+            "install_path": "/opt/crucible",
+            "message": "installed",
+        }
+
+    async def fake_check(host, harness_name, provisioning, install_path=""):
+        return {"host": host, "installed": False}
+
+    monkeypatch.setattr(server, "_install_harness_one", fake_install)
+    monkeypatch.setattr(server, "_check_existing_install_one", fake_check)
+    # The container is stale until the restart, healthy after it.
+    restarted = {"done": False}
+
+    async def run(host, command, timeout=300):
+        if "podman restart" in command:
+            restarted["done"] = True
+            return SSHResult(exit_code=0, stdout="")
+        if "podman exec" in command:
+            return SSHResult(
+                exit_code=0 if restarted["done"] else 1, stdout="", stderr=""
+            )
+        if "podman ps" in command:
+            return SSHResult(stdout="crucible-image-sourcing-x86_64\n")
+        if "crucible help" in command:
+            return SSHResult(stdout="crucible help")
+        if "if [ -r" in command:
+            return SSHResult(stdout="available=1\nbytes=1234\n")
+        return SSHResult(stdout="ok")
+
+    mock_ssh.run = run  # type: ignore[method-assign]
+
+    result = await server._ensure_harness_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG,
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+        CRUCIBLE_PRIVATE_CONFIG.get("constraints", {}),
+    )
+
+    assert restarted["done"] is True
+    assert result["status"] == "success"
+    assert result["restarted_containers"] == ["crucible-image-sourcing-x86_64"]
+    assert "restarted 1 stale container" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_install_path_skips_restart_without_containers(mock_ssh, monkeypatch):
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+
+    async def fake_install(
+        host, harness_name, private_config, provisioning, constraints, branch=""
+    ):
+        return {
+            "host": host,
+            "harness": harness_name,
+            "status": "success",
+            "install_path": "/opt/crucible",
+            "message": "installed",
+        }
+
+    async def fake_check(host, harness_name, provisioning, install_path=""):
+        return {"host": host, "installed": False}
+
+    monkeypatch.setattr(server, "_install_harness_one", fake_install)
+    monkeypatch.setattr(server, "_check_existing_install_one", fake_check)
+    mock_ssh._results = {
+        "podman ps": SSHResult(stdout="", exit_code=0),
+    }
+
+    result = await server._ensure_harness_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG,
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+        CRUCIBLE_PRIVATE_CONFIG.get("constraints", {}),
+    )
+
+    # Fresh install: no containers to restart, no restart command issued.
+    assert not any("restart" in call["command"] for call in mock_ssh.calls)
+    assert "restarted_containers" not in result
+
+
+@pytest.mark.asyncio
+async def test_verify_crucible_fails_closed_when_inventory_unavailable(
+    mock_ssh, monkeypatch
+):
+    """#1356: a podman failure must fail verification, not pass it with an
+    empty container list."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
+        "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+        "/root/.crucible/identity": SSHResult(stdout="identity=1"),
+        "podman ps": SSHResult(
+            exit_code=1, stdout="", stderr="cannot connect to podman socket"
+        ),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is False
+    assert "container inventory could not be verified" in result["message"]
+    assert "podman socket" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_verify_crucible_fails_closed_when_containers_exceed_cap(
+    mock_ssh, monkeypatch
+):
+    """#1356: truncating the container list would let a stale 17th container
+    pass verification; the cap must fail closed instead."""
+    from agents.provisioning import server
+
+    monkeypatch.setattr(server, "_ssh", mock_ssh)
+    monkeypatch.setattr(server, "_MAX_CONTAINER_INSPECT", 2)
+    mock_ssh._results = {
+        "/opt/crucible/bin/crucible help": SSHResult(stdout="crucible help"),
+        "if [ -r": SSHResult(stdout="available=1\nbytes=1234\n"),
+        "/root/.crucible/identity": SSHResult(stdout="identity=1"),
+        "podman ps": SSHResult(stdout="crucible-a\ncrucible-b\ncrucible-c\n"),
+    }
+
+    result = await _verify_harness_install_one(
+        "controller",
+        "crucible",
+        CRUCIBLE_PRIVATE_CONFIG["provisioning"],
+    )
+
+    assert result["verified"] is False
+    assert "inspection cap" in result["message"]
