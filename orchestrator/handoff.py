@@ -147,11 +147,18 @@ def _check_awaiting_provision(ticket: dict[str, Any]) -> tuple[bool, str]:
         all_assigned.update(targets)
         missing = [h for h in named_hosts if h not in all_assigned]
         if missing:
+            # #1381: these identities were transcribed by the TRIAGE stage
+            # from the ticket text; the resource agent can only echo what
+            # required_hosts contains. Name the originating stage so the
+            # operator corrects the source, not the echo.
             return (
                 False,
                 f"User-provided host identities not found in "
-                f"assigned_hardware_ips: {missing}. The resource "
-                f"agent must submit these exact strings verbatim.",
+                f"assigned_hardware_ips: {missing}. These strings were "
+                f"transcribed by the triage stage from the ticket "
+                f"description and are re-validated on every transition — "
+                f"correct required_hosts (re-run triage or fix the ticket "
+                f"fields); the resource agent cannot repair them.",
             )
 
     return True, ""
