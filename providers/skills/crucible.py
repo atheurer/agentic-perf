@@ -41,6 +41,49 @@ _MAX_CONTEXT_DOCUMENTS = 256
 _MAX_CONTEXT_PACKAGE_BYTES = 32 * 1024 * 1024
 
 
+UPERF_DEFAULT_DATA_PORT = 20000
+
+
+def crucible_failure_probe(run_file: dict[str, Any]) -> dict[str, Any] | None:
+    """Read-only diagnostics to run on endpoint hosts after a failed run.
+
+    Harness knowledge for the uperf port-conflict failure mode (#1359,
+    PERF-AFD1570F): a leftover ``uperf -s`` on an endpoint holds the data
+    port; every subsequent run's client then fails instantly and the
+    generic diagnostics blame the client-server connection instead of the
+    port. Returns None for run files with no uperf benchmark.
+
+    The commands are read-only and bounded: an exact-socket ``ss`` filter,
+    PIDs and executable names only (no full argv), and container names.
+    """
+    benchmarks = run_file.get("benchmarks")
+    if not isinstance(benchmarks, list):
+        return None
+    has_uperf = any(
+        isinstance(benchmark, dict)
+        and "uperf" in str(benchmark.get("name", "")).lower()
+        for benchmark in benchmarks
+    )
+    if not has_uperf:
+        return None
+    return {
+        "name": "uperf-port-conflict",
+        "commands": [
+            f"ss -H -tln 'sport = :{UPERF_DEFAULT_DATA_PORT}' || true",
+            "pgrep -x uperf || true",
+            "podman ps --format '{{.Names}}' 2>/dev/null | grep -i uperf || true",
+        ],
+        "guidance": (
+            "A leftover uperf server holding the data port "
+            f"(default {UPERF_DEFAULT_DATA_PORT}) makes every client fail "
+            "instantly while the server start appears to succeed. If the "
+            "port is held or an uperf process is running on an endpoint, "
+            "stop the stray process/container on that host before the next "
+            "run."
+        ),
+    }
+
+
 def crucible_runfile_contract_errors(run_file: dict[str, Any]) -> list[str]:
     """Return deterministic violations of Crucible's required top-level fields."""
     if "tags" not in run_file:

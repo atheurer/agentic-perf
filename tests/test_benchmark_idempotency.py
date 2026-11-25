@@ -480,3 +480,163 @@ async def test_execute_terminal_failure_survives_restart_and_external_identity_i
     assert second["status"] == "failed"
     assert second["existing_operation"] is True
     assert len([c for c in calls if c[0] == "launch"]) == 1
+
+
+class TestUperfFailureDiagnostics:
+    """#1359: failed runs carry endpoint port-conflict diagnostics."""
+
+    def test_probe_declared_for_uperf_only(self):
+        from providers.skills.crucible import crucible_failure_probe
+
+        probe = crucible_failure_probe(
+            {"benchmarks": [{"name": "uperf", "mv-params": {}}]}
+        )
+        assert probe is not None
+        assert probe["name"] == "uperf-port-conflict"
+        assert any("sport = :20000" in command for command in probe["commands"])
+        # PIDs and executable names only — no full argv in diagnostics.
+        assert all("pgrep -a" not in command for command in probe["commands"])
+        assert (
+            crucible_failure_probe({"benchmarks": [{"name": "fio", "mv-params": {}}]})
+            is None
+        )
+        assert crucible_failure_probe({}) is None
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_run_bounded_probes_on_ssh_hosts(
+        self, tmp_path, monkeypatch
+    ):
+        record, _calls = _crucible_fixture(tmp_path, monkeypatch)
+        benchmark_server._ticket.setdefault("custom_fields", {})["ssh_hardware_ips"] = {
+            "controller": "controller",
+            "targets": ["t1", "t2", "t3", "t4"],
+        }
+        calls: list[tuple[str, str, int, bool]] = []
+
+        class _ProbeSSH:
+            async def run(self, host, command, timeout=300, mutating=None, **kw):
+                calls.append((host, command, timeout, bool(mutating)))
+                return SimpleNamespace(
+                    exit_code=0, stdout="LISTEN 0.0.0.0:20000 pid=1234", stderr=""
+                )
+
+        benchmark_server._ssh = _ProbeSSH()
+        try:
+            result = await benchmark_server._endpoint_failure_diagnostics(
+                record["run_file"]
+            )
+        finally:
+            benchmark_server._ssh = None
+        assert "failure_diagnostics" in result
+        diag = result["failure_diagnostics"]
+        assert diag["name"] == "uperf-port-conflict"
+        assert "leftover uperf server" in diag["guidance"]
+        # Host list is capped at three (controller + first two targets).
+        assert set(diag["hosts"]) == {"controller", "t1", "t2"}
+        # Bounded and read-only: 10s timeout, mutating=False.
+        for _host, _command, timeout, mutating in calls:
+            assert timeout == 10
+            assert mutating is False
+        assert len(calls) == 9
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_probe_failure_is_non_fatal(self, tmp_path, monkeypatch):
+        record, _calls = _crucible_fixture(tmp_path, monkeypatch)
+        benchmark_server._ticket.setdefault("custom_fields", {})["ssh_hardware_ips"] = {
+            "controller": "controller",
+            "targets": ["t1"],
+        }
+
+        class _BrokenSSH:
+            async def run(self, host, command, **kw):
+                raise ConnectionError("host unreachable")
+
+        benchmark_server._ssh = _BrokenSSH()
+        try:
+            result = await benchmark_server._endpoint_failure_diagnostics(
+                record["run_file"]
+            )
+        finally:
+            benchmark_server._ssh = None
+        assert "failure_diagnostics" in result
+        assert "probe failed" in result["failure_diagnostics"]["hosts"]["controller"]
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_absent_without_ssh_or_hosts(self, tmp_path, monkeypatch):
+        record, _calls = _crucible_fixture(tmp_path, monkeypatch)
+        saved_ssh = benchmark_server._ssh
+        saved_ticket = benchmark_server._ticket
+        try:
+            benchmark_server._ssh = None
+            assert (
+                await benchmark_server._endpoint_failure_diagnostics(record["run_file"])
+                == {}
+            )
+            benchmark_server._ssh = object()
+
+            class _NoRun:
+                pass
+
+            benchmark_server._ssh = _NoRun()
+            benchmark_server._ticket = {"custom_fields": {"assigned_hardware_ips": {}}}
+            assert (
+                await benchmark_server._endpoint_failure_diagnostics(record["run_file"])
+                == {}
+            )
+        finally:
+            benchmark_server._ssh = saved_ssh
+            benchmark_server._ticket = saved_ticket
+
+
+@pytest.mark.asyncio
+async def test_failed_run_response_includes_failure_diagnostics(tmp_path, monkeypatch):
+    """End to end (#1359): a failed crucible run carries the endpoint
+    port-conflict probe output instead of only the client-connection
+    symptom."""
+    failed_statuses = [
+        {
+            "state": "failed",
+            "result_status": "not_available",
+            "cdm_run_id": "cdm-run-1",
+            "rickshaw_run_id": "rickshaw-run-1",
+            "run_directory": "/var/lib/crucible/run/one",
+            "error_category": "endpoint_failure",
+            "error_message": "client could not connect to server",
+        }
+    ]
+    record, _calls = _crucible_fixture(tmp_path, monkeypatch, statuses=failed_statuses)
+    benchmark_server._ticket.setdefault("custom_fields", {})["ssh_hardware_ips"] = {
+        "controller": "controller",
+        "targets": ["t1"],
+    }
+
+    class _ProbeSSH:
+        async def run(self, host, command, timeout=300, mutating=None, **kw):
+            return SimpleNamespace(
+                exit_code=0,
+                stdout='LISTEN 0.0.0.0:20000 users:(("uperf",pid=4242))',
+                stderr="",
+            )
+
+    benchmark_server._ssh = _ProbeSSH()
+
+    async def _keep_probe_ssh():
+        # The fixture's ensure_init replaces _ssh with a bare object;
+        # keep the probe SSH for this run.
+        return None
+
+    monkeypatch.setattr(benchmark_server, "_ensure_init", _keep_probe_ssh)
+    try:
+        result = json.loads(
+            await benchmark_server.execute_benchmark(
+                "controller", validation_id="val-788", approval_request_id="apr-1"
+            )
+        )
+    finally:
+        benchmark_server._ssh = None
+    assert result["status"] == "failed"
+    diag = result.get("failure_diagnostics")
+    assert diag is not None, result
+    assert diag["name"] == "uperf-port-conflict"
+    assert "4242" in diag["hosts"]["controller"]
+    assert "leftover uperf server" in diag["guidance"]
