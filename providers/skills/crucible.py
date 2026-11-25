@@ -41,13 +41,142 @@ _MAX_CONTEXT_DOCUMENTS = 256
 _MAX_CONTEXT_PACKAGE_BYTES = 32 * 1024 * 1024
 
 
+_MV_PARAM_ROLES = {"client", "server", "all"}
+
+
+def _endpoint_engine_roles(endpoint: dict[str, Any]) -> set[str]:
+    """Engine roles declared by one run-file endpoint.
+
+    Endpoints come in three shapes, all produced by this provider's own
+    run-file generation: flat ``engines`` lists (of role strings or
+    ``{"role": ...}`` engine objects), remotehost endpoints whose engines
+    live under ``remotes[].engines``, and kube endpoints whose ``engines``
+    is a role-keyed dict.
+    """
+    roles: set[str] = set()
+
+    def _add_engines(engines: Any) -> None:
+        if isinstance(engines, list):
+            for engine in engines:
+                if isinstance(engine, dict):
+                    role = engine.get("role")
+                else:
+                    role = engine
+                if role is not None:
+                    roles.add(str(role))
+        elif isinstance(engines, dict):
+            roles.update(str(role) for role in engines)
+
+    _add_engines(endpoint.get("engines"))
+    remotes = endpoint.get("remotes")
+    if isinstance(remotes, list):
+        for remote in remotes:
+            if isinstance(remote, dict):
+                _add_engines(remote.get("engines"))
+    return roles
+
+
+def _run_file_is_paired(run_file: dict[str, Any]) -> bool:
+    """True when the run file binds a client endpoint to a server endpoint.
+
+    Only paired benchmarks need role-scoped mv-params: the client's
+    parameters must be delivered to the client so it can resolve its peer
+    (remotehost). A controller-local or single-role benchmark (one engine
+    role across all endpoints) has no peer binding to lose, and its
+    parameters may legitimately carry no role.
+    """
+    endpoints = run_file.get("endpoints")
+    if not isinstance(endpoints, list):
+        return False
+    engines: set[str] = set()
+    for endpoint in endpoints:
+        if isinstance(endpoint, dict):
+            engines |= _endpoint_engine_roles(endpoint)
+    return "client" in engines and "server" in engines
+
+
+def _mv_params_role_errors(run_file: dict[str, Any]) -> list[str]:
+    """Role violations for paired benchmarks' mv-params (#1432).
+
+    A paired run file whose mv-params carry no ``role`` validates cleanly
+    but fails at execution in every iteration with ``remotehost is not
+    set`` — the client never receives the parameters that bind it to its
+    peer. Reject that at validation time, naming the parameter and the
+    binding that is missing.
+    """
+    errors: list[str] = []
+    for benchmark in run_file.get("benchmarks") or []:
+        if not isinstance(benchmark, dict):
+            continue
+        mv_params = benchmark.get("mv-params")
+        if not isinstance(mv_params, dict):
+            continue
+        sets = mv_params.get("sets")
+        if not isinstance(sets, list):
+            continue
+        benchmark_name = str(benchmark.get("name", "<unnamed>"))
+        global_options = mv_params.get("global-options")
+        if not isinstance(global_options, list):
+            global_options = []
+        for param_set in sets:
+            if not isinstance(param_set, dict):
+                continue
+            # A set may be empty on its own and include a named
+            # global-options group; the effective parameters are the
+            # union, and the role contract applies to all of them.
+            params = list(param_set.get("params") or [])
+            include = param_set.get("include")
+            if isinstance(include, str):
+                for group in global_options:
+                    if (
+                        isinstance(group, dict)
+                        and group.get("name") == include
+                        and isinstance(group.get("params"), list)
+                    ):
+                        params.extend(group["params"])
+            if not params:
+                continue
+            roleless = [
+                str(param.get("arg", "<unnamed>"))
+                for param in params
+                if not isinstance(param, dict)
+                or str(param.get("role", "")).lower() not in _MV_PARAM_ROLES
+            ]
+            if roleless:
+                errors.append(
+                    f"benchmark {benchmark_name!r} mv-params entries "
+                    f"{', '.join(roleless)} are missing a role; every mv-param "
+                    "in a client/server run file must declare "
+                    "role=client, role=server, or role=all — a roleless "
+                    "parameter cannot bind the client to its peer endpoint "
+                    "(execution fails with 'remotehost is not set')"
+                )
+                continue
+            roles = {str(param.get("role", "")).lower() for param in params}
+            # Each set executes independently, so coverage is per set.
+            has_client = bool(roles & {"client", "all"})
+            has_server = bool(roles & {"server", "all"})
+            if not (has_client and has_server):
+                missing = "server" if has_client else "client"
+                errors.append(
+                    f"benchmark {benchmark_name!r} has an mv-params set with "
+                    f"only {sorted(roles)} roles and no {missing}-role "
+                    "parameter; the client/server pair cannot be bound "
+                    "(execution fails with 'remotehost is not set')"
+                )
+    return errors
+
+
 def crucible_runfile_contract_errors(run_file: dict[str, Any]) -> list[str]:
     """Return deterministic violations of Crucible's required top-level fields."""
     if "tags" not in run_file:
         return ["missing required top-level key: tags"]
     if not isinstance(run_file["tags"], dict):
         return ["top-level tags must be an object"]
-    return []
+    errors: list[str] = []
+    if _run_file_is_paired(run_file):
+        errors.extend(_mv_params_role_errors(run_file))
+    return errors
 
 
 def crucible_runfile_schema(schema: dict[str, Any]) -> dict[str, Any]:
