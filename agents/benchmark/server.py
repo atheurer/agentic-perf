@@ -24,13 +24,16 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+
+import httpx
 
 _project_root = str(Path(__file__).resolve().parents[2])
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from agents.benchmark.harnesses.boot_time import BootTimeContext, run_boot_time_test
-from agents.crucible_mcp import CrucibleMCPAdapter
+from agents.crucible_mcp import CrucibleMCPAdapter, CrucibleMCPError
 from agents.mcp_audit import create_ticket_mcp
 from agents.mcp_client import MCPToolCallError
 from agents.server_utils import (
@@ -71,7 +74,10 @@ from providers.execution import (
     RootedPath,
     durable_filesystem_emitter,
 )
-from providers.skills.crucible import crucible_runfile_contract_errors
+from providers.skills.crucible import (
+    CRUCIBLE_MCP_SERVICE_START_COMMAND,
+    crucible_runfile_contract_errors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -660,6 +666,39 @@ class _BenchmarkOperation:
             return (operation.__dict__ if operation else {}), "in_progress"
         return operation.__dict__, status
 
+    async def peek_terminal(self) -> dict[str, Any] | None:
+        """Read the operation without claiming it; return it if terminal.
+
+        Unlike ``acquire``, this never creates or leases the operation —
+        safe to call speculatively (e.g. the controller-MCP preflight,
+        #1425) without interfering with a subsequent real launch.
+        Best-effort: any read failure returns None so callers fall back
+        to their normal paths.
+        """
+        token = os.environ.get("AGENTIC_PERF_API_TOKEN", "")
+        url = os.environ.get("STATE_STORE_URL", "http://localhost:8090")
+        if token:
+            from providers.tracing.client import TraceClient
+
+            client = TraceClient(url, token)
+            try:
+                result = await asyncio.to_thread(client.operation_get, self.key)
+                operation = result.get("operation", {})
+            except Exception:
+                return None
+            finally:
+                await asyncio.to_thread(client.close)
+        else:
+            from paths import TRACE_DB_PATH
+            from state_store.trace_store import TraceStore
+
+            store = TraceStore(TRACE_DB_PATH)
+            record = await asyncio.to_thread(store.get_operation, self.key)
+            operation = record.__dict__ if record else {}
+        if operation.get("state") != "terminal":
+            return None
+        return operation
+
     async def start_renewal(self, operation: dict[str, Any]) -> None:
         """Keep this fenced execution lease alive until terminalization.
 
@@ -948,6 +987,167 @@ class _BenchmarkOperation:
                 except Exception:
                     logger.exception("benchmark operation indeterminate write failed")
         return False
+
+
+async def _terminal_replay_payload(
+    validation_id: str | None, controller: str, harness_name: str
+) -> str | None:
+    """Return the durable result of a terminal execution, if one exists.
+
+    A retry of a completed execution must return its recorded result
+    without relaunching — and, in the controller-MCP preflight (#1425),
+    without health-checking or remediating the controller service: the
+    result is already durable, so the service's state is irrelevant.
+    """
+    if not validation_id:
+        return None
+    ticket_id = os.environ.get("TICKET_ID", "")
+    fields = _ticket.get("custom_fields", {}) if _ticket else {}
+    records = fields.get("benchmark_validations", {}).get("records", {})
+    replay_record = records.get(validation_id, {})
+    if not isinstance(replay_record, dict):
+        return None
+    replay_key, replay_hash, _ = _benchmark_intent_identity(
+        ticket_id,
+        validation_id,
+        replay_record,
+        controller,
+        harness_name,
+        replay_record.get("run_command", "crucible run"),
+    )
+    replay_guard = _BenchmarkOperation(
+        replay_key,
+        replay_hash,
+        os.environ.get("AGENTIC_PERF_INSTANCE_NAME", socket.gethostname()),
+    )
+    replay_operation = await replay_guard.peek_terminal()
+    if replay_operation is None:
+        return None
+    # The peek is read-only, so the hash invariant the acquire path
+    # enforces must be checked explicitly: an operation recorded under a
+    # different controller, harness, or command must not replay here.
+    if str(replay_operation.get("request_hash", "")) != replay_hash:
+        return None
+    descriptor = replay_operation.get("result_descriptor") or {}
+    cached = descriptor.get("benchmark_result") or descriptor.get("result")
+    if isinstance(cached, dict):
+        cached = _replay_operation_result(ticket_id, cached)
+        return json.dumps(
+            {
+                **cached,
+                "operation_id": replay_key,
+                "existing_operation": True,
+            }
+        )
+    return None
+
+
+async def _ensure_crucible_mcp_available(*, allow_start: bool) -> str | None:
+    """Health-check the controller's Crucible MCP service (#1425).
+
+    ``crucible update`` can stop ``crucible-mcp-server`` while
+    ``services.json`` still shows it enabled, leaving the agent unable to
+    obtain a validation id with no actionable error (PERF-887B82D7). This
+    preflight actually round-trips the contract probe (a cached connection
+    may be stale) and returns a clear, actionable error payload — or None
+    when the service is healthy.
+
+    ``allow_start`` gates the one remediation attempt: validation stays
+    read-only (it never starts services), while execution — which starts
+    far heavier things — may start a stopped service on the controller
+    before retrying. Configuration and contract-version failures are
+    never remediated; only unreachable-service failures are.
+    """
+    if _crucible_mcp is None:
+        return None
+    health_check = getattr(_crucible_mcp, "health_check", None)
+    if health_check is None:
+        # Adapters without a health probe (e.g. test doubles) cannot be
+        # checked; the contract call itself will surface any problem.
+        return None
+    try:
+        await health_check()
+        return None
+    except CrucibleMCPError as exc:
+        # Configuration, authentication, or contract problems are not
+        # service problems; restarting would not help and could disrupt a
+        # healthy controller.
+        return json.dumps(
+            {
+                "status": "failed",
+                "reason_code": "controller_mcp_unavailable",
+                "message": (
+                    f"The controller's Crucible MCP service failed its "
+                    f"contract check: {exc}. Check the crucible_mcp "
+                    f"configuration (URL, port, secret) for the controller."
+                ),
+            }
+        )
+    except Exception as exc:
+        # Remediation is reserved for reachability failures — the service
+        # is not listening. An HTTP status, authentication, or request
+        # failure means the service IS running; restarting it would be an
+        # unnecessary mutating action that also obscures the real
+        # problem.
+        remediable = isinstance(exc, (ConnectionError, OSError)) or (
+            isinstance(exc, httpx.ConnectError)
+        )
+        if remediable:
+            remediation = (
+                f"Start it on the controller "
+                f"(e.g. `{CRUCIBLE_MCP_SERVICE_START_COMMAND}` on "
+                f"{_crucible_mcp.controller}) and retry."
+            )
+        else:
+            remediation = (
+                "The service is running but rejected the request; check "
+                "the crucible_mcp configuration (URL, port, secret) for "
+                "the controller."
+            )
+        # Never auto-start when the configured endpoint is an override
+        # (proxy, alternate host): the assigned controller is not
+        # necessarily where the service lives, and starting things there
+        # would be an unrelated mutation.
+        endpoint_host = urlparse(_crucible_mcp.endpoint()).hostname or ""
+        endpoint_is_controller = endpoint_host.lower() == (
+            _crucible_mcp.controller.lower().strip("[]")
+        )
+        if allow_start and remediable and endpoint_is_controller and _ssh is not None:
+            try:
+                started = await _ssh.run(
+                    _crucible_mcp.controller,
+                    CRUCIBLE_MCP_SERVICE_START_COMMAND,
+                    timeout=30,
+                    mutating=True,
+                )
+                if started.exit_code == 0:
+                    try:
+                        await _crucible_mcp.health_check()
+                        return None
+                    except Exception:
+                        pass
+                else:
+                    remediation = (
+                        f"Attempting to start it on the controller failed "
+                        f"(exit {started.exit_code}: "
+                        f"{(started.stderr or '').strip()[:300]}). "
+                        f"{remediation}"
+                    )
+            except Exception as start_exc:
+                remediation = (
+                    f"Attempting to start it on the controller failed "
+                    f"({start_exc}). {remediation}"
+                )
+        return json.dumps(
+            {
+                "status": "failed",
+                "reason_code": "controller_mcp_unavailable",
+                "message": (
+                    f"The controller's Crucible MCP service is not "
+                    f"reachable ({exc}). {remediation}"
+                ),
+            }
+        )
 
 
 async def _ensure_init():
@@ -2530,43 +2730,24 @@ async def execute_benchmark(
         # A terminal replay is safe even after the ticket has advanced or
         # paused. Resolve it before enforcing the current execution status so
         # reconnects can retrieve the durable result without relaunching.
-        ticket_id = os.environ.get("TICKET_ID", "")
-        fields = _ticket.get("custom_fields", {}) if _ticket else {}
-        records = fields.get("benchmark_validations", {}).get("records", {})
-        replay_record = records.get(validation_id, {}) if validation_id else {}
-        if validation_id and isinstance(replay_record, dict):
-            replay_key, replay_hash, _ = _benchmark_intent_identity(
-                ticket_id,
-                validation_id,
-                replay_record,
-                controller,
-                harness_name,
-                replay_record.get("run_command", "crucible run"),
-            )
-            replay_guard = _BenchmarkOperation(
-                replay_key,
-                replay_hash,
-                os.environ.get("AGENTIC_PERF_INSTANCE_NAME", socket.gethostname()),
-            )
-            try:
-                replay_operation, replay_status = await replay_guard.acquire()
-                if replay_status == "terminal":
-                    descriptor = replay_operation.get("result_descriptor") or {}
-                    cached = descriptor.get("benchmark_result") or descriptor.get(
-                        "result"
-                    )
-                    if isinstance(cached, dict):
-                        cached = _replay_operation_result(ticket_id, cached)
-                        return json.dumps(
-                            {
-                                **cached,
-                                "operation_id": replay_key,
-                                "existing_operation": True,
-                            }
-                        )
-            finally:
-                await replay_guard.close()
+        replay_payload = await _terminal_replay_payload(
+            validation_id, controller, harness_name
+        )
+        if replay_payload is not None:
+            return replay_payload
         return json.dumps(active_check)
+
+    # #1425: a terminal replay is resolved before any preflight so a
+    # retry of a completed run still returns its durable result even
+    # when the controller service is down (read-only peek — no claim,
+    # no lease, no remediation).
+    if harness_name == "crucible" and _crucible_mcp is not None:
+        replay_payload = await _terminal_replay_payload(
+            validation_id, controller, harness_name
+        )
+        if replay_payload is not None:
+            return replay_payload
+
     run_uuid = uuid.uuid4().hex[:8]
     step_params = plan_step_params(active_check) or {}
     in_workload_group = bool(step_params.get("workload_group"))
@@ -3203,6 +3384,22 @@ async def execute_benchmark(
             f"[{minutes}m] {output_line}",
             "execute_benchmark",
         )
+
+    # #1425: health-check the controller's Crucible MCP service before
+    # the first launch side effect — after every deterministic intent,
+    # binding, and approval check has passed. A stopped service is
+    # remediated here (execution exists to start far heavier things);
+    # a service that cannot be started fails with the remediation named,
+    # instead of an unactionable failure deep in the launch.
+    if harness_name == "crucible" and _crucible_mcp is not None:
+        health_error = await _ensure_crucible_mcp_available(allow_start=True)
+        if health_error is not None:
+            # Pre-side-effect rejection: release the prepared operation
+            # (non-terminal) so a retry after the service is restored
+            # reuses it rather than minting a new execution attempt.
+            if operation_guard and operation_owned:
+                await operation_guard.close()
+            return health_error
 
     # The validated Crucible path below is the only path with a durable
     # validation lifecycle and controller-side reconciliation identity.  The
@@ -5024,6 +5221,14 @@ async def validate_benchmark(
                 "errors": ["Crucible MCP contract v3 is unavailable"],
             }
         )
+
+    # #1425: health-check the controller service before the contract call.
+    # Diagnostic-only: validation never starts services.
+    health_error = await _ensure_crucible_mcp_available(allow_start=False)
+    if health_error is not None:
+        payload = json.loads(health_error)
+        payload.update({"valid": False, "harness": harness_name})
+        return json.dumps(payload)
 
     try:
         ticket_id = os.environ.get("TICKET_ID", "")

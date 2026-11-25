@@ -276,6 +276,9 @@ async def test_execute_path_duplicate_replay_does_not_launch(monkeypatch) -> Non
     monkeypatch.setattr(benchmark_server, "_validation_records", {"val-1": record})
 
     class DuplicateOperation:
+        def __init__(self, _key, request_hash, _owner):
+            self.request_hash = request_hash
+
         async def acquire(self):
             calls.append("acquire")
             return (
@@ -283,17 +286,28 @@ async def test_execute_path_duplicate_replay_does_not_launch(monkeypatch) -> Non
                 "terminal",
             )
 
+        async def peek_terminal(self):
+            return {
+                "state": "terminal",
+                "request_hash": self.request_hash,
+                "result_descriptor": {"benchmark_result": {"status": "completed"}},
+            }
+
         async def close(self):
             calls.append("close")
 
     monkeypatch.setattr(
-        benchmark_server, "_BenchmarkOperation", lambda *_: DuplicateOperation()
+        benchmark_server,
+        "_BenchmarkOperation",
+        lambda key, request_hash, owner: DuplicateOperation(key, request_hash, owner),
     )
     result = await benchmark_server.execute_benchmark(
         "controller", validation_id="val-1"
     )
     assert '"existing_operation": true' in result
-    assert calls == ["acquire", "close"]
+    # The duplicate replay resolves through the read-only terminal peek
+    # (#1425) — no acquire, no lease, no close.
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -480,3 +494,284 @@ async def test_execute_terminal_failure_survives_restart_and_external_identity_i
     assert second["status"] == "failed"
     assert second["existing_operation"] is True
     assert len([c for c in calls if c[0] == "launch"]) == 1
+
+
+class TestControllerMcpHealthCheck:
+    """#1425: the controller's Crucible MCP service is health-checked
+    before validation (read-only) and before execution (start-if-stopped
+    with a clear remediation error)."""
+
+    @staticmethod
+    def _wire_health(monkeypatch, health_call):
+        class _Adapter:
+            controller = "controller"
+            contract_info = {}
+
+            def endpoint(self):
+                return "http://controller:8889/mcp"
+
+            async def health_check(self):
+                await health_call()
+
+            async def call_tool(self, name, arguments):
+                raise AssertionError("health check should gate tool calls")
+
+        monkeypatch.setattr(benchmark_server, "_crucible_mcp", _Adapter())
+        benchmark_server._ticket.setdefault("custom_fields", {})["ssh_hardware_ips"] = {
+            "controller": "controller"
+        }
+
+    @pytest.mark.asyncio
+    async def test_validation_reports_unreachable_service_without_starting_it(
+        self, tmp_path, monkeypatch
+    ):
+        _crucible_fixture(tmp_path, monkeypatch)
+        ssh_calls: list[str] = []
+
+        class _NoStartSSH:
+            async def run(self, host, command, **kw):
+                ssh_calls.append(command)
+                raise AssertionError("validation must not start services")
+
+        benchmark_server._ssh = _NoStartSSH()
+
+        async def unreachable():
+            raise ConnectionError("connection refused")
+
+        self._wire_health(monkeypatch, unreachable)
+        result = json.loads(
+            await benchmark_server.validate_benchmark(
+                "controller", {"tags": {}, "benchmarks": [{"name": "uperf"}]}
+            )
+        )
+        assert result["status"] == "failed"
+        assert result["reason_code"] == "controller_mcp_unavailable"
+        assert "crucible start mcp-server" in result["message"]
+        assert ssh_calls == []
+
+    @pytest.mark.asyncio
+    async def test_configuration_failure_is_not_restarted(self, tmp_path, monkeypatch):
+        from agents.crucible_mcp import CrucibleMCPError
+
+        _crucible_fixture(tmp_path, monkeypatch)
+
+        class _NoStartSSH:
+            async def run(self, host, command, **kw):
+                raise AssertionError("configuration errors must not restart")
+
+        benchmark_server._ssh = _NoStartSSH()
+
+        async def bad_config():
+            raise CrucibleMCPError("invalid_configuration", "bad config")
+
+        self._wire_health(monkeypatch, bad_config)
+        result = json.loads(
+            await benchmark_server.validate_benchmark(
+                "controller", {"tags": {}, "benchmarks": [{"name": "uperf"}]}
+            )
+        )
+        assert result["reason_code"] == "controller_mcp_unavailable"
+        assert "configuration" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_execution_starts_stopped_service_and_proceeds(
+        self, tmp_path, monkeypatch
+    ):
+        _crucible_fixture(tmp_path, monkeypatch)
+
+        async def _keep_ssh():
+            # The fixture's ensure_init replaces _ssh with a bare object.
+            return None
+
+        monkeypatch.setattr(benchmark_server, "_ensure_init", _keep_ssh)
+        start_calls: list[tuple[str, str]] = []
+
+        class _StartSSH:
+            async def run(self, host, command, timeout=300, mutating=None, **kw):
+                start_calls.append((host, command))
+                from types import SimpleNamespace as _NS
+
+                return _NS(exit_code=0, stdout="", stderr="")
+
+        benchmark_server._ssh = _StartSSH()
+
+        # Simulate: first health check fails, the start succeeds, and the
+        # second health check passes.
+        check_count = {"n": 0}
+
+        async def flaky_health():
+            check_count["n"] += 1
+            if check_count["n"] == 1:
+                raise ConnectionError("connection refused")
+            # subsequent checks: the adapter is healthy
+
+        class _Adapter:
+            controller = "controller"
+            contract_info = {"version": "3"}
+
+            def endpoint(self):
+                return "http://controller:8889/mcp"
+
+            async def health_check(self):
+                await flaky_health()
+
+            async def call_tool(self, name, arguments):
+                # After remediation the run proceeds through the fixture
+                # adapter; this stand-in only proves the gate opened.
+                raise ConnectionError("should use fixture adapter")
+
+        # Keep the fixture's MCP adapter for execution; only the health
+        # stand-in is needed until remediation succeeds. Simplest: patch
+        # health on the real flow via the stand-in, then restore.
+        monkeypatch.setattr(benchmark_server, "_crucible_mcp", _Adapter())
+        result = json.loads(
+            await benchmark_server.execute_benchmark(
+                "controller", validation_id="val-788", approval_request_id="apr-1"
+            )
+        )
+        assert start_calls == [("controller", "crucible start mcp-server")]
+        # The second health check passed, so the preflight returned None
+        # and execution continued (it fails later only because the
+        # stand-in adapter cannot run tools — not with the preflight
+        # error).
+        assert result.get("reason_code") != "controller_mcp_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_execution_reports_clear_error_when_start_fails(
+        self, tmp_path, monkeypatch
+    ):
+        _crucible_fixture(tmp_path, monkeypatch)
+
+        async def _keep_ssh():
+            return None
+
+        monkeypatch.setattr(benchmark_server, "_ensure_init", _keep_ssh)
+
+        class _FailingStartSSH:
+            async def run(self, host, command, timeout=300, mutating=None, **kw):
+                from types import SimpleNamespace as _NS
+
+                return _NS(exit_code=1, stdout="", stderr="unit is masked")
+
+        benchmark_server._ssh = _FailingStartSSH()
+
+        async def unreachable():
+            raise ConnectionError("connection refused")
+
+        self._wire_health(monkeypatch, unreachable)
+        result = json.loads(
+            await benchmark_server.execute_benchmark(
+                "controller", validation_id="val-788", approval_request_id="apr-1"
+            )
+        )
+        assert result["reason_code"] == "controller_mcp_unavailable"
+        assert "crucible start mcp-server" in result["message"]
+        assert "unit is masked" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_http_auth_failure_is_not_restarted(self, tmp_path, monkeypatch):
+        import httpx
+
+        _crucible_fixture(tmp_path, monkeypatch)
+
+        class _NoStartSSH:
+            async def run(self, host, command, **kw):
+                raise AssertionError("auth failures must not restart the service")
+
+        benchmark_server._ssh = _NoStartSSH()
+
+        async def unauthorized():
+            request = httpx.Request("POST", "http://controller:8889/mcp")
+            raise httpx.HTTPStatusError(
+                "401", request=request, response=httpx.Response(401)
+            )
+
+        self._wire_health(monkeypatch, unauthorized)
+        result = json.loads(
+            await benchmark_server.execute_benchmark(
+                "controller", validation_id="val-788", approval_request_id="apr-1"
+            )
+        )
+        assert result["reason_code"] == "controller_mcp_unavailable"
+        # The service is running (it answered 401); the error points at
+        # configuration, not at starting the service.
+        assert "retry" not in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_endpoint_override_never_auto_starts(self, tmp_path, monkeypatch):
+        _crucible_fixture(tmp_path, monkeypatch)
+        start_calls: list[str] = []
+
+        class _NoStartSSH:
+            async def run(self, host, command, **kw):
+                start_calls.append(command)
+                from types import SimpleNamespace as _NS
+
+                return _NS(exit_code=0, stdout="", stderr="")
+
+        benchmark_server._ssh = _NoStartSSH()
+
+        class _OverrideAdapter:
+            controller = "controller"
+            contract_info = {}
+
+            def endpoint(self):
+                # An override pointing elsewhere: the assigned controller
+                # is not where this service lives.
+                return "http://mcp-proxy.example:8889/mcp"
+
+            async def health_check(self):
+                raise ConnectionError("connection refused")
+
+        monkeypatch.setattr(benchmark_server, "_crucible_mcp", _OverrideAdapter())
+        result = json.loads(
+            await benchmark_server.execute_benchmark(
+                "controller", validation_id="val-788", approval_request_id="apr-1"
+            )
+        )
+        assert result["reason_code"] == "controller_mcp_unavailable"
+        assert start_calls == []
+
+
+async def test_terminal_replay_requires_matching_request_hash(tmp_path, monkeypatch):
+    """#1425: the read-only peek must enforce the request-hash binding the
+    acquire path enforces — a different controller or command must not
+    replay an old terminal result."""
+    _crucible_fixture(tmp_path, monkeypatch)
+
+    class _MismatchedOperation:
+        def __init__(self, key, request_hash, owner):
+            self.key = key
+            self.request_hash = request_hash
+
+        async def peek_terminal(self):
+            return {
+                "state": "terminal",
+                "request_hash": "a-different-hash-entirely",
+                "result_descriptor": {"benchmark_result": {"status": "completed"}},
+            }
+
+        async def acquire(self):
+            return ({"external_ids": {}}, "acquired")
+
+        async def transition(self, _action, record, **kwargs):
+            return record
+
+        async def terminalize(self, record, _outcome, descriptor=None):
+            return True
+
+        async def start_renewal(self, _record):
+            return None
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(benchmark_server, "_BenchmarkOperation", _MismatchedOperation)
+    result = json.loads(
+        await benchmark_server.execute_benchmark(
+            "controller", validation_id="val-788", approval_request_id="apr-1"
+        )
+    )
+    # No replay of the mismatched terminal record; execution continued
+    # down its normal validation path (which rejects in the fixture).
+    assert result.get("existing_operation") is not True

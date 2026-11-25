@@ -241,3 +241,53 @@ def test_crucible_runtime_documentation_uses_mcp_contract_v3():
     assert "list_userenvs" in command_broker
     assert "does not fall back to SSH or the Crucible CLI" in command_broker
     assert "controller MCP contract v3" in workspaces
+
+
+@pytest.mark.asyncio
+async def test_health_check_round_trips_through_cached_connection():
+    """#1425: a cached connection is actually probed, not assumed."""
+    instance, client, _secrets = adapter()
+    await instance.connect()
+    assert instance.connected
+    await instance.health_check()
+    # The cached connection served the probe without reconnecting.
+    assert ("crucible_info", {}) in client.calls
+    assert len(client.connect_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_health_check_discards_stale_connection_and_reconnects():
+    """#1425: a service stopped after an earlier successful connect must
+    not pass a connect-only preflight."""
+
+    class _StaleClient(FakeMCPClient):
+        stale = False
+
+        async def call_tool(self, name, arguments):
+            if self.stale:
+                raise ConnectionError("connection refused")
+            return await super().call_tool(name, arguments)
+
+    client = _StaleClient(
+        json.dumps({"mcp_contract_version": "3", "execution_supported": True})
+    )
+    instance = CrucibleMCPAdapter(
+        controller="controller.example",
+        ticket_id="PERF-MCP",
+        agent_id="benchmark-agent",
+        settings=CrucibleMCPSettings(),
+        secrets_provider=SecretProvider(),
+        client=client,
+    )
+    await instance.connect()
+    client.stale = True
+    with pytest.raises(ConnectionError):
+        await instance.health_check()
+    # The stale connection was discarded; the next attempt reconnects.
+    assert not instance.connected
+    client.stale = False
+    await instance.health_check()
+    assert instance.connected
+    # Initial connect, the failed reconnect attempt, and the healthy
+    # reconnect after the service came back.
+    assert len(client.connect_calls) == 3
