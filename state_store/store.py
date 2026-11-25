@@ -103,6 +103,37 @@ class TicketDispatchBlocked(Exception):
     pass
 
 
+def _derive_mv_params_roles(run_file: object) -> dict[str, list[str]]:
+    """Derive the multiplex role map of a validated run file (#1385).
+
+    Returns ``{arg: [roles...]}`` across every mv-params set; an omitted
+    role is recorded as ``"omitted"`` so a human reviewer can see exactly
+    which parameters fall to the harness's ambiguous default. Repeated
+    args with different roles collapse into the sorted role list.
+    """
+    roles: dict[str, set[str]] = {}
+    if not isinstance(run_file, dict):
+        return {}
+    for benchmark in run_file.get("benchmarks") or []:
+        if not isinstance(benchmark, dict):
+            continue
+        mv_params = benchmark.get("mv-params")
+        if not isinstance(mv_params, dict):
+            continue
+        param_sets: list[dict] = [
+            s for s in (mv_params.get("sets") or []) if isinstance(s, dict)
+        ]
+        for param_set in param_sets:
+            for param in param_set.get("params") or []:
+                if not isinstance(param, dict) or not param.get("arg"):
+                    continue
+                role = param.get("role")
+                roles.setdefault(str(param["arg"]), set()).add(
+                    str(role) if isinstance(role, str) and role else "omitted"
+                )
+    return {arg: sorted(values) for arg, values in roles.items()}
+
+
 class TicketStore:
     MAX_CLAIM_RECONCILIATION_RECORD_BYTES = 8 * 1024 * 1024
     MAX_CLAIM_RECONCILIATION_SCAN_BYTES = 16 * 1024 * 1024
@@ -2030,6 +2061,7 @@ class TicketStore:
                 )
                 raise ValueError(f"approval rejected: {rejection_reason}")
             fields = ticket.custom_fields
+            derived_roles: dict[str, list[str]] | None = None
             if request.kind == "kernel_change":
                 # A kernel change binds to the immutable intent record the
                 # provisioning server persisted; both digests carry the
@@ -2103,6 +2135,10 @@ class TicketStore:
                     raise ValueError(
                         "approval does not match an executable validation record"
                     )
+                # #1385: derive the role map from the immutable validated
+                # run file — never from the LLM's summary prose, which can
+                # claim role semantics the JSON does not encode.
+                derived_roles = _derive_mv_params_roles(validation.get("run_file"))
             raw = ticket.custom_fields.setdefault("approval_requests", {})
             if not isinstance(raw, dict):
                 raise ValueError("approval request state is malformed")
@@ -2166,6 +2202,11 @@ class TicketStore:
                 approval_request_id=approval_id,
                 ticket_id=ticket_id,
                 created_by=created_by,
+                mv_params_roles=(
+                    derived_roles
+                    if request.kind == "benchmark_run_file" and derived_roles
+                    else None
+                ),
                 **request.model_dump(
                     exclude={
                         "expires_at",

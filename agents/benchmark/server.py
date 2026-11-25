@@ -2271,6 +2271,43 @@ def _normalize_plan_mv_params(plan_mv_params):
     return {}
 
 
+def _plan_mv_param_entries(plan_mv_params: Any) -> list[dict[str, Any]]:
+    """Extract (arg, vals, role) entries from either plan mv_params form.
+
+    A plan entry may carry an explicit ``role`` — the user's multiplex
+    role contract (#1385). The same argument may appear twice with
+    different roles (e.g. cpu-pin once for the client and once for the
+    server), so entries are a list, never collapsed by arg. The dict form
+    accepts both ``{arg: vals}`` and ``{arg: {"vals": ..., "role": ...}}``.
+    """
+    entries: list[dict[str, Any]] = []
+    if isinstance(plan_mv_params, list):
+        for entry in plan_mv_params:
+            if isinstance(entry, dict) and entry.get("arg"):
+                role = entry.get("role")
+                entries.append(
+                    {
+                        "arg": str(entry["arg"]),
+                        "vals": entry.get("vals"),
+                        "role": str(role) if isinstance(role, str) and role else None,
+                    }
+                )
+    elif isinstance(plan_mv_params, dict):
+        for arg, value in plan_mv_params.items():
+            if isinstance(value, dict):
+                role = value.get("role")
+                entries.append(
+                    {
+                        "arg": str(arg),
+                        "vals": value.get("vals"),
+                        "role": (str(role) if isinstance(role, str) and role else None),
+                    }
+                )
+            else:
+                entries.append({"arg": str(arg), "vals": value, "role": None})
+    return entries
+
+
 def _check_plan_mv_params(
     ticket: dict[str, Any],
     run_file: dict[str, Any] | None,
@@ -2289,7 +2326,10 @@ def _check_plan_mv_params(
     """
     # Harness-neutral: the run file under execution is passed in
     # directly (from the validation record for crucible, or the
-    # caller-supplied file for generic adapters).
+    # caller-supplied file for generic adapters). Extract the role-
+    # bearing entries BEFORE normalization — normalization collapses to
+    # {arg: vals} and would drop the user's role contract (#1385).
+    plan_entries = _plan_mv_param_entries(plan_mv_params)
     plan_mv_params = _normalize_plan_mv_params(plan_mv_params)
     if not plan_mv_params and not enforce_no_extras:
         return ""
@@ -2312,17 +2352,109 @@ def _check_plan_mv_params(
                 not isinstance(param, dict) or not param.get("arg") for param in params
             ):
                 return "run file contains malformed mv-params"
-            names = [str(param["arg"]) for param in params]
-            if len(names) != len(set(names)):
-                return "run file contains duplicate mv-params"
+            # #1385: the same argument may legitimately appear twice
+            # with different roles (cpu-pin for the client and again for
+            # the server); only duplicate (arg, role) pairs are errors.
+            pairs = [
+                (str(param["arg"]), str(param.get("role") or "")) for param in params
+            ]
+            if len(pairs) != len(set(pairs)):
+                return "run file contains duplicate mv-params (same arg and role)"
             runfile_params = {str(param["arg"]): param.get("vals") for param in params}
-            for key, expected in plan_mv_params.items():
-                expected_vals = expected if isinstance(expected, list) else [expected]
-                actual = runfile_params.get(str(key))
-                if actual != [str(value) for value in expected_vals]:
+
+            def _vals_of(param: dict) -> list:
+                vals = param.get("vals")
+                return vals if isinstance(vals, list) else [vals]
+
+            # #1385: when the plan carries any role for an argument, the
+            # run file's role set for that argument must EQUAL the plan's
+            # role set — a requested server-only param generated with both
+            # server and client entries changes scope while passing an
+            # existence-only check. Plan-side hygiene is enforced too:
+            # duplicate (arg, role) entries and mixed role/roleless entries
+            # for one argument are ambiguous contracts, rejected outright.
+            plan_roles: dict[str, set[str]] = {}
+            for entry in plan_entries:
+                key = entry["arg"]
+                role = entry.get("role")
+                if role is None:
+                    if key in plan_roles:
+                        return (
+                            "plan mv-params mix roleless and role-scoped entries "
+                            f"for {key!r}; give every {key!r} entry a role"
+                        )
+                    continue
+                if role in plan_roles.setdefault(key, set()):
+                    return (
+                        f"plan mv-params contain duplicate entries for "
+                        f"{key!r} with role={role!r}"
+                    )
+                plan_roles[key].add(role)
+                if any(
+                    other.get("arg") == key and other.get("role") is None
+                    for other in plan_entries
+                ):
+                    return (
+                        "plan mv-params mix roleless and role-scoped entries "
+                        f"for {key!r}; give every {key!r} entry a role"
+                    )
+            for key, expected_roles in plan_roles.items():
+                actual_roles = {
+                    str(param.get("role") or "")
+                    for param in params
+                    if str(param["arg"]) == key
+                }
+                if actual_roles != expected_roles:
+                    return (
+                        f"run file mv-params violate the requested role contract: "
+                        f"plan requires {key} with role(s) "
+                        f"{sorted(expected_roles)!r}, run file has "
+                        f"{sorted(actual_roles)!r}"
+                    )
+            for entry in plan_entries:
+                key = entry["arg"]
+                expected_vals = (
+                    entry["vals"]
+                    if isinstance(entry["vals"], list)
+                    else [entry["vals"]]
+                )
+                expected_str = [str(value) for value in expected_vals]
+                # Existence, not a dict lookup: the same arg may appear
+                # twice with different roles and different vals.
+                matching = [
+                    param
+                    for param in params
+                    if str(param["arg"]) == key
+                    and [str(value) for value in _vals_of(param)] == expected_str
+                ]
+                if not matching:
+                    actual = runfile_params.get(key)
                     return (
                         f"run file mv-params does not match the plan: plan requires "
                         f"{key}={expected_vals!r}, run file has {actual!r} (or omits it)"
+                    )
+                expected_role = entry.get("role")
+                if expected_role is None:
+                    continue
+                # The user's role contract is enforced mechanically: the
+                # run-file param for this arg must carry exactly the
+                # requested role — an omitted role falls to the harness's
+                # ambiguous default and silently narrows the requested
+                # scope (PERF-92D9775E).
+                if not any(
+                    str(param.get("role") or "") == expected_role for param in matching
+                ):
+                    actual_roles = sorted(
+                        {
+                            str(param.get("role") or "<omitted>")
+                            for param in params
+                            if str(param["arg"]) == key
+                        }
+                    )
+                    return (
+                        f"run file mv-params violate the requested role contract: "
+                        f"plan requires {key} with role={expected_role!r}, run file "
+                        f"has role(s) {actual_roles!r} for {key}"
                     )
             extras = sorted(set(runfile_params) - {str(key) for key in plan_mv_params})
             if extras and (plan_mv_params or enforce_no_extras):

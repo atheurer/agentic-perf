@@ -332,6 +332,14 @@ The execution_plan is a list of steps. Each step has an agent_type and params:
 - **benchmark**: Run a benchmark.
   params: {label, mv_params (run-file parameter overrides)}
 
+  When the user explicitly assigns multiplex roles to parameters ("X and Y are
+  the only shared params", "Z is server-only", "W is client-only"), encode the
+  contract on the mv_params entries as a `role` field (client, server, or all).
+  Emit one entry per (arg, role) — the same arg may appear twice, once per
+  role. The benchmark run file is then validated mechanically against these
+  roles; without them, a role the user requested can be silently dropped from
+  the run file while the approval text still claims it is honored.
+
 - **review**: Analyze and compare benchmark results.
   params: {}
 

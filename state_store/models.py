@@ -223,6 +223,11 @@ class ApprovalRequest(BaseModel):
     expires_at: datetime | None = None
     ticket_attempt: str | None = None
     claim_id: str | None = None
+    # Server-derived evidence (#1385): the multiplex role map of the
+    # immutable validated run file, computed at approval-creation time so
+    # the human sees the JSON's actual roles next to the LLM-authored
+    # summary. Clients never supply it.
+    mv_params_roles: dict[str, list[str]] | None = None
     record_version: int = 1
 
 
