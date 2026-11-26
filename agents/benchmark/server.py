@@ -1393,7 +1393,7 @@ async def get_execution_config(harness_name: str) -> str:
 
 @mcp.tool()
 async def get_runfile_schema(harness: str = "crucible") -> str:
-    """Get the JSON schema that defines the structure of a valid run-file. Use this to understand what top-level keys, benchmark objects, endpoint structures, and mv-params formats are allowed. The schema enforces additionalProperties: false, so only documented keys are permitted."""
+    """Get the JSON schema that defines the structure of a valid run-file. For Crucible, the gateway serves the structural reference as the `docs/run-files` context ref and enforces the installed schema through validation."""
     await _ensure_init()
     harness_name = harness or "crucible"
     if harness_name == "crucible":
@@ -1403,8 +1403,9 @@ async def get_runfile_schema(harness: str = "crucible") -> str:
                 "harness": "crucible",
                 "message": (
                     "The Crucible run-file schema is controller-sourced context. "
-                    'Use get_skill_context(subject="harness/crucible", operation="bootstrap" or '
-                    '"read") to retrieve it.'
+                    "Read get_skill_context(subject='harness/crucible', "
+                    "operation='read', ref='docs/run-files') for the structural "
+                    "reference, and use validate_benchmark for schema enforcement."
                 ),
             }
         )
@@ -1425,7 +1426,7 @@ async def get_runfile_schema(harness: str = "crucible") -> str:
 
 @mcp.tool()
 async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str:
-    """Get the parameter definitions (multiplex.json) for a specific benchmark. Returns presets (named parameter sets like 'basic', 'default') and validations (regex patterns for allowed values per argument). Use this to understand what mv-params arguments are valid and what values they accept."""
+    """Get the parameter definitions for a specific benchmark. For Crucible, use the gateway ref `benchmark/<name>`, which returns parameter validation rules, CDM/output metadata, and the benchmark description."""
     await _ensure_init()
     harness_name = harness or "crucible"
     if harness_name == "crucible":
@@ -1436,8 +1437,11 @@ async def get_benchmark_params(benchmark: str, harness: str = "crucible") -> str
                 "harness": "crucible",
                 "message": (
                     "Crucible benchmark metadata is controller-sourced context. "
-                    "Use get_skill_context(subject='harness/crucible') to read multiplex.json "
-                    "and related files."
+                    "Read get_skill_context(subject='harness/crucible', "
+                    "operation='read', ref='benchmark/<name>') for the description, "
+                    "CDM/output metadata, and parameter_validation rules. Named "
+                    "presets are not exposed; parameters that are omitted keep "
+                    "their preset defaults automatically."
                 ),
             }
         )
@@ -1698,8 +1702,10 @@ async def get_tool_params(tool: str, harness: str = "crucible") -> str:
                 "harness": "crucible",
                 "message": (
                     "Crucible tool metadata is controller-sourced context. "
-                    "Use get_skill_context(subject='harness/crucible') to read the tool "
-                    "metadata and parameter files."
+                    "Read get_skill_context(subject='harness/crucible', "
+                    "operation='read', ref='tools/<tool>') for the tool metadata, "
+                    "and docs/tool-collection for the default tools and their "
+                    "common arguments."
                 ),
             }
         )
@@ -1755,8 +1761,10 @@ async def get_example_runfile(
                 "harness": "crucible",
                 "endpoint_type": ep_type,
                 "message": (
-                    "Crucible examples are controller-sourced context. Use "
-                    "get_skill_context(subject='harness/crucible') to discover and read them."
+                    "Crucible example run-files are not served over MCP. Read "
+                    "get_skill_context(subject='harness/crucible', "
+                    "operation='read', ref='docs/run-files') for the run-file "
+                    "structure and construct the document from the ticket."
                 ),
             }
         )

@@ -142,6 +142,7 @@ async def test_get_runfile_schema_found(handlers_with_schema):
     result = await handlers_with_schema["get_runfile_schema"]()
     assert result["found"] is False
     assert "controller-sourced context" in result["message"]
+    assert "docs/run-files" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -155,6 +156,8 @@ async def test_get_benchmark_params_found(handlers_with_schema):
     result = await handlers_with_schema["get_benchmark_params"](benchmark="uperf")
     assert result["found"] is False
     assert "controller-sourced context" in result["message"]
+    assert "benchmark/<name>" in result["message"]
+    assert "parameter_validation" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -167,7 +170,7 @@ async def test_get_benchmark_params_not_found(handlers_with_schema):
 async def test_get_example_runfile_found(handlers_with_schema):
     result = await handlers_with_schema["get_example_runfile"](benchmark="uperf")
     assert result["found"] is False
-    assert "controller-sourced context" in result["message"]
+    assert "docs/run-files" in result["message"]
 
 
 @pytest.mark.asyncio
