@@ -9,6 +9,10 @@ cd agentic-perf
 ./scripts/validate.sh     # Verify everything works
 ```
 
+`scripts/dev-setup.sh` installs the hashed development lockfile, installs the
+project without resolving dependencies separately, and runs both the dependency
+preflight and `pip check`. Keep local and CI environments tied to that lockfile.
+
 ## Development Workflow
 
 1. **Create a feature branch** from `main`
@@ -43,6 +47,7 @@ requests targeting `main` or `local-pr-tests`.
 | Script | Purpose | When to use |
 |---|---|---|
 | `scripts/dev-setup.sh` | Install hooks + deps | Once after clone |
+| `scripts/dependency_preflight.py` | Check installed OpenTelemetry and test-client versions | After dependency changes |
 | `scripts/lint.sh` | Run ruff lint + format check across the repository | Full local check |
 | `scripts/test.sh` | Run the full pytest suite serially with coverage | Debugging / serial check |
 | `scripts/test-parallel.sh` | Run the full pytest suite with isolated workers | Full local check; CI |
@@ -52,6 +57,22 @@ requests targeting `main` or `local-pr-tests`.
 The CI workflow runs `scripts/lint.sh` and `scripts/test-parallel.sh`, plus
 security checks. The pre-commit hook runs scoped validation for staged Python
 files and uses the full suite as its fallback.
+
+## Dependency Lockfiles
+
+Development and CI installs use `requirements-dev.lock`. Runtime deployment can
+use `requirements.lock`. Regenerate both files with `pip-compile` after changing
+`pyproject.toml`, then run `./scripts/dev-setup.sh` before committing:
+
+```bash
+python -m pip install pip-tools
+pip-compile --generate-hashes --no-strip-extras \
+  --output-file=requirements.lock pyproject.toml
+pip-compile --extra=dev --extra=gemini --extra=openai \
+  --extra=telemetry --extra=telemetry-export --generate-hashes \
+  --no-strip-extras --output-file=requirements-dev.lock pyproject.toml
+./scripts/dev-setup.sh
+```
 
 ## Code Standards
 

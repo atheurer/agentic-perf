@@ -19,6 +19,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.lock && pip install -e . --no-deps
 
+      - name: Check dependencies
+        run: |
+          python3 scripts/dependency_preflight.py
+          python3 -m pip check
+
       - name: Lint
         run: ./scripts/lint.sh
 
@@ -39,6 +44,11 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements-dev.lock && pip install -e . --no-deps
+
+      - name: Check dependencies
+        run: |
+          python3 scripts/dependency_preflight.py
+          python3 -m pip check
 
       - name: Test with coverage
         run: ./scripts/test-parallel.sh
@@ -63,7 +73,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements-dev.lock && pip install -e . --no-deps && pip install bandit pip-audit
+        run: pip install -r requirements-dev.lock && pip install -e . --no-deps
+
+      - name: Check dependencies
+        run: |
+          python3 scripts/dependency_preflight.py
+          python3 -m pip check
+
+      - name: Install security tools
+        run: pip install bandit pip-audit
 
       - name: Static security scan (bandit)
         run: |

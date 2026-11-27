@@ -46,7 +46,13 @@ echo "Step 2: Installing git hooks..."
 
 echo ""
 echo "Step 3: Installing dev dependencies..."
-pip install -e ".[dev]" --quiet
+python3 -m pip install --no-deps -r "${repo_root}/requirements-dev.lock" --quiet
+python3 -m pip install --no-deps -e "${repo_root}" --quiet
+
+echo ""
+echo "Step 4: Checking dependencies..."
+python3 "${repo_root}/scripts/dependency_preflight.py"
+python3 -m pip check
 
 echo ""
 echo "✓ Developer setup complete!"
