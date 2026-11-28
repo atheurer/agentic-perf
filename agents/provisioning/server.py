@@ -4580,8 +4580,17 @@ async def reboot_hosts_and_verify(
     reconnect_timeout_seconds: int = 900,
     poll_interval_seconds: int = 10,
     reboot_policy: str = "always",
+    reason: str = "",
+    preserve_tuning: str = "auto",
 ) -> str:
     """Reboot this ticket's benchmark hosts one at a time and verify each comes back on the expected kernel.
+
+    Every reboot records an intent (``reason``, ``preserve_tuning``) on the
+    transition record.  A reboot invalidates the verification of the host's
+    tuning, not the declaration of it: ``preserve_tuning`` defaults to
+    ``"auto"``, which preserves the contract only for reasons that cannot move
+    NIC/host state, and otherwise requires the tuning to be re-declared.
+    Callers must state ``reason`` so the decision is auditable.
 
     Long-lived, protected operation. Every invocation probes each host first and
     applies the recovery rules: a reboot that already happened in this plan step
@@ -4669,6 +4678,21 @@ async def reboot_hosts_and_verify(
     transition["addresses"] = dict(ctx["addresses"])
     transition["requested_hosts"] = sorted(allowed)
     transition["strategy"] = strategy
+
+    # Durable reboot intent: what this reboot means for the tuning contract.
+    from agents.provisioning.host_state import make_reboot_intent
+
+    intent = make_reboot_intent(
+        allowed,
+        reason=reason,
+        preserve_tuning=preserve_tuning,
+        by="provisioning-agent",
+        at=__import__("datetime")
+        .datetime.now(__import__("datetime").timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        contract_ref=transition.get("tuning_contract_ref"),
+    )
+    transition.setdefault("reboot_intents", []).append(intent)
 
     if reboot_policy != policy:
         return json.dumps(
